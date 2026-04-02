@@ -223,6 +223,7 @@ pub struct SurfnetSvm {
     pub chain_tip: BlockIdentifier,
     pub blocks: Box<dyn Storage<u64, BlockHeader>>,
     pub transactions: Box<dyn Storage<String, SurfnetTransactionStatus>>,
+    pub jito_bundles: Box<dyn Storage<String, Vec<String>>>,
     pub transactions_queued_for_confirmation: VecDeque<(
         VersionedTransaction,
         Sender<TransactionStatusEvent>,
@@ -343,6 +344,7 @@ impl SurfnetSvm {
             // Wrap all storage fields with OverlayStorage
             blocks: OverlayStorage::wrap(self.blocks.clone_box()),
             transactions: OverlayStorage::wrap(self.transactions.clone_box()),
+            jito_bundles: OverlayStorage::wrap(self.jito_bundles.clone_box()),
             profile_tag_map: OverlayStorage::wrap(self.profile_tag_map.clone_box()),
             simulated_transaction_profiles: OverlayStorage::wrap(
                 self.simulated_transaction_profiles.clone_box(),
@@ -456,6 +458,7 @@ impl SurfnetSvm {
         )?;
         let blocks_db = new_kv_store(&database_url, "blocks", surfnet_id)?;
         let transactions_db = new_kv_store(&database_url, "transactions", surfnet_id)?;
+        let jito_bundles_db = new_kv_store(&database_url, "jito_bundles", surfnet_id)?;
         let token_accounts_db = new_kv_store(&database_url, "token_accounts", surfnet_id)?;
         let mut token_mints_db: Box<dyn Storage<String, MintAccount>> =
             new_kv_store(&database_url, "token_mints", surfnet_id)?;
@@ -545,6 +548,7 @@ impl SurfnetSvm {
             chain_tip,
             blocks: blocks_db,
             transactions: transactions_db,
+            jito_bundles: jito_bundles_db,
             perf_samples: VecDeque::new(),
             transactions_processed,
             simnet_events_tx,

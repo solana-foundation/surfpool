@@ -99,6 +99,12 @@ impl SurfpoolError {
         Self(error)
     }
 
+    pub fn invalid_bundle_id() -> Self {
+        let mut error = Error::invalid_request();
+        error.data = Some(json!(format!("Solana RPC client error: Invalid bundle id")));
+        Self(error)
+    }
+
     pub fn missing_context() -> Self {
         let mut error = Error::internal_error();
         error.data = Some(json!("Failed to access internal Surfnet context"));

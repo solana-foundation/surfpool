@@ -1,10 +1,12 @@
 use std::str::FromStr;
 
-use jsonrpc_core::{Error, Result};
+use jsonrpc_core::{BoxFuture, Error, Result};
 use jsonrpc_derive::rpc;
 use sha2::{Digest, Sha256};
 use solana_client::{rpc_config::RpcSendTransactionConfig, rpc_custom_error::RpcCustomError};
+use solana_rpc_client_api::response::Response as RpcResponse;
 use solana_signature::Signature;
+use solana_transaction_status::TransactionStatus;
 
 use super::{
     RunloopContext,
@@ -59,6 +61,47 @@ pub trait Jito {
         transactions: Vec<String>,
         config: Option<RpcSendTransactionConfig>,
     ) -> Result<String>;
+
+    /// Retrieves the statuses of all transactions in a previously submitted bundle.
+    ///
+    /// This RPC method looks up a bundle by its `bundle_id` (the SHA-256 hash returned by
+    /// [`sendBundle`](#method.send_bundle)) and returns the signature statuses for the bundle's
+    /// transactions in the same order they were recorded.
+    ///
+    /// ## Parameters
+    /// - `bundle_id`: The bundle identifier returned by `sendBundle`.
+    ///
+    /// ## Returns
+    /// A contextualized response containing:
+    /// - `value`: A list of optional transaction statuses corresponding to the bundle signatures.
+    ///   Each entry can be:
+    ///   - `null` if the signature is unknown or not sufficiently confirmed for status reporting
+    ///   - a `TransactionStatus` object if the transaction is found and its status can be returned
+    ///
+    /// ## Example Request (JSON-RPC)
+    /// ```json
+    /// {
+    ///   "jsonrpc": "2.0",
+    ///   "id": 1,
+    ///   "method": "getBundleStatuses",
+    ///   "params": [
+    ///     "bundleIdHere"
+    ///   ]
+    /// }
+    /// ```
+    ///
+    /// ## Notes
+    /// - Bundles are stored locally as a mapping from `bundle_id` to a list of base-58 signatures.
+    /// - If the bundle ID is not known locally, an error is returned.
+    /// - Status resolution is delegated to the same logic used by `getSignatureStatuses`:
+    ///   statuses are computed from locally stored transactions (and may fall back to a remote
+    ///   datasource, if configured).
+    #[rpc(meta, name = "getBundleStatuses")]
+    fn get_bundle_statuses(
+        &self,
+        meta: Self::Metadata,
+        bundle_id: String,
+    ) -> BoxFuture<Result<RpcResponse<Vec<Option<TransactionStatus>>>>>;
 }
 
 #[derive(Clone)]
@@ -83,7 +126,7 @@ impl Jito for SurfpoolJitoRpc {
             )));
         }
 
-        let Some(_ctx) = &meta else {
+        let Some(ctx) = &meta else {
             return Err(RpcCustomError::NodeUnhealthy {
                 num_slots_behind: None,
             }
@@ -102,7 +145,7 @@ impl Jito for SurfpoolJitoRpc {
             let bundle_config = Some(SurfpoolRpcSendTransactionConfig {
                 base: RpcSendTransactionConfig {
                     skip_preflight: true,
-                    ..base_config.clone()
+                    ..base_config
                 },
                 skip_sig_verify: None,
             });
@@ -136,7 +179,40 @@ impl Jito for SurfpoolJitoRpc {
         let mut hasher = Sha256::new();
         hasher.update(concatenated_signatures.as_bytes());
         let bundle_id = hasher.finalize();
-        Ok(hex::encode(bundle_id))
+        let bundle_id = hex::encode(bundle_id);
+
+        let _ = ctx
+            .simnet_commands_tx
+            .send(surfpool_types::SimnetCommand::SendBundle((
+                bundle_id.clone(),
+                bundle_signatures
+                    .iter()
+                    .map(|sig| sig.to_string())
+                    .collect(),
+            )));
+
+        Ok(bundle_id)
+    }
+
+    fn get_bundle_statuses(
+        &self,
+        meta: Self::Metadata,
+        bundle_id: String,
+    ) -> BoxFuture<Result<RpcResponse<Vec<Option<TransactionStatus>>>>> {
+        Box::pin(async move {
+            let Some(ctx) = &meta else {
+                return Err(RpcCustomError::NodeUnhealthy {
+                    num_slots_behind: None,
+                }
+                .into());
+            };
+
+            let signatures = ctx.svm_locker.get_bundle(bundle_id)?;
+
+            SurfpoolFullRpc
+                .get_signature_statuses(meta.clone(), signatures, None)
+                .await
+        })
     }
 }
 
@@ -419,6 +495,132 @@ mod tests {
         assert_eq!(
             bundle_id, expected_bundle_id,
             "Bundle ID should match SHA-256 of comma-separated signatures"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_send_bundle_persists_bundle_signatures() {
+        let payer = Keypair::new();
+        let recipient = Pubkey::new_unique();
+        let (mempool_tx, mempool_rx) = crossbeam_channel::unbounded();
+        let setup = TestSetup::new_with_mempool(SurfpoolJitoRpc, mempool_tx);
+
+        let recent_blockhash = setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm_reader| svm_reader.latest_blockhash());
+
+        // Airdrop to payer so tx can succeed in our manual processing
+        let _ = setup
+            .context
+            .svm_locker
+            .0
+            .write()
+            .await
+            .airdrop(&payer.pubkey(), 2 * LAMPORTS_PER_SOL);
+
+        let tx = build_v0_transaction(
+            &payer.pubkey(),
+            &[&payer],
+            &[system_instruction::transfer(
+                &payer.pubkey(),
+                &recipient,
+                LAMPORTS_PER_SOL,
+            )],
+            &recent_blockhash,
+        );
+        let tx_encoded = bs58::encode(bincode::serialize(&tx).unwrap()).into_string();
+
+        // Build expected signatures locally (what we expect to be persisted under bundle_id)
+        let expected_sigs = vec![tx.signatures[0].to_string()];
+
+        let setup_clone = setup.clone();
+        let handle = hiro_system_kit::thread_named("send_bundle")
+            .spawn(move || {
+                setup_clone
+                    .rpc
+                    .send_bundle(Some(setup_clone.context), vec![tx_encoded], None)
+            })
+            .unwrap();
+
+        let mut processed_tx = false;
+        let mut processed_bundle = false;
+        let mut bundle_id_from_cmd: Option<String> = None;
+        let mut sigs_from_cmd: Option<Vec<String>> = None;
+
+        while !(processed_tx && processed_bundle) {
+            match mempool_rx.recv() {
+                Ok(SimnetCommand::ProcessTransaction(_, tx, status_tx, _, _)) => {
+                    let mut writer = setup.context.svm_locker.0.write().await;
+                    let slot = writer.get_latest_absolute_slot();
+                    writer.transactions_queued_for_confirmation.push_back((
+                        tx.clone(),
+                        status_tx.clone(),
+                        None,
+                    ));
+                    let sig = tx.signatures[0];
+                    let tx_with_status_meta = TransactionWithStatusMeta {
+                        slot,
+                        transaction: tx,
+                        ..Default::default()
+                    };
+                    writer
+                        .transactions
+                        .store(
+                            sig.to_string(),
+                            SurfnetTransactionStatus::processed(
+                                tx_with_status_meta,
+                                std::collections::HashSet::new(),
+                            ),
+                        )
+                        .unwrap();
+                    status_tx
+                        .send(TransactionStatusEvent::Success(
+                            TransactionConfirmationStatus::Confirmed,
+                        ))
+                        .unwrap();
+                    processed_tx = true;
+                }
+                Ok(SimnetCommand::SendBundle((bundle_id, signatures))) => {
+                    setup
+                        .context
+                        .svm_locker
+                        .process_bundle(bundle_id.clone(), signatures.clone())
+                        .unwrap();
+                    bundle_id_from_cmd = Some(bundle_id);
+                    sigs_from_cmd = Some(signatures);
+                    processed_bundle = true;
+                }
+                Ok(SimnetCommand::AirdropProcessed) => continue,
+                other => panic!("unexpected simnet command: {:?}", other),
+            }
+        }
+
+        let result = handle.join().unwrap().expect("sendBundle should succeed");
+        let stored_bundle_id = bundle_id_from_cmd.expect("should have received SendBundle command");
+        assert_eq!(
+            result, stored_bundle_id,
+            "sendBundle result bundle id should match stored bundle id"
+        );
+
+        let persisted = setup
+            .context
+            .svm_locker
+            .get_bundle(stored_bundle_id.clone())
+            .expect("bundle should be persisted");
+        assert!(
+            !persisted.is_empty(),
+            "svm_locker.get_bundle(bundle_id) should not be empty"
+        );
+
+        let sigs_from_cmd = sigs_from_cmd.expect("should have captured signatures from SendBundle");
+        assert_eq!(
+            sigs_from_cmd, expected_sigs,
+            "Signatures in SendBundle command should match locally built signatures"
+        );
+        assert_eq!(
+            persisted, expected_sigs,
+            "Persisted bundle signatures should match locally built signatures"
         );
     }
 }
