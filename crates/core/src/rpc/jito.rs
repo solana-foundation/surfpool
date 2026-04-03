@@ -3,10 +3,7 @@ use std::str::FromStr;
 use jsonrpc_core::{Error, Result};
 use jsonrpc_derive::rpc;
 use sha2::{Digest, Sha256};
-use solana_client::{
-    rpc_config::{RpcSendTransactionConfig, RpcSimulateTransactionConfig},
-    rpc_custom_error::RpcCustomError,
-};
+use solana_client::{rpc_config::RpcSendTransactionConfig, rpc_custom_error::RpcCustomError};
 use solana_signature::Signature;
 
 use super::{
@@ -101,13 +98,7 @@ impl Jito for SurfpoolJitoRpc {
         // pre-flight simulate each transaction and bail out early if any of them fails.
         for (idx, txn) in transactions.iter().enumerate() {
             let simulate_result = match hiro_system_kit::nestable_block_on(
-                full_rpc.simulate_transaction(
-                    meta.clone(),
-                    txn.clone(),
-                    Some(RpcSimulateTransactionConfig {
-                        ..Default::default()
-                    }),
-                ),
+                full_rpc.simulate_transaction(meta.clone(), txn.clone(), None),
             ) {
                 Ok(res) => res,
                 Err(e) => {
