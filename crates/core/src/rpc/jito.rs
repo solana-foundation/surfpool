@@ -3,7 +3,10 @@ use std::str::FromStr;
 use jsonrpc_core::{Error, Result};
 use jsonrpc_derive::rpc;
 use sha2::{Digest, Sha256};
-use solana_client::{rpc_config::RpcSendTransactionConfig, rpc_custom_error::RpcCustomError};
+use solana_client::{
+    rpc_config::{RpcSendTransactionConfig, RpcSimulateTransactionConfig},
+    rpc_custom_error::RpcCustomError,
+};
 use solana_signature::Signature;
 
 use super::{
@@ -94,10 +97,40 @@ impl Jito for SurfpoolJitoRpc {
         let mut bundle_signatures = Vec::new();
         let base_config = config.unwrap_or_default();
 
-        // Process each transaction in the bundle sequentially using Full RPC
-        // Force skip_preflight to match Jito Block Engine behavior (no simulation on sendBundle)
-        // NOTE: this is not atomic — earlier transactions are NOT rolled back if a later one fails.
-        // TODO(#594): implement atomic all-or-nothing bundle execution
+        // Jito's block engine doesn't roll back on failure (bundles are non-atomic), so we
+        // pre-flight simulate each transaction and bail out early if any of them fails.
+        for (idx, txn) in transactions.iter().enumerate() {
+            let simulate_result = match hiro_system_kit::nestable_block_on(
+                full_rpc.simulate_transaction(
+                    meta.clone(),
+                    txn.clone(),
+                    Some(RpcSimulateTransactionConfig {
+                        ..Default::default()
+                    }),
+                ),
+            ) {
+                Ok(res) => res,
+                Err(e) => {
+                    return Err(Error {
+                        code: e.code,
+                        message: format!(
+                            "Jito bundle couldn't be sent as it's not atomic: simulation RPC failed for transaction {}: {}",
+                            idx + 1,
+                            e.message
+                        ),
+                        data: e.data,
+                    });
+                }
+            };
+
+            if simulate_result.value.err.is_some() {
+                return Err(Error::invalid_params(format!(
+                    "Jito bundle couldn't be sent as it's not atomic: simulation failed for transaction {}",
+                    idx + 1
+                )));
+            }
+        }
+
         for (idx, tx_data) in transactions.iter().enumerate() {
             let bundle_config = Some(SurfpoolRpcSendTransactionConfig {
                 base: RpcSendTransactionConfig {
@@ -419,6 +452,51 @@ mod tests {
         assert_eq!(
             bundle_id, expected_bundle_id,
             "Bundle ID should match SHA-256 of comma-separated signatures"
+        );
+    }
+
+    #[test]
+    fn test_send_bundle_simulation_failure_returns_not_atomic_error() {
+        let setup = TestSetup::new(SurfpoolJitoRpc);
+
+        // Build a tx that should fail during `simulateTransaction` because the payer
+        // has no lamports (no explicit airdrop in this test).
+        let payer = Keypair::new();
+        let recipient = Pubkey::new_unique();
+        let recent_blockhash = setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm_reader| svm_reader.latest_blockhash());
+
+        let tx = build_v0_transaction(
+            &payer.pubkey(),
+            &[&payer],
+            &[system_instruction::transfer(
+                &payer.pubkey(),
+                &recipient,
+                LAMPORTS_PER_SOL,
+            )],
+            &recent_blockhash,
+        );
+        let tx_encoded = bs58::encode(bincode::serialize(&tx).unwrap()).into_string();
+
+        let result = setup
+            .rpc
+            .send_bundle(Some(setup.context), vec![tx_encoded], None);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+
+        assert!(
+            err.message
+                .contains("Jito bundle couldn't be sent as it's not atomic"),
+            "Expected not-atomic error, got: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("simulation failed for transaction 1"),
+            "Expected simulation-failure error for transaction 1, got: {}",
+            err.message
         );
     }
 }
