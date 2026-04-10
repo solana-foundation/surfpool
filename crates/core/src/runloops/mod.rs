@@ -492,11 +492,6 @@ pub async fn start_block_production_runloop(
                            do_produce_block = true;
                        }
                     }
-                    SimnetCommand::SendBundle((bundle_id, signatures)) => {
-                        if let Err(e) = svm_locker.process_bundle(bundle_id, signatures) {
-                            let _ = svm_locker.simnet_events_tx().send(SimnetEvent::error(format!("Failed to send jito bundle: {}", e)));
-                        }
-                    }
                     SimnetCommand::Terminate(_) => {
                         // Explicitly shutdown storage to trigger WAL checkpoint before exiting
                         svm_locker.shutdown();

@@ -11472,6 +11472,7 @@ dependencies = [
  "solana-transaction",
  "solana-transaction-context",
  "solana-transaction-error 3.0.0",
+ "solana-transaction-status",
  "test-case",
  "txtx-addon-kit",
  "txtx-addon-network-svm-types",

@@ -6,7 +6,9 @@ use sha2::{Digest, Sha256};
 use solana_client::{rpc_config::RpcSendTransactionConfig, rpc_custom_error::RpcCustomError};
 use solana_rpc_client_api::response::Response as RpcResponse;
 use solana_signature::Signature;
-use solana_transaction_status::TransactionStatus;
+use solana_transaction_error::TransactionError;
+use solana_transaction_status::TransactionConfirmationStatus;
+use surfpool_types::JitoBundleStatus;
 
 use super::{
     RunloopContext,
@@ -101,11 +103,20 @@ pub trait Jito {
         &self,
         meta: Self::Metadata,
         bundle_id: String,
-    ) -> BoxFuture<Result<RpcResponse<Vec<Option<TransactionStatus>>>>>;
+    ) -> BoxFuture<Result<RpcResponse<Vec<JitoBundleStatus>>>>;
 }
 
 #[derive(Clone)]
 pub struct SurfpoolJitoRpc;
+
+// #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+// pub struct JitoBundleStatus {
+//     pub bundle_id: String,
+//     pub transactions: Vec<String>,
+//     pub slot: u64,
+//     pub confirmation_status: TransactionConfirmationStatus,
+//     pub err: std::result::Result<(), TransactionError>,
+// }
 
 impl Jito for SurfpoolJitoRpc {
     type Metadata = Option<RunloopContext>;
@@ -181,15 +192,13 @@ impl Jito for SurfpoolJitoRpc {
         let bundle_id = hasher.finalize();
         let bundle_id = hex::encode(bundle_id);
 
-        let _ = ctx
-            .simnet_commands_tx
-            .send(surfpool_types::SimnetCommand::SendBundle((
-                bundle_id.clone(),
-                bundle_signatures
-                    .iter()
-                    .map(|sig| sig.to_string())
-                    .collect(),
-            )));
+        ctx.svm_locker.store_bundle(
+            bundle_id.clone(),
+            bundle_signatures
+                .iter()
+                .map(|sig| sig.to_string())
+                .collect(),
+        )?;
 
         Ok(bundle_id)
     }
@@ -198,7 +207,7 @@ impl Jito for SurfpoolJitoRpc {
         &self,
         meta: Self::Metadata,
         bundle_id: String,
-    ) -> BoxFuture<Result<RpcResponse<Vec<Option<TransactionStatus>>>>> {
+    ) -> BoxFuture<Result<RpcResponse<Vec<JitoBundleStatus>>>> {
         Box::pin(async move {
             let Some(ctx) = &meta else {
                 return Err(RpcCustomError::NodeUnhealthy {
@@ -207,11 +216,62 @@ impl Jito for SurfpoolJitoRpc {
                 .into());
             };
 
-            let signatures = ctx.svm_locker.get_bundle(bundle_id)?;
+            let signatures = ctx.svm_locker.get_bundle(bundle_id.clone())?;
 
-            SurfpoolFullRpc
-                .get_signature_statuses(meta.clone(), signatures, None)
-                .await
+            let statuses = SurfpoolFullRpc
+                .get_signature_statuses(meta.clone(), signatures.clone(), None)
+                .await?;
+
+            fn confirmation_rank(status: &TransactionConfirmationStatus) -> u8 {
+                match status {
+                    TransactionConfirmationStatus::Processed => 0,
+                    TransactionConfirmationStatus::Confirmed => 1,
+                    TransactionConfirmationStatus::Finalized => 2,
+                }
+            }
+
+            let mut slot = 0u64;
+            let mut confirmation_status: Option<TransactionConfirmationStatus> = None;
+            let mut first_err: Option<TransactionError> = None;
+
+            for status in statuses.value.iter().flatten() {
+                slot = slot.max(status.slot);
+
+                if let Some(cs) = status.confirmation_status.clone() {
+                    let should_replace = confirmation_status
+                        .as_ref()
+                        .map(|existing| confirmation_rank(&cs) > confirmation_rank(existing))
+                        .unwrap_or(true);
+                    if should_replace {
+                        confirmation_status = Some(cs);
+                    }
+                }
+
+                if first_err.is_none()
+                    && let Some(err) = status.err.clone()
+                {
+                    first_err = Some(err);
+                }
+            }
+
+            let confirmation_status =
+                confirmation_status.unwrap_or(TransactionConfirmationStatus::Processed);
+
+            let bundle_status = JitoBundleStatus {
+                bundle_id,
+                transactions: signatures,
+                slot,
+                confirmation_status,
+                err: match first_err {
+                    Some(e) => Err(e),
+                    None => Ok(()),
+                },
+            };
+
+            Ok(RpcResponse {
+                context: statuses.context,
+                value: vec![bundle_status],
+            })
         })
     }
 }
@@ -225,6 +285,7 @@ mod tests {
     use solana_signer::Signer;
     use solana_system_interface::instruction as system_instruction;
     use solana_transaction::versioned::VersionedTransaction;
+    use solana_transaction_status::TransactionConfirmationStatus as SolanaTxConfirmationStatus;
     use surfpool_types::{SimnetCommand, TransactionConfirmationStatus, TransactionStatusEvent};
 
     use super::*;
@@ -544,15 +605,14 @@ mod tests {
             .unwrap();
 
         let mut processed_tx = false;
-        let mut processed_bundle = false;
-        let mut bundle_id_from_cmd: Option<String> = None;
-        let mut sigs_from_cmd: Option<Vec<String>> = None;
+        let mut processed_slot: Option<u64> = None;
 
-        while !(processed_tx && processed_bundle) {
+        while !processed_tx {
             match mempool_rx.recv() {
                 Ok(SimnetCommand::ProcessTransaction(_, tx, status_tx, _, _)) => {
                     let mut writer = setup.context.svm_locker.0.write().await;
                     let slot = writer.get_latest_absolute_slot();
+                    processed_slot = Some(slot);
                     writer.transactions_queued_for_confirmation.push_back((
                         tx.clone(),
                         status_tx.clone(),
@@ -581,46 +641,80 @@ mod tests {
                         .unwrap();
                     processed_tx = true;
                 }
-                Ok(SimnetCommand::SendBundle((bundle_id, signatures))) => {
-                    setup
-                        .context
-                        .svm_locker
-                        .process_bundle(bundle_id.clone(), signatures.clone())
-                        .unwrap();
-                    bundle_id_from_cmd = Some(bundle_id);
-                    sigs_from_cmd = Some(signatures);
-                    processed_bundle = true;
-                }
                 Ok(SimnetCommand::AirdropProcessed) => continue,
                 other => panic!("unexpected simnet command: {:?}", other),
             }
         }
 
-        let result = handle.join().unwrap().expect("sendBundle should succeed");
-        let stored_bundle_id = bundle_id_from_cmd.expect("should have received SendBundle command");
-        assert_eq!(
-            result, stored_bundle_id,
-            "sendBundle result bundle id should match stored bundle id"
-        );
+        let bundle_id = handle.join().unwrap().expect("sendBundle should succeed");
 
-        let persisted = setup
-            .context
-            .svm_locker
-            .get_bundle(stored_bundle_id.clone())
-            .expect("bundle should be persisted");
+        // sendBundle stores bundle signatures directly in `jito_bundles`; poll until visible.
+        let started = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(2);
+        let persisted = loop {
+            match setup.context.svm_locker.get_bundle(bundle_id.clone()) {
+                Ok(sigs) if !sigs.is_empty() => break sigs,
+                _ if started.elapsed() > timeout => {
+                    panic!("timed out waiting for bundle to be persisted: {bundle_id}");
+                }
+                _ => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        };
         assert!(
             !persisted.is_empty(),
             "svm_locker.get_bundle(bundle_id) should not be empty"
-        );
-
-        let sigs_from_cmd = sigs_from_cmd.expect("should have captured signatures from SendBundle");
-        assert_eq!(
-            sigs_from_cmd, expected_sigs,
-            "Signatures in SendBundle command should match locally built signatures"
         );
         assert_eq!(
             persisted, expected_sigs,
             "Persisted bundle signatures should match locally built signatures"
         );
+
+        let expected_slot = processed_slot.expect("should have processed a tx slot");
+        let started = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(2);
+        let bundle = loop {
+            let response = setup
+                .rpc
+                .get_bundle_statuses(Some(setup.context.clone()), bundle_id.clone())
+                .await
+                .expect("getBundleStatuses should succeed");
+
+            assert_eq!(
+                response.value.len(),
+                1,
+                "getBundleStatuses should return a single bundle status"
+            );
+
+            let bundle = response.value.into_iter().next().unwrap();
+            if bundle.slot != 0 {
+                break bundle;
+            }
+
+            if started.elapsed() > timeout {
+                break bundle;
+            }
+
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+
+        assert_eq!(bundle.bundle_id, bundle_id, "bundle_id should match");
+        assert_eq!(
+            bundle.transactions, expected_sigs,
+            "transactions should match bundle signatures"
+        );
+        assert!(
+            bundle.slot == 0 || bundle.slot == expected_slot,
+            "bundle slot should be 0 (unknown) or match processed tx slot"
+        );
+        assert!(
+            matches!(
+                bundle.confirmation_status,
+                SolanaTxConfirmationStatus::Processed
+                    | SolanaTxConfirmationStatus::Confirmed
+                    | SolanaTxConfirmationStatus::Finalized
+            ),
+            "confirmation_status should be a valid Solana status"
+        );
+        assert!(bundle.err.is_ok(), "err should be Ok for successful bundle");
     }
 }

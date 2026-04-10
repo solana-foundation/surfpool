@@ -1,11 +1,11 @@
 [package]
 name = "surfpool-types"
-description = "Where you train before surfing Solana"
 version = { workspace = true }
-readme = { workspace = true }
 edition = { workspace = true }
-license = { workspace = true }
+description = "Where you train before surfing Solana"
+readme = { workspace = true }
 repository = { workspace = true }
+license = { workspace = true }
 keywords = { workspace = true }
 categories = { workspace = true }
 
@@ -13,6 +13,7 @@ categories = { workspace = true }
 path = "src/lib.rs"
 
 [dependencies]
+agave-feature-set = { workspace = true }
 anchor-lang-idl = { workspace = true }
 blake3 = { workspace = true }
 chrono = { workspace = true }
@@ -23,7 +24,6 @@ schemars_derive = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_with = { workspace = true, features = ["alloc", "macros"] }
-agave-feature-set = { workspace = true }
 solana-account = { workspace = true }
 solana-account-decoder-client-types = { workspace = true }
 solana-clock = { workspace = true }
@@ -35,6 +35,8 @@ solana-transaction = { workspace = true }
 solana-transaction-context = { workspace = true }
 solana-transaction-error = { workspace = true }
 uuid = { workspace = true }
+
+solana-transaction-status = { workspace = true }
 
 txtx-addon-kit = { workspace = true }
 txtx-addon-network-svm-types = { workspace = true }

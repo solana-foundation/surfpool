@@ -559,7 +559,6 @@ pub enum SimnetCommand {
     CompleteRunbookExecution(String, Option<Vec<String>>),
     FetchRemoteAccounts(Vec<Pubkey>, String),
     AirdropProcessed,
-    SendBundle((String, Vec<String>)),
 }
 
 #[derive(Debug)]
@@ -970,6 +969,15 @@ impl Serialize for UuidOrSignature {
 pub enum DataIndexingCommand {
     ProcessCollection(Uuid),
     ProcessCollectionEntriesPack(Uuid, Vec<u8>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JitoBundleStatus {
+    pub bundle_id: String,
+    pub transactions: Vec<String>,
+    pub slot: u64,
+    pub confirmation_status: solana_transaction_status::TransactionConfirmationStatus,
+    pub err: std::result::Result<(), TransactionError>,
 }
 
 // Define a wrapper struct

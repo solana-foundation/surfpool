@@ -984,6 +984,13 @@ impl SurfnetSvmLocker {
         }
     }
 
+    /// Stores a bundle's signatures under the given bundle ID.
+    pub fn store_bundle(&self, bundle_id: String, signatures: Vec<String>) -> SurfpoolResult<()> {
+        self.with_svm_writer(|svm_writer| svm_writer.jito_bundles.store(bundle_id, signatures))?;
+        Ok(())
+    }
+
+    /// Retrieves the list of transaction signatures for a previously stored bundle.
     pub fn get_bundle(&self, bundle_id: String) -> SurfpoolResult<Vec<String>> {
         self.with_svm_reader(|svm_reader| {
             if let Ok(get_signatures_result) = svm_reader.jito_bundles.get(&bundle_id)
@@ -1122,11 +1129,6 @@ impl SurfnetSvmLocker {
             svm_writer.write_executed_profile_result(signature, profile_result)
         })?;
 
-        Ok(())
-    }
-
-    pub fn process_bundle(&self, bundle_id: String, signatures: Vec<String>) -> SurfpoolResult<()> {
-        self.with_svm_writer(|svm_writer| svm_writer.jito_bundles.store(bundle_id, signatures))?;
         Ok(())
     }
 
