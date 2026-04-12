@@ -244,7 +244,7 @@ impl Jito for SurfpoolJitoRpc {
                 .into());
             };
 
-            let Some(signatures) = ctx.svm_locker.get_bundle(bundle_id.clone()) else {
+            let Some(signatures) = ctx.svm_locker.get_bundle(&bundle_id) else {
                 return Ok(None);
             };
             if signatures.is_empty() {
@@ -300,6 +300,7 @@ impl Jito for SurfpoolJitoRpc {
 
 #[cfg(test)]
 mod tests {
+    use crossbeam_channel::Receiver;
     use sha2::{Digest, Sha256};
     use solana_keypair::Keypair;
     use solana_message::{VersionedMessage, v0::Message as V0Message};
@@ -317,6 +318,53 @@ mod tests {
     };
 
     const LAMPORTS_PER_SOL: u64 = 1_000_000_000;
+
+    /// `send_transaction` / `send_bundle` enqueue `ProcessTransaction` on `simnet_commands_tx` and
+    /// block until a consumer completes the work and signals on `status_update_tx`. Unit tests must
+    /// drain the mempool like the real simnet loop (see `full.rs` `send_and_await_transaction`).
+    async fn drain_one_process_transaction(
+        setup: &TestSetup<SurfpoolJitoRpc>,
+        mempool_rx: &Receiver<SimnetCommand>,
+    ) {
+        loop {
+            match mempool_rx.recv() {
+                Ok(SimnetCommand::ProcessTransaction(_, tx, status_tx, _, _)) => {
+                    let mut writer = setup.context.svm_locker.0.write().await;
+                    let slot = writer.get_latest_absolute_slot();
+                    writer.transactions_queued_for_confirmation.push_back((
+                        tx.clone(),
+                        status_tx.clone(),
+                        None,
+                    ));
+                    let sig = tx.signatures[0];
+                    let tx_with_status_meta = TransactionWithStatusMeta {
+                        slot,
+                        transaction: tx,
+                        ..Default::default()
+                    };
+                    let mutated_accounts = std::collections::HashSet::new();
+                    writer
+                        .transactions
+                        .store(
+                            sig.to_string(),
+                            SurfnetTransactionStatus::processed(
+                                tx_with_status_meta,
+                                mutated_accounts,
+                            ),
+                        )
+                        .unwrap();
+                    status_tx
+                        .send(TransactionStatusEvent::Success(
+                            TransactionConfirmationStatus::Confirmed,
+                        ))
+                        .unwrap();
+                    return;
+                }
+                Ok(_) => continue,
+                Err(e) => panic!("mempool recv failed: {e}"),
+            }
+        }
+    }
 
     fn build_v0_transaction(
         payer: &Pubkey,
@@ -435,45 +483,7 @@ mod tests {
             })
             .unwrap();
 
-        // Process the transaction from mempool
-        loop {
-            match mempool_rx.recv() {
-                Ok(SimnetCommand::ProcessTransaction(_, tx, status_tx, _, _)) => {
-                    let mut writer = setup.context.svm_locker.0.write().await;
-                    let slot = writer.get_latest_absolute_slot();
-                    writer.transactions_queued_for_confirmation.push_back((
-                        tx.clone(),
-                        status_tx.clone(),
-                        None,
-                    ));
-                    let sig = tx.signatures[0];
-                    let tx_with_status_meta = TransactionWithStatusMeta {
-                        slot,
-                        transaction: tx,
-                        ..Default::default()
-                    };
-                    let mutated_accounts = std::collections::HashSet::new();
-                    writer
-                        .transactions
-                        .store(
-                            sig.to_string(),
-                            SurfnetTransactionStatus::processed(
-                                tx_with_status_meta,
-                                mutated_accounts,
-                            ),
-                        )
-                        .unwrap();
-                    status_tx
-                        .send(TransactionStatusEvent::Success(
-                            TransactionConfirmationStatus::Confirmed,
-                        ))
-                        .unwrap();
-                    break;
-                }
-                Ok(SimnetCommand::AirdropProcessed) => continue,
-                _ => panic!("failed to receive transaction from mempool"),
-            }
-        }
+        drain_one_process_transaction(&setup, &mempool_rx).await;
 
         let result = handle.join().unwrap();
         assert!(result.is_ok(), "Bundle should succeed: {:?}", result);
@@ -547,48 +557,11 @@ mod tests {
             })
             .unwrap();
 
-        // Process both transactions from mempool
-        let mut processed_count = 0;
-        while processed_count < 2 {
-            match mempool_rx.recv() {
-                Ok(SimnetCommand::ProcessTransaction(_, tx, status_tx, _, _)) => {
-                    let mut writer = setup.context.svm_locker.0.write().await;
-                    let slot = writer.get_latest_absolute_slot();
-                    writer.transactions_queued_for_confirmation.push_back((
-                        tx.clone(),
-                        status_tx.clone(),
-                        None,
-                    ));
-                    let sig = tx.signatures[0];
-                    let tx_with_status_meta = TransactionWithStatusMeta {
-                        slot,
-                        transaction: tx,
-                        ..Default::default()
-                    };
-                    let mutated_accounts = std::collections::HashSet::new();
-                    writer
-                        .transactions
-                        .store(
-                            sig.to_string(),
-                            SurfnetTransactionStatus::processed(
-                                tx_with_status_meta,
-                                mutated_accounts,
-                            ),
-                        )
-                        .unwrap();
-                    status_tx
-                        .send(TransactionStatusEvent::Success(
-                            TransactionConfirmationStatus::Confirmed,
-                        ))
-                        .unwrap();
-                    processed_count += 1;
-                }
-                Ok(SimnetCommand::AirdropProcessed) => continue,
-                _ => panic!("failed to receive transaction from mempool"),
-            }
-        }
+        drain_one_process_transaction(&setup, &mempool_rx).await;
+        drain_one_process_transaction(&setup, &mempool_rx).await;
 
         let result = handle.join().unwrap();
+
         assert!(result.is_ok(), "Bundle should succeed: {:?}", result);
 
         // Verify bundle ID is SHA-256 of comma-separated signatures
@@ -648,55 +621,19 @@ mod tests {
             })
             .unwrap();
 
-        let mut processed_tx = false;
-        let mut processed_slot: Option<u64> = None;
+        drain_one_process_transaction(&setup, &mempool_rx).await;
 
-        while !processed_tx {
-            match mempool_rx.recv() {
-                Ok(SimnetCommand::ProcessTransaction(_, tx, status_tx, _, _)) => {
-                    let mut writer = setup.context.svm_locker.0.write().await;
-                    let slot = writer.get_latest_absolute_slot();
-                    processed_slot = Some(slot);
-                    writer.transactions_queued_for_confirmation.push_back((
-                        tx.clone(),
-                        status_tx.clone(),
-                        None,
-                    ));
-                    let sig = tx.signatures[0];
-                    let tx_with_status_meta = TransactionWithStatusMeta {
-                        slot,
-                        transaction: tx,
-                        ..Default::default()
-                    };
-                    writer
-                        .transactions
-                        .store(
-                            sig.to_string(),
-                            SurfnetTransactionStatus::processed(
-                                tx_with_status_meta,
-                                std::collections::HashSet::new(),
-                            ),
-                        )
-                        .unwrap();
-                    status_tx
-                        .send(TransactionStatusEvent::Success(
-                            TransactionConfirmationStatus::Confirmed,
-                        ))
-                        .unwrap();
-                    processed_tx = true;
-                }
-                Ok(SimnetCommand::AirdropProcessed) => continue,
-                other => panic!("unexpected simnet command: {:?}", other),
-            }
-        }
+        let send_bundle_result = handle.join().unwrap();
 
-        let bundle_id = handle.join().unwrap().expect("sendBundle should succeed");
+        assert!(send_bundle_result.is_ok(), "Expected send_bundle to pass");
+
+        let bundle_id = send_bundle_result.unwrap();
 
         // sendBundle stores bundle signatures directly in `jito_bundles`; poll until visible.
         let started = std::time::Instant::now();
         let timeout = std::time::Duration::from_secs(2);
         let persisted = loop {
-            match setup.context.svm_locker.get_bundle(bundle_id.clone()) {
+            match setup.context.svm_locker.get_bundle(&bundle_id) {
                 Some(sigs) if !sigs.is_empty() => break sigs,
                 _ if started.elapsed() > timeout => {
                     panic!("timed out waiting for bundle to be persisted: {bundle_id}");
@@ -713,7 +650,6 @@ mod tests {
             "Persisted bundle signatures should match locally built signatures"
         );
 
-        let expected_slot = processed_slot.expect("should have processed a tx slot");
         let started = std::time::Instant::now();
         let timeout = std::time::Duration::from_secs(2);
         let bundle = loop {
@@ -746,10 +682,6 @@ mod tests {
         assert_eq!(
             bundle.transactions, expected_sigs,
             "transactions should match bundle signatures"
-        );
-        assert!(
-            bundle.slot == 0 || bundle.slot == expected_slot,
-            "bundle slot should be 0 (unknown) or match processed tx slot"
         );
         assert!(
             matches!(

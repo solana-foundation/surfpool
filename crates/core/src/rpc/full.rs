@@ -1581,6 +1581,7 @@ impl Full for SurfpoolFullRpc {
         let signature = signatures[0];
         // Clone the message before moving the transaction, as we'll need it for error reporting
         let tx_message = unsanitized_tx.message.clone();
+
         let Some(ctx) = meta else {
             return Err(RpcCustomError::NodeUnhealthy {
                 num_slots_behind: None,
@@ -1597,7 +1598,7 @@ impl Full for SurfpoolFullRpc {
                 config.base.skip_preflight,
                 config.skip_sig_verify,
             ))
-            .map_err(|_| RpcCustomError::NodeUnhealthy {
+            .map_err(|e| RpcCustomError::NodeUnhealthy {
                 num_slots_behind: None,
             })?;
 

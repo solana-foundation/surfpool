@@ -995,9 +995,12 @@ impl SurfnetSvmLocker {
     /// Returns `None` when there is no local entry for `bundle_id` (or the backing store read fails).
     /// This is not an "invalid id" signal: callers such as Jito `getBundleStatuses` treat `None` as
     /// “no data” and return a null RPC result rather than an error.
-    pub fn get_bundle(&self, bundle_id: String) -> Option<Vec<String>> {
+    pub fn get_bundle(&self, bundle_id: &str) -> Option<Vec<String>> {
         self.with_svm_reader(|svm_reader| {
-            svm_reader.jito_bundles.get(&bundle_id).unwrap_or_default()
+            svm_reader
+                .jito_bundles
+                .get(&bundle_id.to_string())
+                .unwrap_or_default()
         })
     }
 
