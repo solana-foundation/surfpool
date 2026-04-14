@@ -1,15 +1,17 @@
-use std::str::FromStr;
-
 use jsonrpc_core::{Error, Result};
 use jsonrpc_derive::rpc;
 use sha2::{Digest, Sha256};
 use solana_client::{rpc_config::RpcSendTransactionConfig, rpc_custom_error::RpcCustomError};
 use solana_signature::Signature;
+use solana_transaction::versioned::VersionedTransaction;
+use solana_transaction_status::UiTransactionEncoding;
 
 use super::{
     RunloopContext,
     full::{Full, SurfpoolFullRpc, SurfpoolRpcSendTransactionConfig},
+    utils::decode_and_deserialize,
 };
+use crate::surfnet::locker::SurfnetSvmLocker;
 
 /// Maximum number of transactions allowed in a single bundle, matching Jito's limit.
 const MAX_BUNDLE_SIZE: usize = 5;
@@ -83,45 +85,100 @@ impl Jito for SurfpoolJitoRpc {
             )));
         }
 
-        let Some(_ctx) = &meta else {
+        let Some(ctx) = &meta else {
             return Err(RpcCustomError::NodeUnhealthy {
                 num_slots_behind: None,
             }
             .into());
         };
 
-        let full_rpc = SurfpoolFullRpc;
-        let mut bundle_signatures = Vec::new();
         let base_config = config.unwrap_or_default();
 
-        // Jito's block engine doesn't roll back on failure (bundles are non-atomic), so we
-        // pre-flight simulate each transaction and bail out early if any of them fails.
-        for (idx, txn) in transactions.iter().enumerate() {
-            let simulate_result = match hiro_system_kit::nestable_block_on(
-                full_rpc.simulate_transaction(meta.clone(), txn.clone(), None),
-            ) {
-                Ok(res) => res,
-                Err(e) => {
-                    return Err(Error {
-                        code: e.code,
-                        message: format!(
-                            "Jito bundle couldn't be sent as it's not atomic: simulation RPC failed for transaction {}: {}",
-                            idx + 1,
-                            e.message
-                        ),
-                        data: e.data,
-                    });
-                }
-            };
+        // Decode all bundle transactions up front so we can run them against a disposable clone.
+        let tx_encoding = base_config
+            .encoding
+            .unwrap_or(UiTransactionEncoding::Base58);
+        let binary_encoding = tx_encoding.into_binary_encoding().ok_or_else(|| {
+            Error::invalid_params(format!(
+                "unsupported encoding: {tx_encoding}. Supported encodings: base58, base64"
+            ))
+        })?;
 
-            if simulate_result.value.err.is_some() {
+        // execute the whole bundle on a disposable sandbox VM
+        // by cloning the svm state into a temporary svm_state
+        let sandbox_svm = ctx
+            .svm_locker
+            .with_svm_reader(|svm_reader| svm_reader.clone_for_profiling());
+        let sandbox_svm_locker = SurfnetSvmLocker::new(sandbox_svm);
+
+        // For now, keep bundle execution local-only; remote ctx / commitment plumbs can be added later.
+        let remote_ctx = &None;
+        let skip_preflight = true;
+        let sigverify = true;
+
+        let mut bundle_signatures: Vec<Signature> = Vec::with_capacity(transactions.len());
+        for (idx, tx_data) in transactions.iter().enumerate() {
+            let (_, tx) =
+                decode_and_deserialize::<VersionedTransaction>(tx_data.clone(), binary_encoding)
+                    .map_err(|e| {
+                        let err_message = e.message;
+                        let code = e.code;
+                        let data = e.data;
+                        Error {
+                            code,
+                            message: format!(
+                                "Failed to decode bundle transaction {}: {}",
+                                idx + 1,
+                                err_message
+                            ),
+                            data,
+                        }
+                    })?;
+
+            let (status_tx, status_rx) = crossbeam_channel::bounded(transactions.len());
+            let process_res =
+                hiro_system_kit::nestable_block_on(sandbox_svm_locker.process_transaction(
+                    remote_ctx,
+                    tx.clone(),
+                    status_tx,
+                    skip_preflight,
+                    sigverify,
+                ));
+
+            let signature = tx.signatures[0];
+            bundle_signatures.push(signature);
+
+            if let Err(e) = process_res {
                 return Err(Error::invalid_params(format!(
-                    "Jito bundle couldn't be sent as it's not atomic: simulation failed for transaction {}",
+                    "Jito bundle couldn't be sent as it's not atomic {}: {e}",
                     idx + 1
                 )));
             }
+
+            // `process_transaction` can return `Ok(())` even when the tx failed, because the
+            // failure is communicated through the status channel. Treat any non-success status
+            // as a bundle failure.
+            match status_rx.recv_timeout(std::time::Duration::from_secs(2)) {
+                Ok(surfpool_types::TransactionStatusEvent::Success(_)) => {}
+                Ok(other) => {
+                    return Err(Error::invalid_params(format!(
+                        "Jito bundle couldn't be sent as it's not atomic: simulation failed for transaction {}: {:?}",
+                        idx + 1,
+                        other
+                    )));
+                }
+                Err(e) => {
+                    return Err(Error::invalid_params(format!(
+                        "Jito bundle couldn't be sent as it's not atomic: simulation RPC failed for transaction {}: {e}",
+                        idx + 1
+                    )));
+                }
+            }
         }
 
+        // TODO: I think it'd be best if we were to copy the changed accounts states and directly change
+        // the original svm state? It's a bit complecated, but will avoid having to send the transactions twice
+        let full_rpc = SurfpoolFullRpc;
         for (idx, tx_data) in transactions.iter().enumerate() {
             let bundle_config = Some(SurfpoolRpcSendTransactionConfig {
                 base: RpcSendTransactionConfig {
@@ -130,23 +187,13 @@ impl Jito for SurfpoolJitoRpc {
                 },
                 skip_sig_verify: None,
             });
-            // Delegate to Full RPC's sendTransaction method
-            match full_rpc.send_transaction(meta.clone(), tx_data.clone(), bundle_config) {
-                Ok(signature_str) => {
-                    // Parse the signature to collect for bundle ID calculation
-                    let signature = Signature::from_str(&signature_str).map_err(|e| {
-                        Error::invalid_params(format!("Failed to parse signature: {e}"))
-                    })?;
-                    bundle_signatures.push(signature);
-                }
-                Err(e) => {
-                    // Add bundle transaction index to error message
-                    return Err(Error {
-                        code: e.code,
-                        message: format!("Bundle transaction {} failed: {}", idx, e.message),
-                        data: e.data,
-                    });
-                }
+            if let Err(e) = full_rpc.send_transaction(meta.clone(), tx_data.clone(), bundle_config)
+            {
+                return Err(Error {
+                    code: e.code,
+                    message: format!("Bundle transaction {} failed: {}", idx, e.message),
+                    data: e.data,
+                });
             }
         }
 
@@ -166,6 +213,14 @@ impl Jito for SurfpoolJitoRpc {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
+
     use sha2::{Digest, Sha256};
     use solana_keypair::Keypair;
     use solana_message::{VersionedMessage, v0::Message as V0Message};
@@ -443,6 +498,144 @@ mod tests {
         assert_eq!(
             bundle_id, expected_bundle_id,
             "Bundle ID should match SHA-256 of comma-separated signatures"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_send_bundle_dependent_transaction_failure_aborts_entire_bundle() {
+        let payer = Keypair::new();
+        let recipient = Keypair::new();
+
+        // Use mempool-backed setup so we can assert that a sandbox failure does NOT enqueue any
+        // ProcessTransaction commands (phase 2 commit currently still uses sendTransaction).
+        let (mempool_tx, mempool_rx) = crossbeam_channel::unbounded();
+        let setup = TestSetup::new_with_mempool(SurfpoolJitoRpc, mempool_tx);
+
+        // Drain any ProcessTransaction commands so `sendTransaction` cannot block this test even
+        // if Phase 2 is accidentally reached. We track whether anything was sent.
+        let observed_process_tx = Arc::new(AtomicUsize::new(0));
+        let stop_drain = Arc::new(AtomicBool::new(false));
+        let observed_process_tx_clone = observed_process_tx.clone();
+        let stop_drain_clone = stop_drain.clone();
+        let svm_locker_clone = setup.context.svm_locker.clone();
+        let drain_handle = hiro_system_kit::thread_named("mempool_drain_dependent_bundle")
+            .spawn(move || {
+                while !stop_drain_clone.load(Ordering::SeqCst) {
+                    let Ok(cmd) = mempool_rx.recv_timeout(Duration::from_millis(200)) else {
+                        continue;
+                    };
+                    match cmd {
+                        SimnetCommand::ProcessTransaction(_, tx, status_tx, _, _) => {
+                            observed_process_tx_clone.fetch_add(1, Ordering::SeqCst);
+
+                            // Minimal bookkeeping (mirrors other bundle tests) + unblock the RPC.
+                            let sig = tx.signatures[0];
+                            let mut writer = svm_locker_clone.0.blocking_write();
+                            let slot = writer.get_latest_absolute_slot();
+                            writer.transactions_queued_for_confirmation.push_back((
+                                tx.clone(),
+                                status_tx.clone(),
+                                None,
+                            ));
+                            let tx_with_status_meta = TransactionWithStatusMeta {
+                                slot,
+                                transaction: tx,
+                                ..Default::default()
+                            };
+                            let mutated_accounts = std::collections::HashSet::new();
+                            let _ = writer.transactions.store(
+                                sig.to_string(),
+                                SurfnetTransactionStatus::processed(
+                                    tx_with_status_meta,
+                                    mutated_accounts,
+                                ),
+                            );
+
+                            let _ = status_tx.send(TransactionStatusEvent::Success(
+                                TransactionConfirmationStatus::Confirmed,
+                            ));
+                        }
+                        SimnetCommand::AirdropProcessed => continue,
+                        _ => continue,
+                    }
+                }
+            })
+            .unwrap();
+
+        let recent_blockhash = setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm_reader| svm_reader.latest_blockhash());
+
+        // Airdrop to payer so tx1 can fund the recipient.
+        let _ = setup
+            .context
+            .svm_locker
+            .0
+            .write()
+            .await
+            .airdrop(&payer.pubkey(), 5 * LAMPORTS_PER_SOL);
+
+        // tx1: payer -> recipient (funds recipient so it can pay fees for tx2)
+        let tx1 = build_v0_transaction(
+            &payer.pubkey(),
+            &[&payer],
+            &[system_instruction::transfer(
+                &payer.pubkey(),
+                &recipient.pubkey(),
+                LAMPORTS_PER_SOL,
+            )],
+            &recent_blockhash,
+        );
+
+        // tx2 depends on tx1 having executed (recipient needs funds), but must still fail.
+        let tx2 = build_v0_transaction(
+            &recipient.pubkey(),
+            &[&recipient],
+            &[system_instruction::transfer(
+                &recipient.pubkey(),
+                &payer.pubkey(),
+                2 * LAMPORTS_PER_SOL,
+            )],
+            &recent_blockhash,
+        );
+
+        let tx1_encoded = bs58::encode(bincode::serialize(&tx1).unwrap()).into_string();
+        let tx2_encoded = bs58::encode(bincode::serialize(&tx2).unwrap()).into_string();
+
+        let setup_clone = setup.clone();
+        let handle =
+            hiro_system_kit::thread_named("send_bundle_dependent_failure").spawn(move || {
+                setup_clone.rpc.send_bundle(
+                    Some(setup_clone.context),
+                    vec![tx1_encoded, tx2_encoded],
+                    None,
+                )
+            });
+        let handle = handle.unwrap();
+
+        let result = handle.join().unwrap();
+
+        assert!(
+            result.is_err(),
+            "Bundle should fail if any sandbox transaction fails"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.message
+                .contains("Jito bundle couldn't be sent as it's not atomic"),
+            "Expected sandbox failure for tx2, got: {}",
+            err.message
+        );
+
+        stop_drain.store(true, Ordering::SeqCst);
+        let _ = drain_handle.join();
+
+        // If sandbox failure happens as expected, Phase 2 should never run.
+        assert_eq!(
+            observed_process_tx.load(Ordering::SeqCst),
+            0,
+            "Expected zero mempool ProcessTransaction commands; sandbox failure should prevent Phase 2"
         );
     }
 
