@@ -9,7 +9,7 @@ use crate::cheatcodes::builders::CheatcodeBuilder;
 ///
 /// ```rust,no_run
 /// use surfpool_sdk::{Pubkey, Surfnet};
-/// use surfpool_sdk::cheatcodes::builders::reset_account::ResetAccount;
+/// use surfpool_sdk::cheatcodes::builders::ResetAccount;
 ///
 /// # async fn example() {
 /// let surfnet = Surfnet::start().await.unwrap();

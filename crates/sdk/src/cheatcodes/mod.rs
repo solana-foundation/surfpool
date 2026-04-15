@@ -22,7 +22,7 @@ use builders::{CheatcodeBuilder, DeployProgram};
 ///
 /// ```rust,no_run
 /// use surfpool_sdk::{Pubkey, Surfnet};
-/// use surfpool_sdk::cheatcodes::builders::set_account::SetAccount;
+/// use surfpool_sdk::cheatcodes::builders::SetAccount;
 ///
 /// # async fn example() {
 /// let surfnet = Surfnet::start().await.unwrap();
@@ -340,9 +340,9 @@ impl<'a> Cheatcodes<'a> {
     /// This writes the program bytes with `surfnet_writeProgram` and, when present,
     /// registers the parsed IDL with `surfnet_registerIdl`.
     ///
-    /// ```rust,ignore
+    /// ```rust
     /// use surfpool_sdk::{Pubkey, Surfnet};
-    /// use surfpool_sdk::builders::deploy_program::DeployProgram;
+    /// use surfpool_sdk::cheatcodes::builders::DeployProgram;
     ///
     /// # async fn example() {
     /// let surfnet = Surfnet::start().await.unwrap();
@@ -377,7 +377,7 @@ impl<'a> Cheatcodes<'a> {
     ///
     /// ```rust,no_run
     /// use surfpool_sdk::{Pubkey, Surfnet};
-    /// use surfpool_sdk::cheatcodes::builders::reset_account::ResetAccount;
+    /// use surfpool_sdk::cheatcodes::builders::ResetAccount;
     ///
     /// # async fn example() {
     /// let surfnet = Surfnet::start().await.unwrap();
