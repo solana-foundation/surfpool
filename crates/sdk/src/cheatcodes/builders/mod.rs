@@ -4,7 +4,7 @@
 //! incrementally and then execute the request through
 //! [`crate::Cheatcodes::execute`].
 //!
-//! ```rust,no_run
+//! ```rust
 //! use surfpool_sdk::{Pubkey, Surfnet};
 //! use surfpool_sdk::cheatcodes::builders::SetAccount;
 //!

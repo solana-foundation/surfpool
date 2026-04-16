@@ -17,7 +17,7 @@ use crate::{
 
 /// Builder for configuring a [`Surfnet`] instance before starting it.
 ///
-/// ```rust,no_run
+/// ```rust
 /// use surfpool_sdk::{Surfnet, BlockProductionMode};
 ///
 /// # async fn example() {

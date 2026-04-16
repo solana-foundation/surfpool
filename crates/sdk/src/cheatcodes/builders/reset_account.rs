@@ -7,7 +7,7 @@ use crate::cheatcodes::builders::CheatcodeBuilder;
 /// This builder starts with the required account address and exposes
 /// additional reset options as fluent setters.
 ///
-/// ```rust,no_run
+/// ```rust
 /// use surfpool_sdk::{Pubkey, Surfnet};
 /// use surfpool_sdk::cheatcodes::builders::ResetAccount;
 ///

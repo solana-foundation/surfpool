@@ -20,7 +20,7 @@ use builders::{CheatcodeBuilder, DeployProgram};
 /// These bypass normal transaction flow to instantly set account state —
 /// perfect for test setup (funding wallets, minting tokens, etc.).
 ///
-/// ```rust,no_run
+/// ```rust
 /// use surfpool_sdk::{Pubkey, Surfnet};
 /// use surfpool_sdk::cheatcodes::builders::SetAccount;
 ///
@@ -64,7 +64,7 @@ impl<'a> Cheatcodes<'a> {
 
     /// Set the SOL balance for an account in lamports.
     ///
-    /// ```rust,no_run
+    /// ```rust
     /// use surfpool_sdk::{Pubkey, Surfnet};
     ///
     /// # async fn example() {
@@ -87,7 +87,7 @@ impl<'a> Cheatcodes<'a> {
     ///
     /// This helper updates lamports, owner, and raw account data in one RPC call.
     ///
-    /// ```rust,no_run
+    /// ```rust
     /// use surfpool_sdk::{Pubkey, Surfnet};
     ///
     /// # async fn example() {
@@ -121,7 +121,7 @@ impl<'a> Cheatcodes<'a> {
     ///
     /// Uses `spl_token` program by default. Pass `token_program` to use Token-2022.
     ///
-    /// ```rust,no_run
+    /// ```rust
     /// use surfpool_sdk::{Pubkey, Surfnet};
     ///
     /// # async fn example() {
@@ -154,7 +154,7 @@ impl<'a> Cheatcodes<'a> {
     ///
     /// This is an alias for [`Self::fund_token`].
     ///
-    /// ```rust,no_run
+    /// ```rust
     /// use surfpool_sdk::{Pubkey, Surfnet};
     ///
     /// # async fn example() {
@@ -178,7 +178,7 @@ impl<'a> Cheatcodes<'a> {
 
     /// Get the associated token address for a wallet/mint pair.
     ///
-    /// ```rust,no_run
+    /// ```rust
     /// use surfpool_sdk::{Pubkey, Surfnet};
     ///
     /// # async fn example() {
@@ -198,7 +198,7 @@ impl<'a> Cheatcodes<'a> {
 
     /// Fund multiple accounts with SOL using repeated `surfnet_setAccount` calls.
     ///
-    /// ```rust,no_run
+    /// ```rust
     /// use surfpool_sdk::{Pubkey, Surfnet};
     ///
     /// # async fn example() {
@@ -221,7 +221,7 @@ impl<'a> Cheatcodes<'a> {
 
     /// Fund multiple wallets with the same token and amount.
     ///
-    /// ```rust,no_run
+    /// ```rust
     /// use surfpool_sdk::{Pubkey, Surfnet};
     ///
     /// # async fn example() {
@@ -251,7 +251,7 @@ impl<'a> Cheatcodes<'a> {
 
     /// Move Surfnet time forward to an absolute epoch.
     ///
-    /// ```rust,no_run
+    /// ```rust
     /// use surfpool_sdk::Surfnet;
     ///
     /// # async fn example() {
@@ -268,7 +268,7 @@ impl<'a> Cheatcodes<'a> {
 
     /// Move Surfnet time forward to an absolute slot.
     ///
-    /// ```rust,no_run
+    /// ```rust
     /// use surfpool_sdk::Surfnet;
     ///
     /// # async fn example() {
@@ -285,7 +285,7 @@ impl<'a> Cheatcodes<'a> {
 
     /// Move Surfnet time forward to an absolute Unix timestamp in milliseconds.
     ///
-    /// ```rust,no_run
+    /// ```rust
     /// use surfpool_sdk::Surfnet;
     ///
     /// # async fn example() {
@@ -309,7 +309,7 @@ impl<'a> Cheatcodes<'a> {
     ///
     /// If an IDL file exists, it is registered after the program bytes are written.
     ///
-    /// ```rust,no_run
+    /// ```rust
     /// use surfpool_sdk::Surfnet;
     ///
     /// # async fn example() {
@@ -375,7 +375,7 @@ impl<'a> Cheatcodes<'a> {
 
     /// Execute a typed cheatcode builder.
     ///
-    /// ```rust,no_run
+    /// ```rust
     /// use surfpool_sdk::{Pubkey, Surfnet};
     /// use surfpool_sdk::cheatcodes::builders::ResetAccount;
     ///

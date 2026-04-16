@@ -4,7 +4,7 @@
 //! No external process needed — just spin up a `Surfnet`, point your RPC client at it,
 //! and test against a real Solana-compatible runtime.
 //!
-//! ```rust,no_run
+//! ```rust
 //! use surfpool_sdk::Surfnet;
 //!
 //! #[tokio::test]

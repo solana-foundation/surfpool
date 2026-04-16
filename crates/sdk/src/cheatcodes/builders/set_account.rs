@@ -7,7 +7,7 @@ use crate::cheatcodes::builders::CheatcodeBuilder;
 /// This builder starts with the required account address and lets tests add
 /// whichever optional account fields they want to override before execution.
 ///
-/// ```rust,no_run
+/// ```rust
 /// use surfpool_sdk::{Pubkey, Surfnet};
 /// use surfpool_sdk::cheatcodes::builders::SetAccount;
 ///

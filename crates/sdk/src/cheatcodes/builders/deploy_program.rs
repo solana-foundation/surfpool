@@ -12,7 +12,7 @@ use crate::{
 /// Unlike single-RPC cheatcode builders, deployment is a compound operation:
 /// it writes the program bytes first and then optionally registers an IDL.
 ///
-/// ```rust,no_run
+/// ```rust
 /// use surfpool_sdk::{Pubkey, Surfnet};
 /// use surfpool_sdk::cheatcodes::builders::DeployProgram;
 ///

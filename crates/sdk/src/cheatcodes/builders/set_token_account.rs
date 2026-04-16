@@ -7,7 +7,7 @@ use crate::cheatcodes::builders::CheatcodeBuilder;
 /// The required inputs are the token owner wallet and mint. Optional methods
 /// can then be used to set token-account fields before execution.
 ///
-/// ```rust,no_run
+/// ```rust
 /// use surfpool_sdk::{Pubkey, Surfnet};
 /// use surfpool_sdk::cheatcodes::builders::SetTokenAccount;
 ///
