@@ -5,6 +5,7 @@ use solana_client::{rpc_config::RpcSendTransactionConfig, rpc_custom_error::RpcC
 use solana_signature::Signature;
 use solana_transaction::versioned::VersionedTransaction;
 use solana_transaction_status::UiTransactionEncoding;
+use surfpool_types::TransactionStatusEvent;
 
 use super::{
     RunloopContext,
@@ -150,7 +151,7 @@ impl Jito for SurfpoolJitoRpc {
 
             if let Err(e) = process_res {
                 return Err(Error::invalid_params(format!(
-                    "Jito bundle couldn't be sent as it's not atomic {}: {e}",
+                    "Jito bundle couldn't be executed, failed to process transaction {}: {e}",
                     idx + 1
                 )));
             }
@@ -159,19 +160,33 @@ impl Jito for SurfpoolJitoRpc {
             // failure is communicated through the status channel. Treat any non-success status
             // as a bundle failure.
             match status_rx.recv_timeout(std::time::Duration::from_secs(2)) {
-                Ok(surfpool_types::TransactionStatusEvent::Success(_)) => {}
-                Ok(other) => {
+                Ok(TransactionStatusEvent::Success(_)) => {}
+                Ok(TransactionStatusEvent::SimulationFailure(other)) => {
                     return Err(Error::invalid_params(format!(
-                        "Jito bundle couldn't be sent as it's not atomic: simulation failed for transaction {}: {:?}",
+                        "Jito bundle couldn't be executed: simulation failed for transaction {}: {:?}",
                         idx + 1,
                         other
                     )));
                 }
-                Err(e) => {
+                Ok(TransactionStatusEvent::ExecutionFailure(other)) => {
                     return Err(Error::invalid_params(format!(
-                        "Jito bundle couldn't be sent as it's not atomic: simulation RPC failed for transaction {}: {e}",
-                        idx + 1
+                        "Jito bundle couldn't be executed: Execution failed for transaction {}: {:?}",
+                        idx + 1,
+                        other
                     )));
+                }
+                Ok(TransactionStatusEvent::VerificationFailure(ver_fail_err)) => {
+                    return Err(Error::invalid_params(format!(
+                        "Jito bundle couldn't be executed: Verification failed for transaction {}: {:?}",
+                        idx + 1,
+                        ver_fail_err
+                    )));
+                }
+                Err(_) => {
+                    return Err(RpcCustomError::NodeUnhealthy {
+                        num_slots_behind: None,
+                    }
+                    .into());
                 }
             }
         }
@@ -232,6 +247,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        surfnet::GetAccountResult,
         tests::helpers::TestSetup,
         types::{SurfnetTransactionStatus, TransactionWithStatusMeta},
     };
@@ -507,7 +523,7 @@ mod tests {
         let recipient = Keypair::new();
 
         // Use mempool-backed setup so we can assert that a sandbox failure does NOT enqueue any
-        // ProcessTransaction commands (phase 2 commit currently still uses sendTransaction).
+        // ProcessTransaction commands
         let (mempool_tx, mempool_rx) = crossbeam_channel::unbounded();
         let setup = TestSetup::new_with_mempool(SurfpoolJitoRpc, mempool_tx);
 
@@ -555,7 +571,6 @@ mod tests {
                                 TransactionConfirmationStatus::Confirmed,
                             ));
                         }
-                        SimnetCommand::AirdropProcessed => continue,
                         _ => continue,
                     }
                 }
@@ -622,14 +637,28 @@ mod tests {
         );
         let err = result.unwrap_err();
         assert!(
-            err.message
-                .contains("Jito bundle couldn't be sent as it's not atomic"),
+            err.message.contains("Jito bundle couldn't be executed"),
             "Expected sandbox failure for tx2, got: {}",
             err.message
         );
 
         stop_drain.store(true, Ordering::SeqCst);
         let _ = drain_handle.join();
+
+        let recp_pubkey = recipient.pubkey();
+        let recp_bal = setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm| svm.get_account(&recp_pubkey))
+            .ok()
+            .flatten()
+            .map(|a| a.lamports)
+            .unwrap_or(0); // this should be fine, since the recp. kp was new, it's not in the svm state
+
+        assert_eq!(
+            recp_bal, 0,
+            "expected jito bundle to not take effect after bundle failure"
+        );
 
         // If sandbox failure happens as expected, Phase 2 should never run.
         assert_eq!(
@@ -672,13 +701,12 @@ mod tests {
         let err = result.unwrap_err();
 
         assert!(
-            err.message
-                .contains("Jito bundle couldn't be sent as it's not atomic"),
+            err.message.contains("Jito bundle couldn't be executed"),
             "Expected not-atomic error, got: {}",
             err.message
         );
         assert!(
-            err.message.contains("simulation failed for transaction 1"),
+            err.message.contains("Jito bundle couldn't be executed:"),
             "Expected simulation-failure error for transaction 1, got: {}",
             err.message
         );
