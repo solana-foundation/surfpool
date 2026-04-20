@@ -22,6 +22,7 @@ jobs:
     environment: release
 
     permissions:
+      contents: read
       id-token: write
 
     steps:
@@ -52,7 +53,7 @@ jobs:
           if [ -n "${{ inputs.crates }}" ]; then
             CRATES="${{ inputs.crates }}"
           else
-            CRATES="surfpool-types surfpool-db surfpool-core surfpool-studio-ui"
+            CRATES="surfpool-types surfpool-db surfpool-core surfpool-sdk surfpool-studio-ui"
           fi
 
           for CRATE in $CRATES; do

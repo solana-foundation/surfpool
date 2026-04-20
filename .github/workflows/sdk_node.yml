@@ -37,11 +37,11 @@ jobs:
             run_sdk_tests: true
             platform_dir: linux-x64-gnu
           - name: macos-x64
-            os: macos-latest
+            os: macos-15-intel
             run_sdk_tests: false
             platform_dir: darwin-x64
           - name: macos-arm64
-            os: macos-latest
+            os: macos-15
             run_sdk_tests: false
             platform_dir: darwin-arm64
 
@@ -69,18 +69,17 @@ jobs:
           cache: npm
           cache-dependency-path: crates/sdk-node/package-lock.json
 
-      - name: Set up pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: 10.14.0
-
       - name: Install npm dependencies
         working-directory: crates/sdk-node
         run: npm ci
 
-      - name: Run sdk tests
+      - name: Run sdk lib tests
         if: matrix.run_sdk_tests
-        run: cargo test -p surfpool-sdk
+        run: cargo test -p surfpool-sdk --lib --tests
+
+      - name: Run sdk doc tests
+        if: matrix.run_sdk_tests
+        run: cargo test -p surfpool-sdk --doc
 
       - name: Build sdk-node crate
         run: cargo build -p surfpool-sdk-node --release
@@ -144,4 +143,6 @@ jobs:
 
           assert.match(surfnet.rpcUrl, /^http:\/\//);
           assert.match(surfnet.wsUrl, /^ws:\/\//);
+          assert.ok(surfnet.instanceId.length > 0);
+          assert.ok(Array.isArray(surfnet.drainEvents()));
           EOF

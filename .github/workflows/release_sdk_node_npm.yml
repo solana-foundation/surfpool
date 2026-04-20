@@ -19,6 +19,10 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.package.outputs.version }}
+      publish_root: ${{ steps.package.outputs.publish_root }}
+      publish_darwin_x64: ${{ steps.package.outputs.publish_darwin_x64 }}
+      publish_darwin_arm64: ${{ steps.package.outputs.publish_darwin_arm64 }}
+      publish_linux_x64_gnu: ${{ steps.package.outputs.publish_linux_x64_gnu }}
       should_publish: ${{ steps.package.outputs.should_publish }}
     steps:
       - name: Checkout repository
@@ -27,8 +31,13 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22.14.0
           registry-url: https://registry.npmjs.org
+
+      - name: Ensure npm 11
+        run: |
+          npm install -g npm@^11.10.0
+          npm --version
 
       - name: Read package version
         id: package
@@ -37,14 +46,28 @@ jobs:
         run: |
           VERSION=$(node -p "require('./package.json').version")
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          SHOULD_PUBLISH=false
 
-          if npm view "surfpool-sdk@${VERSION}" version --registry=https://registry.npmjs.org >/dev/null 2>&1; then
-            echo "should_publish=false" >> "$GITHUB_OUTPUT"
-            echo "surfpool-sdk@${VERSION} is already published"
-          else
-            echo "should_publish=true" >> "$GITHUB_OUTPUT"
-            echo "surfpool-sdk@${VERSION} is ready to publish"
-          fi
+          for ENTRY in \
+            "surfpool-sdk publish_root" \
+            "surfpool-sdk-darwin-x64 publish_darwin_x64" \
+            "surfpool-sdk-darwin-arm64 publish_darwin_arm64" \
+            "surfpool-sdk-linux-x64-gnu publish_linux_x64_gnu"
+          do
+            PACKAGE_NAME="${ENTRY% *}"
+            OUTPUT_NAME="${ENTRY#* }"
+
+            if npm view "${PACKAGE_NAME}@${VERSION}" version --registry=https://registry.npmjs.org >/dev/null 2>&1; then
+              echo "${OUTPUT_NAME}=false" >> "$GITHUB_OUTPUT"
+              echo "${PACKAGE_NAME}@${VERSION} is already published"
+            else
+              echo "${OUTPUT_NAME}=true" >> "$GITHUB_OUTPUT"
+              echo "${PACKAGE_NAME}@${VERSION} is ready to publish"
+              SHOULD_PUBLISH=true
+            fi
+          done
+
+          echo "should_publish=${SHOULD_PUBLISH}" >> "$GITHUB_OUTPUT"
 
   build_artifacts:
     name: Build (${{ matrix.name }})
@@ -60,11 +83,11 @@ jobs:
             upload_metadata: true
             platform_dir: linux-x64-gnu
           - name: macos-x64
-            os: macos-latest
+            os: macos-15-intel
             upload_metadata: false
             platform_dir: darwin-x64
           - name: macos-arm64
-            os: macos-latest
+            os: macos-15
             upload_metadata: false
             platform_dir: darwin-arm64
 
@@ -88,14 +111,9 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22.14.0
           cache: npm
           cache-dependency-path: crates/sdk-node/package-lock.json
-
-      - name: Set up pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: 10.14.0
 
       - name: Install npm dependencies
         working-directory: crates/sdk-node
@@ -135,6 +153,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: release
     permissions:
+      contents: read
       id-token: write
     steps:
       - name: Install Linux dependencies
@@ -149,10 +168,15 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22.14.0
           registry-url: https://registry.npmjs.org
           cache: npm
           cache-dependency-path: crates/sdk-node/package-lock.json
+
+      - name: Ensure npm 11
+        run: |
+          npm install -g npm@^11.10.0
+          npm --version
 
       - name: Install npm dependencies
         working-directory: crates/sdk-node
@@ -193,30 +217,42 @@ jobs:
           cd ../darwin-arm64 && NPM_CONFIG_CACHE=$(mktemp -d) npm pack --dry-run
           cd ../linux-x64-gnu && NPM_CONFIG_CACHE=$(mktemp -d) npm pack --dry-run
 
-      - name: Publish platform packages
-        if: inputs.dry_run != true
-        working-directory: crates/sdk-node
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npx napi prepublish -t npm --skip-gh-release
+      - name: Publish darwin-x64 package
+        if: inputs.dry_run != true && needs.prepare_release.outputs.publish_darwin_x64 == 'true'
+        working-directory: crates/sdk-node/npm/darwin-x64
+        run: npm publish --access public --provenance
 
-      - name: Dry run platform publish
-        if: inputs.dry_run == true
-        working-directory: crates/sdk-node
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npx napi prepublish -t npm --skip-gh-release --dry-run
+      - name: Publish darwin-arm64 package
+        if: inputs.dry_run != true && needs.prepare_release.outputs.publish_darwin_arm64 == 'true'
+        working-directory: crates/sdk-node/npm/darwin-arm64
+        run: npm publish --access public --provenance
+
+      - name: Publish linux-x64-gnu package
+        if: inputs.dry_run != true && needs.prepare_release.outputs.publish_linux_x64_gnu == 'true'
+        working-directory: crates/sdk-node/npm/linux-x64-gnu
+        run: npm publish --access public --provenance
+
+      - name: Dry run darwin-x64 publish
+        if: inputs.dry_run == true && needs.prepare_release.outputs.publish_darwin_x64 == 'true'
+        working-directory: crates/sdk-node/npm/darwin-x64
+        run: npm publish --dry-run --access public
+
+      - name: Dry run darwin-arm64 publish
+        if: inputs.dry_run == true && needs.prepare_release.outputs.publish_darwin_arm64 == 'true'
+        working-directory: crates/sdk-node/npm/darwin-arm64
+        run: npm publish --dry-run --access public
+
+      - name: Dry run linux-x64-gnu publish
+        if: inputs.dry_run == true && needs.prepare_release.outputs.publish_linux_x64_gnu == 'true'
+        working-directory: crates/sdk-node/npm/linux-x64-gnu
+        run: npm publish --dry-run --access public
 
       - name: Publish root package
-        if: inputs.dry_run != true
+        if: inputs.dry_run != true && needs.prepare_release.outputs.publish_root == 'true'
         working-directory: crates/sdk-node
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: npm publish --access public --provenance
 
       - name: Dry run root publish
-        if: inputs.dry_run == true
+        if: inputs.dry_run == true && needs.prepare_release.outputs.publish_root == 'true'
         working-directory: crates/sdk-node
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: npm publish --dry-run --access public
