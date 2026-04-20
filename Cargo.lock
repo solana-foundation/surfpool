@@ -11423,6 +11423,7 @@ dependencies = [
  "solana-pubkey 3.0.0",
  "solana-signer",
  "surfpool-sdk",
+ "surfpool-types",
 ]
 
 [[package]]
