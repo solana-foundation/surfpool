@@ -52,8 +52,8 @@
     "create-npm-dir": "napi create-npm-dir -t .",
     "artifacts": "napi artifacts",
     "pack:dry-run": "npm pack --dry-run",
-    "smoke": "node ./scripts/smoke.js",
-    "prepublishOnly": "napi prepublish -t npm"
+    "smoke": "npm test",
+    "test": "node --test --test-concurrency=1 ./scripts/smoke.js"
   },
   "devDependencies": {
     "@napi-rs/cli": "^2.18.4",
