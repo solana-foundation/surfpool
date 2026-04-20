@@ -498,7 +498,7 @@ pub async fn start_block_production_runloop(
                        // Apply random execution delay to simulate out-of-order processing
                        if let Some(max_delay_ms) = transaction_execution_delay_ms {
                            if max_delay_ms > 0 {
-                                   let delay = rand::random::<u64>() % (max_delay_ms + 1);
+                                   let delay = rand::random::<u64>() % max_delay_ms.saturating_add(1);
                                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                            }
                        }

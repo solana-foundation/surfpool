@@ -9115,7 +9115,7 @@ fn make_sol_transfer_tx(payer: &Keypair, recipient: &Pubkey, blockhash: Hash) ->
         &[system_instruction::transfer(
             &payer.pubkey(),
             recipient,
-            1_000,
+            LAMPORTS_PER_SOL / 10,
         )],
         Some(&payer.pubkey()),
         &blockhash,

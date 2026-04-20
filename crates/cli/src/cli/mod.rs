@@ -287,6 +287,9 @@ pub struct StartSimnet {
     /// Skip signature verification for all transactions (eg. surfpool start --skip-signature-verification)
     #[clap(long = "skip-signature-verification", action=ArgAction::SetTrue, default_value = "false")]
     pub skip_signature_verification: bool,
+    /// Skip blockhash validation for all transactions (eg. surfpool start --skip-blockhash-check)
+    #[clap(long = "skip-blockhash-check", action=ArgAction::SetTrue, default_value = "false")]
+    pub skip_blockhash_check: bool,
     /// Probability (0.0–1.0) that a transaction is randomly dropped, simulating packet loss or leader rejection.
     /// E.g. 0.1 means 10% of transactions will be dropped. (eg. surfpool start --transaction-drop-rate 0.1)
     #[arg(long = "transaction-drop-rate", value_parser = parse_drop_rate)]
