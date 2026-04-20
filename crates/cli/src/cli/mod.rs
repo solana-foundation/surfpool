@@ -30,9 +30,10 @@ use surfpool_types::{
 use txtx_core::manifest::WorkspaceManifest;
 use txtx_gql::kit::{helpers::fs::FileLocation, types::frontend::LogLevel};
 
+use crate::cli::update::handle_update_command;
 use crate::runbook::handle_execute_runbook_command;
-
 mod simnet;
+mod update;
 
 #[derive(Clone)]
 pub struct Context {
@@ -127,6 +128,9 @@ enum Command {
     /// Start MCP server
     #[clap(name = "mcp", bin_name = "mcp")]
     Mcp,
+    /// Update Surfpool to the latest version
+    #[clap(name = "update", bin_name = "update")]
+    Update,
 }
 
 #[derive(Parser, PartialEq, Clone, Debug)]
@@ -649,6 +653,7 @@ fn handle_command(opts: Opts, ctx: &Context) -> Result<(), String> {
         }
         Command::List(cmd) => hiro_system_kit::nestable_block_on(handle_list_command(cmd, ctx)),
         Command::Mcp => hiro_system_kit::nestable_block_on(handle_mcp_command(ctx)),
+        Command::Update => hiro_system_kit::nestable_block_on(handle_update_command()),
     }
 }
 

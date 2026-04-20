@@ -29,6 +29,7 @@ ctrlc = { workspace = true, optional = true }
 dialoguer = { workspace = true }
 dirs = { workspace = true }
 fern = { workspace = true, features = ["colored"] }
+futures = { workspace = true}
 hiro-system-kit = { workspace = true }
 indicatif = { workspace = true }
 juniper_actix = { workspace = true, features = ["subscriptions"] }
@@ -39,6 +40,7 @@ mime_guess = { workspace = true }
 mustache = { workspace = true }
 notify = { workspace = true, features = ["fsevent-sys"]}
 ratatui = { workspace = true }
+reqwest = { workspace = true, features = ["rustls-tls", "json", "stream"]}
 rust-embed = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -66,6 +68,9 @@ txtx-core = { workspace = true }
 txtx-gql = { workspace = true }
 txtx-supervisor-ui = { workspace = true, optional = true }
 opentelemetry_sdk = "0.31.0"
+self-replace = "1.5.0"
+flate2 = "1.1.9"
+tar = "0.4.45"
 
 [features]
 default = ["cli", "sqlite", "register-tracing"]
