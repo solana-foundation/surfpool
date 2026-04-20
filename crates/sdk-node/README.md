@@ -7,7 +7,7 @@ Node.js bindings for the Surfpool SDK, built with `napi-rs`.
 ```bash
 npm ci
 npm run build
-npm run smoke
+npm test
 ```
 
 ## Publishing
@@ -18,4 +18,4 @@ The npm package is released from `crates/sdk-node` using prebuilt native artifac
 - `aarch64-apple-darwin`
 - `x86_64-unknown-linux-gnu`
 
-The GitHub Actions release workflow builds those artifacts first, then runs `napi prepublish -t npm` before `npm publish`.
+The GitHub Actions release workflow builds those artifacts first, assembles the per-platform npm package directories, and then publishes each package with npm trusted publishing over GitHub OIDC.
