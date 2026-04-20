@@ -23,7 +23,7 @@ RUN cp /src/surfpool/target/release/surfpool /out
 FROM debian:bullseye-slim
 
 # Set default network host
-ENV SURFPOOL_NETWORK_HOST=0.0.0.0
+ENV SURFPOOL_NETWORK_HOST=127.0.0.1
 
 RUN apt update && apt install -y ca-certificates libssl-dev
 
