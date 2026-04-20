@@ -9109,3 +9109,223 @@ async fn test_send_transaction_skip_sig_verify_processes_and_updates_state(test_
         final_payer_balance.value,
     );
 }
+
+fn make_sol_transfer_tx(payer: &Keypair, recipient: &Pubkey, blockhash: Hash) -> String {
+    let msg = Message::new_with_blockhash(
+        &[system_instruction::transfer(
+            &payer.pubkey(),
+            recipient,
+            1_000,
+        )],
+        Some(&payer.pubkey()),
+        &blockhash,
+    );
+    let tx = VersionedTransaction::try_new(VersionedMessage::Legacy(msg), &[payer])
+        .expect("failed to create tx");
+    let encoded = bincode::serialize(&tx).expect("failed to serialize tx");
+    bs58::encode(encoded).into_string()
+}
+
+#[test_case(TestType::no_db(); "with no db")]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_transaction_drop_rate_always_drops(test_type: TestType) {
+    let payer = Keypair::new();
+    let recipient = Pubkey::new_unique();
+    let bind_host = "127.0.0.1";
+    let bind_port = get_free_port().unwrap();
+    let ws_port = get_free_port().unwrap();
+
+    let config = SurfpoolConfig {
+        simnets: vec![SimnetConfig {
+            airdrop_addresses: vec![payer.pubkey()],
+            airdrop_token_amount: LAMPORTS_PER_SOL,
+            transaction_drop_rate: Some(1.0), // always drop
+            ..SimnetConfig::default()
+        }],
+        rpc: RpcConfig {
+            bind_host: bind_host.to_string(),
+            bind_port,
+            ws_port,
+            ..Default::default()
+        },
+        ..SurfpoolConfig::default()
+    };
+
+    let (surfnet_svm, simnet_events_rx, geyser_events_rx) = test_type.initialize_svm();
+    let (simnet_commands_tx, simnet_commands_rx) = unbounded();
+    let svm_locker = SurfnetSvmLocker::new(surfnet_svm);
+
+    let _handle = hiro_system_kit::thread_named("test").spawn(move || {
+        let future = start_local_surfnet_runloop(
+            svm_locker,
+            config,
+            simnet_commands_tx,
+            simnet_commands_rx,
+            geyser_events_rx,
+        );
+        if let Err(e) = hiro_system_kit::nestable_block_on(future) {
+            panic!("{e:?}");
+        }
+    });
+
+    wait_for_ready_and_connected(&simnet_events_rx);
+
+    let full_client =
+        http::connect::<FullClient>(format!("http://{bind_host}:{bind_port}").as_str())
+            .await
+            .expect("failed to connect");
+
+    let blockhash = full_client
+        .get_latest_blockhash(None)
+        .await
+        .map(|r| Hash::from_str(r.value.blockhash.as_str()).unwrap())
+        .expect("failed to get blockhash");
+
+    let data = make_sol_transfer_tx(&payer, &recipient, blockhash);
+    let result = full_client.send_transaction(data, None).await;
+
+    assert!(result.is_err(), "expected transaction to be dropped");
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("dropped"),
+        "expected 'dropped' in error, got: {err_msg}"
+    );
+}
+
+#[test_case(TestType::no_db(); "with no db")]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_transaction_drop_rate_never_drops(test_type: TestType) {
+    let payer = Keypair::new();
+    let recipient = Pubkey::new_unique();
+    let bind_host = "127.0.0.1";
+    let bind_port = get_free_port().unwrap();
+    let ws_port = get_free_port().unwrap();
+
+    let config = SurfpoolConfig {
+        simnets: vec![SimnetConfig {
+            airdrop_addresses: vec![payer.pubkey()],
+            airdrop_token_amount: LAMPORTS_PER_SOL,
+            transaction_drop_rate: Some(0.0), // never drop
+            ..SimnetConfig::default()
+        }],
+        rpc: RpcConfig {
+            bind_host: bind_host.to_string(),
+            bind_port,
+            ws_port,
+            ..Default::default()
+        },
+        ..SurfpoolConfig::default()
+    };
+
+    let (surfnet_svm, simnet_events_rx, geyser_events_rx) = test_type.initialize_svm();
+    let (simnet_commands_tx, simnet_commands_rx) = unbounded();
+    let svm_locker = SurfnetSvmLocker::new(surfnet_svm);
+
+    let _handle = hiro_system_kit::thread_named("test").spawn(move || {
+        let future = start_local_surfnet_runloop(
+            svm_locker,
+            config,
+            simnet_commands_tx,
+            simnet_commands_rx,
+            geyser_events_rx,
+        );
+        if let Err(e) = hiro_system_kit::nestable_block_on(future) {
+            panic!("{e:?}");
+        }
+    });
+
+    wait_for_ready_and_connected(&simnet_events_rx);
+
+    let full_client =
+        http::connect::<FullClient>(format!("http://{bind_host}:{bind_port}").as_str())
+            .await
+            .expect("failed to connect");
+
+    let blockhash = full_client
+        .get_latest_blockhash(None)
+        .await
+        .map(|r| Hash::from_str(r.value.blockhash.as_str()).unwrap())
+        .expect("failed to get blockhash");
+
+    let data = make_sol_transfer_tx(&payer, &recipient, blockhash);
+    let result = full_client.send_transaction(data, None).await;
+
+    assert!(
+        result.is_ok(),
+        "expected transaction to succeed, got: {:?}",
+        result.err()
+    );
+}
+
+#[test_case(TestType::no_db(); "with no db")]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_transaction_execution_delay(test_type: TestType) {
+    let payer = Keypair::new();
+    let recipient = Pubkey::new_unique();
+    let bind_host = "127.0.0.1";
+    let bind_port = get_free_port().unwrap();
+    let ws_port = get_free_port().unwrap();
+    let delay_ms = 200u64;
+
+    let config = SurfpoolConfig {
+        simnets: vec![SimnetConfig {
+            airdrop_addresses: vec![payer.pubkey()],
+            airdrop_token_amount: LAMPORTS_PER_SOL,
+            transaction_execution_delay_ms: Some(delay_ms),
+            ..SimnetConfig::default()
+        }],
+        rpc: RpcConfig {
+            bind_host: bind_host.to_string(),
+            bind_port,
+            ws_port,
+            ..Default::default()
+        },
+        ..SurfpoolConfig::default()
+    };
+
+    let (surfnet_svm, simnet_events_rx, geyser_events_rx) = test_type.initialize_svm();
+    let (simnet_commands_tx, simnet_commands_rx) = unbounded();
+    let svm_locker = SurfnetSvmLocker::new(surfnet_svm);
+
+    let _handle = hiro_system_kit::thread_named("test").spawn(move || {
+        let future = start_local_surfnet_runloop(
+            svm_locker,
+            config,
+            simnet_commands_tx,
+            simnet_commands_rx,
+            geyser_events_rx,
+        );
+        if let Err(e) = hiro_system_kit::nestable_block_on(future) {
+            panic!("{e:?}");
+        }
+    });
+
+    wait_for_ready_and_connected(&simnet_events_rx);
+
+    let full_client =
+        http::connect::<FullClient>(format!("http://{bind_host}:{bind_port}").as_str())
+            .await
+            .expect("failed to connect");
+
+    let blockhash = full_client
+        .get_latest_blockhash(None)
+        .await
+        .map(|r| Hash::from_str(r.value.blockhash.as_str()).unwrap())
+        .expect("failed to get blockhash");
+
+    let data = make_sol_transfer_tx(&payer, &recipient, blockhash);
+    let start = std::time::Instant::now();
+    let result = full_client.send_transaction(data, None).await;
+    let elapsed = start.elapsed();
+
+    assert!(
+        result.is_ok(),
+        "expected transaction to succeed with delay set, got: {:?}",
+        result.err()
+    );
+    assert!(
+        elapsed.as_millis() < 5000,
+        "transaction took too long: {}ms",
+        elapsed.as_millis()
+    );
+}
