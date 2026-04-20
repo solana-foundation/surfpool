@@ -64,6 +64,16 @@ lazy_static::lazy_static! {
 /// We set out snap build to set this environment variable to the real home directory,
 /// because by default, snaps run in a confined environment where the home directory is not
 /// the user's actual home directory.
+fn parse_drop_rate(s: &str) -> Result<f64, String> {
+    let v: f64 = s
+        .parse()
+        .map_err(|_| format!("'{}' is not a valid number", s))?;
+    if !(0.0..=1.0).contains(&v) {
+        return Err(format!("drop rate must be between 0.0 and 1.0, got {}", v));
+    }
+    Ok(v)
+}
+
 pub fn get_home_dir() -> String {
     if let Ok(real_home) = env::var("SNAP_REAL_HOME") {
         let path_buf = PathBuf::from(real_home);
@@ -277,9 +287,14 @@ pub struct StartSimnet {
     /// Skip signature verification for all transactions (eg. surfpool start --skip-signature-verification)
     #[clap(long = "skip-signature-verification", action=ArgAction::SetTrue, default_value = "false")]
     pub skip_signature_verification: bool,
-    /// Skip blockhash validation for all transactions (eg. surfpool start --skip-blockhash-check)
-    #[clap(long = "skip-blockhash-check", action=ArgAction::SetTrue, default_value = "false")]
-    pub skip_blockhash_check: bool,
+    /// Probability (0.0–1.0) that a transaction is randomly dropped, simulating packet loss or leader rejection.
+    /// E.g. 0.1 means 10% of transactions will be dropped. (eg. surfpool start --transaction-drop-rate 0.1)
+    #[arg(long = "transaction-drop-rate", value_parser = parse_drop_rate)]
+    pub transaction_drop_rate: Option<f64>,
+    /// Maximum random delay in milliseconds before executing a transaction, simulating out-of-order execution.
+    /// Each transaction waits a random duration from 0 to this value. (eg. surfpool start --transaction-execution-delay-ms 200)
+    #[arg(long = "transaction-execution-delay-ms")]
+    pub transaction_execution_delay_ms: Option<u64>,
 }
 
 #[derive(clap::ValueEnum, PartialEq, Clone, Debug)]
@@ -447,6 +462,8 @@ impl StartSimnet {
             skip_blockhash_check: self.skip_blockhash_check,
             surfnet_id: self.surfnet_id.clone(),
             snapshot,
+            transaction_drop_rate: self.transaction_drop_rate,
+            transaction_execution_delay_ms: self.transaction_execution_delay_ms,
         }
     }
 

@@ -348,6 +348,8 @@ pub async fn start_block_production_runloop(
         expiry_duration_ms.map(|expiry_val| Utc::now().timestamp_millis() as u64 + expiry_val);
     let global_skip_sig_verify = simnet_config.skip_signature_verification;
     let ix_profiling_initially_enabled = simnet_config.instruction_profiling_enabled;
+    let transaction_drop_rate = simnet_config.transaction_drop_rate;
+    let transaction_execution_delay_ms = simnet_config.transaction_execution_delay_ms;
     loop {
         let mut do_produce_block = false;
 
@@ -483,6 +485,23 @@ pub async fn start_block_production_runloop(
                         continue
                     }
                     SimnetCommand::ProcessTransaction(_key, transaction, status_tx, skip_preflight, skip_sig_verify_override) => {
+                       // Randomly drop the transaction to simulate real-world packet loss / leader rejection
+                       if let Some(drop_rate) = transaction_drop_rate {
+                           if rand::random::<f64>() < drop_rate {
+                               let _ = svm_locker.simnet_events_tx().send(SimnetEvent::warn(
+                                   format!("Transaction dropped (simulated, drop_rate={})", drop_rate)
+                               ));
+                               let _ = status_tx.send(surfpool_types::TransactionStatusEvent::Dropped);
+                               continue;
+                           }
+                       }
+                       // Apply random execution delay to simulate out-of-order processing
+                       if let Some(max_delay_ms) = transaction_execution_delay_ms {
+                           if max_delay_ms > 0 {
+                                   let delay = rand::random::<u64>() % (max_delay_ms + 1);
+                               tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                           }
+                       }
                        let skip_sig_verify = skip_sig_verify_override.unwrap_or(global_skip_sig_verify);
                        let sigverify = !skip_sig_verify;
                        if let Err(e) = svm_locker.process_transaction(&remote_client_with_commitment, transaction, status_tx, skip_preflight, sigverify).await {

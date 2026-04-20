@@ -831,6 +831,9 @@ async fn test_transaction_with_ed25519_instruction(test_type: TestType) {
         Ok(TransactionStatusEvent::VerificationFailure(error)) => {
             panic!("Transaction verification failed: {}", error);
         }
+        Ok(TransactionStatusEvent::Dropped) => {
+            panic!("Transaction was unexpectedly dropped");
+        }
         Err(e) => {
             panic!("Failed to receive transaction status: {:?}", e);
         }
@@ -1558,6 +1561,9 @@ async fn test_get_transaction_profile(test_type: TestType) {
         }
         Ok(TransactionStatusEvent::VerificationFailure(error)) => {
             panic!("Transaction verification failed: {}", error);
+        }
+        Ok(TransactionStatusEvent::Dropped) => {
+            panic!("Transaction was unexpectedly dropped");
         }
         Err(e) => {
             panic!("Failed to receive transaction status: {:?}", e);

@@ -1671,6 +1671,18 @@ impl Full for SurfpoolFullRpc {
                     m.record_transaction(true, rpc_start.elapsed().as_millis() as u64);
                 }
             }
+            Ok(TransactionStatusEvent::Dropped) => {
+                #[cfg(feature = "prometheus")]
+                if let Some(m) = crate::telemetry::metrics() {
+                    m.record_transaction(false, rpc_start.elapsed().as_millis() as u64);
+                    m.record_rpc_request("sendTransaction", rpc_start.elapsed().as_millis() as u64);
+                }
+                return Err(Error {
+                    data: None,
+                    message: "Transaction dropped: simulated network condition".to_string(),
+                    code: jsonrpc_core::ErrorCode::ServerError(-32002),
+                });
+            }
         }
 
         #[cfg(feature = "prometheus")]

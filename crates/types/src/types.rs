@@ -537,6 +537,7 @@ pub enum TransactionStatusEvent {
     SimulationFailure((TransactionError, TransactionMetadata)),
     ExecutionFailure((TransactionError, TransactionMetadata)),
     VerificationFailure(String),
+    Dropped,
 }
 
 #[derive(Debug)]
@@ -617,6 +618,14 @@ pub struct SimnetConfig {
     /// Snapshot accounts to preload at startup.
     /// Keys are pubkey strings, values can be None to fetch from remote RPC.
     pub snapshot: BTreeMap<String, Option<AccountSnapshot>>,
+    /// Probability (0.0–1.0) that any given transaction will be randomly dropped,
+    /// simulating real-world packet loss or leader rejection.
+    #[serde(default)]
+    pub transaction_drop_rate: Option<f64>,
+    /// Maximum random delay in milliseconds applied before executing each transaction,
+    /// simulating out-of-order execution under high throughput.
+    #[serde(default)]
+    pub transaction_execution_delay_ms: Option<u64>,
 }
 
 impl Default for SimnetConfig {
@@ -636,6 +645,8 @@ impl Default for SimnetConfig {
             skip_blockhash_check: false,
             surfnet_id: "default".to_string(),
             snapshot: BTreeMap::new(),
+            transaction_drop_rate: None,
+            transaction_execution_delay_ms: None,
         }
     }
 }
