@@ -182,19 +182,25 @@ function sampleIdl(programId) {
 }
 
 async function getBalance(rpcUrl, address) {
-  const result = await surfnetRpc(rpcUrl, "getBalance", [address]);
+  const result = await surfnetRpc(rpcUrl, "getBalance", [
+    address,
+    { commitment: "processed" },
+  ]);
   return result.value;
 }
 
 async function getTokenAmount(rpcUrl, address) {
-  const result = await surfnetRpc(rpcUrl, "getTokenAccountBalance", [address]);
+  const result = await surfnetRpc(rpcUrl, "getTokenAccountBalance", [
+    address,
+    { commitment: "processed" },
+  ]);
   return result.value.amount;
 }
 
 async function getOptionalAccountInfo(rpcUrl, address) {
   const result = await surfnetRpc(rpcUrl, "getAccountInfo", [
     address,
-    { encoding: "base64" },
+    { encoding: "base64", commitment: "processed" },
   ]);
   return result.value;
 }
@@ -208,7 +214,7 @@ async function getAccountInfo(rpcUrl, address) {
 async function getParsedAccountInfo(rpcUrl, address) {
   const result = await surfnetRpc(rpcUrl, "getAccountInfo", [
     address,
-    { encoding: "jsonParsed" },
+    { encoding: "jsonParsed", commitment: "processed" },
   ]);
   assert.notEqual(result.value, null, `expected parsed account ${address} to exist`);
   return result.value;
