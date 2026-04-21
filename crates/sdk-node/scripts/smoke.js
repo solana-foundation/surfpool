@@ -8,6 +8,7 @@ const { Surfnet } = require("../dist");
 
 const SPL_TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const NATIVE_MINT = "So11111111111111111111111111111111111111112";
+const STARTUP_AIRDROP_LAMPORTS = 1_000_000_000;
 
 test("startWithConfig supports custom payer, extra airdrops, instanceId, and drainEvents", async () => {
   const payer = Surfnet.newKeypair();
@@ -15,7 +16,7 @@ test("startWithConfig supports custom payer, extra airdrops, instanceId, and dra
   const surfnet = Surfnet.startWithConfig({
     offline: true,
     blockProductionMode: "manual",
-    airdropSol: 1_234,
+    airdropSol: STARTUP_AIRDROP_LAMPORTS,
     airdropAddresses: [extra.publicKey],
     payerSecretKey: Uint8Array.from(payer.secretKey),
   });
@@ -25,8 +26,8 @@ test("startWithConfig supports custom payer, extra airdrops, instanceId, and dra
   assert.match(surfnet.wsUrl, /^ws:\/\//);
   assert.ok(surfnet.instanceId.length > 0, "expected instanceId");
 
-  assert.equal(await getBalance(surfnet.rpcUrl, payer.publicKey), 1_234);
-  assert.equal(await getBalance(surfnet.rpcUrl, extra.publicKey), 1_234);
+  assert.equal(await getBalance(surfnet.rpcUrl, payer.publicKey), STARTUP_AIRDROP_LAMPORTS);
+  assert.equal(await getBalance(surfnet.rpcUrl, extra.publicKey), STARTUP_AIRDROP_LAMPORTS);
 
   const events = surfnet.drainEvents();
   assert.ok(Array.isArray(events));
