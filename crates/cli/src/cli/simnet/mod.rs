@@ -525,7 +525,11 @@ enum RunbookExecutionMode {
 }
 
 impl RunbookExecutionMode {
-    fn from_inputs(has_custom_artifacts_path: bool, anchor_compat: bool, txtx_exists: bool) -> Self {
+    fn from_inputs(
+        has_custom_artifacts_path: bool,
+        anchor_compat: bool,
+        txtx_exists: bool,
+    ) -> Self {
         match (has_custom_artifacts_path, anchor_compat, txtx_exists) {
             // `--artifacts-path` always wins: the custom bin_path has to be
             // injected, which only the in-memory runbook can do.

@@ -896,9 +896,7 @@ macro_rules! impl_token_program_packable_serde {
 
                 if bytes.is_empty() {
                     return Err(serde::de::Error::custom(concat!(
-                        "Empty ",
-                        $label,
-                        " bytes"
+                        "Empty ", $label, " bytes"
                     )));
                 }
 
@@ -917,8 +915,7 @@ macro_rules! impl_token_program_packable_serde {
                         Ok($enum_name::SplToken2022(inner))
                     }
                     TokenProgramDiscriminant::SplToken => {
-                        let inner =
-                            <$ty_legacy>::unpack(data).map_err(serde::de::Error::custom)?;
+                        let inner = <$ty_legacy>::unpack(data).map_err(serde::de::Error::custom)?;
                         Ok($enum_name::SplToken(inner))
                     }
                 }
