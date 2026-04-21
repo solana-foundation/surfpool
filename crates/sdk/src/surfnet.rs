@@ -1,6 +1,11 @@
-use std::net::TcpListener;
+use std::{
+    net::TcpListener,
+    thread::sleep,
+    time::{Duration, Instant},
+};
 
 use crossbeam_channel::{Receiver, Sender};
+use solana_commitment_config::CommitmentConfig;
 use solana_keypair::Keypair;
 use solana_pubkey::Pubkey;
 use solana_rpc_client::rpc_client::RpcClient;
@@ -102,13 +107,14 @@ impl SurfnetBuilder {
     /// Start the surfnet with the configured options.
     pub async fn start(self) -> SurfnetResult<Surfnet> {
         let payer = self.payer.unwrap_or_else(Keypair::new);
+        let airdrop_lamports = self.airdrop_lamports;
 
         let bind_port = get_free_port()?;
         let ws_port = get_free_port()?;
         let bind_host = "127.0.0.1".to_string();
 
-        let mut airdrop_addresses = vec![payer.pubkey()];
-        airdrop_addresses.extend(self.airdrop_addresses);
+        let mut startup_airdrop_addresses = vec![payer.pubkey()];
+        startup_airdrop_addresses.extend(self.airdrop_addresses);
 
         let surfpool_config = SurfpoolConfig {
             simnets: vec![SimnetConfig {
@@ -116,8 +122,8 @@ impl SurfnetBuilder {
                 remote_rpc_url: self.remote_rpc_url,
                 slot_time: self.slot_time_ms,
                 block_production_mode: self.block_production_mode,
-                airdrop_addresses,
-                airdrop_token_amount: self.airdrop_lamports,
+                airdrop_addresses: startup_airdrop_addresses.clone(),
+                airdrop_token_amount: airdrop_lamports,
                 ..Default::default()
             }],
             rpc: RpcConfig {
@@ -157,6 +163,7 @@ impl SurfnetBuilder {
 
         // Wait for the runtime to signal ready
         wait_for_ready(&simnet_events_rx)?;
+        wait_for_startup_airdrops(&rpc_url, &startup_airdrop_addresses, airdrop_lamports)?;
 
         Ok(Surfnet {
             rpc_url,
@@ -278,4 +285,57 @@ fn wait_for_ready(events_rx: &Receiver<SimnetEvent>) -> SurfnetResult<()> {
             }
         }
     }
+}
+
+fn wait_for_startup_airdrops(
+    rpc_url: &str,
+    addresses: &[Pubkey],
+    expected_lamports: u64,
+) -> SurfnetResult<()> {
+    let rpc_client = RpcClient::new(rpc_url.to_string());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut last_error = None;
+    let mut last_balances = vec![];
+
+    while Instant::now() < deadline {
+        last_balances.clear();
+        let mut all_match = true;
+
+        for address in addresses {
+            match rpc_client.get_balance_with_commitment(address, CommitmentConfig::processed()) {
+                Ok(response) => {
+                    last_balances.push((address.to_string(), response.value));
+                    if response.value != expected_lamports {
+                        all_match = false;
+                    }
+                }
+                Err(err) => {
+                    last_error = Some(err.to_string());
+                    all_match = false;
+                    break;
+                }
+            }
+        }
+
+        if all_match {
+            return Ok(());
+        }
+
+        sleep(Duration::from_millis(25));
+    }
+
+    let balance_summary = if last_balances.is_empty() {
+        "no balances observed".to_string()
+    } else {
+        last_balances
+            .iter()
+            .map(|(address, balance)| format!("{address}={balance}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    Err(SurfnetError::Startup(format!(
+        "startup balances not visible over RPC within timeout (expected {expected_lamports}); last balances: {balance_summary}; last error: {}",
+        last_error.unwrap_or_else(|| "none".to_string())
+    )))
 }

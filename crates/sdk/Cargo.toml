@@ -23,6 +23,7 @@ serde_json = { workspace = true }
 solana-account = { workspace = true }
 solana-client = { workspace = true }
 solana-clock = { workspace = true }
+solana-commitment-config = { workspace = true }
 solana-epoch-info = { workspace = true }
 solana-keypair = { workspace = true }
 solana-pubkey = { workspace = true }
