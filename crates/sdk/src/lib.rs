@@ -29,6 +29,4 @@ pub use solana_pubkey::Pubkey;
 pub use solana_rpc_client::rpc_client::RpcClient;
 pub use solana_signer::Signer;
 pub use surfnet::{Surfnet, SurfnetBuilder};
-pub use surfpool_types::BlockProductionMode;
-pub use surfpool_types::SimnetCommand;
-pub use surfpool_types::SimnetEvent;
+pub use surfpool_types::{BlockProductionMode, SimnetCommand, SimnetEvent};
