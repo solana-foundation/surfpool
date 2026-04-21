@@ -72,6 +72,7 @@ impl SurfnetRemoteClient {
             .danger_accept_invalid_certs(true)
             .tls_built_in_root_certs(false)
             .tls_built_in_webpki_certs(false)
+            .timeout(std::time::Duration::from_secs(30))
             .build()
         {
             Ok(client) => client,
