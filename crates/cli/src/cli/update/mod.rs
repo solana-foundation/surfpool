@@ -1,12 +1,16 @@
 use std::fs::remove_file;
 use std::io::Read;
 
+use dialoguer::{Confirm, console::Style, theme::ColorfulTheme};
 use flate2::read::GzDecoder;
 use futures::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
 use self_replace::self_replace;
+use semver::Version;
 use serde::Deserialize;
 use tar::Archive;
+
+use crate::cli::UpdateCommand;
 
 #[derive(Deserialize, Debug)]
 struct LatestRelease {
@@ -20,10 +24,19 @@ struct Asset {
     browser_download_url: String,
 }
 
-pub async fn handle_update_command() -> Result<(), String> {
+pub async fn handle_update_command(cmd: UpdateCommand) -> Result<(), String> {
     let client = reqwest::Client::new();
+    let release_url = match &cmd.version {
+        Some(version) => format!(
+            "https://api.github.com/repos/solana-foundation/surfpool/releases/tags/v{}",
+            version
+        ),
+        None => {
+            "https://api.github.com/repos/solana-foundation/surfpool/releases/latest".to_string()
+        }
+    };
     let latest_version: LatestRelease = client
-        .get("https://api.github.com/repos/solana-foundation/surfpool/releases/latest")
+        .get(release_url)
         .header(reqwest::header::USER_AGENT, "surfpool-cli")
         .send()
         .await
@@ -33,21 +46,55 @@ pub async fn handle_update_command() -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     let latest_tag_name = latest_version.tag_name.trim_start_matches('v');
     let current_version: &str = env!("CARGO_PKG_VERSION");
-    println!("Latest version: {}", latest_tag_name);
+    let current_semver = Version::parse(current_version)
+        .map_err(|e| format!("Failed to parse current version: {e}"))?;
+    let target_semver = Version::parse(latest_tag_name)
+        .map_err(|e| format!("Failed to parse target version: {e}"))?;
     let users_asset = get_asset_name()?;
     let browser_download_url = latest_version
         .assets
         .iter()
         .find(|a| a.name == users_asset)
         .map(|a| a.browser_download_url.as_str())
-        .ok_or_else(|| format!("No asset name found matching the users platform"))?;
-    println!("Current version: {}", current_version);
-    println!("Download URL: {}", browser_download_url);
+        .ok_or_else(|| {
+            format!(
+                "No asset name found matching the user's platform: {}",
+                users_asset
+            )
+        })?;
 
-    if current_version == latest_tag_name {
-        println!("Already on the latest version {}", latest_tag_name);
+    if current_semver == target_semver {
+        println!("Already on the latest version {}", current_semver);
         return Ok(());
     }
+
+    if cmd.version.is_none() && current_semver > target_semver {
+        println!("Already on the latest version {}", current_semver);
+        return Ok(());
+    }
+
+    if !cmd.skip_confirm {
+        let theme = ColorfulTheme {
+            defaults_style: Style::new().for_stderr(),
+            ..ColorfulTheme::default()
+        };
+        println!("Current version: {}", current_version);
+        println!("Latest version: {}", latest_tag_name);
+        let confirm = Confirm::with_theme(&theme)
+            .with_prompt(format!(
+                "Update surfpool from {} to {}",
+                current_version, latest_tag_name
+            ))
+            .default(true)
+            .interact()
+            .map_err(|e| format!("Failed to read confirmation: {e}"))?;
+
+        if !confirm {
+            println!("Update cancelled");
+            return Ok(());
+        }
+    }
+    println!("Download URL: {}", browser_download_url);
     let response = client
         .get(browser_download_url)
         .send()
@@ -77,7 +124,7 @@ pub async fn handle_update_command() -> Result<(), String> {
     for entry in archive.entries().map_err(|e| e.to_string())? {
         let mut entry = entry.map_err(|e| e.to_string())?;
         let path = entry.path().map_err(|e| e.to_string())?;
-        if path.file_name().and_then(|n| n.to_str()) == Some("surfpool") {
+        if path.file_name().and_then(|n| n.to_str()) == Some(get_binary_name()) {
             let mut buf = Vec::new();
             entry.read_to_end(&mut buf).map_err(|e| e.to_string())?;
             binary_data = Some(buf);
@@ -85,7 +132,8 @@ pub async fn handle_update_command() -> Result<(), String> {
         }
     }
 
-    let binary_data = binary_data.ok_or("Could not find 'surfpool' binary in archive")?;
+    let binary_data =
+        binary_data.ok_or_else(|| format!("Could not find '{}' binary in archive", get_binary_name()))?;
 
     let temp = std::env::temp_dir().join("surfpool-update");
     std::fs::write(&temp, &binary_data).map_err(|e| e.to_string())?;
@@ -106,6 +154,15 @@ fn get_asset_name() -> Result<String, String> {
         ("macos", "aarch64") => Ok("surfpool-darwin-arm64.tar.gz".into()),
         ("macos", "x86_64") => Ok("surfpool-darwin-x64.tar.gz".into()),
         ("linux", "x86_64") => Ok("surfpool-linux-x64.tar.gz".into()),
+        ("windows", "x86_64") => Ok("surfpool-windows-x64.tar.gz".into()),
         _ => Err(format!("Unsupported platform: {users_os}-{users_arch}")),
+    }
+}
+
+fn get_binary_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "surfpool.exe"
+    } else {
+        "surfpool"
     }
 }

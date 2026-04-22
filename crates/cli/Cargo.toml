@@ -71,6 +71,7 @@ opentelemetry_sdk = "0.31.0"
 self-replace = "1.5.0"
 flate2 = "1.1.9"
 tar = "0.4.45"
+semver = "1.0.28"
 
 [features]
 default = ["cli", "sqlite", "register-tracing"]
