@@ -180,7 +180,7 @@ jobs:
 
       - name: Install publish tooling
         working-directory: crates/sdk-node
-        run: npm install --package-lock=false --omit=optional
+        run: npm ci
 
       - name: Download native binaries
         uses: actions/download-artifact@v4
