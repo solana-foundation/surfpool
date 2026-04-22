@@ -38,11 +38,11 @@ where
     })
 }
 
-pub fn new_kv_store_with_default<K, V>(
+pub fn new_kv_store_with_default<K, V, F>(
     database_url: &Option<&str>,
     table_name: &str,
     surfnet_id: &str,
-    default_storage_constructor: fn() -> Box<dyn Storage<K, V>>,
+    default_storage_constructor: F,
 ) -> StorageResult<Box<dyn Storage<K, V>>>
 where
     K: serde::Serialize
@@ -54,6 +54,7 @@ where
         + Eq
         + std::hash::Hash,
     V: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static + Clone,
+    F: FnOnce() -> Box<dyn Storage<K, V>>,
 {
     match database_url {
         Some(url) => {
@@ -271,7 +272,10 @@ pub mod tests {
     use surfpool_types::SimnetEvent;
     use uuid::Uuid;
 
-    use crate::surfnet::{GeyserEvent, svm::SurfnetSvm};
+    use crate::surfnet::{
+        GeyserEvent,
+        svm::{SurfnetSvm, SurfnetSvmConfig},
+    };
 
     /// Environment variable for PostgreSQL database URL used in tests
     pub const POSTGRES_TEST_URL_ENV: &str = "SURFPOOL_TEST_POSTGRES_URL";
@@ -298,14 +302,31 @@ pub mod tests {
         pub fn initialize_svm(&self) -> (SurfnetSvm, Receiver<SimnetEvent>, Receiver<GeyserEvent>) {
             match &self {
                 TestType::NoDb => SurfnetSvm::default(),
-                TestType::InMemorySqlite => SurfnetSvm::new_with_db(Some(":memory:"), "0").unwrap(),
-                TestType::OnDiskSqlite(db_path) => {
-                    SurfnetSvm::new_with_db(Some(db_path.as_ref()), "0").unwrap()
-                }
+                TestType::InMemorySqlite => SurfnetSvm::new_with_db(
+                    Some(":memory:"),
+                    SurfnetSvmConfig {
+                        surfnet_id: "0".to_string(),
+                        ..SurfnetSvmConfig::default()
+                    },
+                )
+                .unwrap(),
+                TestType::OnDiskSqlite(db_path) => SurfnetSvm::new_with_db(
+                    Some(db_path.as_ref()),
+                    SurfnetSvmConfig {
+                        surfnet_id: "0".to_string(),
+                        ..SurfnetSvmConfig::default()
+                    },
+                )
+                .unwrap(),
                 #[cfg(feature = "postgres")]
-                TestType::Postgres { url, surfnet_id } => {
-                    SurfnetSvm::new_with_db(Some(url.as_ref()), surfnet_id).unwrap()
-                }
+                TestType::Postgres { url, surfnet_id } => SurfnetSvm::new_with_db(
+                    Some(url.as_ref()),
+                    SurfnetSvmConfig {
+                        surfnet_id: surfnet_id.clone(),
+                        ..SurfnetSvmConfig::default()
+                    },
+                )
+                .unwrap(),
             }
         }
 

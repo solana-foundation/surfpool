@@ -176,14 +176,16 @@ pub async fn start_local_surfnet_runloop(
         ),
     };
 
-    svm_locker
-        .initialize(
-            simnet.slot_time,
-            &remote_rpc_client,
-            simnet.instruction_profiling_enabled,
-            simnet.log_bytes_limit,
-        )
-        .await?;
+    svm_locker.initialize(&remote_rpc_client).await?;
+
+    if let Some(remote_client) = &remote_rpc_client {
+        let _ = svm_locker
+            .simnet_events_tx()
+            .send(SimnetEvent::Connected(remote_client.client.url()));
+    }
+    let _ = svm_locker
+        .simnet_events_tx()
+        .send(SimnetEvent::EpochInfoUpdate(svm_locker.get_epoch_info()));
 
     svm_locker.airdrop_pubkeys(simnet.airdrop_token_amount, &simnet.airdrop_addresses);
 

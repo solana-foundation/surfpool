@@ -31,11 +31,21 @@ pub struct SurfnetLiteSvm {
 }
 
 impl SurfnetLiteSvm {
-    pub fn new() -> Self {
-        Self {
-            svm: LiteSVM::default(),
+    pub fn new(database_url: Option<&str>, surfnet_id: &str) -> SurfpoolResult<Self> {
+        let mut lite_svm = Self {
+            svm: Self::base_litesvm_settings(),
             db: None,
+        };
+
+        create_native_mint(&mut lite_svm);
+
+        if let Some(db_url) = database_url {
+            let db: Box<dyn Storage<String, AccountSharedData>> =
+                new_kv_store(&Some(db_url), "accounts", surfnet_id)?;
+            lite_svm.db = Some(db);
         }
+
+        Ok(lite_svm)
     }
 
     /// Creates a clone of the SVM with overlay storage wrapper for the database.
@@ -74,25 +84,6 @@ impl SurfnetLiteSvm {
             .with_builtins()
             .with_sysvars()
             .with_default_programs()
-    }
-
-    pub fn initialize(
-        mut self,
-        // feature_set: FeatureSet,
-        database_url: Option<&str>,
-        surfnet_id: &str,
-    ) -> SurfpoolResult<Self> {
-        self.svm = Self::base_litesvm_settings();
-
-        create_native_mint(&mut self);
-
-        if let Some(db_url) = database_url {
-            let db: Box<dyn Storage<String, AccountSharedData>> =
-                new_kv_store(&Some(db_url), "accounts", surfnet_id)?;
-            self.db = Some(db);
-        }
-
-        Ok(self)
     }
 
     /// Explicitly shutdown the storage, performing cleanup like WAL checkpoint for SQLite.

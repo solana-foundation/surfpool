@@ -72,7 +72,7 @@ use uuid::Uuid;
 use super::{
     AccountSubscriptionData, BlockHeader, BlockIdentifier, FINALIZATION_SLOT_THRESHOLD,
     GetAccountResult, GeyserBlockMetadata, GeyserEntryInfo, GeyserEvent, GeyserSlotStatus,
-    ProgramSubscriptionData, SLOTS_PER_EPOCH, SignatureSubscriptionData, SignatureSubscriptionType,
+    ProgramSubscriptionData, SignatureSubscriptionData, SignatureSubscriptionType,
     remote::SurfnetRemoteClient,
 };
 use crate::{
@@ -210,6 +210,31 @@ pub fn get_txtx_value_json_converters() -> Vec<AddonJsonConverter<'static>> {
     ]
 }
 
+const DEFAULT_LOG_BYTES_LIMIT: Option<usize> = Some(10_000);
+
+#[derive(Debug, Clone)]
+pub struct SurfnetSvmConfig {
+    pub surfnet_id: String,
+    pub feature_config: SvmFeatureConfig,
+    pub slot_time: u64,
+    pub instruction_profiling_enabled: bool,
+    pub max_profiles: usize,
+    pub log_bytes_limit: Option<usize>,
+}
+
+impl Default for SurfnetSvmConfig {
+    fn default() -> Self {
+        Self {
+            surfnet_id: "default".to_string(),
+            feature_config: SvmFeatureConfig::default(),
+            slot_time: DEFAULT_SLOT_TIME_MS,
+            instruction_profiling_enabled: true,
+            max_profiles: DEFAULT_PROFILING_MAP_CAPACITY,
+            log_bytes_limit: DEFAULT_LOG_BYTES_LIMIT,
+        }
+    }
+}
+
 /// `SurfnetSvm` provides a lightweight Solana Virtual Machine (SVM) for testing and simulation.
 ///
 /// It supports a local in-memory blockchain state,
@@ -337,14 +362,20 @@ fn remove_pubkey_from_index(
 
 impl SurfnetSvm {
     pub fn default() -> (Self, Receiver<SimnetEvent>, Receiver<GeyserEvent>) {
-        Self::new(None, "0").unwrap()
+        Self::new(SurfnetSvmConfig::default()).unwrap()
+    }
+
+    pub fn new(
+        config: SurfnetSvmConfig,
+    ) -> SurfpoolResult<(Self, Receiver<SimnetEvent>, Receiver<GeyserEvent>)> {
+        Self::build(None, config)
     }
 
     pub fn new_with_db(
         database_url: Option<&str>,
-        surfnet_id: &str,
+        config: SurfnetSvmConfig,
     ) -> SurfpoolResult<(Self, Receiver<SimnetEvent>, Receiver<GeyserEvent>)> {
-        Self::new(database_url, surfnet_id)
+        Self::build(database_url, config)
     }
 
     /// Explicitly shutdown the SVM, performing cleanup like WAL checkpoint for SQLite.
@@ -447,17 +478,40 @@ impl SurfnetSvm {
         }
     }
 
+    pub(crate) fn default_epoch_schedule() -> EpochSchedule {
+        EpochSchedule::without_warmup()
+    }
+
+    pub(crate) fn default_epoch_info(epoch_schedule: &EpochSchedule) -> EpochInfo {
+        EpochInfo {
+            epoch: 0,
+            slot_index: 0,
+            slots_in_epoch: epoch_schedule.slots_per_epoch,
+            absolute_slot: FINALIZATION_SLOT_THRESHOLD,
+            block_height: FINALIZATION_SLOT_THRESHOLD,
+            transaction_count: None,
+        }
+    }
+
+    fn register_builtin_template_idls(&mut self) {
+        let registry = TemplateRegistry::new();
+        for (_, template) in registry.templates.into_iter() {
+            let _ = self.register_idl(template.idl, None);
+        }
+    }
+
     /// Creates a new instance of `SurfnetSvm`.
     ///
     /// Returns a tuple containing the SVM instance, a receiver for simulation events, and a receiver for Geyser plugin events.
-    pub fn new(
+    fn build(
         database_url: Option<&str>,
-        surfnet_id: &str,
+        config: SurfnetSvmConfig,
     ) -> SurfpoolResult<(Self, Receiver<SimnetEvent>, Receiver<GeyserEvent>)> {
         let (simnet_events_tx, simnet_events_rx) = crossbeam_channel::bounded(1024);
         let (geyser_events_tx, geyser_events_rx) = crossbeam_channel::bounded(1024);
+        let surfnet_id = config.surfnet_id;
 
-        let inner = SurfnetLiteSvm::new().initialize(database_url, surfnet_id)?;
+        let inner = SurfnetLiteSvm::new(database_url, &surfnet_id)?;
 
         let native_mint_account = inner
             .get_account(&spl_token_interface::native_mint::ID)?
@@ -489,19 +543,19 @@ impl SurfnetSvm {
 
         // Load native mint into owned account and token mint indexes
         let mut accounts_by_owner_db: Box<dyn Storage<String, Vec<String>>> =
-            new_kv_store(&database_url, "accounts_by_owner", surfnet_id)?;
+            new_kv_store(&database_url, "accounts_by_owner", &surfnet_id)?;
         accounts_by_owner_db.store(
             native_mint_account.owner.to_string(),
             vec![spl_token_interface::native_mint::ID.to_string()],
         )?;
-        let blocks_db = new_kv_store(&database_url, "blocks", surfnet_id)?;
-        let transactions_db = new_kv_store(&database_url, "transactions", surfnet_id)?;
-        let token_accounts_db = new_kv_store(&database_url, "token_accounts", surfnet_id)?;
+        let blocks_db = new_kv_store(&database_url, "blocks", &surfnet_id)?;
+        let transactions_db = new_kv_store(&database_url, "transactions", &surfnet_id)?;
+        let token_accounts_db = new_kv_store(&database_url, "token_accounts", &surfnet_id)?;
         let mut token_mints_db: Box<dyn Storage<String, MintAccount>> =
-            new_kv_store(&database_url, "token_mints", surfnet_id)?;
+            new_kv_store(&database_url, "token_mints", &surfnet_id)?;
         let mut account_associated_data_db: Box<
             dyn Storage<String, SerializableAccountAdditionalData>,
-        > = new_kv_store(&database_url, "account_associated_data", surfnet_id)?;
+        > = new_kv_store(&database_url, "account_associated_data", &surfnet_id)?;
         // Store initial account associated data (native mint)
         account_associated_data_db.store(
             spl_token_interface::native_mint::ID.to_string(),
@@ -512,34 +566,37 @@ impl SurfnetSvm {
             parsed_mint_account,
         )?;
         let token_accounts_by_owner_db: Box<dyn Storage<String, Vec<String>>> =
-            new_kv_store(&database_url, "token_accounts_by_owner", surfnet_id)?;
+            new_kv_store(&database_url, "token_accounts_by_owner", &surfnet_id)?;
         let token_accounts_by_delegate_db: Box<dyn Storage<String, Vec<String>>> =
-            new_kv_store(&database_url, "token_accounts_by_delegate", surfnet_id)?;
+            new_kv_store(&database_url, "token_accounts_by_delegate", &surfnet_id)?;
         let token_accounts_by_mint_db: Box<dyn Storage<String, Vec<String>>> =
-            new_kv_store(&database_url, "token_accounts_by_mint", surfnet_id)?;
+            new_kv_store(&database_url, "token_accounts_by_mint", &surfnet_id)?;
         let streamed_accounts_db: Box<dyn Storage<String, bool>> =
-            new_kv_store(&database_url, "streamed_accounts", surfnet_id)?;
+            new_kv_store(&database_url, "streamed_accounts", &surfnet_id)?;
         let scheduled_overrides_db: Box<dyn Storage<u64, Vec<OverrideInstance>>> =
-            new_kv_store(&database_url, "scheduled_overrides", surfnet_id)?;
+            new_kv_store(&database_url, "scheduled_overrides", &surfnet_id)?;
         let offline_accounts_db: Box<dyn Storage<String, OfflineAccountConfig>> =
-            new_kv_store(&database_url, "offline_accounts", surfnet_id)?;
+            new_kv_store(&database_url, "offline_accounts", &surfnet_id)?;
         let registered_idls_db: Box<dyn Storage<String, Vec<VersionedIdl>>> =
-            new_kv_store(&database_url, "registered_idls", surfnet_id)?;
+            new_kv_store(&database_url, "registered_idls", &surfnet_id)?;
         let profile_tag_map_db: Box<dyn Storage<String, Vec<UuidOrSignature>>> =
-            new_kv_store(&database_url, "profile_tag_map", surfnet_id)?;
+            new_kv_store(&database_url, "profile_tag_map", &surfnet_id)?;
         let simulated_transaction_profiles_db: Box<dyn Storage<String, KeyedProfileResult>> =
-            new_kv_store(&database_url, "simulated_transaction_profiles", surfnet_id)?;
-        let executed_transaction_profiles_db: Box<dyn Storage<String, KeyedProfileResult>> =
+            new_kv_store(&database_url, "simulated_transaction_profiles", &surfnet_id)?;
+        let executed_transaction_profiles_db: Box<dyn Storage<String, KeyedProfileResult>> = {
+            // Ensure max_profiles is at least 1 to avoid creating a zero-capacity FifoMap
+            let max_profiles = max(1, config.max_profiles);
             new_kv_store_with_default(
                 &database_url,
                 "executed_transaction_profiles",
-                surfnet_id,
+                &surfnet_id,
                 // Use FifoMap for executed_transaction_profiles to maintain FIFO eviction behavior
                 // (when no on-disk DB is provided)
-                || Box::new(FifoMap::<String, KeyedProfileResult>::default()),
-            )?;
+                move || Box::new(FifoMap::<String, KeyedProfileResult>::new(max_profiles)),
+            )?
+        };
         let slot_checkpoint_db: Box<dyn Storage<String, u64>> =
-            new_kv_store(&database_url, "slot_checkpoint", surfnet_id)?;
+            new_kv_store(&database_url, "slot_checkpoint", &surfnet_id)?;
 
         // Recover chain state: prefer slot checkpoint, fall back to max block in DB
         let checkpoint_slot = slot_checkpoint_db.get(&"latest_slot".to_string())?;
@@ -578,6 +635,9 @@ impl SurfnetSvm {
 
         // Initialize transactions_processed from database count for persistent storage
         let transactions_processed = transactions_db.count()?;
+        let epoch_schedule = Self::default_epoch_schedule();
+        let epoch_info = Self::default_epoch_info(&epoch_schedule);
+        let updated_at = Utc::now().timestamp_millis() as u64;
 
         let mut svm = Self {
             inner,
@@ -589,14 +649,7 @@ impl SurfnetSvm {
             transactions_processed,
             simnet_events_tx,
             geyser_events_tx,
-            latest_epoch_info: EpochInfo {
-                epoch: 0,
-                slot_index: 0,
-                slots_in_epoch: SLOTS_PER_EPOCH,
-                absolute_slot: 0,
-                block_height: 0,
-                transaction_count: None,
-            },
+            latest_epoch_info: epoch_info.clone(),
             transactions_queued_for_confirmation: VecDeque::new(),
             transactions_queued_for_finalization: VecDeque::new(),
             signature_subscriptions: HashMap::new(),
@@ -608,8 +661,8 @@ impl SurfnetSvm {
             executed_transaction_profiles: executed_transaction_profiles_db,
             logs_subscriptions: Vec::new(),
             snapshot_subscriptions: Vec::new(),
-            updated_at: Utc::now().timestamp_millis() as u64,
-            slot_time: DEFAULT_SLOT_TIME_MS,
+            updated_at,
+            slot_time: config.slot_time,
             start_time: SystemTime::now(),
             accounts_by_owner: accounts_by_owner_db,
             account_associated_data: account_associated_data_db,
@@ -627,22 +680,28 @@ impl SurfnetSvm {
             write_version: 0,
             registered_idls: registered_idls_db,
             feature_set: FeatureSet::default(),
-            instruction_profiling_enabled: true,
-            max_profiles: DEFAULT_PROFILING_MAP_CAPACITY,
+            instruction_profiling_enabled: config.instruction_profiling_enabled,
+            max_profiles: config.max_profiles,
             runbook_executions: Vec::new(),
             account_update_slots: HashMap::new(),
             streamed_accounts: streamed_accounts_db,
             recent_blockhashes: VecDeque::new(),
             scheduled_overrides: scheduled_overrides_db,
             offline_accounts: offline_accounts_db,
-            genesis_slot: 0, // Will be updated when connecting to remote network
-            genesis_updated_at: Utc::now().timestamp_millis() as u64,
+            genesis_slot: epoch_info.absolute_slot,
+            genesis_updated_at: updated_at,
             slot_checkpoint: slot_checkpoint_db,
             last_checkpoint_slot: 0,
         };
 
-        // Generate the initial synthetic blockhash
+        if config.feature_config != SvmFeatureConfig::default() {
+            svm.apply_feature_config(&config.feature_config);
+        }
+        svm.inner.set_log_bytes_limit(config.log_bytes_limit);
         svm.chain_tip = svm.new_blockhash();
+        svm.register_builtin_template_idls();
+        svm.inner.set_sysvar(&epoch_schedule);
+        svm.reconstruct_sysvars();
 
         Ok((svm, simnet_events_rx, geyser_events_rx))
     }
@@ -677,23 +736,14 @@ impl SurfnetSvm {
         self.write_version
     }
 
-    /// Initializes the SVM with the provided epoch info and optionally notifies about remote connection.
+    /// Initializes the SVM with the provided epoch info and epoch schedule.
     ///
-    /// Updates the internal epoch info, sends connection and epoch update events, and sets the clock sysvar.
+    /// This is reserved for remote-derived startup data that is not known until the runloop
+    /// is ready to connect to a remote RPC.
     ///
     /// # Arguments
     /// * `epoch_info` - The epoch information to initialize with.
-    /// * `remote_ctx` - Optional remote client context for event notification.
-    ///
-    pub fn initialize(
-        &mut self,
-        epoch_info: EpochInfo,
-        epoch_schedule: EpochSchedule,
-        slot_time: u64,
-        remote_ctx: &Option<SurfnetRemoteClient>,
-        do_profile_instructions: bool,
-        log_bytes_limit: Option<usize>,
-    ) {
+    pub fn initialize(&mut self, epoch_info: EpochInfo, epoch_schedule: EpochSchedule) {
         self.chain_tip = self.new_blockhash();
         self.latest_epoch_info = epoch_info.clone();
         // Set genesis_slot to the current slot when initializing (syncing with remote)
@@ -702,26 +752,8 @@ impl SurfnetSvm {
         self.updated_at = Utc::now().timestamp_millis() as u64;
         // Update genesis_updated_at to match the new genesis_slot
         self.genesis_updated_at = self.updated_at;
-        self.slot_time = slot_time;
-        self.instruction_profiling_enabled = do_profile_instructions;
-        self.set_profiling_map_capacity(self.max_profiles);
-        self.inner.set_log_bytes_limit(log_bytes_limit);
-
-        let registry = TemplateRegistry::new();
-        for (_, template) in registry.templates.into_iter() {
-            let _ = self.register_idl(template.idl, None);
-        }
 
         self.inner.set_sysvar(&epoch_schedule);
-
-        if let Some(remote_client) = remote_ctx {
-            let _ = self
-                .simnet_events_tx
-                .send(SimnetEvent::Connected(remote_client.client.url()));
-        }
-        let _ = self
-            .simnet_events_tx
-            .send(SimnetEvent::EpochInfoUpdate(epoch_info));
 
         // Reconstruct all sysvars (RecentBlockhashes, SlotHashes, Clock)
         self.reconstruct_sysvars();
@@ -729,16 +761,6 @@ impl SurfnetSvm {
 
     pub fn set_profile_instructions(&mut self, do_profile_instructions: bool) {
         self.instruction_profiling_enabled = do_profile_instructions;
-    }
-
-    pub fn set_profiling_map_capacity(&mut self, capacity: usize) {
-        let clamped_capacity = max(1, capacity);
-        self.max_profiles = clamped_capacity;
-        let is_on_disk_db = self.inner.db.is_some();
-        if !is_on_disk_db {
-            // when using on-disk DB, we're not using the Fifo Map to manage entries
-            self.executed_transaction_profiles = Box::new(FifoMap::new(clamped_capacity));
-        }
     }
 
     /// Airdrops a specified amount of lamports to a single public key.
@@ -1386,7 +1408,11 @@ impl SurfnetSvm {
         Ok(())
     }
 
-    pub fn reset_network(&mut self, epoch_info: EpochInfo) -> SurfpoolResult<()> {
+    pub fn reset_network(
+        &mut self,
+        epoch_info: EpochInfo,
+        epoch_schedule: EpochSchedule,
+    ) -> SurfpoolResult<()> {
         self.inner.reset(self.feature_set.clone())?;
 
         let native_mint_account = self
@@ -1449,6 +1475,7 @@ impl SurfnetSvm {
         self.token_accounts_by_mint.clear()?;
         self.non_circulating_accounts.clear();
         self.registered_idls.clear()?;
+        self.register_builtin_template_idls();
         self.runbook_executions.clear();
         self.streamed_accounts.clear()?;
         self.scheduled_overrides.clear()?;
@@ -1461,6 +1488,7 @@ impl SurfnetSvm {
         self.genesis_slot = epoch_info.absolute_slot;
         let chain_tip_hash = SyntheticBlockhash::new(epoch_info.block_height).to_string();
         self.chain_tip = BlockIdentifier::new(epoch_info.block_height, chain_tip_hash.as_str());
+        self.inner.set_sysvar(&epoch_schedule);
         // Rebuild sysvars so getLatestBlockhash / sendTransaction stay aligned after reset.
         self.reconstruct_sysvars();
         // Reset checkpoint state to avoid recovering stale chain tips after a reset.
@@ -4194,14 +4222,80 @@ mod tests {
         assert_eq!(svm.max_profiles, DEFAULT_PROFILING_MAP_CAPACITY);
     }
 
-    #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
-    #[test_case(TestType::in_memory(); "with in-memory sqlite db")]
-    #[test_case(TestType::no_db(); "with no db")]
-    #[cfg_attr(feature = "postgres", test_case(TestType::postgres(); "with postgres db"))]
-    fn test_profiling_map_capacity_set(test_type: TestType) {
-        let (mut svm, _events_rx, _geyser_rx) = test_type.initialize_svm();
-        svm.set_profiling_map_capacity(10);
-        assert_eq!(svm.max_profiles, 10);
+    #[test]
+    fn test_default_uses_no_db_storage() {
+        let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        assert!(svm.inner.db.is_none());
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn test_new_with_db_uses_sqlite_storage() {
+        let (svm, _events_rx, _geyser_rx) =
+            SurfnetSvm::new_with_db(Some(":memory:"), SurfnetSvmConfig::default()).unwrap();
+        assert!(svm.inner.db.is_some());
+    }
+
+    #[test]
+    fn test_constructor_applies_startup_config() {
+        let config = SurfnetSvmConfig {
+            surfnet_id: "constructor-test".to_string(),
+            feature_config: SvmFeatureConfig::new().disable(disable_fees_sysvar::id()),
+            slot_time: 123,
+            instruction_profiling_enabled: false,
+            max_profiles: 17,
+            log_bytes_limit: None,
+        };
+        let (svm, _events_rx, _geyser_rx) = SurfnetSvm::new(config).unwrap();
+
+        assert_eq!(svm.slot_time, 123);
+        assert!(!svm.instruction_profiling_enabled);
+        assert_eq!(svm.max_profiles, 17);
+        assert_eq!(
+            svm.latest_epoch_info.absolute_slot,
+            FINALIZATION_SLOT_THRESHOLD
+        );
+        assert_eq!(svm.genesis_slot, FINALIZATION_SLOT_THRESHOLD);
+        assert!(!svm.feature_set.is_active(&disable_fees_sysvar::id()));
+
+        let epoch_schedule = svm.inner.get_sysvar::<EpochSchedule>();
+        assert!(!epoch_schedule.warmup);
+
+        let registry = TemplateRegistry::new();
+        for (_, template) in registry.templates {
+            let program_id = template.idl.address.clone();
+            assert!(svm.registered_idls.get(&program_id).unwrap().is_some());
+        }
+    }
+
+    #[test]
+    fn test_initialize_only_updates_remote_state() {
+        let config = SurfnetSvmConfig {
+            surfnet_id: "remote-init-test".to_string(),
+            feature_config: SvmFeatureConfig::new().disable(disable_fees_sysvar::id()),
+            slot_time: 321,
+            instruction_profiling_enabled: false,
+            max_profiles: 23,
+            log_bytes_limit: None,
+        };
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::new(config).unwrap();
+        let epoch_info = EpochInfo {
+            epoch: 7,
+            slot_index: 4,
+            slots_in_epoch: crate::surfnet::SLOTS_PER_EPOCH,
+            absolute_slot: 777,
+            block_height: 777,
+            transaction_count: None,
+        };
+
+        svm.initialize(epoch_info.clone(), EpochSchedule::without_warmup());
+
+        assert_eq!(svm.slot_time, 321);
+        assert!(!svm.instruction_profiling_enabled);
+        assert_eq!(svm.max_profiles, 23);
+        assert!(!svm.feature_set.is_active(&disable_fees_sysvar::id()));
+        assert_eq!(svm.latest_epoch_info, epoch_info);
+        assert_eq!(svm.genesis_slot, 777);
     }
 
     // Feature configuration tests

@@ -10,7 +10,10 @@ use solana_keypair::Keypair;
 use solana_pubkey::Pubkey;
 use solana_rpc_client::rpc_client::RpcClient;
 use solana_signer::Signer;
-use surfpool_core::surfnet::{locker::SurfnetSvmLocker, svm::SurfnetSvm};
+use surfpool_core::surfnet::{
+    locker::SurfnetSvmLocker,
+    svm::{SurfnetSvm, SurfnetSvmConfig},
+};
 use surfpool_types::{
     BlockProductionMode, RpcConfig, SimnetCommand, SimnetConfig, SimnetEvent, SurfpoolConfig,
 };
@@ -138,7 +141,16 @@ impl SurfnetBuilder {
         let rpc_url = format!("http://{bind_host}:{bind_port}");
         let ws_url = format!("ws://{bind_host}:{ws_port}");
 
-        let (surfnet_svm, simnet_events_rx, geyser_events_rx) = SurfnetSvm::default();
+        let svm_config = SurfnetSvmConfig {
+            surfnet_id: surfpool_config.simnets[0].surfnet_id.clone(),
+            slot_time: surfpool_config.simnets[0].slot_time,
+            instruction_profiling_enabled: surfpool_config.simnets[0].instruction_profiling_enabled,
+            max_profiles: surfpool_config.simnets[0].max_profiles,
+            log_bytes_limit: surfpool_config.simnets[0].log_bytes_limit,
+            ..SurfnetSvmConfig::default()
+        };
+        let (surfnet_svm, simnet_events_rx, geyser_events_rx) = SurfnetSvm::new(svm_config)
+            .map_err(|e| SurfnetError::Runtime(format!("failed to initialize Surfnet SVM: {e}")))?;
         let (simnet_commands_tx, simnet_commands_rx) = crossbeam_channel::unbounded();
 
         let svm_locker = SurfnetSvmLocker::new(surfnet_svm);

@@ -21,6 +21,7 @@ use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_compute_budget_interface::ComputeBudgetInstruction;
 use solana_ed25519_program::new_ed25519_instruction_with_signature;
 use solana_epoch_info::EpochInfo;
+use solana_epoch_schedule::EpochSchedule;
 use solana_hash::Hash;
 use solana_keypair::Keypair;
 use solana_message::{
@@ -59,7 +60,8 @@ use crate::{
     runloops::start_local_surfnet_runloop,
     storage::tests::TestType,
     surfnet::{
-        PluginCommand, SignatureSubscriptionType, locker::SurfnetSvmLocker, svm::SurfnetSvm,
+        FINALIZATION_SLOT_THRESHOLD, PluginCommand, SignatureSubscriptionType,
+        locker::SurfnetSvmLocker, svm::SurfnetSvm,
     },
     tests::helpers::get_free_port,
     types::{TimeTravelConfig, TransactionLoadedAddresses},
@@ -119,9 +121,13 @@ async fn test_simnet_ready(test_type: TestType) {
         }
     });
 
-    match simnet_events_rx.recv() {
-        Ok(SimnetEvent::Ready(_)) | Ok(SimnetEvent::Connected(_)) => (),
-        e => panic!("Expected Ready event: {e:?}"),
+    loop {
+        match simnet_events_rx.recv() {
+            Ok(SimnetEvent::Ready(_))
+            | Ok(SimnetEvent::Connected(_))
+            | Ok(SimnetEvent::EpochInfoUpdate(_)) => break,
+            e => panic!("Expected startup event: {e:?}"),
+        }
     }
 }
 
@@ -4919,6 +4925,18 @@ fn test_reset_network_keeps_latest_blockhash_valid(test_type: TestType) {
 
     hiro_system_kit::nestable_block_on(svm_locker.reset_network(&None)).unwrap();
 
+    let epoch_schedule =
+        svm_locker.with_svm_reader(|svm_reader| svm_reader.inner.get_sysvar::<EpochSchedule>());
+    let (genesis_slot, latest_slot) = svm_locker.with_svm_reader(|svm_reader| {
+        (
+            svm_reader.genesis_slot,
+            svm_reader.latest_epoch_info.absolute_slot,
+        )
+    });
+    assert_eq!(genesis_slot, FINALIZATION_SLOT_THRESHOLD);
+    assert_eq!(latest_slot, FINALIZATION_SLOT_THRESHOLD);
+    assert_eq!(epoch_schedule, EpochSchedule::without_warmup());
+
     let latest_blockhash = svm_locker.with_svm_reader(|svm_reader| svm_reader.latest_blockhash());
     let is_recent = svm_locker
         .with_svm_reader(|svm_reader| svm_reader.check_blockhash_is_recent(&latest_blockhash));
@@ -5001,12 +5019,12 @@ fn test_reset_network_time_travel_slot(test_type: TestType) {
         plugin_commands_tx,
     };
 
-    // Do an initial reset to ensure we start from slot 0
+    // Do an initial reset to ensure we start from the offline baseline slot
     let initial_reset: JsonRpcResult<RpcResponse<()>> =
         hiro_system_kit::nestable_block_on(rpc_server.reset_network(Some(runloop_context.clone())));
     assert!(initial_reset.is_ok(), "Initial reset should succeed");
 
-    // Target slot to time travel to (must be greater than 0 after reset)
+    // Target slot to time travel to (must be greater than the reset slot)
     let target_slot = 1000;
 
     // First time travel to target slot
@@ -5026,7 +5044,7 @@ fn test_reset_network_time_travel_slot(test_type: TestType) {
     assert!(reset_response.is_ok(), "Reset network should succeed");
 
     // Second time travel to the same slot should now succeed after reset
-    // because latest_epoch_info.absolute_slot was reset to 0
+    // because latest_epoch_info.absolute_slot was reset to the offline baseline
     let time_travel_response2: JsonRpcResult<EpochInfo> = rpc_server.time_travel(
         Some(runloop_context.clone()),
         Some(TimeTravelConfig::AbsoluteSlot(target_slot)),

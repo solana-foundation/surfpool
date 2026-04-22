@@ -569,7 +569,7 @@ mod tests {
         let setup = TestSetup::new(SurfpoolBankDataRpc);
         let res = setup.rpc.get_epoch_schedule(Some(setup.context)).unwrap();
 
-        assert_eq!(res, EpochSchedule::default());
+        assert_eq!(res, EpochSchedule::without_warmup());
     }
 
     #[test]

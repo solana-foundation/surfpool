@@ -3354,14 +3354,9 @@ mod tests {
     async fn test_get_block() {
         let setup = TestSetup::new(SurfpoolFullRpc);
 
-        // Set up the latest slot so slot 0 is within valid range
-        setup.context.svm_locker.with_svm_writer(|svm_writer| {
-            svm_writer.latest_epoch_info.absolute_slot = 10;
-        });
-
         let res = setup
             .rpc
-            .get_block(Some(setup.context), 0, None)
+            .get_block(Some(setup.context), FINALIZATION_SLOT_THRESHOLD, None)
             .await
             .unwrap();
 
@@ -3378,14 +3373,9 @@ mod tests {
     async fn test_get_block_time() {
         let setup = TestSetup::new(SurfpoolFullRpc);
 
-        // Set up the latest slot so slot 0 is within valid range
-        setup.context.svm_locker.with_svm_writer(|svm_writer| {
-            svm_writer.latest_epoch_info.absolute_slot = 10;
-        });
-
         let res = setup
             .rpc
-            .get_block_time(Some(setup.context), 0)
+            .get_block_time(Some(setup.context), FINALIZATION_SLOT_THRESHOLD)
             .await
             .unwrap();
 
@@ -3947,17 +3937,25 @@ mod tests {
     async fn test_get_blocks_with_limit_large_limit() {
         let setup = TestSetup::new(SurfpoolFullRpc);
 
-        insert_test_blocks(&setup, 0..1000);
+        insert_test_blocks(
+            &setup,
+            FINALIZATION_SLOT_THRESHOLD..1000 + FINALIZATION_SLOT_THRESHOLD,
+        );
 
         let result = setup
             .rpc
-            .get_blocks_with_limit(Some(setup.context.clone()), 0, 1000, None)
+            .get_blocks_with_limit(
+                Some(setup.context.clone()),
+                FINALIZATION_SLOT_THRESHOLD,
+                1000,
+                None,
+            )
             .await
             .unwrap();
 
         assert_eq!(result.len(), 1000);
-        assert_eq!(result[0], 0);
-        assert_eq!(result[999], 999);
+        assert_eq!(result[0], FINALIZATION_SLOT_THRESHOLD);
+        assert_eq!(result[999], 999 + FINALIZATION_SLOT_THRESHOLD);
 
         for i in 1..result.len() {
             assert!(
@@ -4205,7 +4203,7 @@ mod tests {
             .rpc
             .get_blocks(
                 Some(setup.context),
-                10,
+                FINALIZATION_SLOT_THRESHOLD,
                 Some(RpcBlocksConfigWrapper::EndSlotOnly(Some(60))),
                 None,
             )
@@ -4214,7 +4212,7 @@ mod tests {
 
         // With sparse block storage, all slots in range are returned (empty blocks reconstructed)
         // local_min is now 0, so slots 10-60 are all within local range
-        let expected: Vec<Slot> = (10..=60).collect();
+        let expected: Vec<Slot> = (FINALIZATION_SLOT_THRESHOLD..=60).collect();
         assert_eq!(
             result, expected,
             "Should return all local blocks in range including reconstructed empty blocks"
@@ -4239,39 +4237,40 @@ mod tests {
             "Stored blocks minimum should be slot 50"
         );
 
-        // case 1: request blocks 10-30 (entirely "before" stored blocks, but within reconstructible range)
-        // With sparse storage, local_min is 0, so slots 10-30 are all within local range
+        let start_slot = FINALIZATION_SLOT_THRESHOLD;
+        // case 1: request blocks 31-40 (entirely "before" stored blocks, but within reconstructible range)
+        // With sparse storage, local_min is 0, so slots 31-40 are all within local range
         let result = setup
             .rpc
             .get_blocks(
                 Some(setup.context.clone()),
-                10,
-                Some(RpcBlocksConfigWrapper::EndSlotOnly(Some(30))),
+                start_slot,
+                Some(RpcBlocksConfigWrapper::EndSlotOnly(Some(40))),
                 None,
             )
             .await
             .unwrap();
 
         // With sparse storage, all slots in range up to latest_slot (100) can be reconstructed
-        let expected: Vec<Slot> = (10..=30).collect();
+        let expected: Vec<Slot> = (start_slot..=40).collect();
         assert_eq!(
             result, expected,
             "Should return all slots in range (empty blocks are reconstructed)"
         );
 
-        // case 2: request blocks 10-60 (spans entire reconstructible range)
+        // case 2: request blocks 31-60 (spans entire reconstructible range)
         let result = setup
             .rpc
             .get_blocks(
                 Some(setup.context.clone()),
-                10,
+                start_slot,
                 Some(RpcBlocksConfigWrapper::EndSlotOnly(Some(60))),
                 None,
             )
             .await
             .unwrap();
 
-        let expected: Vec<Slot> = (10..=60).collect();
+        let expected: Vec<Slot> = (start_slot..=60).collect();
         assert_eq!(
             result, expected,
             "Should return all local slots (empty blocks reconstructed)"
@@ -4331,38 +4330,20 @@ mod tests {
         });
         assert_eq!(stored_min, Some(100), "Stored blocks minimum should be 100");
         assert_eq!(latest_slot, 200, "Latest slot should be 200");
-
-        // Case 1: slots 10-50 - with sparse storage, all slots in range are returned
+        let start_slot = FINALIZATION_SLOT_THRESHOLD;
+        // Case 1: slots start_slot-50 - with sparse storage, all slots in range are returned
         let result = setup
             .rpc
             .get_blocks(
                 Some(setup.context.clone()),
-                10,
+                start_slot,
                 Some(RpcBlocksConfigWrapper::EndSlotOnly(Some(50))),
                 None,
             )
             .await
             .unwrap();
 
-        let expected: Vec<Slot> = (10..=50).collect();
-        assert_eq!(
-            result, expected,
-            "Should return all slots (empty blocks reconstructed)"
-        );
-
-        // case 2: Request blocks 5-30
-        let result = setup
-            .rpc
-            .get_blocks(
-                Some(setup.context.clone()),
-                5,
-                Some(RpcBlocksConfigWrapper::EndSlotOnly(Some(30))),
-                None,
-            )
-            .await
-            .unwrap();
-
-        let expected: Vec<Slot> = (5..=30).collect();
+        let expected: Vec<Slot> = (start_slot..=50).collect();
         assert_eq!(
             result, expected,
             "Should return all slots (empty blocks reconstructed)"
@@ -4742,7 +4723,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_minimum_ledger_slot_finds_minimum() {
-        // With sparse block storage, minimum ledger slot is always 0 for local surfnets
+        // With sparse block storage, minimum ledger slot is always FINALIZATION_SLOT_THRESHOLD for local surfnets
         let setup = TestSetup::new(SurfpoolFullRpc);
 
         insert_test_blocks(&setup, vec![500, 100, 1000, 50, 750]);
@@ -4756,8 +4737,8 @@ mod tests {
         // With sparse block storage, get_first_local_slot() returns 0 since all
         // blocks from slot 0 can be reconstructed on-the-fly
         assert_eq!(
-            result, 0,
-            "Should return 0 since empty blocks can be reconstructed from slot 0"
+            result, FINALIZATION_SLOT_THRESHOLD,
+            "Should return FINALIZATION_SLOT_THRESHOLD since empty blocks can be reconstructed from that slot"
         );
     }
 

@@ -19,6 +19,7 @@ use log::info;
 use solana_keypair::Keypair;
 use solana_pubkey::Pubkey;
 use solana_signer::{EncodableKey, Signer};
+use surfpool_core::surfnet::svm::SurfnetSvmConfig;
 use surfpool_mcp::McpOptions;
 use surfpool_types::{
     AccountSnapshot, BlockProductionMode, CHANGE_TO_DEFAULT_STUDIO_PORT_ONCE_SUPERVISOR_MERGED,
@@ -395,6 +396,21 @@ impl StartSimnet {
         }
 
         config
+    }
+
+    pub fn svm_config(&self) -> SurfnetSvmConfig {
+        SurfnetSvmConfig {
+            surfnet_id: self.surfnet_id.clone(),
+            feature_config: self.feature_config(),
+            slot_time: self.slot_time,
+            instruction_profiling_enabled: !self.disable_instruction_profiling,
+            max_profiles: self.max_profiles,
+            log_bytes_limit: if self.log_bytes_limit == 0 {
+                None
+            } else {
+                Some(self.log_bytes_limit)
+            },
+        }
     }
 
     pub fn simnet_config(

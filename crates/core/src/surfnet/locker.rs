@@ -34,7 +34,6 @@ use solana_client::{
 use solana_clock::{Clock, Slot, UnixTimestamp};
 use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_epoch_info::EpochInfo;
-use solana_epoch_schedule::EpochSchedule;
 use solana_hash::Hash;
 use solana_loader_v3_interface::{get_program_data_address, state::UpgradeableLoaderState};
 use solana_message::{
@@ -70,7 +69,7 @@ use crate::{
     error::{SurfpoolError, SurfpoolResult},
     helpers::time_travel::calculate_time_travel_clock,
     rpc::utils::{convert_transaction_metadata_from_canonical, verify_pubkey},
-    surfnet::{FINALIZATION_SLOT_THRESHOLD, SLOTS_PER_EPOCH},
+    surfnet::FINALIZATION_SLOT_THRESHOLD,
     types::{
         GeyserAccountUpdate, OfflineAccountConfig, RemoteRpcResult, SurfnetTransactionStatus,
         TimeTravelConfig, TokenAccount, TransactionLoadedAddresses, TransactionWithStatusMeta,
@@ -207,44 +206,21 @@ impl SurfnetSvmLocker {
         Self(Arc::new(RwLock::new(svm)))
     }
 
-    /// Initializes the locked `SurfnetSvm` by fetching or defaulting epoch info,
-    /// then calling its `initialize` method. Returns the epoch info on success.
-    pub async fn initialize(
-        &self,
-        slot_time: u64,
-        remote_ctx: &Option<SurfnetRemoteClient>,
-        do_profile_instructions: bool,
-        log_bytes_limit: Option<usize>,
-    ) -> SurfpoolResult<()> {
-        let (mut epoch_info, epoch_schedule) = if let Some(remote_client) = remote_ctx {
+    /// Initializes the locked `SurfnetSvm` with remote-derived startup state when available.
+    pub async fn initialize(&self, remote_ctx: &Option<SurfnetRemoteClient>) -> SurfpoolResult<()> {
+        let Some(remote_client) = remote_ctx else {
+            return Ok(());
+        };
+
+        let (mut epoch_info, epoch_schedule) = {
             let epoch_info = remote_client.get_epoch_info().await?;
             let epoch_schedule = remote_client.get_epoch_schedule().await?;
             (epoch_info, epoch_schedule)
-        } else {
-            let epoch_schedule = EpochSchedule::without_warmup();
-            (
-                EpochInfo {
-                    epoch: 0,
-                    slot_index: 0,
-                    slots_in_epoch: epoch_schedule.slots_per_epoch,
-                    absolute_slot: FINALIZATION_SLOT_THRESHOLD,
-                    block_height: FINALIZATION_SLOT_THRESHOLD,
-                    transaction_count: None,
-                },
-                epoch_schedule,
-            )
         };
         epoch_info.transaction_count = None;
 
         self.with_svm_writer(move |svm_writer| {
-            svm_writer.initialize(
-                epoch_info,
-                epoch_schedule,
-                slot_time,
-                remote_ctx,
-                do_profile_instructions,
-                log_bytes_limit,
-            );
+            svm_writer.initialize(epoch_info, epoch_schedule);
         });
         Ok(())
     }
@@ -1999,22 +1975,20 @@ impl SurfnetSvmLocker {
         let _ = simnet_events_tx.send(SimnetEvent::info("Resetting network..."));
 
         // Fetch epoch info from remote if available (similar to initialize)
-        let mut epoch_info = if let Some(remote_client) = remote_ctx {
-            remote_client.get_epoch_info().await?
+        let (mut epoch_info, epoch_schedule) = if let Some(remote_client) = remote_ctx {
+            (
+                remote_client.get_epoch_info().await?,
+                remote_client.get_epoch_schedule().await?,
+            )
         } else {
-            EpochInfo {
-                epoch: 0,
-                slot_index: 0,
-                slots_in_epoch: SLOTS_PER_EPOCH,
-                absolute_slot: 0,
-                block_height: 0,
-                transaction_count: None,
-            }
+            let epoch_schedule = SurfnetSvm::default_epoch_schedule();
+            let epoch_info = SurfnetSvm::default_epoch_info(&epoch_schedule);
+            (epoch_info, epoch_schedule)
         };
         epoch_info.transaction_count = None;
 
         self.with_svm_writer(move |svm_writer| {
-            let _ = svm_writer.reset_network(epoch_info);
+            let _ = svm_writer.reset_network(epoch_info, epoch_schedule);
             let _ = svm_writer.offline_accounts.clear();
         });
         Ok(())
@@ -5158,7 +5132,7 @@ mod tests {
         let svm_locker = SurfnetSvmLocker::new(surfnet_svm);
 
         svm_locker
-            .initialize(400, &None, false, None)
+            .initialize(&None)
             .await
             .expect("initialize should succeed");
 
