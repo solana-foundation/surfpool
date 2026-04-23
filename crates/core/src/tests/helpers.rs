@@ -93,6 +93,7 @@ where
 
     pub async fn without_blockhash(self) -> Self {
         let mut state_writer = self.context.svm_locker.0.write().await;
+        state_writer.skip_blockhash_check = true;
         let svm = state_writer.inner.clone();
         let svm = svm.with_blockhash_check(false);
         state_writer.inner = svm;

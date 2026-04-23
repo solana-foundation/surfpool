@@ -4954,4 +4954,131 @@ mod tests {
             assert_eq!(config_false.skip_sig_verify, Some(false));
         }
     }
+
+    mod test_skip_blockhash_check {
+        use super::*;
+
+        fn build_transaction_with_invalid_blockhash(
+            payer: &Keypair,
+            recipient: &Pubkey,
+            lamports: u64,
+        ) -> VersionedTransaction {
+            build_legacy_transaction(
+                &payer.pubkey(),
+                &[payer],
+                &[system_instruction::transfer(
+                    &payer.pubkey(),
+                    recipient,
+                    lamports,
+                )],
+                &Hash::new_unique(),
+            )
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn test_simulate_transaction_invalid_blockhash_fails_by_default() {
+            let payer = Keypair::new();
+            let recipient = Pubkey::new_unique();
+            let lamports = LAMPORTS_PER_SOL;
+            let setup = TestSetup::new(SurfpoolFullRpc);
+
+            let _ = setup
+                .rpc
+                .request_airdrop(
+                    Some(setup.context.clone()),
+                    payer.pubkey().to_string(),
+                    2 * lamports,
+                    None,
+                )
+                .unwrap();
+
+            let tx = build_transaction_with_invalid_blockhash(&payer, &recipient, lamports);
+            assert!(
+                !setup.context.svm_locker.with_svm_reader(|svm_reader| {
+                    svm_reader.check_blockhash_is_recent(tx.message.recent_blockhash())
+                }),
+                "test transaction should use a non-recent blockhash"
+            );
+
+            let simulation_res = setup
+                .rpc
+                .simulate_transaction(
+                    Some(setup.context),
+                    bs58::encode(bincode::serialize(&tx).unwrap()).into_string(),
+                    Some(RpcSimulateTransactionConfig {
+                        sig_verify: true,
+                        replace_recent_blockhash: false,
+                        commitment: Some(CommitmentConfig::finalized()),
+                        encoding: None,
+                        accounts: Some(RpcSimulateTransactionAccountsConfig {
+                            encoding: None,
+                            addresses: vec![recipient.to_string()],
+                        }),
+                        min_context_slot: None,
+                        inner_instructions: false,
+                    }),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                simulation_res.value.err,
+                Some(TransactionError::BlockhashNotFound.into())
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn test_simulate_transaction_invalid_blockhash_succeeds_when_skipped() {
+            let payer = Keypair::new();
+            let recipient = Pubkey::new_unique();
+            let lamports = LAMPORTS_PER_SOL;
+            let setup = TestSetup::new(SurfpoolFullRpc);
+
+            setup
+                .context
+                .svm_locker
+                .with_svm_writer(|svm_writer| svm_writer.skip_blockhash_check = true);
+
+            let _ = setup
+                .rpc
+                .request_airdrop(
+                    Some(setup.context.clone()),
+                    payer.pubkey().to_string(),
+                    2 * lamports,
+                    None,
+                )
+                .unwrap();
+
+            let tx = build_transaction_with_invalid_blockhash(&payer, &recipient, lamports);
+            assert!(
+                !setup.context.svm_locker.with_svm_reader(|svm_reader| {
+                    svm_reader.check_blockhash_is_recent(tx.message.recent_blockhash())
+                }),
+                "test transaction should use a non-recent blockhash"
+            );
+
+            let simulation_res = setup
+                .rpc
+                .simulate_transaction(
+                    Some(setup.context),
+                    bs58::encode(bincode::serialize(&tx).unwrap()).into_string(),
+                    Some(RpcSimulateTransactionConfig {
+                        sig_verify: true,
+                        replace_recent_blockhash: false,
+                        commitment: Some(CommitmentConfig::finalized()),
+                        encoding: None,
+                        accounts: Some(RpcSimulateTransactionAccountsConfig {
+                            encoding: None,
+                            addresses: vec![recipient.to_string()],
+                        }),
+                        min_context_slot: None,
+                        inner_instructions: false,
+                    }),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(simulation_res.value.err, None);
+        }
+    }
 }

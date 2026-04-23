@@ -220,6 +220,7 @@ pub struct SurfnetSvmConfig {
     pub instruction_profiling_enabled: bool,
     pub max_profiles: usize,
     pub log_bytes_limit: Option<usize>,
+    pub skip_blockhash_check: bool,
 }
 
 impl Default for SurfnetSvmConfig {
@@ -231,6 +232,7 @@ impl Default for SurfnetSvmConfig {
             instruction_profiling_enabled: true,
             max_profiles: DEFAULT_PROFILING_MAP_CAPACITY,
             log_bytes_limit: DEFAULT_LOG_BYTES_LIMIT,
+            skip_blockhash_check: false,
         }
     }
 }
@@ -297,6 +299,7 @@ pub struct SurfnetSvm {
     pub feature_set: FeatureSet,
     pub instruction_profiling_enabled: bool,
     pub max_profiles: usize,
+    pub skip_blockhash_check: bool,
     pub runbook_executions: Vec<RunbookExecutionStatusReport>,
     pub account_update_slots: HashMap<Pubkey, Slot>,
     pub streamed_accounts: Box<dyn Storage<String, bool>>,
@@ -467,6 +470,7 @@ impl SurfnetSvm {
             feature_set: self.feature_set.clone(),
             instruction_profiling_enabled: self.instruction_profiling_enabled,
             max_profiles: self.max_profiles,
+            skip_blockhash_check: self.skip_blockhash_check,
             runbook_executions: self.runbook_executions.clone(),
             account_update_slots: self.account_update_slots.clone(),
             recent_blockhashes: self.recent_blockhashes.clone(),
@@ -682,6 +686,7 @@ impl SurfnetSvm {
             feature_set: FeatureSet::default(),
             instruction_profiling_enabled: config.instruction_profiling_enabled,
             max_profiles: config.max_profiles,
+            skip_blockhash_check: config.skip_blockhash_check,
             runbook_executions: Vec::new(),
             account_update_slots: HashMap::new(),
             streamed_accounts: streamed_accounts_db,
@@ -1104,6 +1109,10 @@ impl SurfnetSvm {
     /// # Returns
     /// `true` if the transaction blockhash is valid, `false` otherwise.
     pub fn validate_transaction_blockhash(&self, tx: &VersionedTransaction) -> bool {
+        if self.skip_blockhash_check {
+            return true;
+        }
+
         let recent_blockhash = tx.message.recent_blockhash();
 
         let some_nonce_account_index = tx
@@ -3460,13 +3469,43 @@ mod tests {
     use borsh::BorshSerialize;
     // use test_log::test; // uncomment to get logs from litesvm
     use solana_account::Account;
+    use solana_hash::Hash;
+    use solana_keypair::Keypair;
     use solana_loader_v3_interface::get_program_data_address;
+    use solana_message::VersionedMessage;
     use solana_program_pack::Pack;
+    use solana_signer::Signer;
+    use solana_system_interface::instruction as system_instruction;
+    use solana_transaction::Transaction;
+    use solana_transaction_error::TransactionError;
     use spl_token_interface::state::{Account as TokenAccount, AccountState};
     use test_case::test_case;
 
     use super::*;
     use crate::storage::tests::TestType;
+
+    fn build_transfer_transaction(
+        payer: &Keypair,
+        recipient: &Pubkey,
+        lamports: u64,
+        recent_blockhash: Hash,
+    ) -> VersionedTransaction {
+        let tx = Transaction::new_signed_with_payer(
+            &[system_instruction::transfer(
+                &payer.pubkey(),
+                recipient,
+                lamports,
+            )],
+            Some(&payer.pubkey()),
+            &[payer],
+            recent_blockhash,
+        );
+
+        VersionedTransaction {
+            signatures: tx.signatures,
+            message: VersionedMessage::Legacy(tx.message),
+        }
+    }
 
     #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
     #[test_case(TestType::in_memory(); "with in-memory sqlite db")]
@@ -4245,6 +4284,7 @@ mod tests {
             instruction_profiling_enabled: false,
             max_profiles: 17,
             log_bytes_limit: None,
+            skip_blockhash_check: true,
         };
         let (svm, _events_rx, _geyser_rx) = SurfnetSvm::new(config).unwrap();
 
@@ -4266,6 +4306,7 @@ mod tests {
             let program_id = template.idl.address.clone();
             assert!(svm.registered_idls.get(&program_id).unwrap().is_some());
         }
+        assert!(svm.skip_blockhash_check);
     }
 
     #[test]
@@ -4277,6 +4318,7 @@ mod tests {
             instruction_profiling_enabled: false,
             max_profiles: 23,
             log_bytes_limit: None,
+            skip_blockhash_check: false,
         };
         let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::new(config).unwrap();
         let epoch_info = EpochInfo {
@@ -4296,6 +4338,74 @@ mod tests {
         assert!(!svm.feature_set.is_active(&disable_fees_sysvar::id()));
         assert_eq!(svm.latest_epoch_info, epoch_info);
         assert_eq!(svm.genesis_slot, 777);
+    }
+
+    #[test]
+    fn test_clone_for_profiling_preserves_skip_blockhash_check() {
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        svm.skip_blockhash_check = true;
+
+        let profiling_clone = svm.clone_for_profiling();
+        assert!(profiling_clone.skip_blockhash_check);
+    }
+
+    #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
+    #[test_case(TestType::in_memory(); "with in-memory sqlite db")]
+    #[test_case(TestType::no_db(); "with no db")]
+    #[cfg_attr(feature = "postgres", test_case(TestType::postgres(); "with postgres db"))]
+    fn test_send_transaction_rejects_invalid_blockhash_by_default(test_type: TestType) {
+        let (mut svm, _events_rx, _geyser_rx) = test_type.initialize_svm();
+        let payer = Keypair::new();
+        let recipient = Pubkey::new_unique();
+        let lamports = 1_000_000_000;
+        let invalid_blockhash = Hash::new_unique();
+
+        svm.airdrop(&payer.pubkey(), 2 * lamports).unwrap().unwrap();
+        assert!(!svm.check_blockhash_is_recent(&invalid_blockhash));
+
+        let tx = build_transfer_transaction(&payer, &recipient, lamports, invalid_blockhash);
+        let err = svm.send_transaction(tx, false, false).unwrap_err().err;
+
+        assert_eq!(err, TransactionError::BlockhashNotFound);
+    }
+
+    #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
+    #[test_case(TestType::in_memory(); "with in-memory sqlite db")]
+    #[test_case(TestType::no_db(); "with no db")]
+    #[cfg_attr(feature = "postgres", test_case(TestType::postgres(); "with postgres db"))]
+    fn test_skip_blockhash_check_bypasses_send_simulate_and_estimate(test_type: TestType) {
+        let (mut svm, _events_rx, _geyser_rx) = test_type.initialize_svm();
+        let payer = Keypair::new();
+        let recipient = Pubkey::new_unique();
+        let lamports = 1_000_000_000;
+        let invalid_blockhash = Hash::new_unique();
+
+        svm.skip_blockhash_check = true;
+        svm.airdrop(&payer.pubkey(), 2 * lamports).unwrap().unwrap();
+        assert!(!svm.check_blockhash_is_recent(&invalid_blockhash));
+
+        let tx = build_transfer_transaction(&payer, &recipient, lamports, invalid_blockhash);
+
+        let estimate = svm.estimate_compute_units(&tx);
+        assert!(
+            estimate.success,
+            "estimate should succeed when skip_blockhash_check is enabled: {:?}",
+            estimate.error_message
+        );
+
+        let simulation = svm.simulate_transaction(tx.clone(), false);
+        assert!(
+            simulation.is_ok(),
+            "simulation should succeed when skip_blockhash_check is enabled: {:?}",
+            simulation.err()
+        );
+
+        let send_result = svm.send_transaction(tx, false, false);
+        assert!(
+            send_result.is_ok(),
+            "send should succeed when skip_blockhash_check is enabled: {:?}",
+            send_result.err().map(|err| err.err)
+        );
     }
 
     // Feature configuration tests

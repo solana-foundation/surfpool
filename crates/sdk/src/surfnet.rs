@@ -32,6 +32,7 @@ use crate::{
 /// let surfnet = Surfnet::builder()
 ///     .offline(true)
 ///     .block_production_mode(BlockProductionMode::Transaction)
+///     .skip_blockhash_check(true)
 ///     .airdrop_sol(10_000_000_000)
 ///     .start()
 ///     .await
@@ -45,6 +46,7 @@ pub struct SurfnetBuilder {
     slot_time_ms: u64,
     airdrop_addresses: Vec<Pubkey>,
     airdrop_lamports: u64,
+    skip_blockhash_check: bool,
     payer: Option<Keypair>,
 }
 
@@ -57,6 +59,7 @@ impl Default for SurfnetBuilder {
             slot_time_ms: 1,
             airdrop_addresses: vec![],
             airdrop_lamports: 10_000_000_000, // 10 SOL
+            skip_blockhash_check: false,
             payer: None,
         }
     }
@@ -101,6 +104,12 @@ impl SurfnetBuilder {
         self
     }
 
+    /// Skip blockhash validation for all transactions in this surfnet instance.
+    pub fn skip_blockhash_check(mut self, skip: bool) -> Self {
+        self.skip_blockhash_check = skip;
+        self
+    }
+
     /// Use a specific keypair as the payer. If not set, a random one is generated.
     pub fn payer(mut self, keypair: Keypair) -> Self {
         self.payer = Some(keypair);
@@ -109,24 +118,35 @@ impl SurfnetBuilder {
 
     /// Start the surfnet with the configured options.
     pub async fn start(self) -> SurfnetResult<Surfnet> {
-        let payer = self.payer.unwrap_or_else(Keypair::new);
-        let airdrop_lamports = self.airdrop_lamports;
+        let SurfnetBuilder {
+            offline_mode,
+            remote_rpc_url,
+            block_production_mode,
+            slot_time_ms,
+            airdrop_addresses,
+            airdrop_lamports,
+            skip_blockhash_check,
+            payer,
+        } = self;
+        let payer = payer.unwrap_or_else(Keypair::new);
 
         let bind_port = get_free_port()?;
         let ws_port = get_free_port()?;
         let bind_host = "127.0.0.1".to_string();
 
         let mut startup_airdrop_addresses = vec![payer.pubkey()];
-        startup_airdrop_addresses.extend(self.airdrop_addresses);
+        startup_airdrop_addresses.extend(airdrop_addresses);
+        let startup_airdrop_addresses_for_rpc = startup_airdrop_addresses.clone();
 
         let surfpool_config = SurfpoolConfig {
             simnets: vec![SimnetConfig {
-                offline_mode: self.offline_mode,
-                remote_rpc_url: self.remote_rpc_url,
-                slot_time: self.slot_time_ms,
-                block_production_mode: self.block_production_mode,
-                airdrop_addresses: startup_airdrop_addresses.clone(),
+                offline_mode,
+                remote_rpc_url,
+                slot_time: slot_time_ms,
+                block_production_mode,
+                airdrop_addresses: startup_airdrop_addresses,
                 airdrop_token_amount: airdrop_lamports,
+                skip_blockhash_check,
                 ..Default::default()
             }],
             rpc: RpcConfig {
@@ -147,7 +167,8 @@ impl SurfnetBuilder {
             instruction_profiling_enabled: surfpool_config.simnets[0].instruction_profiling_enabled,
             max_profiles: surfpool_config.simnets[0].max_profiles,
             log_bytes_limit: surfpool_config.simnets[0].log_bytes_limit,
-            ..SurfnetSvmConfig::default()
+            feature_config: surfpool_types::SvmFeatureConfig::default(),
+            skip_blockhash_check,
         };
         let (surfnet_svm, simnet_events_rx, geyser_events_rx) = SurfnetSvm::new(svm_config)
             .map_err(|e| SurfnetError::Runtime(format!("failed to initialize Surfnet SVM: {e}")))?;
@@ -175,7 +196,11 @@ impl SurfnetBuilder {
 
         // Wait for the runtime to signal ready
         wait_for_ready(&simnet_events_rx)?;
-        wait_for_startup_airdrops(&rpc_url, &startup_airdrop_addresses, airdrop_lamports)?;
+        wait_for_startup_airdrops(
+            &rpc_url,
+            &startup_airdrop_addresses_for_rpc,
+            airdrop_lamports,
+        )?;
 
         Ok(Surfnet {
             rpc_url,
@@ -350,4 +375,21 @@ fn wait_for_startup_airdrops(
         "startup balances not visible over RPC within timeout (expected {expected_lamports}); last balances: {balance_summary}; last error: {}",
         last_error.unwrap_or_else(|| "none".to_string())
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn surfnet_builder_skip_blockhash_check_defaults_to_false() {
+        let builder = SurfnetBuilder::default();
+        assert!(!builder.skip_blockhash_check);
+    }
+
+    #[test]
+    fn surfnet_builder_skip_blockhash_check_setter_updates_builder() {
+        let builder = SurfnetBuilder::default().skip_blockhash_check(true);
+        assert!(builder.skip_blockhash_check);
+    }
 }

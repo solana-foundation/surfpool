@@ -277,6 +277,9 @@ pub struct StartSimnet {
     /// Skip signature verification for all transactions (eg. surfpool start --skip-signature-verification)
     #[clap(long = "skip-signature-verification", action=ArgAction::SetTrue, default_value = "false")]
     pub skip_signature_verification: bool,
+    /// Skip blockhash validation for all transactions (eg. surfpool start --skip-blockhash-check)
+    #[clap(long = "skip-blockhash-check", action=ArgAction::SetTrue, default_value = "false")]
+    pub skip_blockhash_check: bool,
 }
 
 #[derive(clap::ValueEnum, PartialEq, Clone, Debug)]
@@ -410,6 +413,7 @@ impl StartSimnet {
             } else {
                 Some(self.log_bytes_limit)
             },
+            skip_blockhash_check: self.skip_blockhash_check,
         }
     }
 
@@ -440,6 +444,7 @@ impl StartSimnet {
                 Some(self.log_bytes_limit)
             },
             skip_signature_verification: self.skip_signature_verification,
+            skip_blockhash_check: self.skip_blockhash_check,
             surfnet_id: self.surfnet_id.clone(),
             snapshot,
         }

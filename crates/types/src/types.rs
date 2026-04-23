@@ -609,6 +609,8 @@ pub struct SimnetConfig {
     pub max_profiles: usize,
     pub log_bytes_limit: Option<usize>,
     pub skip_signature_verification: bool,
+    #[serde(default)]
+    pub skip_blockhash_check: bool,
     /// Unique identifier for this surfnet instance. Used to isolate database storage
     /// when multiple surfnets share the same database. Defaults to "default".
     pub surfnet_id: String,
@@ -631,6 +633,7 @@ impl Default for SimnetConfig {
             max_profiles: DEFAULT_PROFILING_MAP_CAPACITY,
             log_bytes_limit: Some(10_000),
             skip_signature_verification: false,
+            skip_blockhash_check: false,
             surfnet_id: "default".to_string(),
             snapshot: BTreeMap::new(),
         }
@@ -1354,7 +1357,7 @@ impl CheatcodeConfig {
             // remove `surfnet_disableCheatcode` and `surfnet_enableCheatcode` from the list of available cheatcodes
             let filter = available_cheatcodes
                 .into_iter()
-                .filter(|c| (c.ne("surfnet_disableCheatcode") && c.ne("surfnet_enableCheatcode")))
+                .filter(|c| c.ne("surfnet_disableCheatcode") && c.ne("surfnet_enableCheatcode"))
                 .collect();
             CheatcodeFilter::List(filter)
         }
@@ -1827,5 +1830,17 @@ mod tests {
             ..Default::default()
         };
         assert!(config.get_sanitized_datasource_url().is_none());
+    }
+
+    #[test]
+    fn test_simnet_config_skip_blockhash_check_defaults_on_deserialize() {
+        let mut config_json = serde_json::to_value(SimnetConfig::default()).unwrap();
+        config_json
+            .as_object_mut()
+            .unwrap()
+            .remove("skip_blockhash_check");
+
+        let config: SimnetConfig = serde_json::from_value(config_json).unwrap();
+        assert!(!config.skip_blockhash_check);
     }
 }
