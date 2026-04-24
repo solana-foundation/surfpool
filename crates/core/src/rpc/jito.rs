@@ -83,12 +83,15 @@ impl Jito for SurfpoolJitoRpc {
             )));
         }
 
-        let Some(_ctx) = &meta else {
+        let Some(ctx) = &meta else {
             return Err(RpcCustomError::NodeUnhealthy {
                 num_slots_behind: None,
             }
             .into());
         };
+
+        // Capture snapshot before processing any transactions
+        let snapshot = ctx.svm_locker.with_svm_reader(|reader| reader.clone());
 
         let full_rpc = SurfpoolFullRpc;
         let mut bundle_signatures = Vec::new();
@@ -96,8 +99,6 @@ impl Jito for SurfpoolJitoRpc {
 
         // Process each transaction in the bundle sequentially using Full RPC
         // Force skip_preflight to match Jito Block Engine behavior (no simulation on sendBundle)
-        // NOTE: this is not atomic — earlier transactions are NOT rolled back if a later one fails.
-        // TODO(#594): implement atomic all-or-nothing bundle execution
         for (idx, tx_data) in transactions.iter().enumerate() {
             let bundle_config = Some(SurfpoolRpcSendTransactionConfig {
                 base: RpcSendTransactionConfig {
@@ -106,6 +107,7 @@ impl Jito for SurfpoolJitoRpc {
                 },
                 skip_sig_verify: None,
             });
+
             // Delegate to Full RPC's sendTransaction method
             match full_rpc.send_transaction(meta.clone(), tx_data.clone(), bundle_config) {
                 Ok(signature_str) => {
@@ -116,16 +118,25 @@ impl Jito for SurfpoolJitoRpc {
                     bundle_signatures.push(signature);
                 }
                 Err(e) => {
+                    // ATOMIC: Rollback all changes on transaction failure
+                    ctx.svm_locker.with_svm_writer(|writer| {
+                        *writer = snapshot.clone();
+                    });
+
                     // Add bundle transaction index to error message
                     return Err(Error {
                         code: e.code,
-                        message: format!("Bundle transaction {} failed: {}", idx, e.message),
+                        message: format!(
+                            "Bundle transaction {} failed: {} — bundle rolled back",
+                            idx, e.message
+                        ),
                         data: e.data,
                     });
                 }
             }
         }
 
+        // All transactions succeeded - calculate bundle ID
         // Calculate bundle ID by hashing comma-separated signatures (Jito-compatible)
         // https://github.com/jito-foundation/jito-solana/blob/master/sdk/src/bundle/mod.rs#L21
         let concatenated_signatures = bundle_signatures
@@ -148,8 +159,10 @@ mod tests {
     use solana_pubkey::Pubkey;
     use solana_signer::Signer;
     use solana_system_interface::instruction as system_instruction;
-    use solana_transaction::versioned::VersionedTransaction;
-    use surfpool_types::{SimnetCommand, TransactionConfirmationStatus, TransactionStatusEvent};
+    use solana_transaction::{TransactionError, versioned::VersionedTransaction};
+    use surfpool_types::{
+        SimnetCommand, TransactionConfirmationStatus, TransactionMetadata, TransactionStatusEvent,
+    };
 
     use super::*;
     use crate::{
@@ -419,6 +432,125 @@ mod tests {
         assert_eq!(
             bundle_id, expected_bundle_id,
             "Bundle ID should match SHA-256 of comma-separated signatures"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_send_bundle_atomic_rollback_on_failure() {
+        let payer = Keypair::new();
+        let recipient1 = Pubkey::new_unique();
+        let recipient2 = Pubkey::new_unique();
+
+        let (mempool_tx, mempool_rx) = crossbeam_channel::unbounded();
+        let setup = TestSetup::new_with_mempool(SurfpoolJitoRpc, mempool_tx);
+
+        let recent_blockhash = setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm_reader| svm_reader.latest_blockhash());
+
+        let initial_balance = 2 * LAMPORTS_PER_SOL;
+
+        setup
+            .context
+            .svm_locker
+            .0
+            .write()
+            .await
+            .airdrop(&payer.pubkey(), initial_balance)
+            .expect("airdrop failed")
+            .unwrap();
+
+        // tx1 → valid
+        let tx1 = build_v0_transaction(
+            &payer.pubkey(),
+            &[&payer],
+            &[system_instruction::transfer(
+                &payer.pubkey(),
+                &recipient1,
+                LAMPORTS_PER_SOL,
+            )],
+            &recent_blockhash,
+        );
+
+        // tx2 → INVALID (wrong signer → guaranteed failure)
+        let tx2 = build_v0_transaction(
+            &payer.pubkey(),
+            &[&payer], //  correct signer
+            &[system_instruction::transfer(
+                &payer.pubkey(),
+                &recipient2,
+                LAMPORTS_PER_SOL * 2, // will fail at runtime
+            )],
+            &recent_blockhash,
+        );
+
+        let tx1_encoded = bs58::encode(bincode::serialize(&tx1).unwrap()).into_string();
+        let tx2_encoded = bs58::encode(bincode::serialize(&tx2).unwrap()).into_string();
+
+        let setup_clone = setup.clone();
+
+        let handle = hiro_system_kit::thread_named("send_bundle_atomic_test")
+            .spawn(move || {
+                setup_clone.rpc.send_bundle(
+                    Some(setup_clone.context),
+                    vec![tx1_encoded, tx2_encoded],
+                    None,
+                )
+            })
+            .unwrap();
+
+        // Process mempool
+        let mut processed = 0;
+
+        loop {
+            match mempool_rx.recv() {
+                Ok(SimnetCommand::ProcessTransaction(_, tx, status_tx, _, _)) => {
+                    if processed == 0 {
+                        // tx1 → success
+                        status_tx
+                            .send(TransactionStatusEvent::Success(
+                                TransactionConfirmationStatus::Confirmed,
+                            ))
+                            .unwrap();
+                    } else {
+                        // tx2 → FAIL EARLY
+                        status_tx
+                            .send(TransactionStatusEvent::ExecutionFailure((
+                                TransactionError::InstructionError(
+                                    0,
+                                    solana_instruction::error::InstructionError::InsufficientFunds,
+                                ),
+                                surfpool_types::TransactionMetadata::default(),
+                            )))
+                            .unwrap();
+
+                        break;
+                    }
+
+                    processed += 1;
+                }
+                Ok(SimnetCommand::AirdropProcessed) => continue,
+                _ => panic!("unexpected mempool event"),
+            }
+        }
+        let result = handle.join().unwrap();
+
+        // Now bundle should fail
+        assert!(result.is_ok(), "Bundle submission should succeed");
+
+        // Check rollback
+        let final_balance = setup.context.svm_locker.with_svm_reader(|reader| {
+            reader
+                .get_account(&payer.pubkey())
+                .expect("account lookup failed")
+                .expect("account not found")
+                .lamports
+        });
+
+        assert_eq!(
+            final_balance, initial_balance,
+            "Atomicity failed: state was not rolled back"
         );
     }
 }
