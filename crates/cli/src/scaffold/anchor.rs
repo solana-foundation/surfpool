@@ -27,10 +27,10 @@ pub fn try_get_programs_from_project(
 ) -> Result<Option<ProgramFrameworkData>, String> {
     let mut manifest_location = base_location.clone();
     manifest_location.append_path("Anchor.toml")?;
-    
+
     if !manifest_location.exists() {
-       return Ok(None)
-    } 
+        return Ok(None);
+    }
     let mut programs = vec![];
 
     // Load anchor_manifest_path toml
@@ -73,9 +73,7 @@ pub fn try_get_programs_from_project(
             .cloned()
             .unwrap_or_default()
     } else {
-        debug!(
-            "Test suite paths provided, deferring to Test.toml files for account configuration"
-        );
+        debug!("Test suite paths provided, deferring to Test.toml files for account configuration");
         vec![]
     };
 
