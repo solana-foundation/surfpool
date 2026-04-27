@@ -27,142 +27,142 @@ pub fn try_get_programs_from_project(
 ) -> Result<Option<ProgramFrameworkData>, String> {
     let mut manifest_location = base_location.clone();
     manifest_location.append_path("Anchor.toml")?;
-    if manifest_location.exists() {
-        let mut programs = vec![];
+    
+    if !manifest_location.exists() {
+       return Ok(None)
+    } 
+    let mut programs = vec![];
 
-        // Load anchor_manifest_path toml
-        let manifest = manifest_location.read_content_as_utf8()?;
-        let manifest = AnchorManifest::from_manifest_str(&manifest)
-            .map_err(|e| format!("unable to read Anchor.toml: {}", e))?;
+    // Load anchor_manifest_path toml
+    let manifest = manifest_location.read_content_as_utf8()?;
+    let manifest = AnchorManifest::from_manifest_str(&manifest)
+        .map_err(|e| format!("unable to read Anchor.toml: {}", e))?;
 
-        let mut target_location = base_location.clone();
-        target_location.append_path("target")?;
-        if let Some((_, deployments)) = manifest.programs.iter().next() {
-            for (program_name, _) in deployments.iter() {
-                let so_exists = {
-                    if let Some(artifacts) = artifacts_path {
-                        let mut so_path = base_location.clone();
-                        so_path.append_path(&format!("{}/{}.so", artifacts, program_name))?;
-                        so_path.exists()
-                    } else {
-                        let mut so_path = target_location.clone();
-                        so_path.append_path("deploy")?;
-                        so_path.append_path(&format!("{}.so", program_name))?;
-                        so_path.exists()
-                    }
-                };
-                programs.push(ProgramMetadata::new(program_name, so_exists));
-            }
+    let mut target_location = base_location.clone();
+    target_location.append_path("target")?;
+    if let Some((_, deployments)) = manifest.programs.iter().next() {
+        for (program_name, _) in deployments.iter() {
+            let so_exists = {
+                if let Some(artifacts) = artifacts_path {
+                    let mut so_path = base_location.clone();
+                    so_path.append_path(&format!("{}/{}.so", artifacts, program_name))?;
+                    so_path.exists()
+                } else {
+                    let mut so_path = target_location.clone();
+                    so_path.append_path("deploy")?;
+                    so_path.append_path(&format!("{}.so", program_name))?;
+                    so_path.exists()
+                }
+            };
+            programs.push(ProgramMetadata::new(program_name, so_exists));
         }
-        let mut genesis_entries = manifest
-            .test
-            .as_ref()
-            .and_then(|test| test.genesis.as_ref())
-            .cloned()
-            .unwrap_or_default();
+    }
+    let mut genesis_entries = manifest
+        .test
+        .as_ref()
+        .and_then(|test| test.genesis.as_ref())
+        .cloned()
+        .unwrap_or_default();
 
-        let mut accounts: Vec<AccountEntry> = if test_suite_paths.is_empty() {
-            manifest
-                .test
-                .as_ref()
-                .and_then(|test| test.validator.as_ref())
-                .and_then(|validator| validator.account.as_ref())
-                .cloned()
-                .unwrap_or_default()
-        } else {
-            debug!(
-                "Test suite paths provided, deferring to Test.toml files for account configuration"
-            );
-            vec![]
-        };
-
-        let mut accounts_dirs = manifest
+    let mut accounts: Vec<AccountEntry> = if test_suite_paths.is_empty() {
+        manifest
             .test
             .as_ref()
             .and_then(|test| test.validator.as_ref())
-            .and_then(|validator| validator.account_dir.as_ref())
+            .and_then(|validator| validator.account.as_ref())
             .cloned()
-            .unwrap_or_default();
+            .unwrap_or_default()
+    } else {
+        debug!(
+            "Test suite paths provided, deferring to Test.toml files for account configuration"
+        );
+        vec![]
+    };
 
-        let mut clones = manifest
-            .test
-            .as_ref()
-            .and_then(|test| test.validator.as_ref())
-            .and_then(|validator| validator.clone.as_ref())
-            .map(|clones| {
-                clones
-                    .iter()
-                    .map(|c| c.address.clone())
-                    .collect::<Vec<String>>()
-            })
-            .unwrap_or_default();
+    let mut accounts_dirs = manifest
+        .test
+        .as_ref()
+        .and_then(|test| test.validator.as_ref())
+        .and_then(|validator| validator.account_dir.as_ref())
+        .cloned()
+        .unwrap_or_default();
 
-        if let Some(test_configs) =
-            TestConfig::discover_test_toml(test_suite_paths.iter().map(PathBuf::from).collect())
-                .map_err(|e| format!("failed to discover Test.toml files in workspace: {}", e))?
-        {
-            for (_, config) in test_configs.test_suite_configs.iter() {
-                if let Some(test_config) = config.test.as_ref() {
-                    if let Some(genesis) = test_config.genesis.as_ref() {
-                        genesis_entries.extend(genesis.clone());
+    let mut clones = manifest
+        .test
+        .as_ref()
+        .and_then(|test| test.validator.as_ref())
+        .and_then(|validator| validator.clone.as_ref())
+        .map(|clones| {
+            clones
+                .iter()
+                .map(|c| c.address.clone())
+                .collect::<Vec<String>>()
+        })
+        .unwrap_or_default();
+
+    if let Some(test_configs) =
+        TestConfig::discover_test_toml(test_suite_paths.iter().map(PathBuf::from).collect())
+            .map_err(|e| format!("failed to discover Test.toml files in workspace: {}", e))?
+    {
+        for (_, config) in test_configs.test_suite_configs.iter() {
+            if let Some(test_config) = config.test.as_ref() {
+                if let Some(genesis) = test_config.genesis.as_ref() {
+                    genesis_entries.extend(genesis.clone());
+                }
+                if let Some(validator) = test_config.validator.as_ref() {
+                    if let Some(accounts_cfg) = validator.account.as_ref() {
+                        for account in accounts_cfg {
+                            if !accounts.iter().any(|a| a.filename == account.filename) {
+                                accounts.push(account.clone());
+                            }
+                        }
                     }
-                    if let Some(validator) = test_config.validator.as_ref() {
-                        if let Some(accounts_cfg) = validator.account.as_ref() {
-                            for account in accounts_cfg {
-                                if !accounts.iter().any(|a| a.filename == account.filename) {
-                                    accounts.push(account.clone());
-                                }
+                    if let Some(accounts_dirs_cfg) = validator.account_dir.as_ref() {
+                        for account_dir in accounts_dirs_cfg {
+                            if !accounts_dirs
+                                .iter()
+                                .any(|a| a.directory == account_dir.directory)
+                            {
+                                accounts_dirs.push(account_dir.clone());
                             }
                         }
-                        if let Some(accounts_dirs_cfg) = validator.account_dir.as_ref() {
-                            for account_dir in accounts_dirs_cfg {
-                                if !accounts_dirs
-                                    .iter()
-                                    .any(|a| a.directory == account_dir.directory)
-                                {
-                                    accounts_dirs.push(account_dir.clone());
-                                }
-                            }
-                        }
-                        if let Some(clone_cfg) = validator.clone.as_ref() {
-                            for clone_entry in clone_cfg {
-                                if !clones.iter().any(|c| c == &clone_entry.address) {
-                                    clones.push(clone_entry.address.clone());
-                                }
+                    }
+                    if let Some(clone_cfg) = validator.clone.as_ref() {
+                        for clone_entry in clone_cfg {
+                            if !clones.iter().any(|c| c == &clone_entry.address) {
+                                clones.push(clone_entry.address.clone());
                             }
                         }
                     }
                 }
             }
         }
-
-        Ok(Some(ProgramFrameworkData::new(
-            Framework::Anchor,
-            programs,
-            if genesis_entries.is_empty() {
-                None
-            } else {
-                Some(genesis_entries)
-            },
-            if accounts.is_empty() {
-                None
-            } else {
-                Some(accounts)
-            },
-            if accounts_dirs.is_empty() {
-                None
-            } else {
-                Some(accounts_dirs)
-            },
-            if clones.is_empty() {
-                None
-            } else {
-                Some(clones)
-            },
-        )))
-    } else {
-        Ok(None)
     }
+
+    Ok(Some(ProgramFrameworkData::new(
+        Framework::Anchor,
+        programs,
+        if genesis_entries.is_empty() {
+            None
+        } else {
+            Some(genesis_entries)
+        },
+        if accounts.is_empty() {
+            None
+        } else {
+            Some(accounts)
+        },
+        if accounts_dirs.is_empty() {
+            None
+        } else {
+            Some(accounts_dirs)
+        },
+        if clones.is_empty() {
+            None
+        } else {
+            Some(clones)
+        },
+    )))
 }
 
 #[derive(Debug, Default)]
