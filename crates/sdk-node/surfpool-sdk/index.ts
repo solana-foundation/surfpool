@@ -87,6 +87,16 @@ export class Surfnet {
     return this.inner.instanceId;
   }
 
+  /**
+   * Gracefully shut down the surfnet, closing the HTTP + WebSocket RPC
+   * servers and freeing their ports. Blocks briefly while servers close.
+   * Throws if shutdown is not confirmed within the timeout (the port may
+   * still be bound). On success, subsequent calls are a no-op.
+   */
+  stop(): void {
+    this.inner.stop();
+  }
+
   /** Drain buffered simnet events into plain JS objects. */
   drainEvents(): SimnetEventValue[] {
     return this.inner.drainEvents();

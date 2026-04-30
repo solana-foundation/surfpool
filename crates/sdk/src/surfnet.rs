@@ -210,6 +210,7 @@ impl SurfnetBuilder {
             simnet_events_rx,
             svm_locker,
             instance_id: uuid::Uuid::new_v4().to_string(),
+            stopped: false,
         })
     }
 }
@@ -231,6 +232,7 @@ pub struct Surfnet {
     #[allow(dead_code)] // retained for future direct profiling access
     svm_locker: SurfnetSvmLocker,
     instance_id: String,
+    stopped: bool,
 }
 
 impl Surfnet {
@@ -285,11 +287,61 @@ impl Surfnet {
     pub fn instance_id(&self) -> &str {
         &self.instance_id
     }
+
+    /// Gracefully shut down the surfnet, closing the HTTP + WebSocket RPC
+    /// servers and freeing their ports.
+    ///
+    /// Blocks until both RPC servers acknowledge shutdown or the timeout
+    /// elapses. Returns an error if shutdown is not confirmed within the
+    /// timeout (the port may still be bound) — callers that need a
+    /// guaranteed-free port should treat this as fatal. On success, the
+    /// instance is marked stopped and subsequent calls are a no-op.
+    ///
+    /// Note: this drains the simnet events channel while waiting. Don't call
+    /// `events()` / `drain_events()` concurrently from another thread or
+    /// shutdown acknowledgements may be lost, causing this call to time out.
+    pub fn stop(&mut self) -> SurfnetResult<()> {
+        if self.stopped {
+            return Ok(());
+        }
+
+        self.simnet_commands_tx
+            .send(SimnetCommand::Terminate(None))
+            .map_err(|e| {
+                SurfnetError::Runtime(format!("failed to send terminate command: {e}"))
+            })?;
+
+        let timeout = Duration::from_secs(5);
+        let deadline = Instant::now() + timeout;
+        let mut shutdowns_seen = 0;
+        while shutdowns_seen < 2 {
+            let remaining = match deadline.checked_duration_since(Instant::now()) {
+                Some(d) => d,
+                None => break,
+            };
+            match self.simnet_events_rx.recv_timeout(remaining) {
+                Ok(SimnetEvent::Shutdown) => shutdowns_seen += 1,
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+
+        if shutdowns_seen < 2 {
+            return Err(SurfnetError::Runtime(format!(
+                "surfnet shutdown not confirmed within {timeout:?}: {shutdowns_seen} of 2 RPC servers acknowledged. The port may still be bound."
+            )));
+        }
+
+        self.stopped = true;
+        Ok(())
+    }
 }
 
 impl Drop for Surfnet {
     fn drop(&mut self) {
-        let _ = self.simnet_commands_tx.send(SimnetCommand::Terminate(None));
+        if !self.stopped {
+            let _ = self.simnet_commands_tx.send(SimnetCommand::Terminate(None));
+        }
     }
 }
 

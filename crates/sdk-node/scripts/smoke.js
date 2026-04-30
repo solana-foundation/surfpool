@@ -164,6 +164,29 @@ test("deploy() accepts explicit bytes and deployProgram() discovers workspace ar
   }
 });
 
+test("stop() shuts down the runtime and frees the port", async () => {
+  const surfnet = Surfnet.start();
+  const rpcUrl = surfnet.rpcUrl;
+  const port = Number(new URL(rpcUrl).port);
+
+  await surfnetRpc(rpcUrl, "getVersion");
+
+  surfnet.stop();
+  surfnet.stop(); // idempotent
+
+  await assert.rejects(
+    surfnetRpc(rpcUrl, "getVersion"),
+    "expected RPC to fail after stop()",
+  );
+
+  const probe = require("node:net").createServer();
+  await new Promise((resolve, reject) => {
+    probe.once("error", reject);
+    probe.listen(port, "127.0.0.1", resolve);
+  });
+  await new Promise((resolve) => probe.close(resolve));
+});
+
 function sampleIdl(programId) {
   return {
     address: programId,

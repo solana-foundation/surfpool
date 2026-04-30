@@ -97,6 +97,15 @@ impl Surfnet {
         self.inner.instance_id().to_string()
     }
 
+    /// Gracefully shut down the surfnet, closing the HTTP + WebSocket RPC
+    /// servers and freeing their ports. Blocks briefly while servers close.
+    /// Throws if shutdown is not confirmed within the timeout (the port may
+    /// still be bound). On success, subsequent calls are a no-op.
+    #[napi]
+    pub fn stop(&mut self) -> Result<()> {
+        self.inner.stop().map_err(sdk_error_to_napi)
+    }
+
     /// Drain and return currently buffered simnet events.
     #[napi]
     pub fn drain_events(&self) -> Vec<SimnetEventValue> {
