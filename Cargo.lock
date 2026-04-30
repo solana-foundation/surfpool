@@ -11542,6 +11542,7 @@ name = "surfpool-sdk-node"
 version = "1.2.0"
 dependencies = [
  "hiro-system-kit",
+ "log 0.4.29",
  "napi",
  "napi-build",
  "napi-derive",

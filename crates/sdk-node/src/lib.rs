@@ -1,7 +1,7 @@
 #[macro_use]
 extern crate napi_derive;
 
-use std::{convert::TryFrom, path::PathBuf};
+use std::{convert::TryFrom, path::PathBuf, sync::Once};
 
 use napi::{Error, Result, Status};
 use solana_keypair::Keypair;
@@ -12,6 +12,38 @@ use surfpool_sdk::{
     cheatcodes::builders::{DeployProgram, ResetAccount, SetTokenAccount, StreamAccount},
 };
 use surfpool_types::ClockCommand;
+
+/// Silent `log::Log` impl. Installed once at first surfnet boot so parity-ws
+/// (the WebSocket server backing the pubsub endpoint) skips its hardcoded
+/// `println!("Encountered an error: ...\nEnable a logger to see more
+/// information.")` fallback whenever a client closes uncleanly. parity-ws
+/// only ignores ECONNRESET when `errno == 104` (Linux); on macOS ECONNRESET
+/// is 54, so the fallback fires on every client-side reset and pollutes
+/// stderr in test runners. Installing any `log` impl makes
+/// `log_enabled!(Error)` return true, which suppresses the println.
+struct NullLogger;
+
+impl log::Log for NullLogger {
+    fn enabled(&self, _: &log::Metadata) -> bool {
+        true
+    }
+    fn log(&self, _: &log::Record) {}
+    fn flush(&self) {}
+}
+
+static NULL_LOGGER: NullLogger = NullLogger;
+static INIT_LOGGER: Once = Once::new();
+
+fn install_null_logger_once() {
+    INIT_LOGGER.call_once(|| {
+        // Best-effort: if a host has already installed a logger, leave it
+        // alone (including its max level). We only need this when nobody
+        // else has registered one.
+        if log::set_logger(&NULL_LOGGER).is_ok() {
+            log::set_max_level(log::LevelFilter::Error);
+        }
+    });
+}
 
 /// A running Surfpool instance with RPC/WS endpoints on dynamic ports.
 #[napi]
@@ -24,6 +56,7 @@ impl Surfnet {
     /// Start a surfnet with default settings (offline, transaction-mode blocks, 10 SOL payer).
     #[napi(factory)]
     pub fn start() -> Result<Self> {
+        install_null_logger_once();
         let inner = hiro_system_kit::nestable_block_on(NativeSurfnet::start())
             .map_err(sdk_error_to_napi)?;
         Ok(Self { inner })
@@ -32,6 +65,7 @@ impl Surfnet {
     /// Start a surfnet with custom configuration.
     #[napi(factory)]
     pub fn start_with_config(config: SurfnetConfig) -> Result<Self> {
+        install_null_logger_once();
         let mut builder = NativeSurfnet::builder();
 
         if let Some(offline) = config.offline {

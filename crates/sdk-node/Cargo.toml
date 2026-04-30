@@ -14,6 +14,7 @@ crate-type = ["cdylib"]
 napi = { version = "2", features = ["napi4", "napi6"] }
 napi-derive = "2.16"
 hiro-system-kit = { workspace = true }
+log = "0.4"
 surfpool-sdk = { workspace = true }
 surfpool-types = { workspace = true }
 solana-keypair = { workspace = true }
