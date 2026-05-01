@@ -108,7 +108,7 @@ function main() {
     cwd: packageDir,
   });
 
-  console.log(`Prepared surfpool-sdk npm release ${version}`);
+  console.log(`Prepared @solana/surfpool npm release ${version}`);
 }
 
 main();

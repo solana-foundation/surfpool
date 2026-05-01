@@ -49,7 +49,7 @@ jobs:
           SHOULD_PUBLISH=false
 
           for ENTRY in \
-            "surfpool-sdk publish_root" \
+            "@solana/surfpool publish_root" \
             "surfpool-sdk-darwin-x64 publish_darwin_x64" \
             "surfpool-sdk-darwin-arm64 publish_darwin_arm64" \
             "surfpool-sdk-linux-x64-gnu publish_linux_x64_gnu"

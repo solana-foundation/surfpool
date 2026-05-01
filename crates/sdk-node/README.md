@@ -1,4 +1,4 @@
-# `surfpool-sdk`
+# `@solana/surfpool`
 
 Node.js bindings for the Surfpool SDK, built with `napi-rs`.
 

@@ -131,7 +131,7 @@ jobs:
           npm install "./$(basename "${{ steps.pack.outputs.root_pack }}")"
           node - <<'EOF'
           const assert = require("node:assert/strict");
-          const { Surfnet } = require("surfpool-sdk");
+          const { Surfnet } = require("@solana/surfpool");
 
           const keypair = Surfnet.newKeypair();
           assert.equal(keypair.secretKey.length, 64);

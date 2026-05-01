@@ -1,5 +1,5 @@
 {
-  "name": "surfpool-sdk",
+  "name": "@solana/surfpool",
   "version": "1.2.0",
   "description": "Embed a Surfpool Solana runtime in your Node.js tests",
   "main": "dist/index.js",
