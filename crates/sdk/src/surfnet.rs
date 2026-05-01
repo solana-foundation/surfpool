@@ -307,9 +307,7 @@ impl Surfnet {
 
         self.simnet_commands_tx
             .send(SimnetCommand::Terminate(None))
-            .map_err(|e| {
-                SurfnetError::Runtime(format!("failed to send terminate command: {e}"))
-            })?;
+            .map_err(|e| SurfnetError::Runtime(format!("failed to send terminate command: {e}")))?;
 
         let timeout = Duration::from_secs(5);
         let deadline = Instant::now() + timeout;
