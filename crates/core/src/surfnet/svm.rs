@@ -3463,7 +3463,7 @@ mod tests {
         enable_extend_program_checked, enable_loader_v4, enable_sbpf_v1_deployment_and_execution,
         enable_sbpf_v2_deployment_and_execution, enable_sbpf_v3_deployment_and_execution,
         formalize_loaded_transaction_data_size, move_precompile_verification_to_svm,
-        raise_cpi_nesting_limit_to_8,
+        raise_cpi_nesting_limit_to_8, stake_raise_minimum_delegation_to_1_sol,
     };
     use base64::{Engine, engine::general_purpose};
     use borsh::BorshSerialize;
@@ -4481,15 +4481,15 @@ mod tests {
         assert!(!svm.feature_set.is_active(&blake3_syscall_enabled::id()));
         assert!(
             !svm.feature_set
-                .is_active(&enable_sbpf_v1_deployment_and_execution::id())
+                .is_active(&enable_sbpf_v3_deployment_and_execution::id())
         );
         assert!(
             !svm.feature_set
-                .is_active(&formalize_loaded_transaction_data_size::id())
+                .is_active(&raise_cpi_nesting_limit_to_8::id())
         );
         assert!(
             !svm.feature_set
-                .is_active(&move_precompile_verification_to_svm::id())
+                .is_active(&stake_raise_minimum_delegation_to_1_sol::id())
         );
 
         // Features active on mainnet should still be active
@@ -4497,15 +4497,19 @@ mod tests {
         assert!(svm.feature_set.is_active(&curve25519_syscall_enabled::id()));
         assert!(
             svm.feature_set
+                .is_active(&enable_sbpf_v1_deployment_and_execution::id())
+        );
+        assert!(
+            svm.feature_set
                 .is_active(&enable_sbpf_v2_deployment_and_execution::id())
         );
         assert!(
             svm.feature_set
-                .is_active(&enable_sbpf_v3_deployment_and_execution::id())
+                .is_active(&formalize_loaded_transaction_data_size::id())
         );
         assert!(
             svm.feature_set
-                .is_active(&raise_cpi_nesting_limit_to_8::id())
+                .is_active(&move_precompile_verification_to_svm::id())
         );
     }
 
