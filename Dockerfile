@@ -25,13 +25,19 @@ FROM debian:bullseye-slim
 # Set default network host
 ENV SURFPOOL_NETWORK_HOST=127.0.0.1
 
-RUN apt update && apt install -y ca-certificates libssl-dev
+RUN apt update && apt install -y ca-certificates curl libssl-dev
 
 COPY --from=build /out/ /bin/
 
 WORKDIR /workspace
 
 EXPOSE 8899 8900 18488
+
+HEALTHCHECK --interval=10s --timeout=3s --start-period=30s --retries=3 \
+  CMD curl --fail --silent --output /dev/null \
+    --header 'Content-Type: application/json' \
+    --data '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' \
+    http://127.0.0.1:8899
 
 # Create a shell script that provides default behavior
 RUN echo '#!/bin/bash\n\
