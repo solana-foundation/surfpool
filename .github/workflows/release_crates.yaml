@@ -18,6 +18,7 @@ on:
 
 jobs:
   publish:
+    if: github.event.repository.fork == false
     runs-on: ubuntu-latest
     environment: release
 

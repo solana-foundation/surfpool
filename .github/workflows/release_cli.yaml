@@ -19,6 +19,7 @@ concurrency:
 jobs:
   get_release_info:
     name: Get Release Info
+    if: github.event.repository.fork == false
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.new_release_tag.outputs.TAG }}
@@ -50,6 +51,7 @@ jobs:
 
   dist_surfpool:
     name: Build Surfpool Distributions
+    if: github.event.repository.fork == false
     runs-on: ${{ matrix.os }}
     outputs:
       LINUX_X64_SHA: ${{ steps.linux_x64_sha.outputs.LINUX_X64_SHA }}
