@@ -247,7 +247,7 @@ pub struct StartSimnet {
     /// A set of inputs to use for the runbook (eg. surfpool start --runbook-input myInputs.json)
     #[arg(long = "runbook-input", short = 'i')]
     pub runbook_input: Vec<String>,
-    /// Surfnet database connection URL for persistent Surfnets. For an in-memory sqlite database, use ":memory:". For an on-disk sqlite database, use a filename ending in '.sqlite'.
+    /// Surfnet database connection URL for persistent Surfnets. For an in-memory sqlite database, use ":memory:". For an on-disk sqlite database, use a filename ending in '.sqlite'. PostgreSQL URLs (postgres:// or postgresql://) require building from source with the `postgres` feature flag enabled.
     #[arg(long = "db")]
     pub db: Option<String>,
     /// Unique identifier for this surfnet instance. Used to isolate database storage when multiple surfnets share the same database. Defaults to "default".
