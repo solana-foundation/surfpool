@@ -78,8 +78,7 @@ pub async fn handle_update_command(cmd: UpdateCommand) -> Result<(), String> {
             defaults_style: Style::new().for_stderr(),
             ..ColorfulTheme::default()
         };
-        println!("Current version: {}", current_version);
-        println!("Latest version: {}", latest_tag_name);
+
         let confirm = Confirm::with_theme(&theme)
             .with_prompt(format!(
                 "Update surfpool from {} to {}",
