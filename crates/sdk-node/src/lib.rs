@@ -96,9 +96,8 @@ impl Surfnet {
             builder = builder.payer(parse_keypair(&secret_key, "payerSecretKey")?);
         }
         if config.all_features.unwrap_or(false) {
-            builder = builder.feature_config(
-                surfpool_types::SvmFeatureConfig::all_features_enabled(),
-            );
+            builder =
+                builder.feature_config(surfpool_types::SvmFeatureConfig::all_features_enabled());
         }
         if let Some(names) = config.enable_features {
             for name in &names {
