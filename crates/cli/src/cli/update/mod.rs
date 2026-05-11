@@ -1,5 +1,4 @@
-use std::fs::remove_file;
-use std::io::Read;
+use std::{fs::remove_file, io::Read};
 
 use dialoguer::{Confirm, console::Style, theme::ColorfulTheme};
 use flate2::read::GzDecoder;
@@ -131,8 +130,8 @@ pub async fn handle_update_command(cmd: UpdateCommand) -> Result<(), String> {
         }
     }
 
-    let binary_data =
-        binary_data.ok_or_else(|| format!("Could not find '{}' binary in archive", get_binary_name()))?;
+    let binary_data = binary_data
+        .ok_or_else(|| format!("Could not find '{}' binary in archive", get_binary_name()))?;
 
     let temp = std::env::temp_dir().join("surfpool-update");
     std::fs::write(&temp, &binary_data).map_err(|e| e.to_string())?;

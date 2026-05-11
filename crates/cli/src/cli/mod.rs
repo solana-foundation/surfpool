@@ -30,8 +30,7 @@ use surfpool_types::{
 use txtx_core::manifest::WorkspaceManifest;
 use txtx_gql::kit::{helpers::fs::FileLocation, types::frontend::LogLevel};
 
-use crate::cli::update::handle_update_command;
-use crate::runbook::handle_execute_runbook_command;
+use crate::{cli::update::handle_update_command, runbook::handle_execute_runbook_command};
 mod simnet;
 mod update;
 
