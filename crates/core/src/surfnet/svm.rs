@@ -84,7 +84,7 @@ use crate::{
         LogsSubscriptionData, locker::is_supported_token_program, surfnet_lite_svm::SurfnetLiteSvm,
     },
     types::{
-        GeyserAccountUpdate, MintAccount, OfflineAccountConfig, SerializableAccountAdditionalData,
+        MintAccount, OfflineAccountConfig, SerializableAccountAdditionalData,
         SurfnetTransactionStatus, SyntheticBlockhash, TokenAccount, TransactionWithStatusMeta,
     },
 };
@@ -866,18 +866,45 @@ impl SurfnetSvm {
             );
             self.transactions_queued_for_confirmation
                 .push_back((tx, status_tx.clone(), None));
-            let account = self.get_account(pubkey)?.unwrap();
-            self.set_account(pubkey, account)?;
+            if let Some(account) = self.get_account(pubkey)? {
+                self.set_account(pubkey, account)?;
+            }
         }
         Ok(res)
     }
 
     /// Airdrops a specified amount of lamports to a list of public keys.
     ///
+    /// Skips airdrops entirely when `lamports == 0`, or when `lamports` is
+    /// below the rent-exempt minimum for an empty account (in which case the
+    /// underlying SVM would not persist the recipient account and downstream
+    /// state queries would observe a missing account).
+    ///
     /// # Arguments
     /// * `lamports` - The amount of lamports to airdrop.
     /// * `addresses` - Slice of recipient public keys.
     pub fn airdrop_pubkeys(&mut self, lamports: u64, addresses: &[Pubkey]) {
+        if addresses.is_empty() {
+            return;
+        }
+
+        if lamports == 0 {
+            let _ = self.simnet_events_tx.send(SimnetEvent::info(
+                "Skipping genesis airdrops (--airdrop-amount=0)",
+            ));
+            return;
+        }
+
+        let min_rent = self.inner.minimum_balance_for_rent_exemption(0);
+        if lamports < min_rent {
+            let _ = self.simnet_events_tx.send(SimnetEvent::error(format!(
+                "Skipping genesis airdrops: --airdrop-amount={} is below the rent-exempt minimum of {} lamports. \
+                 Set --airdrop-amount to 0 to disable airdrops, or to at least {} lamports.",
+                lamports, min_rent, min_rent
+            )));
+            return;
+        }
+
         for recipient in addresses {
             match self.airdrop(recipient, lamports) {
                 Ok(_) => {

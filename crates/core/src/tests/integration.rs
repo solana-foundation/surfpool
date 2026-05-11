@@ -9103,3 +9103,217 @@ async fn test_send_transaction_skip_sig_verify_processes_and_updates_state(test_
         final_payer_balance.value,
     );
 }
+
+#[cfg_attr(feature = "ignore_tests_ci", ignore = "flaky CI tests")]
+#[test_case(TestType::no_db(); "with no db")]
+#[tokio::test]
+async fn test_airdrop_amount_zero_skips_airdrops(test_type: TestType) {
+    let recipient = Keypair::new().pubkey();
+    let bind_host = "127.0.0.1";
+    let bind_port = get_free_port().unwrap();
+    let ws_port = get_free_port().unwrap();
+
+    let config = SurfpoolConfig {
+        simnets: vec![SimnetConfig {
+            slot_time: 1,
+            airdrop_addresses: vec![recipient],
+            airdrop_token_amount: 0,
+            ..SimnetConfig::default()
+        }],
+        rpc: RpcConfig {
+            bind_host: bind_host.to_string(),
+            bind_port,
+            ws_port,
+            ..Default::default()
+        },
+        ..SurfpoolConfig::default()
+    };
+
+    let (surfnet_svm, simnet_events_rx, geyser_events_rx) = test_type.initialize_svm();
+    let (simnet_commands_tx, simnet_commands_rx) = unbounded();
+
+    let svm_locker = SurfnetSvmLocker::new(surfnet_svm);
+
+    let _handle = hiro_system_kit::thread_named("test").spawn(move || {
+        let future = start_local_surfnet_runloop(
+            svm_locker,
+            config,
+            simnet_commands_tx,
+            simnet_commands_rx,
+            geyser_events_rx,
+        );
+        if let Err(e) = hiro_system_kit::nestable_block_on(future) {
+            panic!("{e:?}");
+        }
+    });
+
+    // Startup must reach Ready without panicking. This is the core regression
+    // assertion for https://github.com/solana-foundation/surfpool/issues/651.
+    wait_for_ready_and_connected(&simnet_events_rx);
+
+    let minimal_client =
+        http::connect::<MinimalClient>(format!("http://{bind_host}:{bind_port}").as_str())
+            .await
+            .expect("Failed to connect to Surfpool");
+
+    let recipient_balance = minimal_client
+        .get_balance(recipient.to_string(), None)
+        .await
+        .expect("Failed to get recipient balance");
+    assert_eq!(
+        recipient_balance.value, 0,
+        "Recipient should have zero balance when --airdrop-amount=0"
+    );
+}
+
+#[cfg_attr(feature = "ignore_tests_ci", ignore = "flaky CI tests")]
+#[test_case(TestType::no_db(); "with no db")]
+#[tokio::test]
+async fn test_airdrop_amount_below_rent_skips_airdrops(test_type: TestType) {
+    let recipient = Keypair::new().pubkey();
+    let bind_host = "127.0.0.1";
+    let bind_port = get_free_port().unwrap();
+    let ws_port = get_free_port().unwrap();
+
+    // 1 lamport is far below any rent-exempt minimum, so airdrop must be skipped.
+    let config = SurfpoolConfig {
+        simnets: vec![SimnetConfig {
+            slot_time: 1,
+            airdrop_addresses: vec![recipient],
+            airdrop_token_amount: 1,
+            ..SimnetConfig::default()
+        }],
+        rpc: RpcConfig {
+            bind_host: bind_host.to_string(),
+            bind_port,
+            ws_port,
+            ..Default::default()
+        },
+        ..SurfpoolConfig::default()
+    };
+
+    let (surfnet_svm, simnet_events_rx, geyser_events_rx) = test_type.initialize_svm();
+    let (simnet_commands_tx, simnet_commands_rx) = unbounded();
+
+    let svm_locker = SurfnetSvmLocker::new(surfnet_svm);
+
+    let _handle = hiro_system_kit::thread_named("test").spawn(move || {
+        let future = start_local_surfnet_runloop(
+            svm_locker,
+            config,
+            simnet_commands_tx,
+            simnet_commands_rx,
+            geyser_events_rx,
+        );
+        if let Err(e) = hiro_system_kit::nestable_block_on(future) {
+            panic!("{e:?}");
+        }
+    });
+
+    wait_for_ready_and_connected(&simnet_events_rx);
+
+    let minimal_client =
+        http::connect::<MinimalClient>(format!("http://{bind_host}:{bind_port}").as_str())
+            .await
+            .expect("Failed to connect to Surfpool");
+
+    let recipient_balance = minimal_client
+        .get_balance(recipient.to_string(), None)
+        .await
+        .expect("Failed to get recipient balance");
+    assert_eq!(
+        recipient_balance.value, 0,
+        "Recipient should have zero balance when --airdrop-amount is below rent-exempt minimum"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_airdrop_pubkeys_zero_amount_unit() {
+    use crate::rpc::minimal::SurfpoolMinimalRpc;
+    use crate::tests::helpers::TestSetup;
+
+    let setup = TestSetup::new(SurfpoolMinimalRpc);
+    let recipient = Pubkey::new_unique();
+    setup.context.svm_locker.airdrop_pubkeys(0, &[recipient]);
+
+    let account = setup
+        .context
+        .svm_locker
+        .with_svm_reader(|svm| svm.get_account(&recipient).ok().flatten());
+    assert!(
+        account.is_none() || account.unwrap().lamports == 0,
+        "Recipient must not be funded when airdrop amount is 0"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_airdrop_pubkeys_below_rent_unit() {
+    use crate::rpc::minimal::SurfpoolMinimalRpc;
+    use crate::tests::helpers::TestSetup;
+
+    let setup = TestSetup::new(SurfpoolMinimalRpc);
+    let recipient = Pubkey::new_unique();
+
+    let min_rent = setup
+        .context
+        .svm_locker
+        .with_svm_reader(|svm| svm.inner.minimum_balance_for_rent_exemption(0));
+    assert!(min_rent > 1, "Rent-exempt minimum should be greater than 1");
+
+    setup
+        .context
+        .svm_locker
+        .airdrop_pubkeys(min_rent - 1, &[recipient]);
+
+    let account = setup
+        .context
+        .svm_locker
+        .with_svm_reader(|svm| svm.get_account(&recipient).ok().flatten());
+    assert!(
+        account.is_none() || account.unwrap().lamports == 0,
+        "Recipient must not be funded when airdrop amount is below rent-exempt minimum"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_airdrop_pubkeys_at_rent_minimum_unit() {
+    use crate::rpc::minimal::SurfpoolMinimalRpc;
+    use crate::tests::helpers::TestSetup;
+
+    let setup = TestSetup::new(SurfpoolMinimalRpc);
+    let recipient = Pubkey::new_unique();
+
+    let min_rent = setup
+        .context
+        .svm_locker
+        .with_svm_reader(|svm| svm.inner.minimum_balance_for_rent_exemption(0));
+
+    setup
+        .context
+        .svm_locker
+        .airdrop_pubkeys(min_rent, &[recipient]);
+
+    let account = setup
+        .context
+        .svm_locker
+        .with_svm_reader(|svm| svm.get_account(&recipient).ok().flatten())
+        .expect("Recipient should be funded when airdrop amount equals rent-exempt minimum");
+    assert_eq!(
+        account.lamports, min_rent,
+        "Recipient should be funded with exactly the rent-exempt minimum"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_airdrop_pubkeys_empty_addresses_unit() {
+    use crate::rpc::minimal::SurfpoolMinimalRpc;
+    use crate::tests::helpers::TestSetup;
+
+    let setup = TestSetup::new(SurfpoolMinimalRpc);
+    // Must not panic with an empty address slice, regardless of amount.
+    setup.context.svm_locker.airdrop_pubkeys(0, &[]);
+    setup
+        .context
+        .svm_locker
+        .airdrop_pubkeys(LAMPORTS_PER_SOL, &[]);
+}

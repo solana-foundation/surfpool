@@ -176,7 +176,8 @@ pub struct StartSimnet {
     /// List of pubkeys to airdrop (eg. surfpool start --airdrop 5cQvx... --airdrop 5cQvy...)
     #[arg(long = "airdrop", short = 'a')]
     pub airdrop_addresses: Vec<String>,
-    /// Quantity of tokens to airdrop
+    /// Quantity of lamports to airdrop to each address on startup. Set to 0 to skip startup airdrops entirely.
+    /// Values greater than 0 but below the rent-exempt minimum are rejected and result in airdrops being skipped.
     #[arg(long = "airdrop-amount", short = 'q', default_value = DEFAULT_AIRDROP_AMOUNT)]
     pub airdrop_token_amount: u64,
     /// List of keypair paths to airdrop (eg. surfpool start --airdrop-keypair-path ~/.config/solana/id.json --airdrop-keypair-path ~/.config/solana/id2.json)
