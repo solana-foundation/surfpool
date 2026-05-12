@@ -116,8 +116,7 @@ impl Jito for SurfpoolJitoRpc {
                 ))
             })?;
 
-            let mut decoded_txs: Vec<VersionedTransaction> =
-                Vec::with_capacity(transactions.len());
+            let mut decoded_txs: Vec<VersionedTransaction> = Vec::with_capacity(transactions.len());
             for (idx, tx_data) in transactions.iter().enumerate() {
                 let (_, tx) = decode_and_deserialize::<VersionedTransaction>(
                     tx_data.clone(),
