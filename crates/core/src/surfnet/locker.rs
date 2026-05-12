@@ -69,6 +69,7 @@ use crate::{
     error::{SurfpoolError, SurfpoolResult},
     helpers::time_travel::calculate_time_travel_clock,
     rpc::utils::{convert_transaction_metadata_from_canonical, verify_pubkey},
+    storage::StorageResult,
     surfnet::FINALIZATION_SLOT_THRESHOLD,
     types::{
         GeyserAccountUpdate, OfflineAccountConfig, RemoteRpcResult, SurfnetTransactionStatus,
@@ -762,6 +763,38 @@ impl SurfnetSvmLocker {
     }
 }
 
+/// Builds the `getSignaturesForAddress` config for the remote leg of a local-then-remote
+/// query, given whether the caller's `before` / `until` reference locally-stored signatures
+/// and how many slots remain under the caller's `limit` after local results were collected.
+///
+/// Surfpool's local transactions are treated as strictly newer than anything on the upstream
+/// chain, so a local-only pagination boundary must be rewritten before being forwarded:
+///   - `before` local-only  => drop the boundary; remote signatures are all older anyway.
+///   - `until` local-only   => every remote signature would be excluded; return `None` to
+///                              skip the remote call entirely.
+///   - neither local-only   => forward the caller's boundaries unchanged.
+///
+/// The returned config always pins `limit` to `remaining_limit` so the remote can't push the
+/// combined result past the caller's requested cap.
+fn signatures_for_address_remote_config(
+    config: Option<&RpcSignaturesForAddressConfig>,
+    before_is_local: bool,
+    until_is_local: bool,
+    remaining_limit: usize,
+) -> Option<RpcSignaturesForAddressConfig> {
+    if until_is_local {
+        return None;
+    }
+    let base = config.cloned().unwrap_or_default();
+    Some(RpcSignaturesForAddressConfig {
+        before: if before_is_local { None } else { base.before },
+        until: base.until,
+        limit: Some(remaining_limit),
+        commitment: base.commitment,
+        min_context_slot: base.min_context_slot,
+    })
+}
+
 /// Get signatures for Addresses
 impl SurfnetSvmLocker {
     /// Returns local `getSignaturesForAddress` results in the same newest-first order expected by
@@ -914,8 +947,37 @@ impl SurfnetSvmLocker {
             inner: mut combined_results,
         } = results;
         if combined_results.len() < limit {
-            let mut remote_results = client.get_signatures_for_address(pubkey, config).await?;
-            combined_results.append(&mut remote_results);
+            let (before_is_local, until_is_local) =
+                self.with_svm_reader(|svm_reader| -> StorageResult<(bool, bool)> {
+                    let is_local = |sig: &String| -> StorageResult<bool> {
+                        Ok(svm_reader.transactions.get(sig)?.is_some())
+                    };
+                    let before_local = match config.and_then(|c| c.before.as_ref()) {
+                        Some(sig) => is_local(sig)?,
+                        None => false,
+                    };
+                    let until_local = match config.and_then(|c| c.until.as_ref()) {
+                        Some(sig) => is_local(sig)?,
+                        None => false,
+                    };
+                    Ok((before_local, until_local))
+                })?;
+
+            let remaining_limit = limit - combined_results.len();
+            if let Some(remote_config) = signatures_for_address_remote_config(
+                config,
+                before_is_local,
+                until_is_local,
+                remaining_limit,
+            ) {
+                let mut remote_results = client
+                    .get_signatures_for_address(pubkey, Some(&remote_config))
+                    .await?;
+                combined_results.append(&mut remote_results);
+                // Belt-and-suspenders: enforce the caller's cap even if the remote returned
+                // more than the requested slice.
+                combined_results.truncate(limit);
+            }
         }
 
         Ok(SvmAccessContext::new(
@@ -5229,6 +5291,98 @@ mod tests {
         let sigs: HashSet<String> = result.inner.iter().map(|s| s.signature.clone()).collect();
         assert!(sigs.contains(&sig_a.to_string()));
         assert!(sigs.contains(&sig_b.to_string()));
+    }
+
+    #[test]
+    fn remote_config_passes_through_when_no_boundary_is_local() {
+        let sig_before = Signature::new_unique().to_string();
+        let sig_until = Signature::new_unique().to_string();
+        let config = RpcSignaturesForAddressConfig {
+            before: Some(sig_before.clone()),
+            until: Some(sig_until.clone()),
+            limit: Some(42),
+            commitment: None,
+            min_context_slot: Some(7),
+        };
+
+        let translated = signatures_for_address_remote_config(Some(&config), false, false, 42)
+            .expect("remote call should not be skipped");
+
+        assert_eq!(translated.before.as_deref(), Some(sig_before.as_str()));
+        assert_eq!(translated.until.as_deref(), Some(sig_until.as_str()));
+        assert_eq!(translated.limit, Some(42));
+        assert_eq!(translated.min_context_slot, Some(7));
+    }
+
+    #[test]
+    fn remote_config_drops_local_before_boundary() {
+        let sig_before = Signature::new_unique().to_string();
+        let sig_until = Signature::new_unique().to_string();
+        let config = RpcSignaturesForAddressConfig {
+            before: Some(sig_before.clone()),
+            until: Some(sig_until.clone()),
+            limit: Some(100),
+            commitment: None,
+            min_context_slot: None,
+        };
+
+        let translated = signatures_for_address_remote_config(Some(&config), true, false, 100)
+            .expect("remote call should not be skipped");
+
+        assert!(
+            translated.before.is_none(),
+            "local `before` must not leak to the remote"
+        );
+        assert_eq!(translated.until.as_deref(), Some(sig_until.as_str()));
+        assert_eq!(translated.limit, Some(100));
+    }
+
+    #[test]
+    fn remote_config_skipped_when_until_is_local() {
+        let config = RpcSignaturesForAddressConfig {
+            before: None,
+            until: Some(Signature::new_unique().to_string()),
+            limit: Some(100),
+            commitment: None,
+            min_context_slot: None,
+        };
+
+        assert!(
+            signatures_for_address_remote_config(Some(&config), false, true, 100).is_none(),
+            "a local `until` boundary excludes the entire remote stream — the call must be skipped"
+        );
+        // And the same when both boundaries are local.
+        assert!(signatures_for_address_remote_config(Some(&config), true, true, 100).is_none());
+    }
+
+    #[test]
+    fn remote_config_pins_remote_limit_to_remaining_slots() {
+        // Caller asked for 100, local already produced 30 → remote should be capped at 70 so
+        // the combined stream cannot exceed the caller-requested limit.
+        let config = RpcSignaturesForAddressConfig {
+            before: None,
+            until: None,
+            limit: Some(100),
+            commitment: None,
+            min_context_slot: None,
+        };
+
+        let translated = signatures_for_address_remote_config(Some(&config), false, false, 70)
+            .expect("remote call should not be skipped");
+        assert_eq!(translated.limit, Some(70));
+    }
+
+    #[test]
+    fn remote_config_handles_missing_caller_config() {
+        let translated = signatures_for_address_remote_config(None, false, false, 250)
+            .expect("remote call should not be skipped");
+        assert_eq!(
+            translated.limit,
+            Some(250),
+            "even without a caller config, the remote must respect the remaining slot budget"
+        );
+        assert!(translated.before.is_none());
+        assert!(translated.until.is_none());
     }
 
     #[tokio::test(flavor = "multi_thread")]
