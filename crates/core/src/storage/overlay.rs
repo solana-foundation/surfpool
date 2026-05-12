@@ -6,7 +6,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use super::{Storage, StorageError, StorageResult};
+use super::{OverlayDelta, OverlayLike, Storage, StorageError, StorageResult};
 
 /// Represents the state of a key in the overlay
 #[derive(Clone)]
@@ -263,6 +263,39 @@ where
             base: self.base.clone_box(),
             overlay: Arc::new(RwLock::new(overlay.clone())),
             base_cleared: Arc::new(RwLock::new(base_cleared)),
+        })
+    }
+
+    fn as_overlay(&self) -> Option<&dyn OverlayLike<K, V>> {
+        Some(self)
+    }
+}
+
+impl<K, V> OverlayLike<K, V> for OverlayStorage<K, V>
+where
+    K: Serialize + for<'de> Deserialize<'de> + Clone + Eq + Hash + Send + Sync + 'static,
+    V: Serialize + for<'de> Deserialize<'de> + Clone + Send + Sync + 'static,
+{
+    fn extract_overlay(&self) -> StorageResult<OverlayDelta<K, V>> {
+        let overlay = self.overlay.read().map_err(|_| StorageError::LockError)?;
+        let base_cleared = *self
+            .base_cleared
+            .read()
+            .map_err(|_| StorageError::LockError)?;
+
+        let mut writes = Vec::new();
+        let mut deletes = Vec::new();
+        for (k, entry) in overlay.iter() {
+            match entry {
+                OverlayEntry::Written(v) => writes.push((k.clone(), v.clone())),
+                OverlayEntry::Deleted => deletes.push(k.clone()),
+            }
+        }
+
+        Ok(OverlayDelta {
+            writes,
+            deletes,
+            base_cleared,
         })
     }
 }
