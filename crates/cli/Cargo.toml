@@ -30,6 +30,7 @@ dialoguer = { workspace = true }
 dirs = { workspace = true }
 fern = { workspace = true, features = ["colored"] }
 futures = { workspace = true}
+hex = { workspace = true }
 hiro-system-kit = { workspace = true }
 indicatif = { workspace = true }
 juniper_actix = { workspace = true, features = ["subscriptions"] }
@@ -44,6 +45,7 @@ reqwest = { workspace = true, features = ["rustls-tls", "json", "stream"]}
 rust-embed = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 agave-feature-set = { workspace = true }
 solana-clock = { workspace = true }
 solana-commitment-config = { workspace = true }

@@ -7,6 +7,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use self_replace::self_replace;
 use semver::Version;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use tar::Archive;
 
 use crate::cli::UpdateCommand;
@@ -21,6 +22,10 @@ struct LatestRelease {
 struct Asset {
     name: String,
     browser_download_url: String,
+    /// SHA256 digest computed by GitHub server-side at upload time. Format is
+    /// `sha256:<hex>`. Older releases or third-party API responses may omit it.
+    #[serde(default)]
+    digest: Option<String>,
 }
 
 pub async fn handle_update_command(cmd: UpdateCommand) -> Result<(), String> {
@@ -50,17 +55,32 @@ pub async fn handle_update_command(cmd: UpdateCommand) -> Result<(), String> {
     let target_semver = Version::parse(latest_tag_name)
         .map_err(|e| format!("Failed to parse target version: {e}"))?;
     let users_asset = get_asset_name()?;
-    let browser_download_url = latest_version
+    let asset = latest_version
         .assets
         .iter()
         .find(|a| a.name == users_asset)
-        .map(|a| a.browser_download_url.as_str())
         .ok_or_else(|| {
             format!(
                 "No asset name found matching the user's platform: {}",
                 users_asset
             )
         })?;
+    let browser_download_url = asset.browser_download_url.as_str();
+    let expected_digest: Option<[u8; 32]> = match &asset.digest {
+        None => {
+            eprintln!(
+                "Warning: release asset {users_asset} has no checksum; integrity will not be verified"
+            );
+            None
+        }
+        Some(d) => match parse_sha256_digest(d) {
+            Ok(bytes) => Some(bytes),
+            Err(e) => {
+                eprintln!("Warning: {e}; integrity will not be verified");
+                None
+            }
+        },
+    };
 
     if current_semver == target_semver {
         println!("Already on the latest version {}", current_semver);
@@ -116,6 +136,18 @@ pub async fn handle_update_command(cmd: UpdateCommand) -> Result<(), String> {
     }
     progress_bar.finish_with_message("Download complete");
 
+    if let Some(expected) = expected_digest {
+        let actual = Sha256::digest(&download);
+        if actual.as_slice() != expected {
+            return Err(format!(
+                "Checksum verification failed for {}.\n  expected: sha256:{}\n  actual:   sha256:{}",
+                users_asset,
+                hex::encode(expected),
+                hex::encode(actual),
+            ));
+        }
+    }
+
     let gz = GzDecoder::new(download.as_slice());
     let mut archive = Archive::new(gz);
     let mut binary_data: Option<Vec<u8>> = None;
@@ -162,5 +194,58 @@ fn get_binary_name() -> &'static str {
         "surfpool.exe"
     } else {
         "surfpool"
+    }
+}
+
+/// Parses a GitHub release asset digest string of the form `sha256:<hex>` into
+/// the raw 32-byte hash. Returns an error for unknown algorithms, non-hex
+/// content, or hex that does not decode to 32 bytes.
+fn parse_sha256_digest(digest: &str) -> Result<[u8; 32], String> {
+    let hex_part = digest
+        .strip_prefix("sha256:")
+        .ok_or_else(|| format!("unsupported digest algorithm (expected sha256:...): {digest}"))?;
+    let bytes =
+        hex::decode(hex_part).map_err(|e| format!("invalid hex in digest {digest}: {e}"))?;
+    bytes
+        .try_into()
+        .map_err(|v: Vec<u8>| format!("digest {digest} decodes to {} bytes, expected 32", v.len()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_sha256_digest_accepts_valid_input() {
+        let expected = [0xabu8; 32];
+        let digest = format!("sha256:{}", hex::encode(expected));
+        assert_eq!(parse_sha256_digest(&digest).unwrap(), expected);
+    }
+
+    #[test]
+    fn parse_sha256_digest_rejects_unknown_algorithm() {
+        let err = parse_sha256_digest("sha512:00").unwrap_err();
+        assert!(err.contains("unsupported digest algorithm"), "{err}");
+    }
+
+    #[test]
+    fn parse_sha256_digest_rejects_wrong_length() {
+        let err = parse_sha256_digest("sha256:abcd").unwrap_err();
+        assert!(err.contains("expected 32"), "{err}");
+    }
+
+    #[test]
+    fn parse_sha256_digest_rejects_non_hex() {
+        let err = parse_sha256_digest("sha256:zzzz").unwrap_err();
+        assert!(err.contains("invalid hex"), "{err}");
+    }
+
+    #[test]
+    fn round_trip_hash_matches_parsed_digest() {
+        let payload = b"surfpool-test-payload";
+        let hash = Sha256::digest(payload);
+        let digest = format!("sha256:{}", hex::encode(hash));
+        let parsed = parse_sha256_digest(&digest).unwrap();
+        assert_eq!(parsed, hash.as_slice());
     }
 }
