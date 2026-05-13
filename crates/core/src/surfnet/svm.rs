@@ -84,7 +84,7 @@ use crate::{
         LogsSubscriptionData, locker::is_supported_token_program, surfnet_lite_svm::SurfnetLiteSvm,
     },
     types::{
-        GeyserAccountUpdate, MintAccount, OfflineAccountConfig, SerializableAccountAdditionalData,
+        MintAccount, OfflineAccountConfig, SerializableAccountAdditionalData,
         SurfnetTransactionStatus, SyntheticBlockhash, TokenAccount, TransactionWithStatusMeta,
     },
 };
@@ -363,6 +363,44 @@ fn remove_pubkey_from_index(
     Ok(())
 }
 
+/// A bundle execution sandbox: an isolated [`SurfnetSvm`] clone whose buffered event channels
+/// can be drained on bundle commit to replay events onto the original VM. Construct via
+/// [`SurfnetSvm::clone_for_bundle_sandbox`] and consume via [`SurfnetSvm::commit_sandbox`] on
+/// success or simply drop on failure to discard all in-progress state.
+pub struct BundleSandbox {
+    pub svm: SurfnetSvm,
+    pub geyser_rx: Receiver<GeyserEvent>,
+    pub simnet_rx: Receiver<SimnetEvent>,
+}
+
+/// Generic helper: drain the overlay state of `sandbox_storage` (which must be an
+/// `OverlayStorage`-wrapped storage as produced by `clone_for_profiling`) and apply each
+/// write/delete to `target_storage`. If the sandbox overlay had been logically cleared
+/// (via `clear()`), the target is cleared first.
+///
+/// If `sandbox_storage` is not overlay-style (i.e. `as_overlay()` returns `None`), this is a
+/// no-op — that should never happen for fields constructed by `clone_for_profiling`, which
+/// always wraps every storage field with `OverlayStorage`.
+fn commit_overlay_storage<K, V>(
+    sandbox_storage: &dyn Storage<K, V>,
+    target_storage: &mut dyn Storage<K, V>,
+) -> SurfpoolResult<()> {
+    let Some(overlay) = sandbox_storage.as_overlay() else {
+        return Ok(());
+    };
+    let delta = overlay.extract_overlay()?;
+    if delta.base_cleared {
+        target_storage.clear()?;
+    }
+    for k in delta.deletes {
+        target_storage.take(&k)?;
+    }
+    for (k, v) in delta.writes {
+        target_storage.store(k, v)?;
+    }
+    Ok(())
+}
+
 impl SurfnetSvm {
     pub fn default() -> (Self, Receiver<SimnetEvent>, Receiver<GeyserEvent>) {
         Self::new(SurfnetSvmConfig::default()).unwrap()
@@ -405,6 +443,20 @@ impl SurfnetSvm {
     /// Creates a clone of the SVM with overlay storage wrappers for all database-backed fields.
     /// This allows profiling transactions without affecting the underlying database.
     /// All storage writes are buffered in memory and discarded when the clone is dropped.
+    ///
+    /// Subscription registries (`signature_subscriptions`, `account_subscriptions`,
+    /// `program_subscriptions`, `slot_subscriptions`, `logs_subscriptions`,
+    /// `snapshot_subscriptions`) are all replaced with empty containers on the sandbox so that
+    /// any notification dispatched during sandbox execution cannot reach live WebSocket clients.
+    /// Although `HashMap::clone()` of the original maps is a deep copy of the container, each
+    /// contained `crossbeam_channel::Sender` is a handle to the same channel held by live
+    /// subscriber receivers — re-firing them from the sandbox would leak notifications even on
+    /// bundle abort. Emptying the containers closes that leak.
+    ///
+    /// Event channels (`simnet_events_tx`, `geyser_events_tx`) are replaced with internal
+    /// buffered channels whose receivers are kept on the sandbox under `sandbox_simnet_events_rx`
+    /// and `sandbox_geyser_events_rx`. Bundle commit code can drain these to replay the events
+    /// on the original VM's channels.
     pub fn clone_for_profiling(&self) -> Self {
         let (dummy_simnet_tx, _) = crossbeam_channel::bounded(1);
         let (dummy_geyser_tx, _) = crossbeam_channel::bounded(1);
@@ -448,10 +500,14 @@ impl SurfnetSvm {
             simnet_events_tx: dummy_simnet_tx,
             geyser_events_tx: dummy_geyser_tx,
 
-            signature_subscriptions: self.signature_subscriptions.clone(),
-            account_subscriptions: self.account_subscriptions.clone(),
-            program_subscriptions: self.program_subscriptions.clone(),
-            // Don't clone subscriptions - profiling clone shouldn't send notifications
+            signature_subscriptions: HashMap::new(),
+            account_subscriptions: HashMap::new(),
+            program_subscriptions: HashMap::new(),
+            // All six subscription containers are emptied on the sandbox so that no notification
+            // dispatched during sandbox execution can reach live WebSocket subscribers. The three
+            // map-based containers above contain `crossbeam_channel::Sender` handles whose
+            // `clone()` produces a producer for the same underlying channel held by the live
+            // subscriber's receiver — emptying the map is what actually prevents the leak.
             slot_subscriptions: Vec::new(),
             logs_subscriptions: Vec::new(),
             snapshot_subscriptions: Vec::new(),
@@ -502,6 +558,205 @@ impl SurfnetSvm {
         for (_, template) in registry.templates.into_iter() {
             let _ = self.register_idl(template.idl, None);
         }
+    }
+
+    /// Creates a sandbox tailored for atomic Jito-style bundle execution. Behavior matches
+    /// [`Self::clone_for_profiling`] (all storage fields are overlay-wrapped; subscription
+    /// containers are emptied so live WS subscribers cannot be notified from the sandbox),
+    /// but the `simnet_events_tx` and `geyser_events_tx` channels are replaced with
+    /// **unbounded buffered** channels whose receivers are returned alongside the sandbox.
+    /// The atomic-commit phase ([`Self::commit_sandbox`]) drains those receivers to replay
+    /// the captured events onto the original VM's real event channels on bundle success.
+    ///
+    /// On bundle failure, simply dropping the returned [`BundleSandbox`] discards every
+    /// buffered event, every overlay write, and the cloned `LiteSVM` state — the original
+    /// VM is left byte-identical to its pre-bundle state.
+    pub fn clone_for_bundle_sandbox(&self) -> BundleSandbox {
+        let mut svm = self.clone_for_profiling();
+        let (geyser_tx, geyser_rx) = crossbeam_channel::unbounded();
+        let (simnet_tx, simnet_rx) = crossbeam_channel::unbounded();
+        svm.geyser_events_tx = geyser_tx;
+        svm.simnet_events_tx = simnet_tx;
+        BundleSandbox {
+            svm,
+            geyser_rx,
+            simnet_rx,
+        }
+    }
+
+    /// Atomically commit the outcome of a fully-successful bundle sandbox onto `self`.
+    ///
+    /// This is the second half of the atomic Jito bundle pipeline. It must be invoked only
+    /// after every transaction in the bundle succeeded inside the sandbox. The caller must
+    /// hold an exclusive writer guard on `self`'s `SurfnetSvmLocker` so that no other RPC
+    /// path can observe a half-committed state.
+    ///
+    /// Order of operations is **state mutations first, side-effects second**:
+    ///   1. Drain every overlay-wrapped storage field from the sandbox onto `self`'s
+    ///      corresponding underlying storage. This is the first moment any SQLite/Postgres
+    ///      handle is touched on behalf of the bundle.
+    ///   2. Move the sandbox's `LiteSVM` (the in-memory accounts DB) onto `self`, replacing
+    ///      `self.inner.svm` with the post-bundle account state.
+    ///   3. Drain the sandbox's account-DB overlay (`inner.db`) onto `self.inner.db` so any
+    ///      SQLite-backed account persistence reflects the bundle's mutations.
+    ///   4. Pull forward counters (`write_version`, `transactions_processed`), per-account
+    ///      update slots, pending confirmation/finalization queues, perf samples, and the
+    ///      recent-blockhash deque from the sandbox.
+    ///   5. Drain the sandbox's buffered geyser events; replay each onto `self.geyser_events_tx`.
+    ///      For each `UpdateAccount` event, also fire `notify_account_subscribers` /
+    ///      `notify_program_subscribers` on `self` (the sandbox's registries were emptied,
+    ///      so those notifications could not have been delivered during sandbox execution).
+    ///   6. Drain the sandbox's buffered simnet events; replay each onto `self.simnet_events_tx`.
+    ///   7. For each transaction committed by the bundle, fire signature and logs subscribers
+    ///      at `Processed` commitment on `self`'s subscription registries, and send a
+    ///      `TransactionStatusEvent::Success(Processed)` on the per-tx status channel that
+    ///      is now part of `self.transactions_queued_for_confirmation` (so the existing
+    ///      confirmation/finalization runloop will promote bundle txs through the commitment
+    ///      ladder identically to txs submitted via `sendTransaction`).
+    ///
+    /// Returns the ordered list of signatures committed by the bundle.
+    pub fn commit_sandbox(
+        &mut self,
+        sandbox: BundleSandbox,
+        bundle_status_tx: Sender<TransactionStatusEvent>,
+    ) -> SurfpoolResult<Vec<Signature>> {
+        let BundleSandbox {
+            mut svm,
+            geyser_rx,
+            simnet_rx,
+        } = sandbox;
+
+        // 1. Drain all overlay storages onto self's real storages.
+        commit_overlay_storage(svm.blocks.as_ref(), self.blocks.as_mut())?;
+        commit_overlay_storage(svm.transactions.as_ref(), self.transactions.as_mut())?;
+        commit_overlay_storage(svm.profile_tag_map.as_ref(), self.profile_tag_map.as_mut())?;
+        commit_overlay_storage(
+            svm.simulated_transaction_profiles.as_ref(),
+            self.simulated_transaction_profiles.as_mut(),
+        )?;
+        commit_overlay_storage(
+            svm.executed_transaction_profiles.as_ref(),
+            self.executed_transaction_profiles.as_mut(),
+        )?;
+        commit_overlay_storage(
+            svm.accounts_by_owner.as_ref(),
+            self.accounts_by_owner.as_mut(),
+        )?;
+        commit_overlay_storage(
+            svm.account_associated_data.as_ref(),
+            self.account_associated_data.as_mut(),
+        )?;
+        commit_overlay_storage(svm.token_accounts.as_ref(), self.token_accounts.as_mut())?;
+        commit_overlay_storage(svm.token_mints.as_ref(), self.token_mints.as_mut())?;
+        commit_overlay_storage(
+            svm.token_accounts_by_owner.as_ref(),
+            self.token_accounts_by_owner.as_mut(),
+        )?;
+        commit_overlay_storage(
+            svm.token_accounts_by_delegate.as_ref(),
+            self.token_accounts_by_delegate.as_mut(),
+        )?;
+        commit_overlay_storage(
+            svm.token_accounts_by_mint.as_ref(),
+            self.token_accounts_by_mint.as_mut(),
+        )?;
+        commit_overlay_storage(svm.registered_idls.as_ref(), self.registered_idls.as_mut())?;
+        commit_overlay_storage(
+            svm.streamed_accounts.as_ref(),
+            self.streamed_accounts.as_mut(),
+        )?;
+        commit_overlay_storage(
+            svm.scheduled_overrides.as_ref(),
+            self.scheduled_overrides.as_mut(),
+        )?;
+        commit_overlay_storage(
+            svm.offline_accounts.as_ref(),
+            self.offline_accounts.as_mut(),
+        )?;
+        commit_overlay_storage(svm.slot_checkpoint.as_ref(), self.slot_checkpoint.as_mut())?;
+
+        // 2. Move the sandbox's executed LiteSVM accounts state onto self.
+        std::mem::swap(&mut self.inner.svm, &mut svm.inner.svm);
+
+        // 3. Drain sandbox's account-DB overlay onto self.inner.db.
+        if let (Some(sandbox_db), Some(target_db)) = (svm.inner.db.as_ref(), self.inner.db.as_mut())
+        {
+            commit_overlay_storage(sandbox_db.as_ref(), target_db.as_mut())?;
+        }
+
+        // 4. Counter/version/queue state.
+        self.transactions_processed = svm.transactions_processed;
+        self.write_version = svm.write_version;
+        for (k, v) in svm.account_update_slots.drain() {
+            self.account_update_slots.insert(k, v);
+        }
+        self.perf_samples = svm.perf_samples.clone();
+        self.recent_blockhashes = svm.recent_blockhashes.clone();
+
+        // Push sandbox's queued txs onto self's queues, rewriting the per-tx status channel
+        // to the bundle's status channel so the runloop's Confirmed/Finalized promotions
+        // flow through a single channel (the caller drops the receiver).
+        let mut signatures = Vec::new();
+        for (tx, _sandbox_status_tx, err) in svm.transactions_queued_for_confirmation.drain(..) {
+            signatures.push(tx.signatures[0]);
+            self.transactions_queued_for_confirmation.push_back((
+                tx,
+                bundle_status_tx.clone(),
+                err,
+            ));
+        }
+        for (slot, tx, _sandbox_status_tx, err) in
+            svm.transactions_queued_for_finalization.drain(..)
+        {
+            self.transactions_queued_for_finalization.push_back((
+                slot,
+                tx,
+                bundle_status_tx.clone(),
+                err,
+            ));
+        }
+
+        // 5. Drain buffered geyser events; replay onto self's real channel; for each
+        //    UpdateAccount, also fire account/program subscribers on self's registries.
+        while let Ok(event) = geyser_rx.try_recv() {
+            if let GeyserEvent::UpdateAccount(update) = &event {
+                self.notify_account_subscribers(&update.pubkey, &update.account);
+                self.notify_program_subscribers(&update.pubkey, &update.account);
+            }
+            let _ = self.geyser_events_tx.send(event);
+        }
+
+        // 6. Drain buffered simnet events; replay onto self's real channel.
+        while let Ok(event) = simnet_rx.try_recv() {
+            let _ = self.simnet_events_tx.try_send(event);
+        }
+
+        // 7. Fire signature/logs subscribers and Success acks for each committed tx.
+        //    Use the now-committed `self.transactions` storage as the source of err/logs.
+        let slot = self.get_latest_absolute_slot();
+        for sig in &signatures {
+            let (err, logs) = match self.transactions.get(&sig.to_string()).ok().flatten() {
+                Some(SurfnetTransactionStatus::Processed(boxed)) => {
+                    let (meta, _mutated) = boxed.as_ref();
+                    let err = meta.meta.status.clone().err();
+                    let logs = meta.meta.log_messages.clone().unwrap_or_default();
+                    (err, logs)
+                }
+                _ => (None, Vec::new()),
+            };
+            self.notify_signature_subscribers(
+                SignatureSubscriptionType::processed(),
+                sig,
+                slot,
+                err.clone(),
+            );
+            self.notify_logs_subscribers(sig, err, logs, CommitmentLevel::Processed);
+            let _ = bundle_status_tx.try_send(TransactionStatusEvent::Success(
+                TransactionConfirmationStatus::Processed,
+            ));
+        }
+
+        Ok(signatures)
     }
 
     /// Creates a new instance of `SurfnetSvm`.

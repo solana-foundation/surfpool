@@ -248,6 +248,29 @@ pub trait Storage<K, V>: Send + Sync {
 
     // Enable cloning of boxed trait objects
     fn clone_box(&self) -> Box<dyn Storage<K, V>>;
+
+    /// Returns `Some` if this storage is an overlay-style wrapper (`OverlayStorage`) whose
+    /// buffered writes/deletes can be drained for atomic commit semantics. Default `None`.
+    /// Used by the atomic Jito bundle commit path to flush a sandbox SVM's overlay storages
+    /// back onto the original VM's underlying storage on bundle success.
+    fn as_overlay(&self) -> Option<&dyn OverlayLike<K, V>> {
+        None
+    }
+}
+
+/// Trait implemented by `OverlayStorage<K, V>` to expose its buffered writes/deletes so that a
+/// caller (e.g. atomic bundle commit) can drain them back onto a target storage.
+pub trait OverlayLike<K, V>: Send + Sync {
+    /// Returns the current in-memory overlay state: pending writes, pending deletes
+    /// (tombstones), and whether the base was logically cleared.
+    fn extract_overlay(&self) -> StorageResult<OverlayDelta<K, V>>;
+}
+
+/// Captured overlay state for atomic replay onto a target storage.
+pub struct OverlayDelta<K, V> {
+    pub writes: Vec<(K, V)>,
+    pub deletes: Vec<K>,
+    pub base_cleared: bool,
 }
 
 // Implement Clone for Box<dyn Storage<K, V>>

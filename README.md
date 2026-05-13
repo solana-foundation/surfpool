@@ -164,10 +164,9 @@ Surfpool is built on the low-level solana-svm API, utilizing the excellent LiteS
 
 We are actively developing Surfpool and welcome contributions from the community. If you'd like to get involved, here’s how:
 
+- Join the [DevEx Telegram channel](https://t.me/SolanaDevEx)
+
 - Explore and contribute to open issues: [GitHub Issues](https://github.com/solana-foundation/surfpool/issues?q=is%3Aissue%20state%3Aopen%20label%3A%22help%20wanted%22)
-
-- Join the discussion on [Discord](https://discord.gg/rqXmWsn2ja)
-
 - Get releases updates via [X](https://x.com/txtx_sol) or [Telegram Channel](https://t.me/surfpool)
 
 Your contributions help shape the future of Surfpool, making it an essential tool for Solana developers worldwide.
