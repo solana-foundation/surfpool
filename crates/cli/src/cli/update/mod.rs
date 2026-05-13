@@ -66,21 +66,6 @@ pub async fn handle_update_command(cmd: UpdateCommand) -> Result<(), String> {
             )
         })?;
     let browser_download_url = asset.browser_download_url.as_str();
-    let expected_digest: Option<[u8; 32]> = match &asset.digest {
-        None => {
-            eprintln!(
-                "Warning: release asset {users_asset} has no checksum; integrity will not be verified"
-            );
-            None
-        }
-        Some(d) => match parse_sha256_digest(d) {
-            Ok(bytes) => Some(bytes),
-            Err(e) => {
-                eprintln!("Warning: {e}; integrity will not be verified");
-                None
-            }
-        },
-    };
 
     if current_semver == target_semver {
         println!("Already on the latest version {}", current_semver);
@@ -112,6 +97,23 @@ pub async fn handle_update_command(cmd: UpdateCommand) -> Result<(), String> {
             return Ok(());
         }
     }
+
+    let expected_digest: Option<[u8; 32]> = match &asset.digest {
+        None => {
+            eprintln!(
+                "Warning: release asset {users_asset} has no checksum; integrity will not be verified"
+            );
+            None
+        }
+        Some(d) => match parse_sha256_digest(d) {
+            Ok(bytes) => Some(bytes),
+            Err(e) => {
+                eprintln!("Warning: {e}; integrity will not be verified");
+                None
+            }
+        },
+    };
+
     println!("Download URL: {}", browser_download_url);
     let response = client
         .get(browser_download_url)
@@ -136,6 +138,13 @@ pub async fn handle_update_command(cmd: UpdateCommand) -> Result<(), String> {
     }
     progress_bar.finish_with_message("Download complete");
 
+    // Note: the digest and browser_download_url originate from the same
+    // GitHub API response, so this verifies the tarball against what GitHub
+    // *says* the hash is. It guards against CDN corruption and in-flight
+    // tampering of the tarball itself, but not against a tampered API
+    // response (which would require MITM of api.github.com's TLS).
+    // Stronger guarantees (signed SHASUMS, GitHub Attestations) are a
+    // separate concern, tracked outside this PR.
     if let Some(expected) = expected_digest {
         let actual = Sha256::digest(&download);
         if actual.as_slice() != expected {
