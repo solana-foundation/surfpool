@@ -50,9 +50,9 @@ jobs:
 
           for ENTRY in \
             "@solana/surfpool publish_root" \
-            "surfpool-sdk-darwin-x64 publish_darwin_x64" \
-            "surfpool-sdk-darwin-arm64 publish_darwin_arm64" \
-            "surfpool-sdk-linux-x64-gnu publish_linux_x64_gnu"
+            "@solana/surfpool-darwin-x64 publish_darwin_x64" \
+            "@solana/surfpool-darwin-arm64 publish_darwin_arm64" \
+            "@solana/surfpool-linux-x64-gnu publish_linux_x64_gnu"
           do
             PACKAGE_NAME="${ENTRY% *}"
             OUTPUT_NAME="${ENTRY#* }"
@@ -126,6 +126,36 @@ jobs:
       - name: Smoke test package
         working-directory: crates/sdk-node
         run: npm run smoke
+
+      - name: Verify install from packed tarballs
+        working-directory: crates/sdk-node
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run create-npm-dir
+          # Place the freshly built binary into its platform package so `npm pack` includes it.
+          cp surfpool-sdk/surfpool-sdk.*.node "npm/${{ matrix.platform_dir }}/"
+          # Build TS so the root tarball ships dist/.
+          npm run build:ts
+          PACK_DIR="$(mktemp -d)"
+          ROOT_TARBALL="$(npm pack --silent --pack-destination "$PACK_DIR")"
+          ROOT_TARBALL_PATH="$PACK_DIR/$ROOT_TARBALL"
+          pushd "npm/${{ matrix.platform_dir }}" >/dev/null
+          PLATFORM_TARBALL="$(npm pack --silent --pack-destination "$PACK_DIR")"
+          PLATFORM_TARBALL_PATH="$PACK_DIR/$PLATFORM_TARBALL"
+          popd >/dev/null
+          # Confirm the root's optionalDependencies reference the @solana/ scoped platform packages.
+          node -e "
+            const o = require('./package.json').optionalDependencies || {};
+            const ok = Object.keys(o).every(k => k.startsWith('@solana/surfpool-'));
+            if (!ok) { console.error('optionalDependencies missing @solana/ scope:', o); process.exit(1); }
+          "
+          INSTALL_DIR="$(mktemp -d)"
+          pushd "$INSTALL_DIR" >/dev/null
+          npm init -y >/dev/null
+          npm install --no-audit --no-fund "$PLATFORM_TARBALL_PATH" "$ROOT_TARBALL_PATH"
+          node -e "require('@solana/surfpool'); console.log('require @solana/surfpool OK');"
+          popd >/dev/null
 
       - name: Upload native binary
         uses: actions/upload-artifact@v4

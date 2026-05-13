@@ -5,9 +5,9 @@ const path = require("path");
 const { spawnSync } = require("child_process");
 
 const PLATFORM_PACKAGES = [
-  "surfpool-sdk-darwin-x64",
-  "surfpool-sdk-darwin-arm64",
-  "surfpool-sdk-linux-x64-gnu",
+  "@solana/surfpool-darwin-x64",
+  "@solana/surfpool-darwin-arm64",
+  "@solana/surfpool-linux-x64-gnu",
 ];
 
 const VERSION_PATTERN =

@@ -1,6 +1,6 @@
 {
   "name": "@solana/surfpool",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "description": "Embed a Surfpool Solana runtime in your Node.js tests",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -61,8 +61,8 @@
     "typescript": "^5.7.0"
   },
   "optionalDependencies": {
-    "surfpool-sdk-darwin-x64": "1.2.1",
-    "surfpool-sdk-darwin-arm64": "1.2.1",
-    "surfpool-sdk-linux-x64-gnu": "1.2.1"
+    "@solana/surfpool-darwin-x64": "1.2.2",
+    "@solana/surfpool-darwin-arm64": "1.2.2",
+    "@solana/surfpool-linux-x64-gnu": "1.2.2"
   }
 }
