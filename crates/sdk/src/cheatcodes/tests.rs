@@ -455,11 +455,13 @@ async fn withdraw_excess_lamports_executes_against_surfnet() {
         recent_blockhash,
     );
 
-    if let Err(err) = client.send_and_confirm_transaction(&tx) {
-        let msg = err.to_string();
+    let sim = client.simulate_transaction(&tx).unwrap().value;
+    if let Some(err) = sim.err {
+        let msg = format!("{err:?}");
         assert!(
             !msg.contains("Custom(12)") && !msg.contains("custom program error: 0xc"),
-            "WithdrawExcessLamports returned InvalidInstruction: {msg}"
+            "WithdrawExcessLamports returned InvalidInstruction: {msg}\nlogs: {:?}",
+            sim.logs
         );
     }
 }
