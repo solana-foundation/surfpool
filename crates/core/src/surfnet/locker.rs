@@ -66,7 +66,7 @@ use super::{
     SurfnetSvm, remote::SurfnetRemoteClient,
 };
 use crate::{
-    error::{SurfpoolError, SurfpoolResult},
+    error::{AirdropError, SurfpoolError, SurfpoolResult},
     helpers::time_travel::calculate_time_travel_clock,
     rpc::utils::{convert_transaction_metadata_from_canonical, verify_pubkey},
     surfnet::FINALIZATION_SLOT_THRESHOLD,
@@ -3291,8 +3291,11 @@ impl SurfnetSvmLocker {
     }
 
     /// Executes an airdrop via the underlying SVM.
-    #[allow(clippy::result_large_err)]
-    pub fn airdrop(&self, pubkey: &Pubkey, lamports: u64) -> SurfpoolResult<TransactionResult> {
+    pub fn airdrop(
+        &self,
+        pubkey: &Pubkey,
+        lamports: u64,
+    ) -> Result<TransactionResult, AirdropError> {
         self.with_svm_writer(|svm_writer| svm_writer.airdrop(pubkey, lamports))
     }
 

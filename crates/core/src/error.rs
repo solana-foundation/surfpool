@@ -487,3 +487,72 @@ impl From<TransactionError> for SurfpoolError {
         SurfpoolError(error)
     }
 }
+
+/// Error returned by [`crate::surfnet::svm::SurfnetSvm::airdrop`] when the
+/// requested airdrop is rejected up front, before any synthetic transaction
+/// is constructed or any account state is touched.
+///
+/// `ZeroAmount` and `BelowRentExemption` are the two pre-validation rejects.
+/// Anything else (storage errors, account fetch failures, etc.) is bubbled
+/// through `Other` so it stays representable as a `SurfpoolError`.
+#[derive(Debug, Clone)]
+pub enum AirdropError {
+    ZeroAmount,
+    BelowRentExemption { lamports: u64, min_rent: u64 },
+    Other(SurfpoolError),
+}
+
+impl From<SurfpoolError> for AirdropError {
+    fn from(e: SurfpoolError) -> Self {
+        AirdropError::Other(e)
+    }
+}
+
+impl From<StorageError> for AirdropError {
+    fn from(e: StorageError) -> Self {
+        AirdropError::Other(SurfpoolError::from(e))
+    }
+}
+
+impl From<AirdropError> for SurfpoolError {
+    fn from(e: AirdropError) -> Self {
+        match e {
+            AirdropError::ZeroAmount => SurfpoolError(Error::invalid_params(
+                "Airdrop amount must be greater than zero",
+            )),
+            AirdropError::BelowRentExemption { lamports, min_rent } => {
+                let mut error = Error::invalid_params(format!(
+                    "Airdrop amount {lamports} is below the rent-exempt minimum of {min_rent} lamports"
+                ));
+                error.data = Some(json!({
+                    "code": "InsufficientFundsForRent",
+                    "lamports": lamports,
+                    "min_rent": min_rent,
+                }));
+                SurfpoolError(error)
+            }
+            AirdropError::Other(e) => e,
+        }
+    }
+}
+
+impl From<AirdropError> for Error {
+    fn from(e: AirdropError) -> Self {
+        SurfpoolError::from(e).into()
+    }
+}
+
+impl Display for AirdropError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AirdropError::ZeroAmount => write!(f, "airdrop amount must be greater than zero"),
+            AirdropError::BelowRentExemption { lamports, min_rent } => write!(
+                f,
+                "airdrop amount {lamports} is below the rent-exempt minimum of {min_rent} lamports"
+            ),
+            AirdropError::Other(e) => Display::fmt(e, f),
+        }
+    }
+}
+
+impl std::error::Error for AirdropError {}

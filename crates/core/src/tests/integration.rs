@@ -9229,8 +9229,7 @@ async fn test_airdrop_amount_below_rent_skips_airdrops(test_type: TestType) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_airdrop_pubkeys_zero_amount_unit() {
-    use crate::rpc::minimal::SurfpoolMinimalRpc;
-    use crate::tests::helpers::TestSetup;
+    use crate::{rpc::minimal::SurfpoolMinimalRpc, tests::helpers::TestSetup};
 
     let setup = TestSetup::new(SurfpoolMinimalRpc);
     let recipient = Pubkey::new_unique();
@@ -9248,8 +9247,7 @@ async fn test_airdrop_pubkeys_zero_amount_unit() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_airdrop_pubkeys_below_rent_unit() {
-    use crate::rpc::minimal::SurfpoolMinimalRpc;
-    use crate::tests::helpers::TestSetup;
+    use crate::{rpc::minimal::SurfpoolMinimalRpc, tests::helpers::TestSetup};
 
     let setup = TestSetup::new(SurfpoolMinimalRpc);
     let recipient = Pubkey::new_unique();
@@ -9277,8 +9275,7 @@ async fn test_airdrop_pubkeys_below_rent_unit() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_airdrop_pubkeys_at_rent_minimum_unit() {
-    use crate::rpc::minimal::SurfpoolMinimalRpc;
-    use crate::tests::helpers::TestSetup;
+    use crate::{rpc::minimal::SurfpoolMinimalRpc, tests::helpers::TestSetup};
 
     let setup = TestSetup::new(SurfpoolMinimalRpc);
     let recipient = Pubkey::new_unique();
@@ -9306,8 +9303,7 @@ async fn test_airdrop_pubkeys_at_rent_minimum_unit() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_airdrop_pubkeys_empty_addresses_unit() {
-    use crate::rpc::minimal::SurfpoolMinimalRpc;
-    use crate::tests::helpers::TestSetup;
+    use crate::{rpc::minimal::SurfpoolMinimalRpc, tests::helpers::TestSetup};
 
     let setup = TestSetup::new(SurfpoolMinimalRpc);
     // Must not panic with an empty address slice, regardless of amount.
@@ -9316,4 +9312,105 @@ async fn test_airdrop_pubkeys_empty_addresses_unit() {
         .context
         .svm_locker
         .airdrop_pubkeys(LAMPORTS_PER_SOL, &[]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_airdrop_returns_zero_amount_variant() {
+    use crate::{error::AirdropError, rpc::minimal::SurfpoolMinimalRpc, tests::helpers::TestSetup};
+
+    let setup = TestSetup::new(SurfpoolMinimalRpc);
+    let recipient = Pubkey::new_unique();
+
+    let err = setup
+        .context
+        .svm_locker
+        .airdrop(&recipient, 0)
+        .expect_err("airdrop with 0 lamports must error");
+    assert!(
+        matches!(err, AirdropError::ZeroAmount),
+        "expected ZeroAmount, got {err:?}",
+    );
+
+    let account = setup
+        .context
+        .svm_locker
+        .with_svm_reader(|svm| svm.get_account(&recipient).ok().flatten());
+    assert!(
+        account.is_none(),
+        "recipient must not be created when airdrop is rejected"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_airdrop_returns_below_rent_variant() {
+    use crate::{error::AirdropError, rpc::minimal::SurfpoolMinimalRpc, tests::helpers::TestSetup};
+
+    let setup = TestSetup::new(SurfpoolMinimalRpc);
+    let recipient = Pubkey::new_unique();
+
+    let min_rent = setup
+        .context
+        .svm_locker
+        .with_svm_reader(|svm| svm.inner.minimum_balance_for_rent_exemption(0));
+    assert!(min_rent > 1);
+
+    let err = setup
+        .context
+        .svm_locker
+        .airdrop(&recipient, 1)
+        .expect_err("airdrop with 1 lamport must error");
+    assert!(
+        matches!(
+            err,
+            AirdropError::BelowRentExemption { lamports: 1, min_rent: m } if m == min_rent
+        ),
+        "expected BelowRentExemption, got {err:?}",
+    );
+
+    let account = setup
+        .context
+        .svm_locker
+        .with_svm_reader(|svm| svm.get_account(&recipient).ok().flatten());
+    assert!(
+        account.is_none(),
+        "recipient must not be created when airdrop is rejected"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_request_airdrop_rejects_zero_amount() {
+    use crate::{
+        rpc::full::{Full, SurfpoolFullRpc},
+        tests::helpers::TestSetup,
+    };
+
+    let setup = TestSetup::new(SurfpoolFullRpc);
+    let recipient = Pubkey::new_unique();
+    let err = setup
+        .rpc
+        .request_airdrop(Some(setup.context.clone()), recipient.to_string(), 0, None)
+        .expect_err("requestAirdrop with 0 lamports must return an RPC error");
+    assert_eq!(err.code, jsonrpc_core::ErrorCode::InvalidParams);
+    assert!(err.message.contains("greater than zero"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_request_airdrop_rejects_below_rent_amount() {
+    use crate::{
+        rpc::full::{Full, SurfpoolFullRpc},
+        tests::helpers::TestSetup,
+    };
+
+    let setup = TestSetup::new(SurfpoolFullRpc);
+    let recipient = Pubkey::new_unique();
+    let err = setup
+        .rpc
+        .request_airdrop(Some(setup.context.clone()), recipient.to_string(), 1, None)
+        .expect_err("requestAirdrop below rent exemption must return an RPC error");
+    assert_eq!(err.code, jsonrpc_core::ErrorCode::InvalidParams);
+    let data = err
+        .data
+        .as_ref()
+        .expect("error must carry InsufficientFundsForRent data");
+    assert_eq!(data["code"], "InsufficientFundsForRent");
 }

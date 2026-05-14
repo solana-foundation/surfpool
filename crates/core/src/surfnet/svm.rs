@@ -76,7 +76,7 @@ use super::{
     remote::SurfnetRemoteClient,
 };
 use crate::{
-    error::{SurfpoolError, SurfpoolResult},
+    error::{AirdropError, SurfpoolError, SurfpoolResult},
     rpc::utils::convert_transaction_metadata_from_canonical,
     scenarios::TemplateRegistry,
     storage::{OverlayStorage, Storage, new_kv_store, new_kv_store_with_default},
@@ -770,14 +770,29 @@ impl SurfnetSvm {
 
     /// Airdrops a specified amount of lamports to a single public key.
     ///
+    /// Validates the amount before doing anything observable: an airdrop of 0
+    /// lamports, or an amount below the rent-exempt minimum for an empty
+    /// account, is rejected up front so no synthetic transaction is written
+    /// and no balances are captured. The underlying SVM would not persist a
+    /// sub-rent-exempt recipient account, and a follow-up account lookup
+    /// would then panic on the missing account.
+    ///
     /// # Arguments
     /// * `pubkey` - The recipient public key.
     /// * `lamports` - The amount of lamports to airdrop.
-    ///
-    /// # Returns
-    /// A `TransactionResult` indicating success or failure.
-    #[allow(clippy::result_large_err)]
-    pub fn airdrop(&mut self, pubkey: &Pubkey, lamports: u64) -> SurfpoolResult<TransactionResult> {
+    pub fn airdrop(
+        &mut self,
+        pubkey: &Pubkey,
+        lamports: u64,
+    ) -> Result<TransactionResult, AirdropError> {
+        if lamports == 0 {
+            return Err(AirdropError::ZeroAmount);
+        }
+        let min_rent = self.inner.minimum_balance_for_rent_exemption(0);
+        if lamports < min_rent {
+            return Err(AirdropError::BelowRentExemption { lamports, min_rent });
+        }
+
         // Capture pre-airdrop balances for the airdrop account, recipient, and system program.
         let airdrop_pubkey = self.inner.airdrop_pubkey();
 
@@ -875,36 +890,15 @@ impl SurfnetSvm {
 
     /// Airdrops a specified amount of lamports to a list of public keys.
     ///
-    /// Skips airdrops entirely when `lamports == 0`, or when `lamports` is
-    /// below the rent-exempt minimum for an empty account (in which case the
-    /// underlying SVM would not persist the recipient account and downstream
-    /// state queries would observe a missing account).
+    /// Defers the zero-amount and below-rent-exemption checks to
+    /// [`Self::airdrop`]; on either of those variants the whole batch is
+    /// abandoned after a single info/error event, since the rejection
+    /// depends only on `lamports` and would otherwise repeat per recipient.
     ///
     /// # Arguments
     /// * `lamports` - The amount of lamports to airdrop.
     /// * `addresses` - Slice of recipient public keys.
     pub fn airdrop_pubkeys(&mut self, lamports: u64, addresses: &[Pubkey]) {
-        if addresses.is_empty() {
-            return;
-        }
-
-        if lamports == 0 {
-            let _ = self.simnet_events_tx.send(SimnetEvent::info(
-                "Skipping genesis airdrops (--airdrop-amount=0)",
-            ));
-            return;
-        }
-
-        let min_rent = self.inner.minimum_balance_for_rent_exemption(0);
-        if lamports < min_rent {
-            let _ = self.simnet_events_tx.send(SimnetEvent::error(format!(
-                "Skipping genesis airdrops: --airdrop-amount={} is below the rent-exempt minimum of {} lamports. \
-                 Set --airdrop-amount to 0 to disable airdrops, or to at least {} lamports.",
-                lamports, min_rent, min_rent
-            )));
-            return;
-        }
-
         for recipient in addresses {
             match self.airdrop(recipient, lamports) {
                 Ok(_) => {
@@ -913,7 +907,19 @@ impl SurfnetSvm {
                         recipient, lamports
                     )));
                 }
-                Err(e) => {
+                Err(AirdropError::ZeroAmount) => {
+                    let _ = self
+                        .simnet_events_tx
+                        .send(SimnetEvent::info("Skipping 0 lamport airdrop"));
+                    return;
+                }
+                Err(AirdropError::BelowRentExemption { lamports, min_rent }) => {
+                    let _ = self.simnet_events_tx.send(SimnetEvent::error(format!(
+                        "Skipping invalid airdrop: amount {lamports} is below the rent-exempt minimum of {min_rent} lamports"
+                    )));
+                    return;
+                }
+                Err(AirdropError::Other(e)) => {
                     let _ = self.simnet_events_tx.send(SimnetEvent::error(format!(
                         "Genesis airdrop failed {}: {}",
                         recipient, e

@@ -1549,7 +1549,8 @@ impl Full for SurfpoolFullRpc {
         };
         let svm_locker = ctx.svm_locker;
         let res = svm_locker
-            .airdrop(&pubkey, lamports)?
+            .airdrop(&pubkey, lamports)
+            .map_err(Error::from)?
             .map_err(|err| Error::invalid_params(format!("failed to send transaction: {err:?}")))?;
         let _ = ctx
             .simnet_commands_tx
