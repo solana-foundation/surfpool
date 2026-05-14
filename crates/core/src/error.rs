@@ -520,16 +520,16 @@ impl From<AirdropError> for SurfpoolError {
             AirdropError::ZeroAmount => SurfpoolError(Error::invalid_params(
                 "Airdrop amount must be greater than zero",
             )),
+            // Real Solana surfaces sub-rent airdrops as
+            // RpcCustomError::SendTransactionPreflightFailure (-32002) carrying
+            // a real TransactionError::InsufficientFundsForRent from the
+            // faucet's transfer transaction. Surfpool rejects up front instead
+            // of routing through the tx pipeline, so we deliberately do not
+            // claim that wire shape — the message names the minimum.
             AirdropError::BelowRentExemption { lamports, min_rent } => {
-                let mut error = Error::invalid_params(format!(
+                SurfpoolError(Error::invalid_params(format!(
                     "Airdrop amount {lamports} is below the rent-exempt minimum of {min_rent} lamports"
-                ));
-                error.data = Some(json!({
-                    "code": "InsufficientFundsForRent",
-                    "lamports": lamports,
-                    "min_rent": min_rent,
-                }));
-                SurfpoolError(error)
+                )))
             }
             AirdropError::Other(e) => e,
         }

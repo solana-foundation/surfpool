@@ -9408,9 +9408,5 @@ async fn test_request_airdrop_rejects_below_rent_amount() {
         .request_airdrop(Some(setup.context.clone()), recipient.to_string(), 1, None)
         .expect_err("requestAirdrop below rent exemption must return an RPC error");
     assert_eq!(err.code, jsonrpc_core::ErrorCode::InvalidParams);
-    let data = err
-        .data
-        .as_ref()
-        .expect("error must carry InsufficientFundsForRent data");
-    assert_eq!(data["code"], "InsufficientFundsForRent");
+    assert!(err.message.contains("rent-exempt minimum"));
 }
