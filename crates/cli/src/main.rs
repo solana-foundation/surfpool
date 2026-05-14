@@ -1,5 +1,6 @@
 #[macro_use]
 mod macros;
+mod no_dna;
 
 extern crate hiro_system_kit;
 

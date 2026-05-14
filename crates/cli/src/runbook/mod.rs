@@ -309,10 +309,20 @@ pub async fn execute_runbook(
             ..ColorfulTheme::default()
         };
 
-        let confirm = Confirm::with_theme(&theme)
-            .with_prompt("Do you want to continue?")
-            .interact()
-            .unwrap();
+        let confirm = if crate::no_dna::is_no_dna() {
+            // non-interactive mode should not block on prompt
+            // safest behavior: require explicit unsupervised/yes-style intent if available
+            if cmd.unsupervised {
+                true
+            } else {
+                return Err("NO_DNA=1 disables interactive confirmation. Re-run with non-interactive intent (e.g. --unsupervised or equivalent explicit approval flag).".to_string());
+            }
+        } else {
+            Confirm::with_theme(&theme)
+                .with_prompt("Do you want to continue?")
+                .interact()
+                .map_err(|e| format!("failed to read confirmation input: {e}"))?
+        };
 
         if !confirm {
             return Ok(());

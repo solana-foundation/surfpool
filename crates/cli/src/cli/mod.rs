@@ -105,7 +105,15 @@ impl Context {
 }
 
 #[derive(Parser, Debug)]
-#[clap(author, version, about, long_about = None, name = "surfpool", bin_name = "surfpool")]
+#[clap(
+    author,
+    version,
+    about,
+    long_about = "Where you train before surfing Solana\n\nAutomation mode:\nSet NO_DNA=1 to disable interactive prompts and        
+ TUI-oriented UX for agent/CI execution.",
+    name = "surfpool",
+    bin_name = "surfpool"
+)]
 struct Opts {
     #[clap(subcommand)]
     command: Command,
@@ -632,6 +640,10 @@ pub async fn handle_mcp_command(_ctx: &Context) -> Result<(), String> {
 fn handle_command(opts: Opts, ctx: &Context) -> Result<(), String> {
     match opts.command {
         Command::Simnet(mut cmd) => {
+            if crate::no_dna::is_no_dna() {
+                cmd.no_tui = true;
+            }
+
             if cmd.ci {
                 cmd.disable_instruction_profiling = true;
                 cmd.no_studio = true;

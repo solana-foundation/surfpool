@@ -223,21 +223,25 @@ pub fn scaffold_iac_layout(
     let selected_programs = match auto_generate_runbooks {
         true => programs,
         false => {
-            let selection = MultiSelect::with_theme(&theme)
-                .with_prompt("Select the programs to deploy (all by default):")
-                .items_checked(
-                    &programs
-                        .iter()
-                        .map(|p| (p.name.as_str(), true))
-                        .collect::<Vec<_>>(),
-                )
-                .interact()
-                .map_err(|e| format!("unable to select programs to deploy: {e}"))?;
+            if crate::no_dna::is_no_dna() {
+                programs
+            } else {
+                let selection = MultiSelect::with_theme(&theme)
+                    .with_prompt("Select the programs to deploy (all by default):")
+                    .items_checked(
+                        &programs
+                            .iter()
+                            .map(|p| (p.name.as_str(), true))
+                            .collect::<Vec<_>>(),
+                    )
+                    .interact()
+                    .map_err(|e| format!("unable to select programs to deploy: {e}"))?;
 
-            &selection
-                .iter()
-                .map(|i| programs[*i].clone())
-                .collect::<Vec<_>>()
+                &selection
+                    .iter()
+                    .map(|i| programs[*i].clone())
+                    .collect::<Vec<_>>()
+            }
         }
     };
 
