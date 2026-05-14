@@ -11537,6 +11537,7 @@ dependencies = [
  "solana-commitment-config",
  "solana-epoch-info",
  "solana-hash 3.1.0",
+ "solana-instruction 3.1.0",
  "solana-keypair",
  "solana-message 3.0.1",
  "solana-program-pack 3.0.0",

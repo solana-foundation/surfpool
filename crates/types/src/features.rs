@@ -158,8 +158,6 @@ impl SvmFeatureConfig {
             reenable_zk_elgamal_proof_program::id(),
             // remaining_compute_units syscall not yet on mainnet
             remaining_compute_units_syscall_enabled::id(),
-            // SPL token / p-token replacement not yet on mainnet
-            replace_spl_token_with_p_token::id(),
             // Stake minimum delegation raise not yet on mainnet
             stake_raise_minimum_delegation_to_1_sol::id(),
             // Stricter ABI and runtime constraints not yet on mainnet
@@ -457,6 +455,10 @@ mod tests {
             None
         );
         assert_eq!(config.is_enabled(&loosen_cpi_size_restriction::id()), None);
+        assert_eq!(
+            config.is_enabled(&replace_spl_token_with_p_token::id()),
+            None
+        );
     }
 
     // ==================== Serialization tests ====================

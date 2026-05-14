@@ -418,3 +418,48 @@ fn resolve_target_dir_walks_up_to_project_root_target() {
         temp.path().join("target").canonicalize().unwrap()
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn withdraw_excess_lamports_executes_against_surfnet() {
+    use solana_instruction::{AccountMeta, Instruction};
+    use solana_message::Message;
+    use solana_signer::Signer;
+    use solana_transaction::Transaction;
+
+    const WITHDRAW_EXCESS_LAMPORTS: u8 = 38;
+
+    let _guard = test_lock();
+    let surfnet = Surfnet::start().await.unwrap();
+    let client = surfnet.rpc_client();
+    let payer = surfnet.payer();
+
+    let source = crate::Keypair::new();
+    surfnet
+        .cheatcodes()
+        .fund_sol(&source.pubkey(), 1_000_000_000)
+        .unwrap();
+
+    let ix = Instruction {
+        program_id: spl_token_program_id(),
+        accounts: vec![
+            AccountMeta::new(source.pubkey(), false),
+            AccountMeta::new(payer.pubkey(), false),
+            AccountMeta::new_readonly(payer.pubkey(), true),
+        ],
+        data: vec![WITHDRAW_EXCESS_LAMPORTS],
+    };
+    let recent_blockhash = client.get_latest_blockhash().unwrap();
+    let tx = Transaction::new(
+        &[payer],
+        Message::new(&[ix], Some(&payer.pubkey())),
+        recent_blockhash,
+    );
+
+    if let Err(err) = client.send_and_confirm_transaction(&tx) {
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("Custom(12)") && !msg.contains("custom program error: 0xc"),
+            "WithdrawExcessLamports returned InvalidInstruction: {msg}"
+        );
+    }
+}
