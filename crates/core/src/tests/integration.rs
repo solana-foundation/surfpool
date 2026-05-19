@@ -5316,6 +5316,214 @@ async fn test_closed_accounts(test_type: TestType) {
     }
 }
 
+/// Regression test for #618: when a `getSignaturesForAddress` call against a forked surfnet uses
+/// a pagination boundary (`before` / `until`) that references a transaction that exists only on
+/// the local surfnet, surfpool used to forward the boundary unchanged to the upstream, which
+/// either returned an error (strict providers) or silently mis-paginated (lenient providers
+/// like surfpool itself).
+///
+/// To exercise the real `get_signatures_for_address_local_then_remote` glue, we spin up TWO
+/// surfnets in this test: one acts as the upstream "datasource" and the other forks it. Both
+/// surfnets receive airdrops for the same `target` pubkey; the datasource airdrops become
+/// "remote-only" signatures from the local surfnet's perspective, and the local airdrops become
+/// "local-only" signatures invisible to the datasource.
+#[test_case(TestType::sqlite(); "with on-disk sqlite db")]
+#[test_case(TestType::in_memory(); "with in-memory sqlite db")]
+#[test_case(TestType::no_db(); "with no db")]
+#[cfg_attr(feature = "postgres", test_case(TestType::postgres(); "with postgres db"))]
+#[cfg_attr(feature = "ignore_tests_ci", ignore = "flaky CI tests")]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_get_signatures_for_address_local_then_remote(test_type: TestType) {
+    use solana_client::rpc_client::GetConfirmedSignaturesForAddress2Config;
+    use solana_signature::Signature;
+
+    // Each surfnet needs an isolated storage instance; clone the TestType variant just like
+    // `test_closed_accounts` does so the two SVMs don't share a sqlite file or surfnet_id.
+    let another_test_type = match &test_type {
+        TestType::OnDiskSqlite(_) => TestType::sqlite(),
+        TestType::InMemorySqlite => TestType::in_memory(),
+        TestType::NoDb => TestType::no_db(),
+        #[cfg(feature = "postgres")]
+        TestType::Postgres { url, .. } => TestType::Postgres {
+            url: url.clone(),
+            surfnet_id: crate::storage::tests::random_surfnet_id(),
+        },
+    };
+
+    let target = Pubkey::new_unique();
+
+    // Step 1: bring up the datasource surfnet (offline; no upstream of its own) and seed it
+    // with 3 airdrops for `target`. Each airdrop stores one signature referencing `target`.
+    //
+    // Note: litesvm's `airdrop` synthesises a `transfer(airdrop_kp, target, lamports)` tx and
+    // signs over the *current* blockhash. With `slot_time = 1ms` consecutive airdrops can land
+    // in the same slot, share the same blockhash, and — because Ed25519 signatures are
+    // deterministic — collapse to the same signature. Varying `lamports` per call guarantees a
+    // distinct message (and therefore a distinct signature) regardless of slot timing.
+    let (datasource_url, _datasource_locker) =
+        start_surfnet(vec![], None, test_type).expect("start datasource surfnet");
+    let datasource_rpc = RpcClient::new(datasource_url.clone());
+    let mut datasource_sigs: Vec<Signature> = Vec::new();
+    for i in 0..3u64 {
+        let sig = datasource_rpc
+            .request_airdrop(&target, LAMPORTS_PER_SOL + i)
+            .await
+            .expect("airdrop on datasource");
+        datasource_sigs.push(sig);
+    }
+    // `request_airdrop` returns sigs in creation order; `getSignaturesForAddress` is newest-first.
+    datasource_sigs.reverse();
+    assert_eq!(
+        datasource_sigs
+            .iter()
+            .map(Signature::to_string)
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        datasource_sigs.len(),
+        "datasource airdrops must produce distinct signatures"
+    );
+
+    // Step 2: bring up the local surfnet, configured to fork the datasource, and seed 2 LOCAL
+    // airdrops for `target`. These signatures only ever land in the local surfnet's storage.
+    let (local_url, _local_locker) =
+        start_surfnet(vec![], Some(datasource_url), another_test_type)
+            .expect("start local surfnet");
+    let local_rpc = RpcClient::new(local_url);
+    let mut local_sigs: Vec<Signature> = Vec::new();
+    for i in 0..2u64 {
+        let sig = local_rpc
+            .request_airdrop(&target, LAMPORTS_PER_SOL + 100 + i)
+            .await
+            .expect("airdrop on local");
+        local_sigs.push(sig);
+    }
+    local_sigs.reverse();
+    assert_eq!(
+        local_sigs
+            .iter()
+            .map(Signature::to_string)
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        local_sigs.len(),
+        "local airdrops must produce distinct signatures"
+    );
+    // local_sigs[0] is the newer local signature; local_sigs[1] is the older one.
+
+    // Scenario A: `before` is a local-only signature.
+    // Pre-fix surfpool forwarded `before=local_sigs[0]` to the datasource, which had never seen
+    // that signature — so the datasource's local lookup returned an empty window and the caller
+    // saw only `[local_sigs[1]]` (or `-32603` against a strict provider). Post-fix, the local
+    // boundary is dropped on the remote leg, so the upstream contributes its full 3 sigs.
+    {
+        let result = local_rpc
+            .get_signatures_for_address_with_config(
+                &target,
+                GetConfirmedSignaturesForAddress2Config {
+                    before: Some(local_sigs[0]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("scenario A: getSignaturesForAddress(before=local) must succeed");
+        let got: Vec<String> = result.iter().map(|s| s.signature.clone()).collect();
+        let mut expected: Vec<String> = vec![local_sigs[1].to_string()];
+        expected.extend(datasource_sigs.iter().map(Signature::to_string));
+        assert_eq!(
+            got, expected,
+            "scenario A: expected [older-local, datasource-sigs...] when paginating past the newer local sig"
+        );
+    }
+
+    // Scenario B: `until` is a local-only signature.
+    // Pre-fix surfpool forwarded `until=local_sigs[1]` to the datasource, which didn't recognise
+    // it and so returned its FULL signature list — leaking 3 datasource sigs the caller never
+    // wanted. Post-fix, the entire remote call is skipped because every remote signature is
+    // older than the (local) boundary by construction.
+    {
+        let result = local_rpc
+            .get_signatures_for_address_with_config(
+                &target,
+                GetConfirmedSignaturesForAddress2Config {
+                    until: Some(local_sigs[1]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("scenario B: getSignaturesForAddress(until=local) must succeed");
+        let got: Vec<String> = result.iter().map(|s| s.signature.clone()).collect();
+        assert_eq!(
+            got,
+            vec![local_sigs[0].to_string()],
+            "scenario B: a local `until` must skip the remote leg entirely"
+        );
+    }
+
+    // Scenario C: limit truncation across the local/remote boundary.
+    // The fix caps the remote leg at `limit - local_count` and truncates the combined result.
+    // Pre-fix the remote leg used the caller's full `limit` and nothing truncated the union, so
+    // a caller asking for 3 received `local_count + limit` = 2 + 3 = 5 signatures.
+    {
+        let result = local_rpc
+            .get_signatures_for_address_with_config(
+                &target,
+                GetConfirmedSignaturesForAddress2Config {
+                    limit: Some(3),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("scenario C: getSignaturesForAddress(limit=3) must succeed");
+        assert_eq!(
+            result.len(),
+            3,
+            "scenario C: combined result must respect the caller's limit"
+        );
+        let got: Vec<String> = result.iter().map(|s| s.signature.clone()).collect();
+        let expected = vec![
+            local_sigs[0].to_string(),
+            local_sigs[1].to_string(),
+            datasource_sigs[0].to_string(),
+        ];
+        assert_eq!(got, expected, "scenario C: unexpected merged ordering");
+    }
+
+    // Scenario D (sanity): no boundary — local sigs come first, then the datasource sigs.
+    {
+        let result = local_rpc
+            .get_signatures_for_address(&target)
+            .await
+            .expect("scenario D: getSignaturesForAddress(no config) must succeed");
+        let got: Vec<String> = result.iter().map(|s| s.signature.clone()).collect();
+        let mut expected: Vec<String> = local_sigs.iter().map(Signature::to_string).collect();
+        expected.extend(datasource_sigs.iter().map(Signature::to_string));
+        assert_eq!(
+            got, expected,
+            "scenario D: local sigs must precede datasource sigs in the merged stream"
+        );
+    }
+
+    // Scenario E (sanity): `before` is a DATASOURCE signature, not a local one.
+    // The fix must forward the boundary to the remote unchanged in this case.
+    {
+        let result = local_rpc
+            .get_signatures_for_address_with_config(
+                &target,
+                GetConfirmedSignaturesForAddress2Config {
+                    before: Some(datasource_sigs[0]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("scenario E: getSignaturesForAddress(before=datasource) must succeed");
+        let got: Vec<String> = result.iter().map(|s| s.signature.clone()).collect();
+        let expected: Vec<String> = datasource_sigs[1..].iter().map(Signature::to_string).collect();
+        assert_eq!(
+            got, expected,
+            "scenario E: a non-local `before` must be forwarded to the remote unchanged"
+        );
+    }
+}
+
 #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
 #[test_case(TestType::in_memory(); "with in-memory sqlite db")]
 #[test_case(TestType::no_db(); "with no db")]
