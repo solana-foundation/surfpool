@@ -5385,9 +5385,8 @@ async fn test_get_signatures_for_address_local_then_remote(test_type: TestType) 
 
     // Step 2: bring up the local surfnet, configured to fork the datasource, and seed 2 LOCAL
     // airdrops for `target`. These signatures only ever land in the local surfnet's storage.
-    let (local_url, _local_locker) =
-        start_surfnet(vec![], Some(datasource_url), another_test_type)
-            .expect("start local surfnet");
+    let (local_url, _local_locker) = start_surfnet(vec![], Some(datasource_url), another_test_type)
+        .expect("start local surfnet");
     let local_rpc = RpcClient::new(local_url);
     let mut local_sigs: Vec<Signature> = Vec::new();
     for i in 0..2u64 {
@@ -5516,7 +5515,10 @@ async fn test_get_signatures_for_address_local_then_remote(test_type: TestType) 
             .await
             .expect("scenario E: getSignaturesForAddress(before=datasource) must succeed");
         let got: Vec<String> = result.iter().map(|s| s.signature.clone()).collect();
-        let expected: Vec<String> = datasource_sigs[1..].iter().map(Signature::to_string).collect();
+        let expected: Vec<String> = datasource_sigs[1..]
+            .iter()
+            .map(Signature::to_string)
+            .collect();
         assert_eq!(
             got, expected,
             "scenario E: a non-local `before` must be forwarded to the remote unchanged"
