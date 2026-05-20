@@ -166,6 +166,17 @@ impl SvmFeatureConfig {
             None
         }
     }
+
+    /// Returns a config with every known agave feature gate explicitly enabled.
+    ///
+    /// Mirrors the CLI's `--features-all` flag.
+    pub fn all_features_enabled() -> Self {
+        let mut cfg = Self::default();
+        for pubkey in FEATURE_NAMES.keys() {
+            cfg = cfg.enable(*pubkey);
+        }
+        cfg
+    }
 }
 
 #[cfg(test)]

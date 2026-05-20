@@ -11,7 +11,7 @@ use surfpool_sdk::{
     BlockProductionMode, SimnetEvent, Surfnet as NativeSurfnet,
     cheatcodes::builders::{DeployProgram, ResetAccount, SetTokenAccount, StreamAccount},
 };
-use surfpool_types::ClockCommand;
+use surfpool_types::{ClockCommand, parse_feature_pubkey};
 
 /// Silent `log::Log` impl. Installed once at first surfnet boot so parity-ws
 /// (the WebSocket server backing the pubsub endpoint) skips its hardcoded
@@ -94,6 +94,23 @@ impl Surfnet {
         }
         if let Some(secret_key) = config.payer_secret_key {
             builder = builder.payer(parse_keypair(&secret_key, "payerSecretKey")?);
+        }
+        if config.all_features.unwrap_or(false) {
+            builder = builder.feature_config(
+                surfpool_types::SvmFeatureConfig::all_features_enabled(),
+            );
+        }
+        if let Some(names) = config.enable_features {
+            for name in &names {
+                let pubkey = parse_feature_name(name, "enableFeatures")?;
+                builder = builder.enable_feature(pubkey);
+            }
+        }
+        if let Some(names) = config.disable_features {
+            for name in &names {
+                let pubkey = parse_feature_name(name, "disableFeatures")?;
+                builder = builder.disable_feature(pubkey);
+            }
         }
 
         let inner =
@@ -493,6 +510,12 @@ pub struct SurfnetConfig {
     pub airdrop_sol: Option<f64>,
     pub airdrop_addresses: Option<Vec<String>>,
     pub payer_secret_key: Option<Vec<u8>>,
+    /// Feature gates to enable (base58 pubkey or kebab-case name).
+    pub enable_features: Option<Vec<String>>,
+    /// Feature gates to disable (base58 pubkey or kebab-case name).
+    pub disable_features: Option<Vec<String>>,
+    /// Activate all known agave feature gates. Applied before explicit enable/disable.
+    pub all_features: Option<bool>,
 }
 
 #[napi(object)]
@@ -774,6 +797,11 @@ fn parse_pubkeys(values: &[String], field_name: &str) -> Result<Vec<Pubkey>> {
         .iter()
         .map(|value| parse_pubkey(value, field_name))
         .collect()
+}
+
+fn parse_feature_name(value: &str, field_name: &str) -> Result<Pubkey> {
+    parse_feature_pubkey(value)
+        .map_err(|e| Error::new(Status::InvalidArg, format!("Invalid {field_name}: {e}")))
 }
 
 fn parse_keypair(bytes: &[u8], field_name: &str) -> Result<Keypair> {

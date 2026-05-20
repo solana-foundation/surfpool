@@ -583,11 +583,7 @@ impl StartSimnet {
     pub fn feature_config(&self) -> SvmFeatureConfig {
         let mut config = if self.svm.all_features {
             // Enable all SVM features from agave-feature-set (override mainnet defaults)
-            let mut cfg = SvmFeatureConfig::default();
-            for pubkey in agave_feature_set::FEATURE_NAMES.keys() {
-                cfg = cfg.enable(*pubkey);
-            }
-            cfg
+            SvmFeatureConfig::all_features_enabled()
         } else {
             // No overrides → run with the mainnet baseline (applied by LiteSVM
             // when the SVM is constructed).

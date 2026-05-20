@@ -16,6 +16,7 @@ use surfpool_core::surfnet::{
 };
 use surfpool_types::{
     BlockProductionMode, RpcConfig, SimnetCommand, SimnetConfig, SimnetEvent, SurfpoolConfig,
+    SvmFeatureConfig,
 };
 
 use crate::{
@@ -48,6 +49,7 @@ pub struct SurfnetBuilder {
     airdrop_lamports: u64,
     skip_blockhash_check: bool,
     payer: Option<Keypair>,
+    feature_config: SvmFeatureConfig,
 }
 
 impl Default for SurfnetBuilder {
@@ -61,6 +63,7 @@ impl Default for SurfnetBuilder {
             airdrop_lamports: 10_000_000_000, // 10 SOL
             skip_blockhash_check: false,
             payer: None,
+            feature_config: SvmFeatureConfig::default(),
         }
     }
 }
@@ -116,6 +119,24 @@ impl SurfnetBuilder {
         self
     }
 
+    /// Enable an SVM feature gate at startup. Mirrors the CLI's `--feature` flag.
+    pub fn enable_feature(mut self, feature: Pubkey) -> Self {
+        self.feature_config = self.feature_config.enable(feature);
+        self
+    }
+
+    /// Disable an SVM feature gate at startup. Mirrors the CLI's `--disable-feature` flag.
+    pub fn disable_feature(mut self, feature: Pubkey) -> Self {
+        self.feature_config = self.feature_config.disable(feature);
+        self
+    }
+
+    /// Replace the feature config wholesale. Default: [`SvmFeatureConfig::default_mainnet_features`].
+    pub fn feature_config(mut self, config: SvmFeatureConfig) -> Self {
+        self.feature_config = config;
+        self
+    }
+
     /// Start the surfnet with the configured options.
     pub async fn start(self) -> SurfnetResult<Surfnet> {
         let SurfnetBuilder {
@@ -127,6 +148,7 @@ impl SurfnetBuilder {
             airdrop_lamports,
             skip_blockhash_check,
             payer,
+            feature_config,
         } = self;
         let payer = payer.unwrap_or_else(Keypair::new);
 
@@ -167,7 +189,7 @@ impl SurfnetBuilder {
             instruction_profiling_enabled: surfpool_config.simnets[0].instruction_profiling_enabled,
             max_profiles: surfpool_config.simnets[0].max_profiles,
             log_bytes_limit: surfpool_config.simnets[0].log_bytes_limit,
-            feature_config: surfpool_types::SvmFeatureConfig::default(),
+            feature_config,
             skip_blockhash_check,
         };
         let (surfnet_svm, simnet_events_rx, geyser_events_rx) = SurfnetSvm::new(svm_config)

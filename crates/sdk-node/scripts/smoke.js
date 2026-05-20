@@ -33,6 +33,20 @@ test("startWithConfig supports custom payer, extra airdrops, instanceId, and dra
   assert.ok(Array.isArray(events));
 });
 
+test("startWithConfig accepts feature-gate enable/disable lists", async () => {
+  const surfnet = Surfnet.startWithConfig({
+    enableFeatures: ["enable-loader-v4"],
+    disableFeatures: ["blake3_syscall_enabled"],
+  });
+  assert.ok(surfnet.instanceId.length > 0);
+
+  // Unknown feature name should reject with InvalidArg.
+  assert.throws(
+    () => Surfnet.startWithConfig({ enableFeatures: ["not-a-real-feature"] }),
+    /Invalid enableFeatures/,
+  );
+});
+
 test("SOL account helpers can set and reset account state", async () => {
   const surfnet = Surfnet.start();
   const address = Surfnet.newKeypair().publicKey;
