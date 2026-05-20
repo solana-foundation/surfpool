@@ -108,7 +108,7 @@ pub async fn handle_update_command(cmd: UpdateCommand) -> Result<(), String> {
         Some(d) => match parse_sha256_digest(d) {
             Ok(bytes) => Some(bytes),
             Err(e) => {
-                eprintln!("Warning: {e}; integrity will not be verified");
+                eprintln!("Warning: {e}; the integrity of the release cannot be verified");
                 None
             }
         },
