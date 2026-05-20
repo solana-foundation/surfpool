@@ -101,7 +101,7 @@ pub async fn handle_update_command(cmd: UpdateCommand) -> Result<(), String> {
     let expected_digest: Option<[u8; 32]> = match &asset.digest {
         None => {
             eprintln!(
-                "Warning: release asset {users_asset} has no checksum; integrity will not be verified"
+                "Warning: release asset {users_asset} has no checksum, so the integrity of the release cannot be verified"
             );
             None
         }
