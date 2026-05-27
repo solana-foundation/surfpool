@@ -1209,7 +1209,7 @@ impl SurfnetSvmLocker {
         Ok(self.with_contextualized_svm_reader(|_| uuid))
     }
 
-    async fn fetch_all_tx_accounts_then_process_tx_returning_profile_res(
+    pub(crate) async fn fetch_all_tx_accounts_then_process_tx_returning_profile_res(
         &self,
         remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
         transaction: VersionedTransaction,
