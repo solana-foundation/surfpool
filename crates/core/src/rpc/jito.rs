@@ -733,6 +733,26 @@ impl Jito for SurfpoolJitoRpc {
                 let pre_accounts =
                     snapshot_accounts(&sandbox_locker, &pre_pubkeys[idx]).await?;
 
+                // Pre-pass sigverify — when the caller asked us to verify
+                // signatures, do it here so a failure surfaces a typed
+                // SignatureFailure (or AlreadyProcessed) directly. The inner
+                // locker call also runs sigverify, but its typed err is
+                // erased into a SurfpoolError on the return path — once it
+                // becomes our `Err(e)` arm we'd have to string-match to
+                // recover the variant. Doing it ourselves first keeps the
+                // typed err cleanly attributable.
+                let sigverify_err: Option<solana_transaction_error::TransactionError> =
+                    if sigverify {
+                        match sandbox_locker
+                            .with_svm_reader(|svm_reader| svm_reader.sigverify(tx))
+                        {
+                            Ok(()) => None,
+                            Err(failed) => Some(failed.err),
+                        }
+                    } else {
+                        None
+                    };
+
                 // Per-iteration status channel: do_propagate=true causes the
                 // locker to emit TransactionStatusEvent::SimulationFailure /
                 // ExecutionFailure into our channel on tx error, carrying the
@@ -742,16 +762,30 @@ impl Jito for SurfpoolJitoRpc {
                 // The receiver is dropped at end-of-iteration so events never
                 // accumulate across the bundle.
                 let (status_tx, status_rx) = crossbeam_channel::unbounded();
-                let profile_res = sandbox_locker
-                    .fetch_all_tx_accounts_then_process_tx_returning_profile_res(
-                        remote_ctx,
-                        tx.clone(),
-                        &status_tx,
-                        skip_preflight,
-                        sigverify,
-                        true, // do_propagate -> status_rx receives typed errors
-                    )
-                    .await;
+                let profile_res = if let Some(ref typed) = sigverify_err {
+                    // Skip the inner call; we already know it'll fail sigverify
+                    // and we have the typed err in hand. Construct a synthetic
+                    // SurfpoolError to drive the Err(e) arm below — it carries
+                    // the typed-err Display in its message for the bundle
+                    // summary, and the typed_err recovery path gates on
+                    // sigverify_err.is_some() to plant SignatureFailure /
+                    // AlreadyProcessed without round-tripping through a string.
+                    Err(crate::error::SurfpoolError::from(typed.clone()))
+                } else {
+                    sandbox_locker
+                        .fetch_all_tx_accounts_then_process_tx_returning_profile_res(
+                            remote_ctx,
+                            tx.clone(),
+                            &status_tx,
+                            skip_preflight,
+                            // Skip sigverify in the inner call — we already did
+                            // it above. This is a hot path on long bundles and
+                            // the verification is non-trivial CPU work.
+                            false,
+                            true, // do_propagate -> status_rx receives typed errors
+                        )
+                        .await
+                };
 
                 // Always attempt the post-snapshot — the caller asked for it and a
                 // failed tx may have partially mutated state. If the snapshot itself
@@ -777,8 +811,16 @@ impl Jito for SurfpoolJitoRpc {
                                 Ok(TransactionStatusEvent::ExecutionFailure((err, _meta))) => {
                                     Some(err)
                                 }
+                                // VerificationFailure → SignatureFailure: the event
+                                // variant indicates signature/verification failure, so
+                                // SignatureFailure (matches svm::sigverify and the
+                                // single-tx simulate path in full.rs) is the correct
+                                // mapping. Defensive — in practice sigverify failures
+                                // bubble out as Err(e) below before this event would
+                                // ever be emitted on our channel, but exhaustiveness
+                                // guards against future changes to the locker.
                                 Ok(TransactionStatusEvent::VerificationFailure(_)) => Some(
-                                    solana_transaction_error::TransactionError::SanitizeFailure,
+                                    solana_transaction_error::TransactionError::SignatureFailure,
                                 ),
                                 Ok(TransactionStatusEvent::Success(_)) | Err(_) => None,
                             };
@@ -820,19 +862,32 @@ impl Jito for SurfpoolJitoRpc {
                     }
                     Err(e) => {
                         // The internal call errored before producing a profile —
-                        // typically a pre-processing failure (account loading, ALT
-                        // resolution, etc.). The typed err may also be in the
-                        // status channel courtesy of the locker's catch-all
-                        // dispatch (see SurfnetSvmLocker::process_transaction).
+                        // typically a pre-processing failure (sigverify, account
+                        // loading, ALT resolution, AccountLoadedTwice). The
+                        // sigverify case was caught and short-circuited above,
+                        // so when sigverify_err is Some we can plant the typed
+                        // err directly. Otherwise the locker did not push to
+                        // the status channel (the catch-all dispatch lives in
+                        // process_transaction's wrapper, which we deliberately
+                        // bypass), so try_recv is expected to be empty. The
+                        // match is defensive — if a future locker change emits
+                        // an event before bubbling up, we recover it here.
                         let typed_err: Option<solana_transaction_error::TransactionError> =
-                            match status_rx.try_recv() {
-                                Ok(TransactionStatusEvent::SimulationFailure((err, _meta))) => {
-                                    Some(err)
+                            if let Some(ref typed) = sigverify_err {
+                                Some(typed.clone())
+                            } else {
+                                match status_rx.try_recv() {
+                                    Ok(TransactionStatusEvent::SimulationFailure((err, _meta))) => {
+                                        Some(err)
+                                    }
+                                    Ok(TransactionStatusEvent::ExecutionFailure((err, _meta))) => {
+                                        Some(err)
+                                    }
+                                    Ok(TransactionStatusEvent::VerificationFailure(_)) => Some(
+                                        solana_transaction_error::TransactionError::SignatureFailure,
+                                    ),
+                                    Ok(_) | Err(_) => None,
                                 }
-                                Ok(TransactionStatusEvent::ExecutionFailure((err, _meta))) => {
-                                    Some(err)
-                                }
-                                Ok(_) | Err(_) => None,
                             };
                         transaction_results[idx] = build_tx_result(
                             typed_err,
@@ -2411,6 +2466,77 @@ mod tests {
         assert!(
             !matches!(err, solana_transaction_error::TransactionError::SanitizeFailure),
             "execution failure must surface a typed err, not SanitizeFailure (got {:?})",
+            err,
+        );
+    }
+
+    /// Pins the SignatureFailure mapping for sigverify failures. A bundle with
+    /// a tx whose signature has been corrupted (post-sign mutation) and
+    /// `skip_sig_verify=false` must surface `TransactionError::SignatureFailure`
+    /// in the typed err — NOT `SanitizeFailure` (the previous catch-all that
+    /// reviewer @greptile-apps flagged) and NOT a generic untyped err.
+    /// `SanitizeFailure` semantically means structurally malformed; the right
+    /// variant here is the same one `svm::sigverify` and the single-tx
+    /// simulate path already use.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_simulate_bundle_propagates_typed_signature_failure() {
+        let payer = Keypair::new();
+        let recipient = Pubkey::new_unique();
+        let setup = TestSetup::new(SurfpoolJitoRpc);
+        let recent_blockhash = setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm| svm.latest_blockhash());
+
+        // Build a valid transfer tx, then corrupt the first signature byte —
+        // the surrounding message stays well-formed (passes sanitize) but the
+        // signature no longer verifies.
+        let mut tx = build_v0_transaction(
+            &payer.pubkey(),
+            &[&payer],
+            &[system_instruction::transfer(&payer.pubkey(), &recipient, 1_000)],
+            &recent_blockhash,
+        );
+        let mut sig_bytes = tx.signatures[0].as_ref().to_vec();
+        sig_bytes[0] = sig_bytes[0].wrapping_add(1);
+        tx.signatures[0] = Signature::try_from(sig_bytes.as_slice()).unwrap();
+
+        use base64::Engine;
+        let tx_b64 =
+            base64::engine::general_purpose::STANDARD.encode(bincode::serialize(&tx).unwrap());
+
+        let response = setup
+            .rpc
+            .simulate_bundle(
+                Some(setup.context.clone()),
+                RpcBundleRequest {
+                    encoded_transactions: vec![tx_b64],
+                },
+                Some(RpcSimulateBundleConfig {
+                    pre_execution_accounts_configs: vec![None],
+                    post_execution_accounts_configs: vec![None],
+                    transaction_encoding: Some(UiTransactionEncoding::Base64),
+                    simulation_bank: None,
+                    // Sigverify ON — we want to exercise the verification path.
+                    skip_sig_verify: false,
+                    replace_recent_blockhash: false,
+                }),
+            )
+            .await
+            .expect("simulate_bundle should return Ok with a Failed summary");
+
+        match &response.value.summary {
+            RpcBundleSimulationSummary::Failed { .. } => {}
+            other => panic!("expected Failed summary, got {:?}", other),
+        }
+
+        let err = response.value.transaction_results[0]
+            .err
+            .as_ref()
+            .expect("err must be populated for a sig-verify failure");
+        assert!(
+            matches!(err, solana_transaction_error::TransactionError::SignatureFailure),
+            "sig-verify failure must surface SignatureFailure (got {:?})",
             err,
         );
     }
