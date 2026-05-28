@@ -609,7 +609,7 @@ impl Jito for SurfpoolJitoRpc {
                 || post_execution_accounts_configs.len() != bundle_len
             {
                 return Err(Error::invalid_params(
-                    "pre/post_execution_accounts_configs, when provided, must be equal in length to the number of transactions",
+                    "preExecutionAccountsConfigs/postExecutionAccountsConfigs, when provided, must be equal in length to the number of transactions",
                 ));
             }
 
@@ -635,7 +635,7 @@ impl Jito for SurfpoolJitoRpc {
             // notice rather than seeing a SignatureFailure mid-bundle.
             if replace_recent_blockhash && !skip_sig_verify {
                 return Err(Error::invalid_params(
-                    "replace_recent_blockhash cannot be used with !skip_sig_verify",
+                    "replaceRecentBlockhash requires skipSigVerify=true (replacing the blockhash invalidates pre-existing signatures)",
                 ));
             }
 
@@ -749,7 +749,10 @@ impl Jito for SurfpoolJitoRpc {
                 (0..bundle_len).map(|_| empty_tx_result(replacement_blockhash.clone())).collect();
             let mut summary: RpcBundleSimulationSummary = RpcBundleSimulationSummary::Succeeded;
 
-            for (idx, tx) in decoded_txs.iter().enumerate() {
+            // Move owned txs into the loop — `into_iter()` so we can pass each
+            // `tx` by value into `fetch_all_tx_accounts_then_process_tx_returning_profile_res`
+            // without cloning. `decoded_txs` is not used after this point.
+            for (idx, tx) in decoded_txs.into_iter().enumerate() {
                 // We rejected sig-less txs at decode time, so signatures[0]
                 // always exists here.
                 let signature: Signature = tx.signatures[0];
@@ -771,7 +774,7 @@ impl Jito for SurfpoolJitoRpc {
                 // to recover the variant.
                 if sigverify {
                     if let Err(failed) = sandbox_locker
-                        .with_svm_reader(|svm_reader| svm_reader.sigverify(tx))
+                        .with_svm_reader(|svm_reader| svm_reader.sigverify(&tx))
                     {
                         let post_accounts =
                             snapshot_accounts(&sandbox_locker, &post_pubkeys[idx]).await?;
@@ -809,7 +812,7 @@ impl Jito for SurfpoolJitoRpc {
                 let profile_res = sandbox_locker
                     .fetch_all_tx_accounts_then_process_tx_returning_profile_res(
                         remote_ctx,
-                        tx.clone(),
+                        tx,
                         &status_tx,
                         skip_preflight,
                         // sigverify=false: we already verified above when the
@@ -2063,8 +2066,8 @@ mod tests {
             result
                 .unwrap_err()
                 .message
-                .contains("replace_recent_blockhash cannot be used"),
-            "expected explicit error about the dangerous combination"
+                .contains("replaceRecentBlockhash requires skipSigVerify=true"),
+            "expected explicit camelCase JSON error about the dangerous combination"
         );
     }
 
