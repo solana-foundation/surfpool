@@ -57,7 +57,9 @@ pub struct RpcSimulateBundleConfig {
     /// Per-tx post-execution account snapshot hints. MUST have the same
     /// length as `RpcBundleRequest.encoded_transactions`.
     pub post_execution_accounts_configs: Vec<Option<RpcSimulateTransactionAccountsConfig>>,
-    /// Encoding the transactions are submitted in. Only `Base64` is supported.
+    /// Encoding the transactions are submitted in. Only `Base64` is supported
+    /// — the server rejects any other value with `invalid_params`. Matches
+    /// Jito's reference simulateBundle, which also enforces base64 only.
     pub transaction_encoding: Option<UiTransactionEncoding>,
     /// Which bank to simulate against. Surfpool always treats this as
     /// `Tip`-equivalent (the working SVM); accepted for API compatibility.

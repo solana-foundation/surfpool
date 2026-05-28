@@ -622,12 +622,19 @@ impl Jito for SurfpoolJitoRpc {
                 ));
             }
 
+            // Match Jito's reference simulateBundle: only base64 is accepted.
+            // base58 is too slow at the byte-blob sizes bundle simulation uses,
+            // and accepting both creates client-side ambiguity over which one
+            // the server will use when none is specified.
             let tx_encoding = transaction_encoding.unwrap_or(UiTransactionEncoding::Base64);
-            let binary_encoding = tx_encoding.into_binary_encoding().ok_or_else(|| {
-                Error::invalid_params(format!(
-                    "unsupported encoding: {tx_encoding}. Supported encodings: base58, base64"
-                ))
-            })?;
+            if tx_encoding != UiTransactionEncoding::Base64 {
+                return Err(Error::invalid_params(
+                    "Base64 is the only supported encoding for transactions in simulateBundle",
+                ));
+            }
+            let binary_encoding = tx_encoding
+                .into_binary_encoding()
+                .expect("Base64 has a binary encoding");
 
             // Decode every transaction up front — fail-fast on any decode error before
             // we spend cycles cloning the SVM.
@@ -679,8 +686,14 @@ impl Jito for SurfpoolJitoRpc {
             // so historical/expired transactions can be replayed. Reproduces the
             // RpcBlockhash payload Jito returns under `replacement_blockhash`.
             let replacement_blockhash: Option<RpcBlockhash> = if replace_recent_blockhash {
-                let (latest_hash, last_valid_block_height) = sandbox_locker
-                    .with_svm_reader(|svm| (svm.latest_blockhash(), svm.get_latest_absolute_slot()));
+                // Pull both fields under a single reader lock and use the
+                // bank's actual block height (NOT the absolute slot) for
+                // last_valid_block_height — `RpcBlockhash` documents this as
+                // a block height, and clients rely on the distinction.
+                let (latest_hash, last_valid_block_height) =
+                    sandbox_locker.with_svm_reader(|svm| {
+                        (svm.latest_blockhash(), svm.latest_epoch_info().block_height)
+                    });
                 for tx in decoded_txs.iter_mut() {
                     tx.message.set_recent_blockhash(latest_hash);
                 }
@@ -704,23 +717,31 @@ impl Jito for SurfpoolJitoRpc {
                 (0..bundle_len).map(|_| empty_tx_result(replacement_blockhash.clone())).collect();
             let mut summary: RpcBundleSimulationSummary = RpcBundleSimulationSummary::Succeeded;
 
-            // The status channel is required by the internal API but we don't read
-            // from it — bundle simulation extracts metadata from the returned
-            // KeyedProfileResult instead.
-            let (status_tx, _status_rx) = crossbeam_channel::unbounded();
-            let do_propagate_status_updates = false;
-
             for (idx, tx) in decoded_txs.iter().enumerate() {
-                let signature = tx.signatures.first().copied().unwrap_or_default();
+                // Track the signature as Option — a tx with no signatures must
+                // surface tx_signature: None in the bundle summary rather than the
+                // all-zero default Signature, which would mislead clients into
+                // querying status for a signature that was never actually present.
+                let signature: Option<Signature> = tx.signatures.first().copied();
+                let pre_was_some = pre_execution_accounts_configs[idx].is_some();
+                let post_was_some = post_execution_accounts_configs[idx].is_some();
 
-                // Snapshot pre-state for the requested pubkeys BEFORE running the tx.
-                let pre_accounts = snapshot_accounts(&sandbox_locker, &pre_pubkeys[idx]).await?;
+                // Snapshot pre-state for the requested pubkeys BEFORE running the
+                // tx. When the caller did not ask for a snapshot for this tx, the
+                // pubkey list is empty and we surface the field as None — matches
+                // Jito's wire shape (null vs []).
+                let pre_accounts =
+                    snapshot_accounts(&sandbox_locker, &pre_pubkeys[idx]).await?;
 
-                // Run the tx through the sandbox via the same internal entry point
-                // `send_bundle` and `profile_transaction` use. This stages writes on
-                // the sandbox's overlay so the next tx in the bundle sees them, and
-                // returns the profile result we need (logs, units, error_message)
-                // without going through the side-effecting status-channel path.
+                // Per-iteration status channel: do_propagate=true causes the
+                // locker to emit TransactionStatusEvent::SimulationFailure /
+                // ExecutionFailure into our channel on tx error, carrying the
+                // typed TransactionError. The sandbox's signature/logs subscriber
+                // registries were emptied by clone_for_bundle_sandbox, so the
+                // notify_*_subscribers calls upstream of the send fire to nobody.
+                // The receiver is dropped at end-of-iteration so events never
+                // accumulate across the bundle.
+                let (status_tx, status_rx) = crossbeam_channel::unbounded();
                 let profile_res = sandbox_locker
                     .fetch_all_tx_accounts_then_process_tx_returning_profile_res(
                         remote_ctx,
@@ -728,96 +749,105 @@ impl Jito for SurfpoolJitoRpc {
                         &status_tx,
                         skip_preflight,
                         sigverify,
-                        do_propagate_status_updates,
+                        true, // do_propagate -> status_rx receives typed errors
                     )
                     .await;
 
                 // Always attempt the post-snapshot — the caller asked for it and a
                 // failed tx may have partially mutated state. If the snapshot itself
                 // errors (sandbox poisoned, etc.) we surface that to the caller.
-                let post_accounts = snapshot_accounts(&sandbox_locker, &post_pubkeys[idx]).await?;
+                let post_accounts =
+                    snapshot_accounts(&sandbox_locker, &post_pubkeys[idx]).await?;
+
+                let pre_for_idx = if pre_was_some { Some(pre_accounts) } else { None };
+                let post_for_idx = if post_was_some { Some(post_accounts) } else { None };
 
                 match profile_res {
                     Ok(keyed) => {
                         let profile = &keyed.transaction_profile;
-                        // error_message Some => the tx errored; we still capture
-                        // logs and units. Map the message to a TransactionError —
-                        // litesvm doesn't return the typed error here, so we fall
-                        // back to SanitizeFailure as a generic carrier and put the
-                        // upstream message in the bundle summary.
-                        if let Some(err_msg) = profile.error_message.clone() {
-                            transaction_results[idx] = RpcSimulateBundleTransactionResult {
-                                err: Some(
+                        // Drain the status channel non-blockingly to recover the
+                        // typed TransactionError when the tx errored. The locker
+                        // emits exactly one event per tx; absence (try_recv ->
+                        // Empty) means the tx succeeded.
+                        let typed_err: Option<solana_transaction_error::TransactionError> =
+                            match status_rx.try_recv() {
+                                Ok(TransactionStatusEvent::SimulationFailure((err, _meta))) => {
+                                    Some(err)
+                                }
+                                Ok(TransactionStatusEvent::ExecutionFailure((err, _meta))) => {
+                                    Some(err)
+                                }
+                                Ok(TransactionStatusEvent::VerificationFailure(_)) => Some(
                                     solana_transaction_error::TransactionError::SanitizeFailure,
                                 ),
-                                logs: profile.log_messages.clone(),
-                                pre_execution_accounts: Some(pre_accounts),
-                                post_execution_accounts: Some(post_accounts),
-                                units_consumed: Some(profile.compute_units_consumed),
-                                loaded_accounts_data_size: None,
-                                return_data: None,
-                                replacement_blockhash: replacement_blockhash.clone(),
-                                fee: None,
-                                pre_balances: None,
-                                post_balances: None,
-                                pre_token_balances: None,
-                                post_token_balances: None,
-                                loaded_addresses: None,
+                                Ok(TransactionStatusEvent::Success(_)) | Err(_) => None,
                             };
+
+                        if let Some(err_msg) = profile.error_message.clone() {
+                            // Tx errored. Use the typed err recovered from the
+                            // status channel; if for some reason no typed event
+                            // arrived (race or future code change), fall back to
+                            // None — clients should rely on summary's
+                            // TransactionFailure(signature, message) anyway, which
+                            // carries the upstream string regardless.
+                            transaction_results[idx] = build_tx_result(
+                                typed_err,
+                                profile.log_messages.clone(),
+                                pre_for_idx,
+                                post_for_idx,
+                                Some(profile.compute_units_consumed),
+                                replacement_blockhash.clone(),
+                            );
                             summary = RpcBundleSimulationSummary::Failed {
                                 error: RpcBundleExecutionError::TransactionFailure(
-                                    signature, err_msg,
+                                    signature.unwrap_or_default(),
+                                    err_msg,
                                 ),
-                                tx_signature: Some(signature.to_string()),
+                                tx_signature: signature.map(|s| s.to_string()),
                             };
                             break;
                         }
 
                         // Success path.
-                        transaction_results[idx] = RpcSimulateBundleTransactionResult {
-                            err: None,
-                            logs: profile.log_messages.clone(),
-                            pre_execution_accounts: Some(pre_accounts),
-                            post_execution_accounts: Some(post_accounts),
-                            units_consumed: Some(profile.compute_units_consumed),
-                            loaded_accounts_data_size: None,
-                            return_data: None,
-                            replacement_blockhash: replacement_blockhash.clone(),
-                            fee: None,
-                            pre_balances: None,
-                            post_balances: None,
-                            pre_token_balances: None,
-                            post_token_balances: None,
-                            loaded_addresses: None,
-                        };
+                        transaction_results[idx] = build_tx_result(
+                            None,
+                            profile.log_messages.clone(),
+                            pre_for_idx,
+                            post_for_idx,
+                            Some(profile.compute_units_consumed),
+                            replacement_blockhash.clone(),
+                        );
                     }
                     Err(e) => {
                         // The internal call errored before producing a profile —
-                        // fail-fast at this index.
-                        transaction_results[idx] = RpcSimulateBundleTransactionResult {
-                            err: Some(
-                                solana_transaction_error::TransactionError::SanitizeFailure,
-                            ),
-                            logs: None,
-                            pre_execution_accounts: Some(pre_accounts),
-                            post_execution_accounts: Some(post_accounts),
-                            units_consumed: None,
-                            loaded_accounts_data_size: None,
-                            return_data: None,
-                            replacement_blockhash: replacement_blockhash.clone(),
-                            fee: None,
-                            pre_balances: None,
-                            post_balances: None,
-                            pre_token_balances: None,
-                            post_token_balances: None,
-                            loaded_addresses: None,
-                        };
+                        // typically a pre-processing failure (account loading, ALT
+                        // resolution, etc.). The typed err may also be in the
+                        // status channel courtesy of the locker's catch-all
+                        // dispatch (see SurfnetSvmLocker::process_transaction).
+                        let typed_err: Option<solana_transaction_error::TransactionError> =
+                            match status_rx.try_recv() {
+                                Ok(TransactionStatusEvent::SimulationFailure((err, _meta))) => {
+                                    Some(err)
+                                }
+                                Ok(TransactionStatusEvent::ExecutionFailure((err, _meta))) => {
+                                    Some(err)
+                                }
+                                Ok(_) | Err(_) => None,
+                            };
+                        transaction_results[idx] = build_tx_result(
+                            typed_err,
+                            None,
+                            pre_for_idx,
+                            post_for_idx,
+                            None,
+                            replacement_blockhash.clone(),
+                        );
                         summary = RpcBundleSimulationSummary::Failed {
                             error: RpcBundleExecutionError::TransactionFailure(
-                                signature,
+                                signature.unwrap_or_default(),
                                 e.to_string(),
                             ),
-                            tx_signature: Some(signature.to_string()),
+                            tx_signature: signature.map(|s| s.to_string()),
                         };
                         break;
                     }
@@ -906,11 +936,22 @@ async fn snapshot_accounts(
         let pubkey = pubkeys[idx];
         let account = match result {
             crate::surfnet::GetAccountResult::None(_) => {
-                // The Jito reference implementation omits missing accounts entirely
-                // from the returned vec. We follow suit by encoding an empty owner-
-                // is-system zero-lamport account; this is consistent with how
-                // simulateTransaction's `accounts` array represents not-found.
-                solana_account::Account::default()
+                // The account does not exist in the sandbox (or has zero lamports
+                // and no data). We surface a canonical "missing" placeholder:
+                // zero-lamport, system-program-owned, empty data. Encoding owner
+                // as system_program::id() (rather than relying on
+                // Account::default(), which produces an all-zero owner pubkey)
+                // matches what `getAccountInfo` returns for never-created system
+                // accounts and avoids surprising downstream consumers that key
+                // on the owner field. simulateTransaction's `accounts` array
+                // does the same.
+                solana_account::Account {
+                    lamports: 0,
+                    data: Vec::new(),
+                    owner: solana_system_interface::program::id(),
+                    executable: false,
+                    rent_epoch: 0,
+                }
             }
             crate::surfnet::GetAccountResult::FoundAccount(_, account, _)
             | crate::surfnet::GetAccountResult::FoundProgramAccount((_, account), _)
@@ -941,6 +982,39 @@ fn empty_tx_result(
         pre_execution_accounts: None,
         post_execution_accounts: None,
         units_consumed: None,
+        loaded_accounts_data_size: None,
+        return_data: None,
+        replacement_blockhash,
+        fee: None,
+        pre_balances: None,
+        post_balances: None,
+        pre_token_balances: None,
+        post_token_balances: None,
+        loaded_addresses: None,
+    }
+}
+
+/// Construct a per-tx bundle simulation result from the fields we actually
+/// populate. The remaining fields (token balances, loaded addresses,
+/// loaded_accounts_data_size, fee, lamport balances) are uniformly None
+/// in this implementation — same gap as Surfpool's existing single-tx
+/// `simulateTransaction` path. Centralizing the construction here keeps
+/// the success / typed-error / internal-error branches in lockstep when
+/// new fields land.
+fn build_tx_result(
+    err: Option<solana_transaction_error::TransactionError>,
+    logs: Option<Vec<String>>,
+    pre_execution_accounts: Option<Vec<UiAccount>>,
+    post_execution_accounts: Option<Vec<UiAccount>>,
+    units_consumed: Option<u64>,
+    replacement_blockhash: Option<RpcBlockhash>,
+) -> RpcSimulateBundleTransactionResult {
+    RpcSimulateBundleTransactionResult {
+        err,
+        logs,
+        pre_execution_accounts,
+        post_execution_accounts,
+        units_consumed,
         loaded_accounts_data_size: None,
         return_data: None,
         replacement_blockhash,
@@ -2112,6 +2186,232 @@ mod tests {
             response.value.transaction_results[1].err.is_none()
                 && response.value.transaction_results[1].logs.is_none(),
             "second tx should be in skipped (empty) state — never simulated"
+        );
+    }
+
+    /// Pins the Jito wire-format contract for null pre/post account configs.
+    /// Reviewer @greptile-apps caught that we were emitting `Some([])` where
+    /// the reference returns `None` — clients distinguishing "not requested"
+    /// from "requested but empty" would see a false positive.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_simulate_bundle_null_account_configs_yield_none_not_empty_array() {
+        let payer = Keypair::new();
+        let recipient = Pubkey::new_unique();
+        let setup = TestSetup::new(SurfpoolJitoRpc);
+        let recent_blockhash = setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm| svm.latest_blockhash());
+
+        let _ = setup
+            .context
+            .svm_locker
+            .0
+            .write()
+            .await
+            .airdrop(&payer.pubkey(), 2 * LAMPORTS_PER_SOL);
+
+        let tx_b64 = make_transfer_b64(&payer, &recipient, LAMPORTS_PER_SOL, &recent_blockhash);
+
+        // Caller does NOT request pre/post snapshots for this tx (None entry).
+        let cfg = RpcSimulateBundleConfig {
+            pre_execution_accounts_configs: vec![None],
+            post_execution_accounts_configs: vec![None],
+            transaction_encoding: Some(UiTransactionEncoding::Base64),
+            simulation_bank: None,
+            skip_sig_verify: false,
+            replace_recent_blockhash: false,
+        };
+
+        let response = setup
+            .rpc
+            .simulate_bundle(
+                Some(setup.context.clone()),
+                RpcBundleRequest {
+                    encoded_transactions: vec![tx_b64],
+                },
+                Some(cfg),
+            )
+            .await
+            .expect("simulate_bundle should not error");
+
+        let result = &response.value.transaction_results[0];
+        assert!(
+            result.pre_execution_accounts.is_none(),
+            "pre_execution_accounts must be None when config entry is None, got {:?}",
+            result.pre_execution_accounts,
+        );
+        assert!(
+            result.post_execution_accounts.is_none(),
+            "post_execution_accounts must be None when config entry is None, got {:?}",
+            result.post_execution_accounts,
+        );
+    }
+
+    /// Pins the Jito wire-format contract for explicit-empty pubkey lists.
+    /// Distinguishing this from the None case lets clients tell "I asked for
+    /// nothing" apart from "I didn't ask".
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_simulate_bundle_empty_addresses_yield_some_empty_vec() {
+        let payer = Keypair::new();
+        let recipient = Pubkey::new_unique();
+        let setup = TestSetup::new(SurfpoolJitoRpc);
+        let recent_blockhash = setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm| svm.latest_blockhash());
+
+        let _ = setup
+            .context
+            .svm_locker
+            .0
+            .write()
+            .await
+            .airdrop(&payer.pubkey(), 2 * LAMPORTS_PER_SOL);
+
+        let tx_b64 = make_transfer_b64(&payer, &recipient, LAMPORTS_PER_SOL, &recent_blockhash);
+
+        // Caller DID request snapshots, but with an empty pubkey list.
+        let cfg = RpcSimulateBundleConfig {
+            pre_execution_accounts_configs: vec![Some(
+                surfpool_types::RpcSimulateTransactionAccountsConfig {
+                    encoding: Some(UiAccountEncoding::Base64),
+                    addresses: vec![],
+                },
+            )],
+            post_execution_accounts_configs: vec![Some(
+                surfpool_types::RpcSimulateTransactionAccountsConfig {
+                    encoding: Some(UiAccountEncoding::Base64),
+                    addresses: vec![],
+                },
+            )],
+            transaction_encoding: Some(UiTransactionEncoding::Base64),
+            simulation_bank: None,
+            skip_sig_verify: false,
+            replace_recent_blockhash: false,
+        };
+
+        let response = setup
+            .rpc
+            .simulate_bundle(
+                Some(setup.context.clone()),
+                RpcBundleRequest {
+                    encoded_transactions: vec![tx_b64],
+                },
+                Some(cfg),
+            )
+            .await
+            .expect("simulate_bundle should not error");
+
+        let result = &response.value.transaction_results[0];
+        assert_eq!(
+            result.pre_execution_accounts.as_deref(),
+            Some(&[][..]),
+            "pre_execution_accounts must be Some(empty) when config addresses is explicitly []",
+        );
+        assert_eq!(
+            result.post_execution_accounts.as_deref(),
+            Some(&[][..]),
+            "post_execution_accounts must be Some(empty) when config addresses is explicitly []",
+        );
+    }
+
+    /// Pins the rejection of non-base64 tx encodings — Jito's reference does
+    /// the same. Without this guard a base58 caller would silently get a
+    /// confusing "unsupported encoding" deeper in the stack.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_simulate_bundle_rejects_non_base64_encoding() {
+        let setup = TestSetup::new(SurfpoolJitoRpc);
+        let cfg = RpcSimulateBundleConfig {
+            pre_execution_accounts_configs: vec![None],
+            post_execution_accounts_configs: vec![None],
+            transaction_encoding: Some(UiTransactionEncoding::Base58),
+            simulation_bank: None,
+            skip_sig_verify: true,
+            replace_recent_blockhash: false,
+        };
+        let result = setup
+            .rpc
+            .simulate_bundle(
+                Some(setup.context.clone()),
+                RpcBundleRequest {
+                    encoded_transactions: vec!["x".to_string()],
+                },
+                Some(cfg),
+            )
+            .await;
+        assert!(result.is_err(), "base58 encoding must be rejected");
+        assert!(
+            result
+                .unwrap_err()
+                .message
+                .contains("Base64 is the only supported encoding"),
+            "expected explicit error about base64-only enforcement"
+        );
+    }
+
+    /// Pins typed `TransactionError` propagation for execution failures.
+    /// A bundle whose first tx tries to spend more lamports than the wallet
+    /// holds must surface the typed `InstructionError(0, Custom(1))` (or the
+    /// SVM's equivalent typed err) — NOT a generic `SanitizeFailure`.
+    /// Reviewer @greptile-apps + @copilot both flagged the SanitizeFailure
+    /// catch-all as actively misleading.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_simulate_bundle_propagates_typed_execution_error() {
+        let payer = Keypair::new();
+        let recipient = Pubkey::new_unique();
+        let setup = TestSetup::new(SurfpoolJitoRpc);
+        let recent_blockhash = setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm| svm.latest_blockhash());
+
+        // Fund the wallet with FAR less than the transfer amount asks for —
+        // SVM execution will reject the tx with a typed error.
+        let _ = setup
+            .context
+            .svm_locker
+            .0
+            .write()
+            .await
+            .airdrop(&payer.pubkey(), 1_000); // 0.000001 SOL — not enough for fees, let alone the transfer
+
+        let tx_b64 = make_transfer_b64(&payer, &recipient, LAMPORTS_PER_SOL, &recent_blockhash);
+
+        let response = setup
+            .rpc
+            .simulate_bundle(
+                Some(setup.context.clone()),
+                RpcBundleRequest {
+                    encoded_transactions: vec![tx_b64],
+                },
+                None,
+            )
+            .await
+            .expect("simulate_bundle should return Ok with a Failed summary");
+
+        // Bundle summary should be Failed.
+        match &response.value.summary {
+            RpcBundleSimulationSummary::Failed { tx_signature, .. } => {
+                assert!(tx_signature.is_some(), "Failed summary must carry signature");
+            }
+            other => panic!("expected Failed summary, got {:?}", other),
+        }
+
+        let err = response.value.transaction_results[0]
+            .err
+            .as_ref()
+            .expect("err must be populated for a failed tx");
+        // The typed error should NOT be SanitizeFailure (the previous
+        // implementation's catch-all). For an insufficient-funds-during-
+        // execution path the SVM typically reports either an
+        // InstructionError or a typed transaction error like
+        // InsufficientFundsForRent — anything BUT SanitizeFailure is the
+        // win we are pinning.
+        assert!(
+            !matches!(err, solana_transaction_error::TransactionError::SanitizeFailure),
+            "execution failure must surface a typed err, not SanitizeFailure (got {:?})",
+            err,
         );
     }
 }
