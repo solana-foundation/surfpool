@@ -51,11 +51,17 @@ pub struct RpcSimulateTransactionAccountsConfig {
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RpcSimulateBundleConfig {
-    /// Per-tx pre-execution account snapshot hints. MUST have the same length
-    /// as `RpcBundleRequest.encoded_transactions`.
+    /// Per-tx pre-execution account snapshot hints. When provided MUST have
+    /// the same length as `RpcBundleRequest.encoded_transactions`. Omitting
+    /// the field (or sending an empty array) is allowed — the server treats
+    /// it as "no snapshots requested for any tx", equivalent to sending
+    /// `vec![None; bundle_len]`. Mismatched non-empty lengths are rejected
+    /// with `invalid_params`.
+    #[serde(default)]
     pub pre_execution_accounts_configs: Vec<Option<RpcSimulateTransactionAccountsConfig>>,
-    /// Per-tx post-execution account snapshot hints. MUST have the same
-    /// length as `RpcBundleRequest.encoded_transactions`.
+    /// Per-tx post-execution account snapshot hints. Same shape and
+    /// "omitted = no snapshots" rules as `pre_execution_accounts_configs`.
+    #[serde(default)]
     pub post_execution_accounts_configs: Vec<Option<RpcSimulateTransactionAccountsConfig>>,
     /// Encoding the transactions are submitted in. Only `Base64` is supported
     /// — the server rejects any other value with `invalid_params`. Matches
@@ -133,10 +139,16 @@ pub enum RpcBundleExecutionError {
 
 /// Per-transaction simulation outcome inside a bundle. Matches the wire shape
 /// Jito-Solana returns from `simulateBundle`. Fields are `Option` because not
-/// every backend populates every enrichment (Surfpool currently leaves
-/// `pre_token_balances` / `post_token_balances` / `loaded_addresses` /
-/// `loaded_accounts_data_size` as `None` — the same gap that already exists on
-/// the single-tx `simulateTransaction` path; tracked for a follow-up PR).
+/// every backend populates every enrichment. Surfpool currently populates
+/// `err`, `logs`, `pre/post_execution_accounts`, `units_consumed`, and
+/// `replacement_blockhash`. The remaining fields — `return_data`, `fee`,
+/// `pre/post_balances`, `pre/post_token_balances`, `loaded_addresses`,
+/// `loaded_accounts_data_size` — are uniformly `None` from this backend.
+/// This is the same gap that already exists on the single-tx
+/// `simulateTransaction` path's bundle-only fields; closing it requires
+/// piping richer metadata through `ProfileResult` and is tracked for a
+/// follow-up PR. Wire-format clients should treat `None` as "not provided
+/// by this server" rather than "field unsupported".
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct RpcSimulateBundleTransactionResult {

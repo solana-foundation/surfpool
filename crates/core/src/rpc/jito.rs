@@ -586,13 +586,30 @@ impl Jito for SurfpoolJitoRpc {
                 replace_recent_blockhash,
             } = config;
 
-            // Length of pre/post configs MUST match the bundle. This matches Jito's
-            // contract — a mismatch would silently drop snapshots or panic on indexing.
+            // Treat omitted/empty pre+post config vecs as "no snapshots
+            // requested for any tx" — equivalent to `vec![None; bundle_len]`.
+            // The wire types use `#[serde(default)]` so callers may send a
+            // partial config (just `skipSigVerify`, etc.) without specifying
+            // these arrays. Mismatched non-empty lengths below are rejected.
+            let pre_execution_accounts_configs = if pre_execution_accounts_configs.is_empty() {
+                vec![None; bundle_len]
+            } else {
+                pre_execution_accounts_configs
+            };
+            let post_execution_accounts_configs = if post_execution_accounts_configs.is_empty() {
+                vec![None; bundle_len]
+            } else {
+                post_execution_accounts_configs
+            };
+
+            // Length of pre/post configs MUST match the bundle when provided.
+            // This matches Jito's contract — a mismatch would silently drop
+            // snapshots or panic on indexing.
             if pre_execution_accounts_configs.len() != bundle_len
                 || post_execution_accounts_configs.len() != bundle_len
             {
                 return Err(Error::invalid_params(
-                    "pre/post_execution_accounts_configs must be equal in length to the number of transactions",
+                    "pre/post_execution_accounts_configs, when provided, must be equal in length to the number of transactions",
                 ));
             }
 
@@ -653,6 +670,21 @@ impl Jito for SurfpoolJitoRpc {
                     ),
                     data: e.data,
                 })?;
+                // Reject transactions without signatures up front. A versioned
+                // transaction is required to carry at least one signature
+                // (the fee-payer's); the validator rejects sig-less txs at
+                // ingest, so a bundle entry with empty `signatures` is not a
+                // valid Solana transaction. Rejecting here avoids having to
+                // synthesize a zero-byte placeholder Signature into the
+                // RpcBundleExecutionError::TransactionFailure(Signature, _)
+                // wire variant downstream — that would mislead clients
+                // keying off the sig inside `error`.
+                if tx.signatures.is_empty() {
+                    return Err(Error::invalid_params(format!(
+                        "Bundle transaction {} has no signatures",
+                        idx + 1
+                    )));
+                }
                 decoded_txs.push(tx);
             }
 
@@ -718,11 +750,9 @@ impl Jito for SurfpoolJitoRpc {
             let mut summary: RpcBundleSimulationSummary = RpcBundleSimulationSummary::Succeeded;
 
             for (idx, tx) in decoded_txs.iter().enumerate() {
-                // Track the signature as Option — a tx with no signatures must
-                // surface tx_signature: None in the bundle summary rather than the
-                // all-zero default Signature, which would mislead clients into
-                // querying status for a signature that was never actually present.
-                let signature: Option<Signature> = tx.signatures.first().copied();
+                // We rejected sig-less txs at decode time, so signatures[0]
+                // always exists here.
+                let signature: Signature = tx.signatures[0];
                 let pre_was_some = pre_execution_accounts_configs[idx].is_some();
                 let post_was_some = post_execution_accounts_configs[idx].is_some();
 
@@ -842,10 +872,9 @@ impl Jito for SurfpoolJitoRpc {
                             );
                             summary = RpcBundleSimulationSummary::Failed {
                                 error: RpcBundleExecutionError::TransactionFailure(
-                                    signature.unwrap_or_default(),
-                                    err_msg,
+                                    signature, err_msg,
                                 ),
-                                tx_signature: signature.map(|s| s.to_string()),
+                                tx_signature: Some(signature.to_string()),
                             };
                             break;
                         }
@@ -899,10 +928,10 @@ impl Jito for SurfpoolJitoRpc {
                         );
                         summary = RpcBundleSimulationSummary::Failed {
                             error: RpcBundleExecutionError::TransactionFailure(
-                                signature.unwrap_or_default(),
+                                signature,
                                 e.to_string(),
                             ),
-                            tx_signature: signature.map(|s| s.to_string()),
+                            tx_signature: Some(signature.to_string()),
                         };
                         break;
                     }
@@ -1050,12 +1079,14 @@ fn empty_tx_result(
 }
 
 /// Construct a per-tx bundle simulation result from the fields we actually
-/// populate. The remaining fields (token balances, loaded addresses,
-/// loaded_accounts_data_size, fee, lamport balances) are uniformly None
-/// in this implementation — same gap as Surfpool's existing single-tx
-/// `simulateTransaction` path. Centralizing the construction here keeps
-/// the success / typed-error / internal-error branches in lockstep when
-/// new fields land.
+/// populate. The remaining fields — `return_data`, `fee`, lamport balances,
+/// token balances, loaded addresses, `loaded_accounts_data_size` — are
+/// uniformly None in this implementation. Closing that gap requires piping
+/// richer metadata through `ProfileResult`; tracked for a follow-up PR. See
+/// the doc comment on `RpcSimulateBundleTransactionResult` in
+/// `surfpool-types::jito_bundles` for the canonical list. Centralizing the
+/// construction here keeps the success / typed-error / internal-error
+/// branches in lockstep when new fields land.
 fn build_tx_result(
     err: Option<solana_transaction_error::TransactionError>,
     logs: Option<Vec<String>>,
@@ -2538,6 +2569,132 @@ mod tests {
             matches!(err, solana_transaction_error::TransactionError::SignatureFailure),
             "sig-verify failure must surface SignatureFailure (got {:?})",
             err,
+        );
+    }
+
+    /// Pins the up-front rejection of sig-less transactions. Reviewer
+    /// @copilot flagged that `unwrap_or_default()` on a None signature
+    /// would inject an all-zero `Signature` into the
+    /// `RpcBundleExecutionError::TransactionFailure(Signature, _)` wire
+    /// shape — clients keying off the sig inside `error` would be misled.
+    /// Rejecting the tx at decode time avoids the synthesis entirely.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_simulate_bundle_rejects_sigless_tx() {
+        let setup = TestSetup::new(SurfpoolJitoRpc);
+        let recent_blockhash = setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm| svm.latest_blockhash());
+
+        // Build a versioned tx with NO signatures. Note: Solana's signing
+        // helpers always inject the fee-payer sig, so we go through the
+        // raw constructor and leave signatures empty.
+        let payer = Keypair::new();
+        let recipient = Pubkey::new_unique();
+        let msg = VersionedMessage::V0(
+            V0Message::try_compile(
+                &payer.pubkey(),
+                &[system_instruction::transfer(&payer.pubkey(), &recipient, 1_000)],
+                &[],
+                recent_blockhash,
+            )
+            .unwrap(),
+        );
+        let tx = VersionedTransaction {
+            signatures: vec![], // explicit empty
+            message: msg,
+        };
+        use base64::Engine;
+        let tx_b64 =
+            base64::engine::general_purpose::STANDARD.encode(bincode::serialize(&tx).unwrap());
+
+        let result = setup
+            .rpc
+            .simulate_bundle(
+                Some(setup.context.clone()),
+                RpcBundleRequest {
+                    encoded_transactions: vec![tx_b64],
+                },
+                None,
+            )
+            .await;
+
+        assert!(result.is_err(), "sig-less tx must be rejected at decode time");
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("has no signatures"),
+            "expected explicit no-signatures rejection (got {})",
+            err.message,
+        );
+    }
+
+    /// Pins the partial-config behavior. Reviewer @copilot flagged that
+    /// `RpcSimulateBundleConfig` previously required both
+    /// `pre_execution_accounts_configs` and `post_execution_accounts_configs`
+    /// to be present in JSON, contradicting the docstring's implication
+    /// that callers may send a partial config. Now both fields are
+    /// `#[serde(default)]` and an empty/omitted vec is treated as
+    /// `vec![None; bundle_len]`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_simulate_bundle_accepts_partial_config_omitting_account_configs() {
+        let payer = Keypair::new();
+        let recipient = Pubkey::new_unique();
+        let setup = TestSetup::new(SurfpoolJitoRpc);
+        let recent_blockhash = setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm| svm.latest_blockhash());
+
+        let _ = setup
+            .context
+            .svm_locker
+            .0
+            .write()
+            .await
+            .airdrop(&payer.pubkey(), 10 * LAMPORTS_PER_SOL);
+
+        // Send 1 SOL — well above rent-exempt minimum so recipient creation
+        // doesn't fail with InsufficientFundsForRent.
+        let tx_b64 = make_transfer_b64(&payer, &recipient, LAMPORTS_PER_SOL, &recent_blockhash);
+
+        // Partial config: only skip_sig_verify is set, both pre/post account
+        // config arrays are omitted (default = empty vec). Server must
+        // expand them to vec![None; bundle_len] and accept the request.
+        let cfg = RpcSimulateBundleConfig {
+            pre_execution_accounts_configs: vec![],
+            post_execution_accounts_configs: vec![],
+            transaction_encoding: Some(UiTransactionEncoding::Base64),
+            simulation_bank: None,
+            skip_sig_verify: true,
+            replace_recent_blockhash: false,
+        };
+
+        let response = setup
+            .rpc
+            .simulate_bundle(
+                Some(setup.context.clone()),
+                RpcBundleRequest {
+                    encoded_transactions: vec![tx_b64],
+                },
+                Some(cfg),
+            )
+            .await
+            .expect("partial config must be accepted");
+
+        match &response.value.summary {
+            RpcBundleSimulationSummary::Succeeded => {}
+            other => panic!("expected Succeeded summary, got {:?}", other),
+        }
+        let result = &response.value.transaction_results[0];
+        assert!(
+            result.pre_execution_accounts.is_none(),
+            "omitted pre config must yield None (got {:?})",
+            result.pre_execution_accounts,
+        );
+        assert!(
+            result.post_execution_accounts.is_none(),
+            "omitted post config must yield None (got {:?})",
+            result.post_execution_accounts,
         );
     }
 }
