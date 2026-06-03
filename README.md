@@ -77,6 +77,18 @@ cd surfpool
 cargo surfpool-install
 ```
 
+Source builds include the bundled Surfpool Studio UI. By default, the build script
+downloads the latest `studio-dist.zip` from
+[`solana-foundation/surfpool-web-ui`](https://github.com/solana-foundation/surfpool-web-ui).
+To make the build reproducible or use a local Studio build, either pin a release
+with `STUDIO_UI_VERSION=<tag>` or point `STUDIO_UI_DIST` at a pre-built
+`studio-dist.zip`:
+
+```console
+STUDIO_UI_VERSION=0.2.0-alpha.0 cargo surfpool-install
+STUDIO_UI_DIST=/path/to/studio-dist.zip cargo surfpool-install
+```
+
 Surfpool can also be used through our public [docker image](https://hub.docker.com/r/surfpool/surfpool):
 
 ```console
