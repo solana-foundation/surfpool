@@ -30,7 +30,7 @@ pub fn format_agent_json_at(ts: DateTime<Utc>, level: &str, target: &str, msg: &
 }
 
 /// Like [`format_agent_json_at`] but optionally includes a `data` object for
-/// structured payloads (used by `surfpool ls` to attach runbook metadata —
+/// structured payloads (used by `surfpool ls` to attach runbook metadata).
 pub fn format_agent_json_with_data_at(
     ts: DateTime<Utc>,
     level: &str,
