@@ -35,7 +35,11 @@ use txtx_gql::kit::{
     uuid::Uuid,
 };
 
-use crate::cli::{ExecuteRunbook, setup_logger};
+use crate::{
+    cli::{ExecuteRunbook, setup_logger},
+    cli_debug, cli_error, cli_info, cli_trace, cli_warn,
+    no_dna::AgentMode,
+};
 
 lazy_static::lazy_static! {
     static ref CLI_SPINNER_STYLE: ProgressStyle = {
@@ -98,6 +102,9 @@ pub async fn handle_execute_runbook_command(cmd: ExecuteRunbook) -> Result<(), S
     let log_filter: LogLevel = cmd.log_level.as_str().into();
 
     let _ = hiro_system_kit::thread_named("Runbook Progress Event Loop").spawn(move || {
+        // handle_log_event is NO_DNA-aware; under agent mode it never
+        // inserts a ProgressBar so this IndexMap + MultiProgress stay
+        // empty for the run (no rendering ever).
         let mut active_spinners: IndexMap<Uuid, ProgressBar> = IndexMap::new();
         let mut multi_progress = MultiProgress::new();
         while let Ok(msg) = progress_rx.recv() {
@@ -209,12 +216,16 @@ pub async fn execute_runbook(
         .unwrap_or_else(AuthorizationContext::empty);
 
     if do_setup_logger {
+        // AgentMode::from_env() is OnceLock-cached; same value as resolved in
+        // handle_command. Under NO_DNA, setup_logger forces stderr output
+        // even when log_to_stdout=false so agents retain console visibility.
         setup_logger(
             &cmd.log_dir,
             Some(&top_level_inputs_map.current_top_level_input_name()),
             &runbook_id,
             &cmd.log_level,
             false,
+            &AgentMode::from_env(),
         )?;
     }
 
@@ -309,10 +320,16 @@ pub async fn execute_runbook(
             ..ColorfulTheme::default()
         };
 
-        let confirm = Confirm::with_theme(&theme)
-            .with_prompt("Do you want to continue?")
-            .interact()
-            .unwrap();
+        // Under NO_DNA the caller has opted into non-interactive execution;
+        // treat the snapshot-diff confirmation as approved.
+        let confirm = if AgentMode::from_env().is_active() {
+            true
+        } else {
+            Confirm::with_theme(&theme)
+                .with_prompt("Do you want to continue?")
+                .interact()
+                .map_err(|e| format!("failed to read confirmation: {e}"))?
+        };
 
         if !confirm {
             return Ok(());
@@ -472,6 +489,8 @@ pub async fn configure_supervised_execution(
 
     let log_filter = cmd.log_level.as_str().into();
     let block_store_handle = tokio::spawn(async move {
+        // Gating happens inside handle_log_event under NO_DNA;
+        // these maps stay empty for the agent path.
         let mut active_spinners: IndexMap<Uuid, ProgressBar> = IndexMap::new();
         let mut multi_progress = MultiProgress::new();
         loop {
@@ -797,32 +816,50 @@ pub fn persist_log(
         LogLevel::Trace => {
             trace!(target: &namespace, "{}", msg);
             if do_log_to_cli && log_filter.should_log(log_level) {
-                println!("→ {}", msg);
+                cli_trace!("surfpool.runbook", "→ {}", msg);
             }
         }
         LogLevel::Debug => {
             debug!(target: &namespace, "{}", msg);
             if do_log_to_cli && log_filter.should_log(log_level) {
-                println!("→ {}", msg);
+                cli_debug!("surfpool.runbook", "→ {}", msg);
             }
         }
 
         LogLevel::Info => {
             info!(target: &namespace, "{}", msg);
             if do_log_to_cli && log_filter.should_log(log_level) {
-                println!("{} {} - {}", purple!("→"), purple!(summary), message);
+                cli_info!(
+                    "surfpool.runbook",
+                    "{} {} - {}",
+                    purple!("→"),
+                    purple!(summary),
+                    message
+                );
             }
         }
         LogLevel::Warn => {
             warn!(target: &namespace, "{}", msg);
             if do_log_to_cli && log_filter.should_log(log_level) {
-                println!("{} {} - {}", yellow!("!"), yellow!(summary), message);
+                cli_warn!(
+                    "surfpool.runbook",
+                    "{} {} - {}",
+                    yellow!("!"),
+                    yellow!(summary),
+                    message
+                );
             }
         }
         LogLevel::Error => {
             error!(target: &namespace, "{}", msg);
             if do_log_to_cli && log_filter.should_log(log_level) {
-                println!("{} {} - {}", red!("x"), red!(summary), message);
+                cli_error!(
+                    "surfpool.runbook",
+                    "{} {} - {}",
+                    red!("x"),
+                    red!(summary),
+                    message
+                );
             }
         }
     }
@@ -835,6 +872,12 @@ pub fn handle_log_event(
     active_spinners: &mut IndexMap<Uuid, ProgressBar>,
     do_log_to_cli: bool,
 ) {
+    // Under NO_DNA, transient events do NOT construct
+    // ProgressBars. Each lifecycle stage emits a plain stderr line so the
+    // agent retains visibility without any spinner UI. `active_spinners`
+    // stays empty for the run.
+    let agent_mode_active = AgentMode::from_env().is_active();
+
     match log {
         LogEvent::Static(static_log_event) => {
             let LogDetails { message, summary } = static_log_event.details;
@@ -845,6 +888,28 @@ pub fn handle_log_event(
                 &static_log_event.level,
                 log_filter,
                 do_log_to_cli,
+            );
+        }
+        LogEvent::Transient(log) if agent_mode_active => {
+            let (tag, level, details) = match log.status {
+                TransientLogEventStatus::Pending(d) => ("start", "info", d),
+                TransientLogEventStatus::Success(d) => ("ok", "info", d),
+                TransientLogEventStatus::Failure(d) => ("fail", "error", d),
+            };
+            let LogDetails { message, summary } = details;
+            // Route through cli_emit so the line is JSONL under NO_DNA.
+            crate::agent_io::cli_emit(
+                level,
+                "surfpool.runbook.action",
+                &format!("[{tag}] {summary} - {message}"),
+            );
+            persist_log(
+                &message,
+                &summary,
+                &log.namespace,
+                &log.level,
+                log_filter,
+                false,
             );
         }
         LogEvent::Transient(log) => match log.status {
@@ -880,7 +945,7 @@ pub fn handle_log_event(
                         pb.finish_with_message(msg);
                     }
                 } else if do_log_to_cli {
-                    println!("{}", msg);
+                    crate::agent_io::cli_emit("info", "surfpool.runbook.action", &msg);
                 }
 
                 persist_log(
@@ -899,7 +964,7 @@ pub fn handle_log_event(
                         pb.finish_with_message(msg);
                     }
                 } else if do_log_to_cli {
-                    println!("{}", msg);
+                    crate::agent_io::cli_emit("info", "surfpool.runbook.action", &msg);
                 }
                 persist_log(
                     &message,

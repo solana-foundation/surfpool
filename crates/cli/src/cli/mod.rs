@@ -31,7 +31,12 @@ use surfpool_types::{
 use txtx_core::manifest::WorkspaceManifest;
 use txtx_gql::kit::{helpers::fs::FileLocation, types::frontend::LogLevel};
 
-use crate::{cli::update::handle_update_command, runbook::handle_execute_runbook_command};
+use crate::{
+    agent_io::format_agent_json_at,
+    cli::update::handle_update_command,
+    no_dna::{AgentMode, ColorChoice, OutputFormat},
+    runbook::handle_execute_runbook_command,
+};
 mod simnet;
 mod update;
 
@@ -105,7 +110,25 @@ impl Context {
 }
 
 #[derive(Parser, Debug)]
-#[clap(author, version, about, long_about = None, name = "surfpool", bin_name = "surfpool")]
+#[clap(
+    author,
+    version,
+    about,
+    long_about = "Surfpool — a local Solana surfnet for development and testing.\n\
+                  \n\
+                  AGENT MODE (NO_DNA)\n\
+                  Set the NO_DNA environment variable to any non-empty value to run \
+                  non-interactively for AI agents and automation. Disables interactive \
+                  prompts, the TUI, spinners, and progress bars; auto-selects \
+                  scaffolding defaults; routes log output to stderr as JSONL with \
+                  RFC3339 UTC timestamps; and disables ANSI color. NO_COLOR is honored \
+                  independently. Detection follows the NO_DNA standard at \
+                  https://no-dna.org — any non-empty value activates, including NO_DNA=0 \
+                  (same semantics as NO_COLOR). NO_DNA is orthogonal to --ci; both can \
+                  be set and apply independently.",
+    name = "surfpool",
+    bin_name = "surfpool"
+)]
 struct Opts {
     #[clap(subcommand)]
     command: Command,
@@ -868,6 +891,13 @@ impl ExecuteRunbook {
 }
 
 pub fn main() {
+    // AgentMode's OnceLock before any logger init so downstream `setup_logger`
+    // calls (cli/mod.rs and runbook/mod.rs) see the same cached value.
+    // The hiro_system_kit early init below is best-effort our fern dispatch
+    // replaces the global logger inside handle_command and is where
+    // stderr routing actually takes effect.
+    let _agent_mode = AgentMode::from_env();
+
     let logger = hiro_system_kit::log::setup_logger();
     let _guard = hiro_system_kit::log::setup_global_logger(logger.clone());
     let ctx = Context {
@@ -884,7 +914,7 @@ pub fn main() {
     };
 
     if let Err(e) = handle_command(opts, &ctx) {
-        eprintln!("Error: {e}");
+        crate::cli_error!("surfpool.cli", "Error: {e}");
         std::thread::sleep(std::time::Duration::from_millis(500));
         process::exit(1);
     }
@@ -898,15 +928,50 @@ pub async fn handle_mcp_command(_ctx: &Context) -> Result<(), String> {
     Ok(())
 }
 
+/// Apply NO_DNA agent-mode rewrites to a `start` (Simnet) command. See
+/// Under agent mode we force the no-TUI and auto-runbook-scaffolding knobs
+/// that the user would otherwise toggle via CLI flags.
+fn apply_agent_mode_to_simnet(cmd: &mut StartSimnet, agent_mode: &AgentMode) {
+    if agent_mode.is_active() {
+        cmd.runtime.no_tui = true;
+        cmd.project.skip_runbook_generation_prompts = true;
+    }
+}
+
+/// Apply NO_DNA agent-mode rewrites to a `run` (ExecuteRunbook) command
+fn apply_agent_mode_to_run(cmd: &mut ExecuteRunbook, agent_mode: &AgentMode) {
+    if agent_mode.is_active() {
+        cmd.unsupervised = true;
+    }
+}
+
+/// Apply NO_DNA agent-mode rewrites to an `update` command
+fn apply_agent_mode_to_update(cmd: &mut UpdateCommand, agent_mode: &AgentMode) {
+    if agent_mode.is_active() {
+        cmd.skip_confirm = true;
+    }
+}
+
+/// Apply `--ci` rewrites to a `start` (Simnet) command. Extracted so that
+/// composition with `apply_agent_mode_to_simnet` is testable;
+/// these two helpers are independent inputs and should both apply when set.
+fn apply_ci_mode_to_simnet(cmd: &mut StartSimnet) {
+    if cmd.runtime.ci {
+        cmd.observability.disable_instruction_profiling = true;
+        cmd.runtime.no_studio = true;
+        cmd.runtime.no_tui = true;
+        cmd.observability.log_level = "none".to_string();
+    }
+}
+
 fn handle_command(opts: Opts, ctx: &Context) -> Result<(), String> {
+    // Resolve NO_DNA agent mode once for the whole command invocation. See
+    let agent_mode = AgentMode::from_env();
+
     match opts.command {
         Command::Simnet(mut cmd) => {
-            if cmd.runtime.ci {
-                cmd.observability.disable_instruction_profiling = true;
-                cmd.runtime.no_studio = true;
-                cmd.runtime.no_tui = true;
-                cmd.observability.log_level = "none".to_string();
-            }
+            apply_agent_mode_to_simnet(&mut cmd, &agent_mode);
+            apply_ci_mode_to_simnet(&mut cmd);
 
             if cmd.runtime.daemon {
                 // The only way to support daemon mode on macos is to either:
@@ -915,7 +980,10 @@ fn handle_command(opts: Opts, ctx: &Context) -> Result<(), String> {
                 // Known issue: https://github.com/firebase/firebase-tools/issues/6628
                 // Both of these options are confusing for users, so we just emit a warning and disable daemon mode
                 if !cfg!(target_os = "linux") {
-                    println!("Daemon mode is only supported on Linux");
+                    crate::cli_warn!(
+                        "surfpool.cli.daemon",
+                        "Daemon mode is only supported on Linux"
+                    );
                     cmd.runtime.daemon = false;
                 } else {
                     cmd.runtime.no_tui = true;
@@ -929,6 +997,7 @@ fn handle_command(opts: Opts, ctx: &Context) -> Result<(), String> {
                     "simnet",
                     &cmd.observability.log_level,
                     cmd.runtime.no_tui,
+                    &agent_mode,
                 )?;
             }
 
@@ -953,12 +1022,41 @@ fn handle_command(opts: Opts, ctx: &Context) -> Result<(), String> {
         Command::Completions(cmd) => {
             hiro_system_kit::nestable_block_on(generate_completion_helpers(cmd))
         }
-        Command::Run(cmd) => {
+        Command::Run(mut cmd) => {
+            apply_agent_mode_to_run(&mut cmd, &agent_mode);
             hiro_system_kit::nestable_block_on(handle_execute_runbook_command(cmd))
         }
-        Command::List(cmd) => hiro_system_kit::nestable_block_on(handle_list_command(cmd, ctx)),
+        Command::List(cmd) => {
+            // Under NO_DNA, ensure fern is initialized so any
+            // log!() calls in handle_list_command (or its txtx descendants)
+            // flow through the JSON format closure to stderr.
+            if agent_mode.is_active() {
+                setup_logger(
+                    DEFAULT_LOG_DIR.as_str(),
+                    None,
+                    "list",
+                    "info",
+                    true,
+                    &agent_mode,
+                )?;
+            }
+            hiro_system_kit::nestable_block_on(handle_list_command(cmd, ctx))
+        }
         Command::Mcp => hiro_system_kit::nestable_block_on(handle_mcp_command(ctx)),
-        Command::Update(cmd) => hiro_system_kit::nestable_block_on(handle_update_command(cmd)),
+        Command::Update(mut cmd) => {
+            apply_agent_mode_to_update(&mut cmd, &agent_mode);
+            if agent_mode.is_active() {
+                setup_logger(
+                    DEFAULT_LOG_DIR.as_str(),
+                    None,
+                    "update",
+                    "info",
+                    true,
+                    &agent_mode,
+                )?;
+            }
+            hiro_system_kit::nestable_block_on(handle_update_command(cmd))
+        }
     }
 }
 
@@ -999,22 +1097,87 @@ async fn generate_completion_helpers(cmd: Completions) -> Result<(), String> {
 async fn handle_list_command(cmd: ListRunbooks, _ctx: &Context) -> Result<(), String> {
     let manifest_location = FileLocation::from_path_string(&cmd.manifest_path)?;
     let manifest = WorkspaceManifest::from_location(&manifest_location)?;
+    let agent_mode = AgentMode::from_env();
+
     if manifest.runbooks.is_empty() {
-        println!(
-            "{}: no runbooks referenced in the txtx.yml manifest.\nRun the command `txtx new` to create a new runbook.",
-            yellow!("warning")
-        );
+        if agent_mode.is_active() {
+            crate::cli_warn!(
+                "surfpool.ls",
+                "no runbooks referenced in the txtx.yml manifest. Run `txtx new` to create one."
+            );
+        } else {
+            println!(
+                "{}: no runbooks referenced in the txtx.yml manifest.\nRun the command `txtx new` to create a new runbook.",
+                yellow!("warning")
+            );
+        }
         std::process::exit(1);
     }
-    println!("{:<35}\t{}", "Name", yellow!("Description"));
-    for runbook in manifest.runbooks {
-        println!(
-            "{:<35}\t{}",
-            runbook.name,
-            yellow!(format!("{}", runbook.description.unwrap_or("".into())))
-        );
+
+    if agent_mode.is_active() {
+        // One JSON object per runbook to stderr (consistent JSONL contract).
+        // Tabular human output is replaced; the `data` field carries
+        // structured metadata so agents can parse without scraping.
+        for runbook in manifest.runbooks {
+            crate::agent_io::agent_emit_with_data(
+                "info",
+                "surfpool.ls.runbook",
+                &runbook.name,
+                runbook_to_agent_json_data(
+                    &runbook.name,
+                    runbook.description.as_deref(),
+                    &runbook.location,
+                ),
+            );
+        }
+    } else {
+        println!("{:<35}\t{}", "Name", yellow!("Description"));
+        for runbook in manifest.runbooks {
+            println!(
+                "{:<35}\t{}",
+                runbook.name,
+                yellow!(format!("{}", runbook.description.unwrap_or("".into())))
+            );
+        }
     }
     Ok(())
+}
+
+/// Build the `data` payload for a runbook listing under NO_DNA.
+pub(crate) fn runbook_to_agent_json_data(
+    name: &str,
+    description: Option<&str>,
+    location: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "name": name,
+        "description": description,
+        "location": location,
+    })
+}
+
+/// Where the logger's console branch writes records. The `Stderr` arm is
+/// selected when [`AgentMode`] is active: agents must see log
+/// output on stderr so stdout stays clean for any structured output added in
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LogConsoleTarget {
+    Stdout,
+    Stderr,
+    None,
+}
+
+/// Pure function exposing the routing decision so it can be unit-tested
+/// without touching `fern::Dispatch` (which is not introspectable). Under
+/// NO_DNA we always route to stderr regardless of `log_to_stdout` — agents
+/// need console visibility, just on the correct stream.
+pub(crate) fn log_console_target(log_to_stdout: bool, agent_mode: &AgentMode) -> LogConsoleTarget {
+    if agent_mode.is_active() {
+        LogConsoleTarget::Stderr
+    } else if log_to_stdout {
+        LogConsoleTarget::Stdout
+    } else {
+        LogConsoleTarget::None
+    }
 }
 
 pub fn setup_logger(
@@ -1023,6 +1186,7 @@ pub fn setup_logger(
     filename: &str,
     log_filter: &str,
     log_to_stdout: bool,
+    agent_mode: &AgentMode,
 ) -> Result<(), String> {
     let log_location = {
         let mut log_location = FileLocation::from_path_string(log_dir)?;
@@ -1074,25 +1238,55 @@ pub fn setup_logger(
                 .map_err(|e| format!("Failed to create log file: {}", e))?,
         );
 
-    // Stdout branch: filtered to only txtx/surfopol target, minimal + colored format
-    let stdout_config = fern::Dispatch::new()
-        .filter(|metadata| {
-            metadata.target().starts_with("txtx") || metadata.target().starts_with("surfpool")
+    // Console branch routing:
+    let agent_mode_for_console = *agent_mode;
+    let console_dispatch_base = fern::Dispatch::new()
+        .filter(move |metadata| {
+            if agent_mode_for_console.is_active() {
+                true
+            } else {
+                metadata.target().starts_with("txtx") || metadata.target().starts_with("surfpool")
+            }
         })
-        .format(move |out, message, record| {
-            out.finish(format_args!(
-                "{} {} {}",
-                Local::now().format("%b %d %H:%M:%S%.3f"),
-                colors.color(record.level()),
-                message
-            ))
-        })
-        .chain(std::io::stdout());
+        .format(
+            move |out, message, record| match agent_mode_for_console.output_format {
+                OutputFormat::Json => {
+                    out.finish(format_args!(
+                        "{}",
+                        format_agent_json_at(
+                            chrono::Utc::now(),
+                            &record.level().to_string().to_lowercase(),
+                            record.target(),
+                            &message.to_string(),
+                        )
+                    ));
+                }
+                OutputFormat::Human => match agent_mode_for_console.color {
+                    ColorChoice::Never => out.finish(format_args!(
+                        "{} {} {}",
+                        Local::now().format("%b %d %H:%M:%S%.3f"),
+                        record.level(),
+                        message
+                    )),
+                    ColorChoice::Always | ColorChoice::Auto => out.finish(format_args!(
+                        "{} {} {}",
+                        Local::now().format("%b %d %H:%M:%S%.3f"),
+                        colors.color(record.level()),
+                        message
+                    )),
+                },
+            },
+        );
+
+    let console_chain = match log_console_target(log_to_stdout, agent_mode) {
+        LogConsoleTarget::Stdout => Some(console_dispatch_base.chain(std::io::stdout())),
+        LogConsoleTarget::Stderr => Some(console_dispatch_base.chain(std::io::stderr())),
+        LogConsoleTarget::None => None,
+    };
 
     let mut builder = fern::Dispatch::new().level(log_filter).chain(file_config);
-
-    if log_to_stdout {
-        builder = builder.chain(stdout_config)
+    if let Some(console) = console_chain {
+        builder = builder.chain(console);
     }
 
     builder
@@ -1205,5 +1399,207 @@ mod tests {
     fn start_parser_accepts_hidden_deprecated_subgraph_db() {
         let cmd = parse_start(&["surfpool", "start", "--subgraph-db", "./legacy.sqlite"]);
         assert_eq!(cmd.subgraph_db.as_deref(), Some("./legacy.sqlite"));
+    }
+
+    fn parse_run(args: &[&str]) -> ExecuteRunbook {
+        match Opts::try_parse_from(args)
+            .expect("run args should parse")
+            .command
+        {
+            Command::Run(cmd) => cmd,
+            command => panic!("expected run command, got {command:?}"),
+        }
+    }
+
+    fn parse_update(args: &[&str]) -> UpdateCommand {
+        match Opts::try_parse_from(args)
+            .expect("update args should parse")
+            .command
+        {
+            Command::Update(cmd) => cmd,
+            command => panic!("expected update command, got {command:?}"),
+        }
+    }
+
+    const ACTIVE: AgentMode = AgentMode::const_active();
+    const INACTIVE: AgentMode = AgentMode::const_inactive();
+
+    #[test]
+    fn no_dna_forces_simnet_no_tui_and_skip_runbook_gen() {
+        let mut cmd = parse_start(&["surfpool", "start"]);
+        assert!(!cmd.runtime.no_tui, "baseline: no_tui should default off");
+        assert!(
+            !cmd.project.skip_runbook_generation_prompts,
+            "baseline: skip_runbook_generation_prompts should default off"
+        );
+        apply_agent_mode_to_simnet(&mut cmd, &ACTIVE);
+        assert!(cmd.runtime.no_tui);
+        assert!(cmd.project.skip_runbook_generation_prompts);
+    }
+
+    #[test]
+    fn inactive_agent_mode_leaves_simnet_flags_untouched() {
+        let mut cmd = parse_start(&["surfpool", "start"]);
+        apply_agent_mode_to_simnet(&mut cmd, &INACTIVE);
+        assert!(!cmd.runtime.no_tui);
+        assert!(!cmd.project.skip_runbook_generation_prompts);
+    }
+
+    #[test]
+    fn no_dna_forces_run_unsupervised() {
+        let mut cmd = parse_run(&["surfpool", "run", "deployment"]);
+        assert!(!cmd.unsupervised, "baseline: unsupervised default off");
+        apply_agent_mode_to_run(&mut cmd, &ACTIVE);
+        assert!(cmd.unsupervised);
+    }
+
+    #[test]
+    fn inactive_agent_mode_leaves_run_unsupervised_untouched() {
+        let mut cmd = parse_run(&["surfpool", "run", "deployment"]);
+        apply_agent_mode_to_run(&mut cmd, &INACTIVE);
+        assert!(!cmd.unsupervised);
+    }
+
+    #[test]
+    fn no_dna_forces_update_skip_confirm() {
+        let mut cmd = parse_update(&["surfpool", "update"]);
+        assert!(!cmd.skip_confirm, "baseline: skip_confirm default off");
+        apply_agent_mode_to_update(&mut cmd, &ACTIVE);
+        assert!(cmd.skip_confirm);
+    }
+
+    #[test]
+    fn inactive_agent_mode_leaves_update_skip_confirm_untouched() {
+        let mut cmd = parse_update(&["surfpool", "update"]);
+        apply_agent_mode_to_update(&mut cmd, &INACTIVE);
+        assert!(!cmd.skip_confirm);
+    }
+
+    #[test]
+    fn top_level_help_documents_no_dna() {
+        let mut command = Opts::command();
+        let mut buffer = Vec::new();
+        command
+            .write_long_help(&mut buffer)
+            .expect("top-level long help should render");
+        let help = String::from_utf8(buffer).expect("help should be utf8");
+        assert!(help.contains("NO_DNA"), "long help should mention NO_DNA");
+        assert!(
+            help.contains("https://no-dna.org"),
+            "long help should link to https://no-dna.org"
+        );
+    }
+
+    // NO_DNA and --ci are independent inputs. when both
+    // active, all flag rewrites from both apply (idempotent on shared keys
+    // like no_tui). this guards against future refactors collapsing the two
+    // helpers (`apply_agent_mode_to_simnet`, `apply_ci_mode_to_simnet`) into
+    // a single conditional that drops one set of rewrites.
+    #[test]
+    fn no_dna_and_ci_compose_for_simnet() {
+        let mut cmd = parse_start(&["surfpool", "start", "--ci"]);
+        apply_agent_mode_to_simnet(&mut cmd, &ACTIVE);
+        apply_ci_mode_to_simnet(&mut cmd);
+
+        assert!(cmd.runtime.no_tui, "both NO_DNA and --ci force no_tui");
+        assert!(
+            cmd.project.skip_runbook_generation_prompts,
+            "NO_DNA forces skip_runbook_generation_prompts; --ci does not"
+        );
+        assert!(
+            cmd.observability.disable_instruction_profiling,
+            "--ci forces disable_instruction_profiling; NO_DNA does not"
+        );
+        assert!(cmd.runtime.no_studio, "--ci forces no_studio");
+        assert_eq!(
+            cmd.observability.log_level, "none",
+            "--ci sets log_level=none"
+        );
+    }
+
+    #[test]
+    fn ci_alone_does_not_set_skip_runbook_generation_prompts() {
+        let mut cmd = parse_start(&["surfpool", "start", "--ci"]);
+        apply_agent_mode_to_simnet(&mut cmd, &INACTIVE);
+        apply_ci_mode_to_simnet(&mut cmd);
+
+        assert!(
+            !cmd.project.skip_runbook_generation_prompts,
+            "without NO_DNA, --ci alone must NOT set skip_runbook_generation_prompts"
+        );
+        assert!(cmd.runtime.no_studio, "--ci still applies its own rewrites");
+    }
+
+    #[test]
+    fn agent_mode_alone_does_not_set_ci_rewrites() {
+        let mut cmd = parse_start(&["surfpool", "start"]);
+        apply_agent_mode_to_simnet(&mut cmd, &ACTIVE);
+        apply_ci_mode_to_simnet(&mut cmd);
+
+        assert!(cmd.runtime.no_tui, "NO_DNA forces no_tui");
+        assert!(
+            !cmd.observability.disable_instruction_profiling,
+            "without --ci, NO_DNA alone must NOT set disable_instruction_profiling"
+        );
+        assert!(
+            !cmd.runtime.no_studio,
+            "without --ci, NO_DNA alone must NOT set no_studio"
+        );
+        assert_ne!(
+            cmd.observability.log_level, "none",
+            "without --ci, NO_DNA alone must NOT silence the log_level"
+        );
+    }
+
+    // Under NO_DNA the fern dispatch must route the console
+    // branch to stderr (never stdout), regardless of log_to_stdout. fern's
+    // Dispatch is opaque, so V25 is encoded in the pure helper this matrix tests.
+    // `surfpool ls` under NO_DNA emits one JSON object per
+    // runbook with a populated `data` field. Tests the pure helper so the
+    // test doesn't have to construct a WorkspaceManifest or capture stderr.
+    #[test]
+    fn runbook_to_agent_json_data_contains_required_fields() {
+        let data = super::runbook_to_agent_json_data(
+            "deploy_hello",
+            Some("Deploy the hello-world program"),
+            "runbooks/deployment/main.tx",
+        );
+        assert_eq!(data["name"], "deploy_hello");
+        assert_eq!(data["description"], "Deploy the hello-world program");
+        assert_eq!(data["location"], "runbooks/deployment/main.tx");
+    }
+
+    #[test]
+    fn runbook_to_agent_json_data_handles_missing_description() {
+        let data = super::runbook_to_agent_json_data("scratch", None, "runbooks/scratch.tx");
+        assert!(
+            data["description"].is_null(),
+            "missing description → JSON null"
+        );
+        assert_eq!(data["name"], "scratch");
+    }
+
+    #[test]
+    fn log_console_target_routes_to_stderr_under_agent_mode() {
+        assert_eq!(
+            log_console_target(true, &ACTIVE),
+            LogConsoleTarget::Stderr,
+            "NO_DNA + log_to_stdout=true must route to stderr"
+        );
+        assert_eq!(
+            log_console_target(false, &ACTIVE),
+            LogConsoleTarget::Stderr,
+            "NO_DNA + log_to_stdout=false must STILL route to stderr (V25 forces visibility)"
+        );
+        assert_eq!(
+            log_console_target(true, &INACTIVE),
+            LogConsoleTarget::Stdout,
+            "no NO_DNA + log_to_stdout=true must route to stdout (legacy path)"
+        );
+        assert_eq!(
+            log_console_target(false, &INACTIVE),
+            LogConsoleTarget::None,
+            "no NO_DNA + log_to_stdout=false must route nowhere (file-only legacy path)"
+        );
     }
 }

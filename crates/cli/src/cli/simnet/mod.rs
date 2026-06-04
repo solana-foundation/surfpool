@@ -235,7 +235,7 @@ pub async fn handle_start_local_surfnet_command(
     let initial_transactions = loop {
         match simnet_events_rx.recv() {
             Ok(SimnetEvent::Aborted(error)) => {
-                eprintln!("Error: {}", error);
+                crate::cli_error!("surfpool.simnet", "Error: {}", error);
                 return Err(error);
             }
             Ok(SimnetEvent::Shutdown) => return Ok(()),
@@ -435,6 +435,10 @@ fn log_events(
     } else {
         LogLevel::Info
     };
+    // Under NO_DNA, this path is reached (no_tui is forced) but `handle_log_event`
+    // short-circuits transient events under agent mode and never inserts a
+    // ProgressBar. The IndexMap + MultiProgress stay empty — neither renders
+    // without children — so no UI escapes.
     let mut active_spinners: IndexMap<Uuid, ProgressBar> = IndexMap::new();
     let mut multi_progress = MultiProgress::new();
 

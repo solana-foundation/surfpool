@@ -10,7 +10,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tar::Archive;
 
-use crate::cli::UpdateCommand;
+use crate::{cli::UpdateCommand, cli_info, cli_warn, no_dna::AgentMode};
 
 #[derive(Deserialize, Debug)]
 struct LatestRelease {
@@ -73,21 +73,29 @@ pub async fn handle_update_command(cmd: UpdateCommand) -> Result<(), String> {
     }
 
     if cmd.version.is_none() && current_semver > target_semver {
-        println!("Already on the latest version {}", current_semver);
+        cli_info!(
+            "surfpool.update",
+            "Already on the latest version {}",
+            current_semver
+        );
         return Ok(());
     }
 
     let expected_digest: Option<[u8; 32]> = match &asset.digest {
         None => {
-            eprintln!(
-                "Warning: release asset {users_asset} has no checksum, so the integrity of the release cannot be verified"
+            cli_warn!(
+                "surfpool.update.verify",
+                "release asset {users_asset} has no checksum, so the integrity of the release cannot be verified"
             );
             None
         }
         Some(d) => match parse_sha256_digest(d) {
             Ok(bytes) => Some(bytes),
             Err(e) => {
-                eprintln!("Warning: {e}; the integrity of the release cannot be verified");
+                cli_warn!(
+                    "surfpool.update.verify",
+                    "{e}; the integrity of the release cannot be verified"
+                );
                 None
             }
         },
@@ -109,34 +117,58 @@ pub async fn handle_update_command(cmd: UpdateCommand) -> Result<(), String> {
             .map_err(|e| format!("Failed to read confirmation: {e}"))?;
 
         if !confirm {
-            println!("Update cancelled");
+            cli_info!("surfpool.update", "Update cancelled");
             return Ok(());
         }
     }
 
-    println!("Download URL: {}", browser_download_url);
+    cli_info!(
+        "surfpool.update.download",
+        "Download URL: {}",
+        browser_download_url
+    );
     let response = client
         .get(browser_download_url)
         .send()
         .await
         .map_err(|e| e.to_string())?;
     let total_size = response.content_length().unwrap_or(0);
-    let progress_bar = ProgressBar::new(total_size);
-    progress_bar.set_style(
-        ProgressStyle::default_bar()
-            .template("{spinner:.green} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
-            .unwrap()
-            .progress_chars("#>-"),
-    );
+
+    // Under NO_DNA the progress bar is NOT constructed (skip, don't
+    // hide-after-construct). Agents still need download visibility, so
+    // emit start/end markers via cli_info!.
+    let agent_mode = AgentMode::from_env();
+    let progress_bar = if agent_mode.is_active() {
+        cli_info!("surfpool.update.download", "Downloading {total_size} bytes");
+        None
+    } else {
+        let pb = ProgressBar::new(total_size);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
+                .unwrap()
+                .progress_chars("#>-"),
+        );
+        Some(pb)
+    };
 
     let mut download: Vec<u8> = Vec::with_capacity(total_size as usize);
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| e.to_string())?;
         download.extend_from_slice(&chunk);
-        progress_bar.set_position(download.len() as u64);
+        if let Some(pb) = &progress_bar {
+            pb.set_position(download.len() as u64);
+        }
     }
-    progress_bar.finish_with_message("Download complete");
+    match &progress_bar {
+        Some(pb) => pb.finish_with_message("Download complete"),
+        None => cli_info!(
+            "surfpool.update.download",
+            "Download complete: {} bytes",
+            download.len()
+        ),
+    }
 
     // Roots trust in api.github.com's TLS: the digest comes from the same
     // API response as browser_download_url. Stronger guarantees (signed
