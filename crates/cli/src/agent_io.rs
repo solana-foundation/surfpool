@@ -31,6 +31,10 @@ pub fn format_agent_json_at(ts: DateTime<Utc>, level: &str, target: &str, msg: &
 
 /// Like [`format_agent_json_at`] but optionally includes a `data` object for
 /// structured payloads (used by `surfpool ls` to attach runbook metadata).
+///
+/// `msg` is passed through [`strip_ansi`] before serialization
+/// (defense-in-depth against any caller that leaks color escapes into a CLI
+/// emit; the primary line of defense is V38 in macros.rs).
 pub fn format_agent_json_with_data_at(
     ts: DateTime<Utc>,
     level: &str,
@@ -48,11 +52,41 @@ pub fn format_agent_json_with_data_at(
         "target".into(),
         serde_json::Value::String(target.to_string()),
     );
-    obj.insert("msg".into(), serde_json::Value::String(msg.to_string()));
+    obj.insert("msg".into(), serde_json::Value::String(strip_ansi(msg)));
     if let Some(d) = data {
         obj.insert("data".into(), d);
     }
     serde_json::Value::Object(obj).to_string()
+}
+
+/// Strip ANSI CSI escape sequences (e.g., color codes like `\x1b[35m`) from a
+/// string. Used by [`format_agent_json_with_data_at`] to ensure no ANSI bytes
+/// land in the JSON `msg` field even if a caller accidentally leaks them
+fn strip_ansi(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b {
+            if i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+                // CSI: ESC [ params* final-byte (ASCII letter)
+                i += 2;
+                while i < bytes.len() && !bytes[i].is_ascii_alphabetic() {
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    i += 1;
+                }
+                continue;
+            }
+            // Other ESC sequence — skip the ESC byte itself.
+            i += 1;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| s.to_string())
 }
 
 /// Write a single JSONL line to stderr in agent-mode shape.
@@ -75,16 +109,21 @@ pub fn agent_emit_with_data(level: &str, target: &str, msg: &str, data: serde_js
 /// Emit a CLI line, branching on agent mode.
 ///
 /// Under NO_DNA: JSON to stderr via [`agent_emit`].
-/// Outside NO_DNA: plain text — `stderr` for `warn`/`error`, `stdout` for
-/// everything else (preserves the legacy split humans expect).
+/// Outside NO_DNA: plain text — `stderr` with a `Warning: ` / `Error: `
+/// prefix for `warn`/`error`, `stdout` for everything else. The prefix
+/// preserves the legacy human-mode look from the `eprintln!("Warning: ...")`
+/// sites this macro replaces; call sites pass the bare message
+/// without a level prefix.
 pub fn cli_emit(level: &str, target: &str, msg: &str) {
     let mode = AgentMode::from_env();
     if mode.output_format == OutputFormat::Json {
         agent_emit(level, target, msg);
-    } else if matches!(level, "warn" | "error") {
-        eprintln!("{msg}");
     } else {
-        println!("{msg}");
+        match level {
+            "error" => eprintln!("Error: {msg}"),
+            "warn" => eprintln!("Warning: {msg}"),
+            _ => println!("{msg}"),
+        }
     }
 }
 
@@ -184,6 +223,42 @@ mod tests {
             !s.contains('\x1b'),
             "JSON output must contain no ANSI ESC byte (0x1b)"
         );
+    }
+
+    // Defensive — strip ANSI escapes from `msg` so a leaky
+    // caller (color macros, third-party libs) cannot pollute the JSON shape.
+    #[test]
+    fn strip_ansi_removes_csi_sequences() {
+        assert_eq!(super::strip_ansi("\x1b[35mfoo\x1b[0m"), "foo");
+        assert_eq!(super::strip_ansi("plain"), "plain");
+        assert_eq!(
+            super::strip_ansi("\x1b[1;31merror:\x1b[0m hello"),
+            "error: hello"
+        );
+        assert_eq!(super::strip_ansi(""), "");
+    }
+
+    #[test]
+    fn format_agent_json_strips_ansi_in_msg() {
+        let ts = Utc.with_ymd_and_hms(2026, 6, 4, 17, 30, 0).unwrap();
+        // Simulate what would happen if a caller leaked ANSI bytes into msg.
+        let s = format_agent_json_at(
+            ts,
+            "info",
+            "surfpool.test",
+            "\x1b[35m→\x1b[0m \x1b[35mdeploy\x1b[0m - done",
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&s).expect("must be valid JSON");
+        let msg = parsed["msg"].as_str().unwrap();
+        assert!(
+            !msg.contains('\x1b'),
+            "msg field must not contain ANSI ESC after strip_ansi: {msg:?}"
+        );
+        assert!(
+            !msg.contains("[35m"),
+            "CSI params must be stripped: {msg:?}"
+        );
+        assert_eq!(msg, "→ deploy - done");
     }
 
     #[test]

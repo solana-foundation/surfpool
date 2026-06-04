@@ -1,3 +1,7 @@
+// Color macros gate on BOTH `atty::is(Stream::Stdout)` AND
+// `AgentMode::color != ColorChoice::Never`. Without the AgentMode check, ANSI
+// escapes leak into the JSONL `msg` field under NO_DNA when stdout is a TTY
+
 #[allow(unused_macros)]
 #[macro_export]
 macro_rules! green {
@@ -5,17 +9,13 @@ macro_rules! green {
         {
             use atty::Stream;
             use ansi_term::Colour;
-            if atty::is(Stream::Stdout) {
+            if atty::is(Stream::Stdout)
+                && $crate::no_dna::AgentMode::from_env().color != $crate::no_dna::ColorChoice::Never
+            {
                 let colour = Colour::Green.bold();
-                format!(
-                    "{}",
-                    colour.paint($($arg)*)
-                )
+                format!("{}", colour.paint($($arg)*))
             } else {
-                format!(
-                    "{}",
-                    $($arg)*
-                )
+                format!("{}", $($arg)*)
             }
         }
     )
@@ -28,17 +28,13 @@ macro_rules! red {
         {
             use atty::Stream;
             use ansi_term::Colour;
-            if atty::is(Stream::Stdout) {
+            if atty::is(Stream::Stdout)
+                && $crate::no_dna::AgentMode::from_env().color != $crate::no_dna::ColorChoice::Never
+            {
                 let colour = Colour::Red.bold();
-                format!(
-                    "{}",
-                    colour.paint($($arg)*)
-                )
+                format!("{}", colour.paint($($arg)*))
             } else {
-                format!(
-                    "{}",
-                    $($arg)*
-                )
+                format!("{}", $($arg)*)
             }
         }
     )
@@ -51,17 +47,13 @@ macro_rules! yellow {
         {
             use atty::Stream;
             use ansi_term::Colour;
-            if atty::is(Stream::Stdout) {
+            if atty::is(Stream::Stdout)
+                && $crate::no_dna::AgentMode::from_env().color != $crate::no_dna::ColorChoice::Never
+            {
                 let colour = Colour::Yellow.bold();
-                format!(
-                    "{}",
-                    colour.paint($($arg)*)
-                )
+                format!("{}", colour.paint($($arg)*))
             } else {
-                format!(
-                    "{}",
-                    $($arg)*
-                )
+                format!("{}", $($arg)*)
             }
         }
     )
@@ -74,17 +66,13 @@ macro_rules! blue {
         {
             use atty::Stream;
             use ansi_term::Colour;
-            if atty::is(Stream::Stdout) {
+            if atty::is(Stream::Stdout)
+                && $crate::no_dna::AgentMode::from_env().color != $crate::no_dna::ColorChoice::Never
+            {
                 let colour = Colour::Cyan.bold();
-                format!(
-                    "{}",
-                    colour.paint($($arg)*)
-                )
+                format!("{}", colour.paint($($arg)*))
             } else {
-                format!(
-                    "{}",
-                    $($arg)*
-                )
+                format!("{}", $($arg)*)
             }
         }
     )
@@ -97,17 +85,13 @@ macro_rules! purple {
         {
             use atty::Stream;
             use ansi_term::Colour;
-            if atty::is(Stream::Stdout) {
+            if atty::is(Stream::Stdout)
+                && $crate::no_dna::AgentMode::from_env().color != $crate::no_dna::ColorChoice::Never
+            {
                 let colour = Colour::Purple.bold();
-                format!(
-                    "{}",
-                    colour.paint($($arg)*)
-                )
+                format!("{}", colour.paint($($arg)*))
             } else {
-                format!(
-                    "{}",
-                    $($arg)*
-                )
+                format!("{}", $($arg)*)
             }
         }
     )
@@ -120,17 +104,13 @@ macro_rules! black {
         {
             use atty::Stream;
             use ansi_term::Colour;
-            if atty::is(Stream::Stdout) {
+            if atty::is(Stream::Stdout)
+                && $crate::no_dna::AgentMode::from_env().color != $crate::no_dna::ColorChoice::Never
+            {
                 let colour = Colour::Fixed(244);
-                format!(
-                    "{}",
-                    colour.paint($($arg)*)
-                )
+                format!("{}", colour.paint($($arg)*))
             } else {
-                format!(
-                    "{}",
-                    $($arg)*
-                )
+                format!("{}", $($arg)*)
             }
         }
     )

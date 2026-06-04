@@ -914,7 +914,9 @@ pub fn main() {
     };
 
     if let Err(e) = handle_command(opts, &ctx) {
-        crate::cli_error!("surfpool.cli", "Error: {e}");
+        // cli_emit (under cli_error!) prepends "Error: " automatically in
+        // human mode. Agent mode gets `{"level":"error",...}`.
+        crate::cli_error!("surfpool.cli", "{e}");
         std::thread::sleep(std::time::Duration::from_millis(500));
         process::exit(1);
     }

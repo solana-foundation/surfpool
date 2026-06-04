@@ -235,7 +235,7 @@ pub async fn handle_start_local_surfnet_command(
     let initial_transactions = loop {
         match simnet_events_rx.recv() {
             Ok(SimnetEvent::Aborted(error)) => {
-                crate::cli_error!("surfpool.simnet", "Error: {}", error);
+                crate::cli_error!("surfpool.simnet", "{}", error);
                 return Err(error);
             }
             Ok(SimnetEvent::Shutdown) => return Ok(()),
