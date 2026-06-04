@@ -1158,7 +1158,7 @@ pub(crate) fn runbook_to_agent_json_data(
 
 /// Where the logger's console branch writes records. The `Stderr` arm is
 /// selected when [`AgentMode`] is active: agents must see log
-/// output on stderr so stdout stays clean for any structured output added in
+/// output on stderr so stdout stays clean for any structured output added in future.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LogConsoleTarget {
     Stdout,
