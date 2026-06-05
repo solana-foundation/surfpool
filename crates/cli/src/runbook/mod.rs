@@ -812,23 +812,29 @@ pub fn persist_log(
     do_log_to_cli: bool,
 ) {
     let msg = format!("{} - {}", summary, message);
+    // Under NO_DNA, fern's console branch already emits a JSONL line to stderr
+    // (target=namespace) via the format closure. Firing `cli_*` here would
+    // produce a SECOND stderr line (target="surfpool.runbook"), so we suppress
+    // the cli_* path in agent mode and let fern be the sole stderr source.
+    // The log-crate macros still fire so the file dispatch retains the audit trail.
+    let suppress_cli = AgentMode::from_env().is_active();
     match log_level {
         LogLevel::Trace => {
             trace!(target: &namespace, "{}", msg);
-            if do_log_to_cli && log_filter.should_log(log_level) {
+            if do_log_to_cli && log_filter.should_log(log_level) && !suppress_cli {
                 cli_trace!("surfpool.runbook", "→ {}", msg);
             }
         }
         LogLevel::Debug => {
             debug!(target: &namespace, "{}", msg);
-            if do_log_to_cli && log_filter.should_log(log_level) {
+            if do_log_to_cli && log_filter.should_log(log_level) && !suppress_cli {
                 cli_debug!("surfpool.runbook", "→ {}", msg);
             }
         }
 
         LogLevel::Info => {
             info!(target: &namespace, "{}", msg);
-            if do_log_to_cli && log_filter.should_log(log_level) {
+            if do_log_to_cli && log_filter.should_log(log_level) && !suppress_cli {
                 cli_info!(
                     "surfpool.runbook",
                     "{} {} - {}",
@@ -840,7 +846,7 @@ pub fn persist_log(
         }
         LogLevel::Warn => {
             warn!(target: &namespace, "{}", msg);
-            if do_log_to_cli && log_filter.should_log(log_level) {
+            if do_log_to_cli && log_filter.should_log(log_level) && !suppress_cli {
                 cli_warn!(
                     "surfpool.runbook",
                     "{} {} - {}",
@@ -852,7 +858,7 @@ pub fn persist_log(
         }
         LogLevel::Error => {
             error!(target: &namespace, "{}", msg);
-            if do_log_to_cli && log_filter.should_log(log_level) {
+            if do_log_to_cli && log_filter.should_log(log_level) && !suppress_cli {
                 cli_error!(
                     "surfpool.runbook",
                     "{} {} - {}",
@@ -891,23 +897,25 @@ pub fn handle_log_event(
             );
         }
         LogEvent::Transient(log) if agent_mode_active => {
-            let (tag, level, details) = match log.status {
-                TransientLogEventStatus::Pending(d) => ("start", "info", d),
-                TransientLogEventStatus::Success(d) => ("ok", "info", d),
-                TransientLogEventStatus::Failure(d) => ("fail", "error", d),
+            let (tag, status_level, details) = match log.status {
+                TransientLogEventStatus::Pending(d) => ("start", LogLevel::Info, d),
+                TransientLogEventStatus::Success(d) => ("ok", LogLevel::Info, d),
+                TransientLogEventStatus::Failure(d) => ("fail", LogLevel::Error, d),
             };
             let LogDetails { message, summary } = details;
-            // Route through cli_emit so the line is JSONL under NO_DNA.
-            crate::agent_io::cli_emit(
-                level,
-                "surfpool.runbook.action",
-                &format!("[{tag}] {summary} - {message}"),
-            );
+            // Fold the lifecycle tag into the summary and emit through the
+            // log-crate path inside persist_log. Fern's console branch under
+            // NO_DNA renders this as a single JSONL line on stderr (target=
+            // namespace) AND the file dispatch retains it. Pre-fix this branch
+            // also called cli_emit, producing a duplicate stderr record. The
+            // status-derived level overrides log.level so Failure surfaces as
+            // level="error" for agent filtering.
+            let tagged_summary = format!("[{tag}] {summary}");
             persist_log(
                 &message,
-                &summary,
+                &tagged_summary,
                 &log.namespace,
-                &log.level,
+                &status_level,
                 log_filter,
                 false,
             );
