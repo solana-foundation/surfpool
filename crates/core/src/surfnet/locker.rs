@@ -905,11 +905,17 @@ impl SurfnetSvmLocker {
                             Err(e) => Some(e.clone().into()),
                         };
 
+                        // Synthesize the block time from the slot, matching `getBlockTime`
+                        // (and real Agave). `calculate_block_time_for_slot` returns
+                        // milliseconds, so divide by 1000 to get `UnixTimestamp` seconds.
+                        let block_time =
+                            Some((svm_reader.calculate_block_time_for_slot(slot) / 1_000) as i64);
+
                         Some(RpcConfirmedTransactionStatusWithSignature {
                             err,
                             slot,
                             memo,
-                            block_time: None,
+                            block_time,
                             confirmation_status: Some(confirmation_status),
                             signature: sig,
                         })
@@ -4670,7 +4676,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_get_signatures_for_address_local_populates_memo() {
+    async fn test_get_signatures_for_address_local_populates_memo_and_block_time() {
         use std::str::FromStr;
 
         use crossbeam_channel::unbounded;
@@ -4767,6 +4773,19 @@ mod tests {
             row_without_memo.memo, None,
             "plain transfer must still yield a null memo"
         );
+
+        // block_time is synthesized from the slot and must match `getBlockTime`.
+        // `calculate_block_time_for_slot` returns milliseconds; the summary field is
+        // `UnixTimestamp` seconds, so it is scaled down by 1000.
+        for row in [row_with_memo, row_without_memo] {
+            let expected = (locker.with_svm_reader(|r| r.calculate_block_time_for_slot(row.slot))
+                / 1_000) as i64;
+            assert_eq!(
+                row.block_time,
+                Some(expected),
+                "block_time should be the slot's synthetic unix-seconds time"
+            );
+        }
     }
 
     // Snapshot loading tests
