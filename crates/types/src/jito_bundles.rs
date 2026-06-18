@@ -11,21 +11,17 @@
 //! `RpcSimulateBundleResult` and friends are the public surface; the rest are
 //! sub-shapes referenced from it.
 
-use {
-    serde::{Deserialize, Serialize},
-    solana_account_decoder_client_types::{UiAccount, UiAccountEncoding},
-    solana_clock::Slot,
-    solana_commitment_config::{CommitmentConfig, CommitmentLevel},
-    solana_signature::Signature,
-    solana_transaction_error::TransactionError,
-    solana_transaction_status::{
-        UiLoadedAddresses, UiTransactionEncoding, UiTransactionReturnData,
-        UiTransactionTokenBalance,
-    },
-    thiserror::Error,
-};
-
+use serde::{Deserialize, Serialize};
+use solana_account_decoder_client_types::{UiAccount, UiAccountEncoding};
+use solana_clock::Slot;
+use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_rpc_client_api::response::RpcBlockhash;
+use solana_signature::Signature;
+use solana_transaction_error::TransactionError;
+use solana_transaction_status::{
+    UiLoadedAddresses, UiTransactionEncoding, UiTransactionReturnData, UiTransactionTokenBalance,
+};
+use thiserror::Error;
 
 /// Request payload for `simulateBundle`. Carries the encoded transactions; the
 /// per-tx pre/post-account hints + flags live in the optional config below.

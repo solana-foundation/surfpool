@@ -6,9 +6,7 @@ use sha2::{Digest, Sha256};
 use solana_account_decoder::{UiAccount, UiAccountEncoding, encode_ui_account};
 use solana_client::{rpc_config::RpcSendTransactionConfig, rpc_custom_error::RpcCustomError};
 use solana_pubkey::Pubkey;
-use solana_rpc_client_api::response::{
-    Response as RpcResponse, RpcBlockhash, RpcResponseContext,
-};
+use solana_rpc_client_api::response::{Response as RpcResponse, RpcBlockhash, RpcResponseContext};
 use solana_signature::Signature;
 use solana_transaction::versioned::VersionedTransaction;
 use solana_transaction_status::{TransactionConfirmationStatus, UiTransactionEncoding};
@@ -745,8 +743,9 @@ impl Jito for SurfpoolJitoRpc {
             // Initialize per-tx results to the empty/skipped shape. We overwrite
             // entries as we simulate; on early-exit failure the trailing entries stay
             // empty (matching Jito's "skipped txs after first failure" semantics).
-            let mut transaction_results: Vec<RpcSimulateBundleTransactionResult> =
-                (0..bundle_len).map(|_| empty_tx_result(replacement_blockhash.clone())).collect();
+            let mut transaction_results: Vec<RpcSimulateBundleTransactionResult> = (0..bundle_len)
+                .map(|_| empty_tx_result(replacement_blockhash.clone()))
+                .collect();
             let mut summary: RpcBundleSimulationSummary = RpcBundleSimulationSummary::Succeeded;
 
             // Move owned txs into the loop — `into_iter()` so we can pass each
@@ -763,8 +762,7 @@ impl Jito for SurfpoolJitoRpc {
                 // tx. When the caller did not ask for a snapshot for this tx, the
                 // pubkey list is empty and we surface the field as None — matches
                 // Jito's wire shape (null vs []).
-                let pre_accounts =
-                    snapshot_accounts(&sandbox_locker, &pre_pubkeys[idx]).await?;
+                let pre_accounts = snapshot_accounts(&sandbox_locker, &pre_pubkeys[idx]).await?;
 
                 // Pre-pass sigverify when the caller asked us to verify
                 // signatures. We do it ourselves so a failure surfaces a typed
@@ -773,13 +771,21 @@ impl Jito for SurfpoolJitoRpc {
                 // SurfpoolError on return, which would force us to string-match
                 // to recover the variant.
                 if sigverify {
-                    if let Err(failed) = sandbox_locker
-                        .with_svm_reader(|svm_reader| svm_reader.sigverify(&tx))
+                    if let Err(failed) =
+                        sandbox_locker.with_svm_reader(|svm_reader| svm_reader.sigverify(&tx))
                     {
                         let post_accounts =
                             snapshot_accounts(&sandbox_locker, &post_pubkeys[idx]).await?;
-                        let pre_for_idx = if pre_was_some { Some(pre_accounts) } else { None };
-                        let post_for_idx = if post_was_some { Some(post_accounts) } else { None };
+                        let pre_for_idx = if pre_was_some {
+                            Some(pre_accounts)
+                        } else {
+                            None
+                        };
+                        let post_for_idx = if post_was_some {
+                            Some(post_accounts)
+                        } else {
+                            None
+                        };
                         let typed = failed.err;
                         transaction_results[idx] = build_tx_result(
                             Some(typed.clone()),
@@ -825,11 +831,18 @@ impl Jito for SurfpoolJitoRpc {
                 // Always attempt the post-snapshot — the caller asked for it and a
                 // failed tx may have partially mutated state. If the snapshot itself
                 // errors (sandbox poisoned, etc.) we surface that to the caller.
-                let post_accounts =
-                    snapshot_accounts(&sandbox_locker, &post_pubkeys[idx]).await?;
+                let post_accounts = snapshot_accounts(&sandbox_locker, &post_pubkeys[idx]).await?;
 
-                let pre_for_idx = if pre_was_some { Some(pre_accounts) } else { None };
-                let post_for_idx = if post_was_some { Some(post_accounts) } else { None };
+                let pre_for_idx = if pre_was_some {
+                    Some(pre_accounts)
+                } else {
+                    None
+                };
+                let post_for_idx = if post_was_some {
+                    Some(post_accounts)
+                } else {
+                    None
+                };
 
                 match profile_res {
                     Ok(keyed) => {
@@ -1974,7 +1987,11 @@ mod tests {
         let tx = build_v0_transaction(
             &payer.pubkey(),
             &[payer],
-            &[system_instruction::transfer(&payer.pubkey(), recipient, lamports)],
+            &[system_instruction::transfer(
+                &payer.pubkey(),
+                recipient,
+                lamports,
+            )],
             recent_blockhash,
         );
         use base64::Engine;
@@ -1996,7 +2013,10 @@ mod tests {
             .await;
         assert!(result.is_err(), "empty bundle should be rejected");
         assert!(
-            result.unwrap_err().message.contains("Bundle cannot be empty"),
+            result
+                .unwrap_err()
+                .message
+                .contains("Bundle cannot be empty"),
             "expected empty-bundle error message"
         );
     }
@@ -2475,7 +2495,10 @@ mod tests {
         // Bundle summary should be Failed.
         match &response.value.summary {
             RpcBundleSimulationSummary::Failed { tx_signature, .. } => {
-                assert!(tx_signature.is_some(), "Failed summary must carry signature");
+                assert!(
+                    tx_signature.is_some(),
+                    "Failed summary must carry signature"
+                );
             }
             other => panic!("expected Failed summary, got {:?}", other),
         }
@@ -2491,7 +2514,10 @@ mod tests {
         // InsufficientFundsForRent — anything BUT SanitizeFailure is the
         // win we are pinning.
         assert!(
-            !matches!(err, solana_transaction_error::TransactionError::SanitizeFailure),
+            !matches!(
+                err,
+                solana_transaction_error::TransactionError::SanitizeFailure
+            ),
             "execution failure must surface a typed err, not SanitizeFailure (got {:?})",
             err,
         );
@@ -2521,7 +2547,11 @@ mod tests {
         let mut tx = build_v0_transaction(
             &payer.pubkey(),
             &[&payer],
-            &[system_instruction::transfer(&payer.pubkey(), &recipient, 1_000)],
+            &[system_instruction::transfer(
+                &payer.pubkey(),
+                &recipient,
+                1_000,
+            )],
             &recent_blockhash,
         );
         let mut sig_bytes = tx.signatures[0].as_ref().to_vec();
@@ -2562,7 +2592,10 @@ mod tests {
             .as_ref()
             .expect("err must be populated for a sig-verify failure");
         assert!(
-            matches!(err, solana_transaction_error::TransactionError::SignatureFailure),
+            matches!(
+                err,
+                solana_transaction_error::TransactionError::SignatureFailure
+            ),
             "sig-verify failure must surface SignatureFailure (got {:?})",
             err,
         );
@@ -2590,7 +2623,11 @@ mod tests {
         let msg = VersionedMessage::V0(
             V0Message::try_compile(
                 &payer.pubkey(),
-                &[system_instruction::transfer(&payer.pubkey(), &recipient, 1_000)],
+                &[system_instruction::transfer(
+                    &payer.pubkey(),
+                    &recipient,
+                    1_000,
+                )],
                 &[],
                 recent_blockhash,
             )
@@ -2615,7 +2652,10 @@ mod tests {
             )
             .await;
 
-        assert!(result.is_err(), "sig-less tx must be rejected at decode time");
+        assert!(
+            result.is_err(),
+            "sig-less tx must be rejected at decode time"
+        );
         let err = result.unwrap_err();
         assert!(
             err.message.contains("has no signatures"),
