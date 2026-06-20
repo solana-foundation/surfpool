@@ -2468,7 +2468,7 @@ mod tests {
                     "Profile should succeed, found error: {}",
                     ix_profile.error_message.as_ref().unwrap()
                 );
-                assert_eq!(ix_profile.compute_units_consumed, 1230);
+                assert_eq!(ix_profile.compute_units_consumed, 1278);
                 let account_states = &ix_profile.account_states;
 
                 assert!(account_states.get(&payer.pubkey()).is_none());

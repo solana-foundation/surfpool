@@ -644,7 +644,7 @@ async fn test_simulate_add_alt_entries_fetching(test_type: TestType) {
     );
     assert_eq!(
         simulation_res.value.loaded_accounts_data_size.unwrap(),
-        140134,
+        6090,
         "Incorrect loaded_accounts_data_size value"
     );
     let simulation_res2 = full_client
@@ -3096,7 +3096,7 @@ async fn test_profile_transaction_token_transfer(test_type: TestType) {
                 "Profile should succeed, found error: {}",
                 ix_profile.error_message.as_ref().unwrap()
             );
-            assert_eq!(ix_profile.compute_units_consumed, 1230);
+            assert_eq!(ix_profile.compute_units_consumed, 1278);
             assert!(ix_profile.error_message.is_none());
             let account_states = &ix_profile.account_states;
 

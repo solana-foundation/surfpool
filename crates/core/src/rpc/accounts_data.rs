@@ -699,7 +699,7 @@ mod tests {
     use solana_keypair::Keypair;
     use solana_program_option::COption;
     use solana_program_pack::Pack;
-    use solana_pubkey::{Pubkey, new_rand};
+    use solana_pubkey::Pubkey;
     use solana_signer::Signer;
     use solana_system_interface::instruction::create_account;
     use solana_transaction::Transaction;
@@ -1536,9 +1536,9 @@ mod tests {
         setup.context.remote_rpc_client = Some(remote_client);
 
         // Create three accounts with different lamport amounts
-        let pk1 = new_rand();
-        let pk2 = new_rand();
-        let pk3 = new_rand();
+        let pk1 = Pubkey::new_unique();
+        let pk2 = Pubkey::new_unique();
+        let pk3 = Pubkey::new_unique();
 
         println!("{}", pk1);
         println!("{}", pk2);

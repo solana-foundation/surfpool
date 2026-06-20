@@ -918,6 +918,7 @@ impl SurfnetSvmLocker {
                             block_time,
                             confirmation_status: Some(confirmation_status),
                             signature: sig,
+                            transaction_index: None,
                         })
                     })
                     .collect()
@@ -1125,6 +1126,7 @@ impl SurfnetSvmLocker {
                     slot,
                     transaction: encoded,
                     block_time: Some(block_time),
+                    transaction_index: None,
                 },
                 latest_absolute_slot,
             ))

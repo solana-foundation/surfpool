@@ -27,9 +27,9 @@ resolver = "2"
 [workspace.dependencies]
 actix-cors = "0.7.0"
 actix-web = { version = "4", default-features = false }
-agave-feature-set = { version = "3.1.9", default-features = false }
-agave-geyser-plugin-interface = { version = "3.1", default-features = false }
-agave-reserved-account-keys = { version = "3.1", default-features = false }
+agave-feature-set = { version = "4.0", default-features = false }
+agave-geyser-plugin-interface = { version = "4.0", default-features = false }
+agave-reserved-account-keys = { version = "4.0", default-features = false }
 anchor-lang-idl = "0.1.2"
 ansi_term = "0.12.1"
 anyhow = { version = "1.0.95", default-features = false }
@@ -83,8 +83,8 @@ juniper_codegen = { version = "0.16.0", default-features = false }
 juniper_graphql_ws = { version = "0.4.0", default-features = false }
 lazy_static = "1.5.0"
 libloading = "0.7.4"
-litesvm = { version = "0.12.0", features = ["nodejs-internal", "precompiles"] }
-litesvm-token = "0.12.0"
+litesvm = { version = "0.13.0", features = ["nodejs-internal", "precompiles"] }
+litesvm-token = "0.13.0"
 log = "0.4.27"
 mime_guess = { version = "2.0.4", default-features = false }
 mustache = "0.9.0"
@@ -104,11 +104,11 @@ serde_derive = { version = "1.0.226", default-features = false } # must match th
 serde_json = { version = "1.0.135", default-features = false }
 serde_with = { version = "3.14.0", default-features = false }
 strum = { version = "0.26", default-features = false, features = ["derive"] }
-solana-account = { version = "3.2", default-features = false }
-solana-account-decoder = { version = "3.1", default-features = false }
-solana-account-decoder-client-types = { version = "3.1", default-features = false }
+solana-account = { version = "3.4", default-features = false }
+solana-account-decoder = { version = "4.0", default-features = false }
+solana-account-decoder-client-types = { version = "4.0", default-features = false }
 solana-address-lookup-table-interface = { version = "3.0", default-features = false }
-solana-client = { version = "3.1", default-features = false }
+solana-client = { version = "4.0", default-features = false }
 solana-clock = { version = "3.0", default-features = false }
 solana-commitment-config = { version = "3.1", default-features = false }
 solana-compute-budget-interface = { version = "3.0", default-features = false }
@@ -117,34 +117,34 @@ solana-epoch-schedule = { version = "3.0", default-features = false }
 solana-ed25519-program = { version = "3.0", default-features = false }
 solana-feature-gate-interface = { version = "3.1", default-features = false }
 solana-genesis-config = { version = "3.0", default-features = false }
-solana-hash = { version = "3.1", default-features = false }
+solana-hash = { version = "4.2", default-features = false }
 solana-inflation = { version = "3.0", default-features = false }
-solana-instruction = { version = "3.1", default-features = false }
+solana-instruction = { version = "=3.2.0", default-features = false }
 solana-keypair = { version = "3.1", default-features = false }
 solana-loader-v3-interface = { version = "6.1", default-features = false }
-solana-message = { version = "3.0", default-features = false }
+solana-message = { version = "3.1", default-features = false }
 solana-nonce = { version = "3.0", default-features = false }
 solana-packet = { version = "4.0", default-features = false }
 solana-program-option = { version = "3.0", default-features = false }
 solana-program-pack = { version = "3.0", default-features = false }
 solana-pubkey = { version = "3.0", default-features = false }
-solana-rpc-client = { version = "3.1", default-features = false }
-solana-rpc-client-api = { version = "3.1", default-features = false }
-solana-runtime = { version = "3.1", default-features = false, features = ["agave-unstable-api"] }
+solana-rpc-client = { version = "4.0", default-features = false }
+solana-rpc-client-api = { version = "4.0", default-features = false }
+solana-runtime = { version = "4.0", default-features = false, features = ["agave-unstable-api"] }
 solana-sdk-ids = { version = "3.1", default-features = false }
 solana-signature = { version = "3.1", default-features = false, features = [
     "rand",
 ] }
 solana-signer = { version = "3.0", default-features = false }
 solana-slot-hashes = { version = "3.0", default-features = false }
-solana-system-interface = { version = "3.2", default-features = false }
+solana-system-interface = { version = "3.1", default-features = false }
 solana-sysvar = { version = "3.1", default-features = false }
 solana-sysvar-id = { version = "3.1", default-features = false }
 solana-transaction = { version = "3.0", default-features = false }
-solana-transaction-context = { version = "3.1", default-features = false }
+solana-transaction-context = { version = "4.0", default-features = false }
 solana-transaction-error = { version = "3.0", default-features = false }
-solana-transaction-status = { version = "3.1", default-features = false }
-solana-version = { version = "3.1", default-features = false }
+solana-transaction-status = { version = "4.0", default-features = false }
+solana-version = { version = "4.0", default-features = false }
 spl-associated-token-account-interface = { version = "2.0.0", default-features = false }
 spl-token-2022-interface = { version = "2.0.0", default-features = false }
 spl-token-interface = { version = "2.0.0", default-features = false }

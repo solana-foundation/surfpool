@@ -16,7 +16,7 @@ fn lookup_feature_by_name(name: &str) -> Option<Pubkey> {
 
     let pubkey = match s {
         "move-precompile-verification-to-svm" => move_precompile_verification_to_svm::id(),
-        "stricter-abi-and-runtime-constraints" => stricter_abi_and_runtime_constraints::id(),
+        // "stricter-abi-and-runtime-constraints" removed in agave-feature-set 4.0.x
         "enable-bpf-loader-set-authority-checked-ix" => {
             enable_bpf_loader_set_authority_checked_ix::id()
         }

@@ -770,7 +770,7 @@ impl Minimal for SurfpoolMinimalRpc {
         Ok(SurfpoolRpcVersionInfo {
             surfnet_version: SURFPOOL_VERSION.to_string(),
             solana_core: version.to_string(),
-            feature_set: Some(version.feature_set),
+            feature_set: Some(version.feature_set()),
         })
     }
 

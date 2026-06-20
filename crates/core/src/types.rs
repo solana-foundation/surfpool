@@ -24,7 +24,7 @@ use solana_transaction::{
     sanitized::SanitizedTransaction,
     versioned::{TransactionVersion, VersionedTransaction},
 };
-use solana_transaction_context::TransactionReturnData;
+use solana_transaction_context::transaction::TransactionReturnData;
 use solana_transaction_error::TransactionError;
 use solana_transaction_status::{
     Encodable, EncodableWithMeta, EncodeError, EncodedTransaction,
