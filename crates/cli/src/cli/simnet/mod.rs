@@ -16,6 +16,7 @@ use notify::{
     Config, Event, EventKind, RecursiveMode, Result as NotifyResult, Watcher,
     event::{CreateKind, DataChange, ModifyKind},
 };
+#[cfg(feature = "version_check")]
 use serde::{Deserialize, Serialize};
 use solana_keypair::Keypair;
 use solana_signer::Signer;
@@ -42,6 +43,7 @@ use crate::{
     tui::{self, simnet::DisplayedUrl},
 };
 
+#[cfg(feature = "version_check")]
 #[derive(Debug, Serialize, Deserialize)]
 struct CheckVersionResponse {
     pub latest: String,
