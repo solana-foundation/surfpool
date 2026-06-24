@@ -51,6 +51,25 @@ pub async fn start_studio_and_scenario_server(
     let template_registry_wrapped = Data::new(RwLock::new(TemplateRegistry::new()));
     let loaded_scenarios = Data::new(RwLock::new(LoadedScenarios::new()));
 
+    let default_port = network_binding.split(':').last().unwrap_or("18488");
+    let final_bind_addr = std::env::var("SURFPOOL_STUDIO_HOST")
+        .map(|host| {
+            if host.contains(']') {
+                if host.rfind(':') > host.rfind(']') {
+                    host
+                } else {
+                    format!("{}:{}", host, default_port)
+                }
+            } else {
+                match host.matches(':').count() {
+                    0 => format!("{}:{}", host, default_port),
+                    1 => host,
+                    _ => format!("[{}]:{}", host, default_port),
+                }
+            }
+        })
+        .unwrap_or(network_binding);
+
     let server = HttpServer::new(move || {
         let mut app = App::new()
             .app_data(config_wrapped.clone())
@@ -81,7 +100,7 @@ pub async fn start_studio_and_scenario_server(
         app
     })
     .workers(5)
-    .bind(network_binding)?
+    .bind(final_bind_addr)?
     .run();
     let handle = server.handle();
     tokio::spawn(server);
