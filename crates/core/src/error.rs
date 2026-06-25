@@ -271,6 +271,14 @@ impl SurfpoolError {
         Self(error)
     }
 
+    /// Generic `Invalid params` error carrying a free-form message.
+    pub fn invalid_params<M>(message: M) -> Self
+    where
+        M: ToString,
+    {
+        Self(Error::invalid_params(message.to_string()))
+    }
+
     pub fn invalid_pubkey_at_index<D>(pubkey: &str, index: usize, data: D) -> Self
     where
         D: Serialize,

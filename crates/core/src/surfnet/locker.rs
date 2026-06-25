@@ -37,7 +37,7 @@ use solana_epoch_info::EpochInfo;
 use solana_hash::Hash;
 use solana_loader_v3_interface::{get_program_data_address, state::UpgradeableLoaderState};
 use solana_message::{
-    Message, SimpleAddressLoader, VersionedMessage,
+    AccountKeys, Message, SimpleAddressLoader, VersionedMessage,
     compiled_instruction::CompiledInstruction,
     v0::{LoadedAddresses, MessageAddressTableLookup},
 };
@@ -48,8 +48,9 @@ use solana_transaction::{sanitized::SanitizedTransaction, versioned::VersionedTr
 use solana_transaction_error::TransactionError;
 use solana_transaction_status::{
     EncodedConfirmedTransactionWithStatusMeta,
-    TransactionConfirmationStatus as SolanaTransactionConfirmationStatus, UiConfirmedBlock,
-    UiTransactionEncoding, VersionedTransactionWithStatusMeta, extract_and_fmt_memos,
+    TransactionConfirmationStatus as SolanaTransactionConfirmationStatus, TransactionStatusMeta,
+    TransactionTokenBalance, UiConfirmedBlock, UiTransactionEncoding,
+    VersionedTransactionWithStatusMeta, extract_and_fmt_memos,
 };
 use surfpool_types::{
     AccountSnapshot, ComputeUnitsEstimationResult, ExecutionCapture, ExportSnapshotConfig, Idl,
@@ -68,6 +69,12 @@ use super::{
 use crate::{
     error::{AirdropError, SurfpoolError, SurfpoolResult},
     helpers::time_travel::calculate_time_travel_clock,
+    rpc::full::{
+        ComparisonFilter, RpcGetTransactionsForAddressConfig, RpcTransactionForAddressEntry,
+        RpcTransactionForAddressFullInfo, RpcTransactionForAddressSignatureInfo,
+        RpcTransactionsForAddressResult, SortOrder, TransactionsForAddressDetails,
+        TransactionsForAddressStatusFilter, TransactionsForAddressTokenFilter,
+    },
     rpc::utils::{convert_transaction_metadata_from_canonical, verify_pubkey},
     storage::StorageResult,
     surfnet::FINALIZATION_SLOT_THRESHOLD,
@@ -833,6 +840,373 @@ fn signatures_for_address_remote_config(
     })
 }
 
+/// Returns `true` if the queried owner holds a token account that appears in
+/// this transaction's pre/post token-balance metadata.
+fn owner_in_token_balances(meta: &TransactionStatusMeta, owner: &str) -> bool {
+    let has_owner = |balances: &Option<Vec<TransactionTokenBalance>>| {
+        balances
+            .as_ref()
+            .is_some_and(|list| list.iter().any(|tb| tb.owner == owner))
+    };
+    has_owner(&meta.pre_token_balances) || has_owner(&meta.post_token_balances)
+}
+
+/// Returns `true` if a token account owned by `owner` had its balance change in
+/// this transaction (raw amount differs between pre and post, or the entry only
+/// appears on one side).
+fn owner_token_balance_changed(meta: &TransactionStatusMeta, owner: &str) -> bool {
+    let collect = |balances: &Option<Vec<TransactionTokenBalance>>| -> HashMap<u8, String> {
+        balances
+            .as_ref()
+            .map(|list| {
+                list.iter()
+                    .filter(|tb| tb.owner == owner)
+                    .map(|tb| (tb.account_index, tb.ui_token_amount.amount.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let pre = collect(&meta.pre_token_balances);
+    let post = collect(&meta.post_token_balances);
+    let mut indices: HashSet<u8> = pre.keys().copied().collect();
+    indices.extend(post.keys().copied());
+    indices.iter().any(|idx| pre.get(idx) != post.get(idx))
+}
+
+/// Maps each transaction signature (base-58) in the given slots to its
+/// execution index within its block, read from block headers. Signatures whose
+/// block header is missing are absent from the map.
+///
+/// Shared by `getSignaturesForAddress` and `getTransactionsForAddress` to derive
+/// a stable intra-slot ordering (and, for the latter, the `transactionIndex`).
+/// Slots are de-duplicated internally, so callers can pass the raw slot of each
+/// record.
+fn signature_positions_in_blocks(
+    svm_reader: &SurfnetSvm,
+    slots: impl IntoIterator<Item = u64>,
+) -> HashMap<String, usize> {
+    let unique_slots: HashSet<u64> = slots.into_iter().collect();
+    let mut positions = HashMap::new();
+    for slot in unique_slots {
+        if let Ok(Some(block_header)) = svm_reader.blocks.get(&slot) {
+            for (idx, block_sig) in block_header.signatures.iter().enumerate() {
+                positions.insert(block_sig.to_string(), idx);
+            }
+        }
+    }
+    positions
+}
+
+/// Returns `true` if `pubkey` appears in the transaction's resolved account
+/// keys, including addresses pulled in from on-chain address lookup tables
+/// (via `meta.loaded_addresses`).
+fn transaction_involves_address(
+    transaction: &VersionedTransaction,
+    loaded_addresses: &LoadedAddresses,
+    pubkey: &Pubkey,
+) -> bool {
+    AccountKeys::new(
+        transaction.message.static_account_keys(),
+        Some(loaded_addresses),
+    )
+    .iter()
+    .any(|key| key == pubkey)
+}
+
+/// Canonical ascending order for address-scoped transaction listings:
+/// `(slot, intra-block execution index, signature)`. Callers apply `.reverse()`
+/// for descending (newest-first) order. The signature acts as a final
+/// tie-breaker so the total order is deterministic even when a block header is
+/// missing (both indices fall back to `usize::MAX`).
+fn compare_by_slot_index_signature(
+    a: (u64, usize, &str),
+    b: (u64, usize, &str),
+) -> std::cmp::Ordering {
+    a.0.cmp(&b.0)
+        .then_with(|| a.1.cmp(&b.1))
+        .then_with(|| a.2.cmp(b.2))
+}
+
+/// Returns `true` when `value` satisfies every bound present in `filter`
+/// (none filter matches everything). Used by `getTransactionsForAddress`
+/// slot / blockTime range filters.
+fn comparison_matches<T: PartialOrd>(value: &T, filter: Option<&ComparisonFilter<T>>) -> bool {
+    let Some(filter) = filter else {
+        return true;
+    };
+    if let Some(bound) = filter.gte.as_ref()
+        && value < bound
+    {
+        return false;
+    }
+    if let Some(bound) = filter.gt.as_ref()
+        && value <= bound
+    {
+        return false;
+    }
+    if let Some(bound) = filter.lte.as_ref()
+        && value > bound
+    {
+        return false;
+    }
+    if let Some(bound) = filter.lt.as_ref()
+        && value >= bound
+    {
+        return false;
+    }
+    true
+}
+
+/// `getTransactionsForAddress`: returns transactions touching an address in a
+/// single call, in either `signatures` or `full` detail mode.
+impl SurfnetSvmLocker {
+    pub async fn get_transactions_for_address(
+        &self,
+        remote_ctx: &Option<(SurfnetRemoteClient, ())>,
+        pubkey: &Pubkey,
+        config: &RpcGetTransactionsForAddressConfig,
+    ) -> SurfpoolResult<SvmAccessContext<RpcTransactionsForAddressResult>> {
+        // Intentionally local-only for now
+        let _ = remote_ctx;
+        self.get_transactions_for_address_local(pubkey, config)
+    }
+
+    /// Collects matching local transactions, orders them by `(slot, intra-block
+    /// index, signature)`, applies the `paginationToken` cursor and `limit`,
+    /// then renders each entry as signature metadata or a fully encoded
+    /// transaction.
+    pub fn get_transactions_for_address_local(
+        &self,
+        pubkey: &Pubkey,
+        config: &RpcGetTransactionsForAddressConfig,
+    ) -> SurfpoolResult<SvmAccessContext<RpcTransactionsForAddressResult>> {
+        let full =
+            config.transaction_details.unwrap_or_default() == TransactionsForAddressDetails::Full;
+        let sort_desc = config.sort_order.unwrap_or_default() == SortOrder::Desc;
+        let status_filter = config
+            .filters
+            .as_ref()
+            .and_then(|f| f.status)
+            .unwrap_or_default();
+        let token_accounts = config
+            .filters
+            .as_ref()
+            .and_then(|f| f.token_accounts)
+            .unwrap_or_default();
+        let encoding = config.encoding.unwrap_or(UiTransactionEncoding::Json);
+
+        let spec_max_limit = if full { 100usize } else { 1000usize };
+        let requested_limit = config.limit.unwrap_or(spec_max_limit);
+        if requested_limit == 0 {
+            return Err(SurfpoolError::invalid_params(format!(
+                "invalid limit, must be at least 1"
+            )));
+        }
+        let limit = requested_limit.min(spec_max_limit);
+
+        let slot_filter = config.filters.as_ref().and_then(|f| f.slot.as_ref());
+        let block_time_filter = config.filters.as_ref().and_then(|f| f.block_time.as_ref());
+        let max_version = config.max_supported_transaction_version;
+        let pagination_token = config.pagination_token.as_deref();
+        let pubkey = *pubkey;
+        let address_str = pubkey.to_string();
+
+        // A locally-stored transaction that matched all filters, carried through
+        // sorting/pagination before being rendered into a response entry.
+        struct Record {
+            signature: String,
+            slot: u64,
+            transaction_index: Option<usize>,
+            block_time: Option<i64>,
+            err: Option<TransactionError>,
+            memo: Option<String>,
+            confirmation_status: SolanaTransactionConfirmationStatus,
+            tx: TransactionWithStatusMeta,
+        }
+
+        let ctx = self.with_contextualized_svm_reader(move |svm_reader| {
+            let current_slot = svm_reader.get_latest_absolute_slot();
+
+            let mut records: Vec<Record> = svm_reader
+                .transactions
+                .into_iter()
+                .map(|iter| {
+                    iter.filter_map(|(sig, status)| {
+                        let Some((tx_with_meta, _)) = status.as_processed() else {
+                            return None;
+                        };
+                        let slot = tx_with_meta.slot;
+
+                        let direct = transaction_involves_address(
+                            &tx_with_meta.transaction,
+                            &tx_with_meta.meta.loaded_addresses,
+                            &pubkey,
+                        );
+                        let include = match token_accounts {
+                            TransactionsForAddressTokenFilter::None => direct,
+                            TransactionsForAddressTokenFilter::All => {
+                                direct || owner_in_token_balances(&tx_with_meta.meta, &address_str)
+                            }
+                            TransactionsForAddressTokenFilter::BalanceChanged => {
+                                direct
+                                    || owner_token_balance_changed(&tx_with_meta.meta, &address_str)
+                            }
+                        };
+                        if !include {
+                            return None;
+                        }
+
+                        if !comparison_matches(&slot, slot_filter) {
+                            return None;
+                        }
+
+                        // Synthesize block time from the slot, matching
+                        // `getBlockTime` and `getSignaturesForAddress` (ms -> s).
+                        let block_time =
+                            Some((svm_reader.calculate_block_time_for_slot(slot) / 1_000) as i64);
+                        if !comparison_matches(&block_time.unwrap(), block_time_filter) {
+                            return None;
+                        }
+
+                        let err = match &tx_with_meta.meta.status {
+                            Ok(_) => None,
+                            Err(e) => Some(e.clone()),
+                        };
+                        match status_filter {
+                            TransactionsForAddressStatusFilter::Succeeded if err.is_some() => {
+                                return None;
+                            }
+                            TransactionsForAddressStatusFilter::Failed if err.is_none() => {
+                                return None;
+                            }
+                            _ => {}
+                        }
+
+                        let memo = extract_and_fmt_memos(&VersionedTransactionWithStatusMeta {
+                            transaction: tx_with_meta.transaction.clone(),
+                            meta: tx_with_meta.meta.clone(),
+                        });
+
+                        let confirmation_status = match current_slot {
+                            cs if cs == slot => SolanaTransactionConfirmationStatus::Processed,
+                            cs if cs < slot + FINALIZATION_SLOT_THRESHOLD => {
+                                SolanaTransactionConfirmationStatus::Confirmed
+                            }
+                            _ => SolanaTransactionConfirmationStatus::Finalized,
+                        };
+
+                        Some(Record {
+                            signature: sig,
+                            slot,
+                            transaction_index: None,
+                            block_time,
+                            err,
+                            memo,
+                            confirmation_status,
+                            tx: tx_with_meta,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+
+            // Resolve intra-block execution order from block headers so that
+            // same-slot transactions sort deterministically and expose a stable
+            // `transactionIndex`.
+            let sig_position =
+                signature_positions_in_blocks(svm_reader, records.iter().map(|r| r.slot));
+            for record in records.iter_mut() {
+                record.transaction_index = sig_position.get(&record.signature).copied();
+            }
+
+            // Canonical order by (slot, intra-block index, signature); `desc`
+            // (default) is newest-first.
+            records.sort_by(|a, b| {
+                let ord = compare_by_slot_index_signature(
+                    (
+                        a.slot,
+                        a.transaction_index.unwrap_or(usize::MAX),
+                        &a.signature,
+                    ),
+                    (
+                        b.slot,
+                        b.transaction_index.unwrap_or(usize::MAX),
+                        &b.signature,
+                    ),
+                );
+                if sort_desc { ord.reverse() } else { ord }
+            });
+
+            // Apply the `paginationToken` cursor (exclusive). A token that is
+            // not present locally yields an empty page, matching the
+            // `getSignaturesForAddress` `before` semantics.
+            let start = match pagination_token {
+                Some(token) => match records.iter().position(|r| r.signature == token) {
+                    Some(idx) => idx + 1,
+                    None => records.len(),
+                },
+                None => 0,
+            };
+
+            let page: Vec<Record> = records.into_iter().skip(start).take(limit).collect();
+
+            // A full page implies there may be more, surface the last signature
+            // as the next cursor.
+            let pagination_next = if page.len() == limit {
+                page.last().map(|r| r.signature.clone())
+            } else {
+                None
+            };
+
+            let mut data = Vec::with_capacity(page.len());
+            for record in page {
+                let entry = if full {
+                    let encoded = record.tx.encode(encoding, max_version, true)?;
+                    RpcTransactionForAddressEntry::Full(Box::new(
+                        RpcTransactionForAddressFullInfo {
+                            slot: record.slot,
+                            transaction_index: record.transaction_index,
+                            block_time: record.block_time,
+                            transaction: encoded,
+                        },
+                    ))
+                } else {
+                    RpcTransactionForAddressEntry::Signature(
+                        RpcTransactionForAddressSignatureInfo {
+                            signature: record.signature,
+                            slot: record.slot,
+                            transaction_index: record.transaction_index,
+                            err: record.err,
+                            memo: record.memo,
+                            block_time: record.block_time,
+                            confirmation_status: Some(record.confirmation_status),
+                        },
+                    )
+                };
+                data.push(entry);
+            }
+
+            Ok::<RpcTransactionsForAddressResult, SurfpoolError>(RpcTransactionsForAddressResult {
+                data,
+                pagination_token: pagination_next,
+            })
+        });
+
+        let SvmAccessContext {
+            slot,
+            latest_epoch_info,
+            latest_blockhash,
+            inner,
+        } = ctx;
+        Ok(SvmAccessContext::new(
+            slot,
+            latest_epoch_info,
+            latest_blockhash,
+            inner?,
+        ))
+    }
+}
+
 /// Get signatures for Addresses
 impl SurfnetSvmLocker {
     /// Returns local `getSignaturesForAddress` results in the same newest-first order expected by
@@ -864,24 +1238,27 @@ impl SurfnetSvmLocker {
                 .into_iter()
                 .map(|iter| {
                     iter.filter_map(|(sig, status)| {
-                        let (
+                        let Some((
                             TransactionWithStatusMeta {
                                 slot,
                                 transaction,
                                 meta,
                             },
                             _,
-                        ) = status
-                            .as_processed()
-                            .expect("expected processed transaction");
+                        )) = status.as_processed()
+                        else {
+                            return None;
+                        };
 
                         if slot < min_context_slot {
                             return None;
                         }
 
-                        // Check if the pubkey is a signer
-
-                        if !transaction.message.static_account_keys().contains(pubkey) {
+                        if !transaction_involves_address(
+                            &transaction,
+                            &meta.loaded_addresses,
+                            pubkey,
+                        ) {
                             return None;
                         }
 
@@ -927,26 +1304,20 @@ impl SurfnetSvmLocker {
 
             // `getSignaturesForAddress` is ordered newest-first, but transactions that share a
             // slot also need to preserve their execution order within that block.
-            let unique_slots: HashSet<u64> = sigs.iter().map(|s| s.slot).collect();
-            let mut sig_position: HashMap<String, usize> = HashMap::new();
-            for slot in unique_slots {
-                if let Ok(Some(block_header)) = svm_reader.blocks.get(&slot) {
-                    for (idx, block_sig) in block_header.signatures.iter().enumerate() {
-                        sig_position.insert(block_sig.to_string(), idx);
-                    }
-                }
-            }
+            let sig_position =
+                signature_positions_in_blocks(svm_reader, sigs.iter().map(|s| s.slot));
 
+            let position_of = |sig: &str| sig_position.get(sig).copied().unwrap_or(usize::MAX);
             let sigs: Vec<_> = sigs
                 .into_iter()
                 // Order from most recent to least recent so pagination boundaries
                 // can be applied against the exact transaction sequence.
                 .sorted_by(|a, b| {
-                    b.slot.cmp(&a.slot).then_with(|| {
-                        let a_pos = sig_position.get(&a.signature).unwrap_or(&usize::MAX);
-                        let b_pos = sig_position.get(&b.signature).unwrap_or(&usize::MAX);
-                        b_pos.cmp(&a_pos)
-                    })
+                    compare_by_slot_index_signature(
+                        (a.slot, position_of(&a.signature), &a.signature),
+                        (b.slot, position_of(&b.signature), &b.signature),
+                    )
+                    .reverse()
                 })
                 .collect();
 
@@ -4046,6 +4417,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        rpc::full::RpcTransactionsForAddressFilters,
         scenarios::registry::PYTH_V2_IDL_CONTENT,
         surfnet::{BlockHeader, SurfnetSvm, svm::apply_override_to_decoded_account},
     };
@@ -5487,6 +5859,451 @@ mod tests {
         let sigs: HashSet<String> = result.inner.iter().map(|s| s.signature.clone()).collect();
         assert!(sigs.contains(&sig_a.to_string()));
         assert!(sigs.contains(&sig_b.to_string()));
+    }
+
+    /// Extract the ordered signatures from a `signatures`-mode result.
+    fn tfa_signatures(result: &RpcTransactionsForAddressResult) -> Vec<String> {
+        result
+            .data
+            .iter()
+            .map(|entry| match entry {
+                RpcTransactionForAddressEntry::Signature(info) => info.signature.clone(),
+                RpcTransactionForAddressEntry::Full(_) => {
+                    panic!("expected signatures-mode entry")
+                }
+            })
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_tfa_default_is_signatures_newest_first() {
+        let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let locker = SurfnetSvmLocker::new(svm);
+
+        let pubkey = Pubkey::new_unique();
+        let sig_a = Signature::new_unique();
+        let sig_b = Signature::new_unique();
+        let sig_c = Signature::new_unique();
+
+        seed_signature_history(
+            &locker,
+            &pubkey,
+            &[(5, vec![sig_a, sig_b]), (6, vec![sig_c])],
+        );
+
+        let result = locker
+            .get_transactions_for_address_local(
+                &pubkey,
+                &RpcGetTransactionsForAddressConfig::default(),
+            )
+            .unwrap()
+            .inner;
+
+        // Newest slot first; within a slot, latest execution index first.
+        assert_eq!(
+            tfa_signatures(&result),
+            vec![sig_c.to_string(), sig_b.to_string(), sig_a.to_string(),]
+        );
+        // Page not full (no limit hit) => no further cursor.
+        assert_eq!(result.pagination_token, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_tfa_sort_order_asc() {
+        let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let locker = SurfnetSvmLocker::new(svm);
+
+        let pubkey = Pubkey::new_unique();
+        let sig_a = Signature::new_unique();
+        let sig_b = Signature::new_unique();
+        let sig_c = Signature::new_unique();
+
+        seed_signature_history(
+            &locker,
+            &pubkey,
+            &[(5, vec![sig_a, sig_b]), (6, vec![sig_c])],
+        );
+
+        let result = locker
+            .get_transactions_for_address_local(
+                &pubkey,
+                &RpcGetTransactionsForAddressConfig {
+                    sort_order: Some(SortOrder::Asc),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .inner;
+
+        assert_eq!(
+            tfa_signatures(&result),
+            vec![sig_a.to_string(), sig_b.to_string(), sig_c.to_string(),]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_tfa_limit_and_pagination_token() {
+        let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let locker = SurfnetSvmLocker::new(svm);
+
+        let pubkey = Pubkey::new_unique();
+        let sig_a = Signature::new_unique();
+        let sig_b = Signature::new_unique();
+        let sig_c = Signature::new_unique();
+
+        // desc order: c, b, a
+        seed_signature_history(&locker, &pubkey, &[(5, vec![sig_a, sig_b, sig_c])]);
+
+        let first = locker
+            .get_transactions_for_address_local(
+                &pubkey,
+                &RpcGetTransactionsForAddressConfig {
+                    limit: Some(2),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .inner;
+
+        assert_eq!(
+            tfa_signatures(&first),
+            vec![sig_c.to_string(), sig_b.to_string()]
+        );
+        // Full page => cursor points at the last returned signature.
+        assert_eq!(first.pagination_token, Some(sig_b.to_string()));
+
+        let second = locker
+            .get_transactions_for_address_local(
+                &pubkey,
+                &RpcGetTransactionsForAddressConfig {
+                    limit: Some(2),
+                    pagination_token: first.pagination_token.clone(),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .inner;
+
+        // Continues after the cursor, exclusive.
+        assert_eq!(tfa_signatures(&second), vec![sig_a.to_string()]);
+        assert_eq!(second.pagination_token, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_tfa_slot_filter() {
+        let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let locker = SurfnetSvmLocker::new(svm);
+
+        let pubkey = Pubkey::new_unique();
+        let sig_low = Signature::new_unique();
+        let sig_high = Signature::new_unique();
+
+        seed_signature_history(
+            &locker,
+            &pubkey,
+            &[(5, vec![sig_low]), (10, vec![sig_high])],
+        );
+
+        let result = locker
+            .get_transactions_for_address_local(
+                &pubkey,
+                &RpcGetTransactionsForAddressConfig {
+                    filters: Some(RpcTransactionsForAddressFilters {
+                        slot: Some(ComparisonFilter {
+                            gte: Some(10),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .inner;
+
+        assert_eq!(tfa_signatures(&result), vec![sig_high.to_string()]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_tfa_full_mode_returns_encoded_transactions() {
+        let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let locker = SurfnetSvmLocker::new(svm);
+
+        let pubkey = Pubkey::new_unique();
+        let sig = Signature::new_unique();
+        seed_signature_history(&locker, &pubkey, &[(5, vec![sig])]);
+
+        let result = locker
+            .get_transactions_for_address_local(
+                &pubkey,
+                &RpcGetTransactionsForAddressConfig {
+                    transaction_details: Some(TransactionsForAddressDetails::Full),
+                    encoding: Some(UiTransactionEncoding::Base64),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .inner;
+
+        assert_eq!(result.data.len(), 1);
+        match &result.data[0] {
+            RpcTransactionForAddressEntry::Full(info) => {
+                assert_eq!(info.slot, 5);
+                // base64-encoded binary transaction expected.
+                assert!(matches!(
+                    info.transaction.transaction,
+                    solana_transaction_status::EncodedTransaction::Binary(_, _)
+                ));
+            }
+            RpcTransactionForAddressEntry::Signature(_) => panic!("expected full-mode entry"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_tfa_rejects_zero_limit() {
+        let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let locker = SurfnetSvmLocker::new(svm);
+        let pubkey = Pubkey::new_unique();
+
+        let config = RpcGetTransactionsForAddressConfig {
+            limit: Some(0),
+            ..Default::default()
+        };
+        assert!(
+            locker
+                .get_transactions_for_address_local(&pubkey, &config)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_tfa_config_rejects_unknown_enum_spellings() {
+        // Unknown enum values are rejected by serde at params-deserialization
+        // time (before the handler runs), so the RPC layer returns invalid
+        // params without any manual checks.
+        for value in [
+            serde_json::json!({ "transactionDetails": "abc" }),
+            serde_json::json!({ "sortOrder": "invalid" }),
+            serde_json::json!({ "encoding": "yaml" }),
+            serde_json::json!({ "filters": { "status": "test" } }),
+            serde_json::json!({ "filters": { "tokenAccounts": "some" } }),
+        ] {
+            assert!(
+                serde_json::from_value::<RpcGetTransactionsForAddressConfig>(value.clone())
+                    .is_err(),
+                "expected deserialization to reject {value}"
+            );
+        }
+    }
+
+    /// Store a transaction that does NOT list `owner` as a direct account key
+    /// but records `owner` in its token-balance metadata, with the given
+    /// pre/post raw amounts. Used to exercise the `tokenAccounts` filter.
+    fn store_token_tx(
+        svm: &mut SurfnetSvm,
+        sig: Signature,
+        slot: u64,
+        owner: &Pubkey,
+        pre_amount: &str,
+        post_amount: &str,
+    ) {
+        let unrelated = Pubkey::new_unique();
+        let tx = make_test_tx(sig, &unrelated);
+        let mint = Pubkey::new_unique().to_string();
+        let program_id = Pubkey::new_unique().to_string();
+        let balance = |amount: &str| TransactionTokenBalance {
+            account_index: 1,
+            mint: mint.clone(),
+            ui_token_amount: UiTokenAmount {
+                ui_amount: None,
+                decimals: 0,
+                amount: amount.to_string(),
+                ui_amount_string: amount.to_string(),
+            },
+            owner: owner.to_string(),
+            program_id: program_id.clone(),
+        };
+        svm.transactions
+            .store(
+                sig.to_string(),
+                SurfnetTransactionStatus::processed(
+                    TransactionWithStatusMeta {
+                        slot,
+                        transaction: tx,
+                        meta: TransactionStatusMeta {
+                            status: Ok(()),
+                            fee: 5000,
+                            pre_balances: vec![0; 3],
+                            post_balances: vec![0; 3],
+                            inner_instructions: Some(vec![]),
+                            log_messages: Some(vec![]),
+                            pre_token_balances: Some(vec![balance(pre_amount)]),
+                            post_token_balances: Some(vec![balance(post_amount)]),
+                            rewards: Some(vec![]),
+                            loaded_addresses: LoadedAddresses::default(),
+                            return_data: None,
+                            compute_units_consumed: Some(0),
+                            cost_units: None,
+                        },
+                    },
+                    HashSet::new(),
+                ),
+            )
+            .unwrap();
+    }
+
+    fn tfa_config_with_token_accounts(
+        value: TransactionsForAddressTokenFilter,
+    ) -> RpcGetTransactionsForAddressConfig {
+        RpcGetTransactionsForAddressConfig {
+            filters: Some(RpcTransactionsForAddressFilters {
+                token_accounts: Some(value),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_tfa_token_accounts_all_includes_owned_activity() {
+        let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let locker = SurfnetSvmLocker::new(svm);
+
+        let owner = Pubkey::new_unique();
+        let sig = Signature::new_unique();
+        // owner is not a direct key; only present via token-balance metadata.
+        locker.with_svm_writer(|svm| store_token_tx(svm, sig, 5, &owner, "100", "100"));
+
+        // Default (tokenAccounts: none) excludes indirect token activity.
+        let none = locker
+            .get_transactions_for_address_local(
+                &owner,
+                &RpcGetTransactionsForAddressConfig::default(),
+            )
+            .unwrap()
+            .inner;
+        assert!(none.data.is_empty());
+
+        // `all` folds it in even though the balance did not change.
+        let all = locker
+            .get_transactions_for_address_local(
+                &owner,
+                &tfa_config_with_token_accounts(TransactionsForAddressTokenFilter::All),
+            )
+            .unwrap()
+            .inner;
+        assert_eq!(tfa_signatures(&all), vec![sig.to_string()]);
+
+        // `balanceChanged` excludes it (pre == post).
+        let changed = locker
+            .get_transactions_for_address_local(
+                &owner,
+                &tfa_config_with_token_accounts(TransactionsForAddressTokenFilter::BalanceChanged),
+            )
+            .unwrap()
+            .inner;
+        assert!(changed.data.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_tfa_token_accounts_balance_changed() {
+        let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let locker = SurfnetSvmLocker::new(svm);
+
+        let owner = Pubkey::new_unique();
+        let unchanged_sig = Signature::new_unique();
+        let changed_sig = Signature::new_unique();
+        locker.with_svm_writer(|svm| {
+            store_token_tx(svm, unchanged_sig, 5, &owner, "100", "100");
+            store_token_tx(svm, changed_sig, 6, &owner, "100", "150");
+        });
+
+        let changed = locker
+            .get_transactions_for_address_local(
+                &owner,
+                &tfa_config_with_token_accounts(TransactionsForAddressTokenFilter::BalanceChanged),
+            )
+            .unwrap()
+            .inner;
+
+        // Only the transaction whose owned token balance moved is returned.
+        assert_eq!(tfa_signatures(&changed), vec![changed_sig.to_string()]);
+    }
+
+    /// Store a v0 transaction whose static keys do NOT include `loaded`, but
+    /// whose `meta.loaded_addresses` does — i.e. the address is referenced only
+    /// through an address lookup table.
+    fn store_alt_loaded_tx(svm: &mut SurfnetSvm, sig: Signature, slot: u64, loaded: &Pubkey) {
+        use solana_message::{MessageHeader, v0};
+        let payer = Pubkey::new_unique();
+        let message = VersionedMessage::V0(v0::Message {
+            header: MessageHeader {
+                num_required_signatures: 1,
+                num_readonly_signed_accounts: 0,
+                num_readonly_unsigned_accounts: 0,
+            },
+            account_keys: vec![payer],
+            recent_blockhash: Hash::default(),
+            instructions: vec![],
+            address_table_lookups: vec![],
+        });
+        let tx = VersionedTransaction {
+            signatures: vec![sig],
+            message,
+        };
+        svm.transactions
+            .store(
+                sig.to_string(),
+                SurfnetTransactionStatus::processed(
+                    TransactionWithStatusMeta {
+                        slot,
+                        transaction: tx,
+                        meta: TransactionStatusMeta {
+                            status: Ok(()),
+                            fee: 5000,
+                            pre_balances: vec![0; 1],
+                            post_balances: vec![0; 1],
+                            inner_instructions: Some(vec![]),
+                            log_messages: Some(vec![]),
+                            pre_token_balances: Some(vec![]),
+                            post_token_balances: Some(vec![]),
+                            rewards: Some(vec![]),
+                            loaded_addresses: LoadedAddresses {
+                                writable: vec![*loaded],
+                                readonly: vec![],
+                            },
+                            return_data: None,
+                            compute_units_consumed: Some(0),
+                            cost_units: None,
+                        },
+                    },
+                    HashSet::new(),
+                ),
+            )
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_tfa_matches_address_loaded_via_lookup_table() {
+        let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let locker = SurfnetSvmLocker::new(svm);
+
+        // The address appears only in `meta.loaded_addresses`, not in the
+        // transaction's static account keys.
+        let alt_address = Pubkey::new_unique();
+        let sig = Signature::new_unique();
+        locker.with_svm_writer(|svm| store_alt_loaded_tx(svm, sig, 5, &alt_address));
+
+        let result = locker
+            .get_transactions_for_address_local(
+                &alt_address,
+                &RpcGetTransactionsForAddressConfig::default(),
+            )
+            .unwrap()
+            .inner;
+
+        // Matching only static keys would miss this; ALT-loaded keys are folded in.
+        assert_eq!(tfa_signatures(&result), vec![sig.to_string()]);
     }
 
     #[test]

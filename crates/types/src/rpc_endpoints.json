@@ -124,6 +124,33 @@
           "returns": "A list of transaction signatures."
         },
         {
+          "method": "getTransactionsForAddress",
+          "description": "Returns transactions involving an address in a single call (signatures or full detail), collapsing the getSignaturesForAddress + getTransaction pattern.",
+          "params": [
+            {
+              "name": "address",
+              "type": "string",
+              "description": "The address to get transactions for."
+            },
+            {
+              "name": "config",
+              "type": "object",
+              "description": "Configuration object.",
+              "schema": {
+                "transactionDetails": "string",
+                "sortOrder": "string",
+                "limit": "number",
+                "paginationToken": "string",
+                "commitment": "string",
+                "encoding": "string",
+                "maxSupportedTransactionVersion": "number",
+                "filters": "object"
+              }
+            }
+          ],
+          "returns": "An object with a `data` array of transactions (or signatures) and a `paginationToken` cursor."
+        },
+        {
           "method": "getFeeForMessage",
           "description": "Returns the fee for a message.",
           "params": [

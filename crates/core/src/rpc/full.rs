@@ -30,8 +30,9 @@ use solana_signature::Signature;
 use solana_system_interface::program as system_program;
 use solana_transaction_error::TransactionError;
 use solana_transaction_status::{
-    EncodedConfirmedTransactionWithStatusMeta, TransactionBinaryEncoding,
-    TransactionConfirmationStatus, TransactionStatus, UiConfirmedBlock,
+    EncodedConfirmedTransactionWithStatusMeta, EncodedTransactionWithStatusMeta,
+    TransactionBinaryEncoding, TransactionConfirmationStatus, TransactionStatus, UiConfirmedBlock,
+    UiTransactionEncoding,
 };
 use surfpool_types::{SimnetCommand, TransactionStatusEvent};
 
@@ -62,6 +63,132 @@ pub struct SurfpoolRpcSendTransactionConfig {
     pub base: RpcSendTransactionConfig,
     /// skip sign verification for this txn (overrides global config)
     pub skip_sig_verify: Option<bool>,
+}
+
+/// Comparison bounds for a numeric field
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct ComparisonFilter<T> {
+    pub gte: Option<T>,
+    pub gt: Option<T>,
+    pub lte: Option<T>,
+    pub lt: Option<T>,
+}
+
+/// Sort order for RPC responses
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SortOrder {
+    #[default]
+    Desc,
+    Asc,
+}
+
+/// Detail level for `getTransactionsForAddress` results.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TransactionsForAddressDetails {
+    /// Only return signatures
+    #[default]
+    Signatures,
+    /// Full transactions and metadata.
+    Full,
+}
+
+/// Transaction success filter for `getTransactionsForAddress`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TransactionsForAddressStatusFilter {
+    #[default]
+    Any,
+    Succeeded,
+    Failed,
+}
+
+/// Token-account activity filter for `getTransactionsForAddress`
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TransactionsForAddressTokenFilter {
+    /// Only transactions where the address appears directly (default).
+    #[default]
+    None,
+    /// Also include transactions touching a token account owned by the address.
+    All,
+    /// Like `all`, but only when the owned token account's balance changed.
+    BalanceChanged,
+}
+
+/// Server-side filters accepted by `getTransactionsForAddress`.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcTransactionsForAddressFilters {
+    pub slot: Option<ComparisonFilter<u64>>,
+    pub block_time: Option<ComparisonFilter<i64>>,
+    pub status: Option<TransactionsForAddressStatusFilter>,
+    pub token_accounts: Option<TransactionsForAddressTokenFilter>,
+}
+
+/// Configuration for the `getTransactionsForAddress` RPC method.
+///
+/// Mirrors the Superbank `getTransactionsForAddress` options.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcGetTransactionsForAddressConfig {
+    pub transaction_details: Option<TransactionsForAddressDetails>,
+    pub sort_order: Option<SortOrder>,
+    /// Max results. Defaults/caps to 1000 for `signatures`, 100 for `full`.
+    pub limit: Option<usize>,
+    /// Cursor from a previous response's `paginationToken`, results returned
+    /// after this signature.
+    pub pagination_token: Option<String>,
+    /// Accepted for compatibility, the local ledger treats stored transactions
+    /// as finalized.
+    #[serde(flatten)]
+    pub commitment: Option<CommitmentConfig>,
+    /// Encoding for `full` transaction details (default `json`).
+    pub encoding: Option<UiTransactionEncoding>,
+    pub max_supported_transaction_version: Option<u8>,
+    pub filters: Option<RpcTransactionsForAddressFilters>,
+}
+
+/// A single `signatures` entry in a `getTransactionsForAddress` response.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcTransactionForAddressSignatureInfo {
+    pub signature: String,
+    pub slot: Slot,
+    pub transaction_index: Option<usize>,
+    pub err: Option<TransactionError>,
+    pub memo: Option<String>,
+    pub block_time: Option<i64>,
+    pub confirmation_status: Option<TransactionConfirmationStatus>,
+}
+
+/// A single `full` entry in a `getTransactionsForAddress` response.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcTransactionForAddressFullInfo {
+    pub slot: Slot,
+    pub transaction_index: Option<usize>,
+    pub block_time: Option<i64>,
+    #[serde(flatten)]
+    pub transaction: EncodedTransactionWithStatusMeta,
+}
+
+/// One entry of a `getTransactionsForAddress` response — either signature
+/// metadata or a full transaction, depending on `transactionDetails`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+pub enum RpcTransactionForAddressEntry {
+    Signature(RpcTransactionForAddressSignatureInfo),
+    Full(Box<RpcTransactionForAddressFullInfo>),
+}
+
+/// Response envelope for `getTransactionsForAddress`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcTransactionsForAddressResult {
+    pub data: Vec<RpcTransactionForAddressEntry>,
+    pub pagination_token: Option<String>,
 }
 
 #[rpc]
@@ -1022,6 +1149,42 @@ pub trait Full {
         address: String,
         config: Option<RpcSignaturesForAddressConfig>,
     ) -> BoxFuture<Result<Vec<RpcConfirmedTransactionStatusWithSignature>>>;
+
+    /// Returns transactions involving an address in a single call.
+    ///
+    /// This Superbank-compatible custom method collapses the common
+    /// `getSignaturesForAddress` + N `getTransaction` pattern into one request.
+    /// Depending on `transactionDetails` it returns either signature metadata
+    /// (`signatures`, default) or fully encoded transactions (`full`), along
+    /// with a `paginationToken` cursor for fetching subsequent pages.
+    ///
+    /// ## Parameters
+    /// - `address`: The base-58 encoded address to query.
+    /// - `config` (optional): see [`RpcGetTransactionsForAddressConfig`]
+    ///
+    /// ## Returns
+    /// An object `{ "data": [...], "paginationToken": <string|null> }`. In
+    /// `signatures` mode each entry contains `signature`, `slot`,
+    /// `transactionIndex`, `err`, `memo`, `blockTime`, and
+    /// `confirmationStatus`. In `full` mode each entry contains `slot`,
+    /// `transactionIndex`, `blockTime`, `transaction`, `meta`, and `version`.
+    ///
+    /// # Notes
+    /// - Initial version is served from the local ledger only (no remote fan-out)
+    ///   see `SurfnetSvmLocker::get_transactions_for_address`.
+    /// - `paginationToken` is the cursor's signature, `null` if there are no more results.
+    /// - `limit` defaults to and is capped at 1000 for `signatures` and 100 for
+    ///   `full`.
+    ///
+    /// # See Also
+    /// - `getSignaturesForAddress`, `getTransaction`
+    #[rpc(meta, name = "getTransactionsForAddress")]
+    fn get_transactions_for_address(
+        &self,
+        meta: Self::Metadata,
+        address: String,
+        config: Option<RpcGetTransactionsForAddressConfig>,
+    ) -> BoxFuture<Result<RpcTransactionsForAddressResult>>;
 
     /// Returns the slot of the lowest confirmed block that has not been purged from the ledger.
     ///
@@ -2220,6 +2383,34 @@ impl Full for SurfpoolFullRpc {
                 .await?
                 .inner;
             Ok(signatures)
+        })
+    }
+
+    fn get_transactions_for_address(
+        &self,
+        meta: Self::Metadata,
+        address: String,
+        config: Option<RpcGetTransactionsForAddressConfig>,
+    ) -> BoxFuture<Result<RpcTransactionsForAddressResult>> {
+        let pubkey = match verify_pubkey(&address) {
+            Ok(s) => s,
+            Err(e) => return e.into(),
+        };
+        let SurfnetRpcContext {
+            svm_locker,
+            remote_ctx,
+        } = match meta.get_rpc_context(()) {
+            Ok(res) => res,
+            Err(e) => return e.into(),
+        };
+        let config = config.unwrap_or_default();
+
+        Box::pin(async move {
+            let result = svm_locker
+                .get_transactions_for_address(&remote_ctx, &pubkey, &config)
+                .await?
+                .inner;
+            Ok(result)
         })
     }
 
