@@ -2332,7 +2332,7 @@ impl SurfnetSvm {
                     previous_blockhash: previous_chain_tip.hash.clone(),
                     block_time: self.updated_at as i64 / 1_000,
                     block_height: self.chain_tip.index,
-                    parent_slot: slot,
+                    parent_slot: slot.saturating_sub(1),
                     signatures: confirmed_signatures,
                 },
             )?;
