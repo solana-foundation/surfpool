@@ -3371,6 +3371,16 @@ mod tests {
             block.signatures.is_none() || block.signatures.as_ref().unwrap().is_empty(),
             "Reconstructed empty block should have no signatures"
         );
+
+        // blockTime must be unix SECONDS (the header stores seconds since #428; a
+        // stale ms->s division here once returned seconds/1000 — ~1000x off, which
+        // this window catches without wall-clock flakiness).
+        let block_time = block.block_time.expect("block has a blockTime");
+        let now = chrono::Utc::now().timestamp();
+        assert!(
+            (now - block_time).abs() < 600,
+            "getBlock blockTime must be unix seconds: got {block_time}, now {now}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3457,6 +3467,14 @@ mod tests {
         };
 
         setup.process_txs(vec![tx.clone()]).await;
+        // Confirm the block so it is stored — getTransaction sources blockTime
+        // from the stored BlockHeader (null while the block is unconfirmed).
+        setup
+            .context
+            .svm_locker
+            .confirm_current_block(&None)
+            .await
+            .unwrap();
 
         let res = setup
             .rpc
@@ -3516,6 +3534,28 @@ mod tests {
                 block_time: res.block_time, // Using the same values to avoid flakyness
                 transaction_index: None,
             }
+        );
+
+        // blockTime must be unix SECONDS and agree with the getBlockTime surface
+        // (the #401/#428 unit regression made getTransaction return seconds/1000
+        // while getBlockTime was correct; the self-comparison above couldn't catch
+        // it). The 600s window never flakes yet is ~6 orders of magnitude tighter
+        // than a unit error.
+        let block_time = res.block_time.expect("executed tx has a blockTime");
+        let now = chrono::Utc::now().timestamp();
+        assert!(
+            (now - block_time).abs() < 600,
+            "getTransaction blockTime must be unix seconds: got {block_time}, now {now}"
+        );
+        let via_get_block_time = setup
+            .rpc
+            .get_block_time(Some(setup.context.clone()), res.slot)
+            .await
+            .unwrap()
+            .expect("getBlockTime for the tx's slot");
+        assert_eq!(
+            block_time, via_get_block_time,
+            "getTransaction and getBlockTime must report the same blockTime"
         );
     }
 
