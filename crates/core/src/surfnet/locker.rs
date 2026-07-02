@@ -1113,7 +1113,7 @@ impl SurfnetSvmLocker {
             let block_time = svm_reader
                 .blocks
                 .get(&slot)?
-                .map(|b| (b.block_time / 1_000) as UnixTimestamp)
+                .map(|b| b.block_time as UnixTimestamp)
                 .unwrap_or(0);
             let encoded = transaction_with_status_meta.encode(
                 config.encoding.unwrap_or(UiTransactionEncoding::JsonParsed),

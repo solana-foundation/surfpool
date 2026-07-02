@@ -3055,7 +3055,7 @@ impl SurfnetSvm {
             signatures,
             rewards: if show_rewards { Some(vec![]) } else { None },
             num_reward_partitions: None,
-            block_time: Some(block.block_time / 1000),
+            block_time: Some(block.block_time),
             block_height: Some(block.block_height),
         };
         Ok(Some(block))
