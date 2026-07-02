@@ -1111,7 +1111,10 @@ impl SurfnetSvmLocker {
             let (transaction_with_status_meta, _) = entry.expect_processed();
             let slot = transaction_with_status_meta.slot;
             // `None` (spec: null) when the block isn't stored — never a fake 0.
-            let block_time = svm_reader.blocks.get(&slot)?.map(|b| b.block_time as UnixTimestamp);
+            let block_time = svm_reader
+                .blocks
+                .get(&slot)?
+                .map(|b| b.block_time as UnixTimestamp);
             let encoded = transaction_with_status_meta.encode(
                 config.encoding.unwrap_or(UiTransactionEncoding::JsonParsed),
                 config.max_supported_transaction_version,
