@@ -120,6 +120,7 @@ spl-token-metadata-interface = { workspace = true }
 
 [features]
 default = ["sqlite"]
+sbpf-debugger = ["litesvm/sbpf-debugger"]
 sqlite = ["surfpool-db/sqlite"]
 postgres = ["surfpool-db/postgres"]
 ignore_tests_ci = []

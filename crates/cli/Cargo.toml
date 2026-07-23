@@ -86,6 +86,7 @@ sqlite = ["surfpool-core/sqlite"]
 postgres = ["surfpool-core/postgres"]
 version_check = []
 register-tracing = ["surfpool-core/register-tracing"]
+sbpf-debugger = ["surfpool-core/sbpf-debugger"]
 prometheus = ["surfpool-core/prometheus", "surfpool-types/prometheus"]
 
 [dev-dependencies]
