@@ -8,7 +8,18 @@
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
-    }
+    },
+    "./kit": {
+      "import": {
+        "types": "./dist/kit/esm/index.d.ts",
+        "default": "./dist/kit/esm/index.js"
+      },
+      "require": {
+        "types": "./dist/kit/index.d.ts",
+        "default": "./dist/kit/index.js"
+      }
+    },
+    "./package.json": "./package.json"
   },
   "files": [
     "README.md",
@@ -48,17 +59,37 @@
     "build:debug": "npm run build:native:debug && npm run build:ts",
     "build:native": "napi build --platform --release surfpool-sdk --dts internal.d.ts --js internal.js",
     "build:native:debug": "napi build --platform surfpool-sdk --dts internal.d.ts --js internal.js",
-    "build:ts": "tsc && node ./scripts/sync-dist.js",
+    "build:ts": "tsc && tsc -p tsconfig.kit.json && tsc -p tsconfig.kit.esm.json && node ./scripts/sync-dist.js",
     "create-npm-dir": "napi create-npm-dir -t .",
     "artifacts": "napi artifacts",
     "pack:dry-run": "npm pack --dry-run",
     "prepare-release": "node ./scripts/prepare-release.js",
     "smoke": "npm test",
-    "test": "node --test --test-concurrency=1 ./scripts/smoke.js"
+    "test": "npm run typecheck:kit && node --test --test-concurrency=1 ./scripts/smoke.js ./scripts/kit-unit.js ./scripts/kit-smoke.js",
+    "typecheck:kit": "tsc -p tsconfig.kit.typetests.json"
   },
   "devDependencies": {
     "@napi-rs/cli": "^2.18.4",
+    "@solana/kit": "^7.0.0",
+    "@solana/kit-plugin-rpc": "^0.15.0",
+    "@solana/kit-plugin-signer": "^0.13.0",
     "typescript": "^5.7.0"
+  },
+  "peerDependencies": {
+    "@solana/kit": "^7.0.0",
+    "@solana/kit-plugin-rpc": "^0.15.0",
+    "@solana/kit-plugin-signer": "^0.13.0"
+  },
+  "peerDependenciesMeta": {
+    "@solana/kit": {
+      "optional": true
+    },
+    "@solana/kit-plugin-rpc": {
+      "optional": true
+    },
+    "@solana/kit-plugin-signer": {
+      "optional": true
+    }
   },
   "optionalDependencies": {
     "@solana/surfpool-darwin-x64": "1.5.0",

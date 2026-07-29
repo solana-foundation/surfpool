@@ -1,0 +1,13 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "surfpool-sdk/kit",
+    "outDir": "dist/kit",
+    "baseUrl": ".",
+    "paths": {
+      "@solana/surfpool": ["./dist/index.d.ts"]
+    }
+  },
+  "include": ["surfpool-sdk/kit/**/*.ts"],
+  "exclude": ["surfpool-sdk/kit/__typetests__"]
+}

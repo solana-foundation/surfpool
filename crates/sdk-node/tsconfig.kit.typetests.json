@@ -1,0 +1,10 @@
+{
+  "extends": "./tsconfig.kit.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "declaration": false,
+    "declarationMap": false
+  },
+  "include": ["surfpool-sdk/kit/**/*.ts"],
+  "exclude": []
+}

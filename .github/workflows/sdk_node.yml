@@ -148,3 +148,40 @@ jobs:
           assert.ok(surfnet.instanceId.length > 0);
           assert.ok(Array.isArray(surfnet.drainEvents()));
           EOF
+
+      - name: Smoke test packed kit entry
+        working-directory: crates/sdk-node
+        shell: bash
+        run: |
+          TMP_DIR=$(mktemp -d)
+          cp "${{ steps.pack.outputs.root_pack }}" "${TMP_DIR}/"
+          cp "${{ steps.pack.outputs.platform_pack }}" "${TMP_DIR}/"
+          cd "${TMP_DIR}"
+          npm init -y
+          npm install "./$(basename "${{ steps.pack.outputs.platform_pack }}")"
+          npm install "./$(basename "${{ steps.pack.outputs.root_pack }}")"
+          # The kit peers are optional and not auto-installed; installing them
+          # here validates the documented opt-in flow.
+          npm install "@solana/kit@^7.0.0" "@solana/kit-plugin-rpc@^0.15.0" "@solana/kit-plugin-signer@^0.13.0"
+          node - <<'EOF'
+          const assert = require("node:assert/strict");
+          const { createClient } = require("@solana/kit");
+          const { surfpool } = require("@solana/surfpool/kit");
+
+          async function main() {
+            const client = await createClient().use(surfpool({ surfnet: { offline: true } }));
+            assert.equal(client.payer.address, client.surfnet.payer);
+            const info = await client.cheatcodes.getSurfnetInfo().send();
+            assert.ok(Array.isArray(info.runbookExecutions));
+            const slot = await client.rpc.getSlot().send();
+            assert.equal(typeof slot, "bigint");
+            client.surfnet.stop();
+          }
+          main();
+          EOF
+          node --input-type=module - <<'EOF'
+          import assert from "node:assert/strict";
+          import { surfpool, createSurfnetCheatcodesRpc } from "@solana/surfpool/kit";
+          assert.equal(typeof surfpool, "function");
+          assert.equal(typeof createSurfnetCheatcodesRpc, "function");
+          EOF

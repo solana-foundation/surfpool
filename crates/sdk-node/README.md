@@ -5,7 +5,7 @@ Node.js bindings for the Surfpool SDK, built with `napi-rs`.
 ## Usage
 
 ```ts
-import { Surfnet } from "surfpool-sdk";
+import { Surfnet } from "@solana/surfpool";
 
 const surfnet = Surfnet.start();
 console.log(surfnet.rpcUrl); // http://127.0.0.1:xxxxx
@@ -19,6 +19,67 @@ surfnet.stop();
 `stop()` is idempotent and synchronous; it blocks briefly while servers close.
 Wire it into test teardown (e.g. `afterAll`) to avoid `connection reset` /
 `broken pipe` warnings caused by the OS yanking sockets at process exit.
+
+## Kit plugin (`@solana/surfpool/kit`)
+
+The `@solana/surfpool/kit` entry provides an [`@solana/kit`](https://github.com/anza-xyz/kit)
+plugin that is a drop-in replacement for `solanaLocalRpc()` or `litesvm()`,
+plus a typed RPC client for every `surfnet_*` cheatcode.
+
+The kit dependencies are optional peers — install them alongside this package:
+
+```bash
+npm install --save-dev @solana/surfpool @solana/kit @solana/kit-plugin-rpc @solana/kit-plugin-signer
+```
+
+**Embedded mode** boots an in-process Surfnet, installs a pre-funded `payer`,
+the full local RPC stack (`rpc`, `rpcSubscriptions`, `airdrop`,
+`sendTransactions`, …), the native handle as `client.surfnet`, and a typed
+cheatcodes RPC as `client.cheatcodes`:
+
+```ts
+import { createClient } from "@solana/kit";
+import { surfpool } from "@solana/surfpool/kit";
+
+const client = await createClient().use(surfpool());
+
+await client.cheatcodes.timeTravel({ absoluteSlot: 1_000_000 }).send();
+client.surfnet.fundSol(client.payer.address, 1_000_000_000);
+const slot = await client.rpc.getSlot().send();
+
+client.surfnet.stop();
+```
+
+Surfnet startup options go under the `surfnet` key; everything else is
+forwarded to the standard local RPC plugin:
+
+```ts
+const client = await createClient().use(
+  surfpool({ surfnet: { offline: true }, skipPreflight: true }),
+);
+```
+
+**Attach mode** connects to an already-running Surfpool (e.g. `surfpool start`)
+instead of booting one — no native module is loaded and the client must
+already have a `payer`:
+
+```ts
+import { createClient } from "@solana/kit";
+import { payer } from "@solana/kit-plugin-signer";
+import { surfpool } from "@solana/surfpool/kit";
+
+const client = await createClient()
+  .use(payer(myPayer))
+  .use(surfpool({ rpcUrl: "http://127.0.0.1:8899" }));
+```
+
+For one-off use without a client, `createSurfnetCheatcodesRpc(url)` returns a
+standalone `Rpc<SurfnetCheatcodesApi>`, and `surfnetCheatcodes()` installs
+`client.cheatcodes` on any existing client.
+
+Note on integers: cheatcode responses arrive with `bigint` integers (the
+cheatcodes transport parses all JSON integers as `bigint` so u64 values like
+`rentEpoch` survive above 2^53); request payloads accept `number | bigint`.
 
 ## Development
 
