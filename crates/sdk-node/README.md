@@ -89,6 +89,17 @@ npm run build
 npm test
 ```
 
+The TypeScript types for the `surfnet_*` cheatcodes under
+`surfpool-sdk/kit/generated/` are generated from the Rust wire types in
+`crates/types` (ts-rs, behind the `ts-bindings` feature) and committed. After
+changing those Rust types, refresh them with:
+
+```bash
+npm run generate:kit-types
+```
+
+CI regenerates the bindings and fails on any diff.
+
 ## Publishing
 
 The npm package is released from `crates/sdk-node` using prebuilt native artifacts for:

@@ -4,7 +4,6 @@ import type {
     AccountSnapshot,
     AccountUpdate,
     CheatcodeControlConfig,
-    CheatcodeFilter,
     ExportSnapshotConfig,
     GetStreamedAccountsResponse,
     GetSurfnetInfoResponse,
@@ -15,12 +14,15 @@ import type {
     StreamAccountConfig,
     StreamAccountsEntry,
     SupplyUpdate,
-    TimeTravelConfig,
+    SurfnetCheatcodeMethod,
     TokenAccountUpdate,
     UiKeyedProfileResult,
-} from './generated.js';
+} from '../generated/index.js';
 
-// ── RPC-only types (not defined in surfpool's Rust wire types) ──────────────
+// ── Handwritten wire types ──────────────────────────────────────────────────
+// These few types are deliberately not generated: their custom Rust serde
+// implementations (or foreign definitions) serialize to shapes that are
+// expressed more precisely by hand. Each notes the Rust definition it mirrors.
 
 /**
  * Clock state returned by `timeTravel`, `pauseClock`, and `resumeClock` —
@@ -30,6 +32,24 @@ import type {
  * the `{ context, value }` envelope.
  */
 export type EpochInfo = ReturnType<GetEpochInfoApi['getEpochInfo']>;
+
+/**
+ * Config for `timeTravel`. Mirrors `TimeTravelConfig` in
+ * `crates/core/src/types.rs` (externally tagged, camelCase); its wire shape
+ * is pinned by the `time_travel_config_wire_keys_are_stable` test next to
+ * the `SurfnetCheatcodes` trait.
+ */
+export type TimeTravelConfig =
+    | { absoluteEpoch: number | bigint }
+    | { absoluteSlot: number | bigint }
+    | { absoluteTimestamp: number | bigint };
+
+/**
+ * The string `"all"` to target every cheatcode, or a list of full method
+ * names (e.g. `["surfnet_setAccount"]`) to target specific ones. Mirrors
+ * `CheatcodeFilter` in `crates/types/src/types.rs` (untagged).
+ */
+export type CheatcodeFilter = 'all' | readonly string[];
 
 /** Anchor IDL structure for `registerIdl` / `getActiveIdl`. */
 export type AnchorIdl = Readonly<{
@@ -48,7 +68,10 @@ export type AnchorIdl = Readonly<{
     types?: readonly unknown[];
 }>;
 
-/** Entry returned by `getLocalSignatures`. */
+/**
+ * Entry returned by `getLocalSignatures`. Mirrors
+ * `solana_rpc_client_api::response::RpcLogsResponse`.
+ */
 export type LocalSignatureEntry = Readonly<{
     /**
      * `null` on success, otherwise a `TransactionError` in its JSON-RPC
@@ -190,3 +213,16 @@ export type SurfnetCheatcodesApi = SurfnetCloneProgramAccountApi &
     SurfnetStreamAccountsApi &
     SurfnetTimeTravelApi &
     SurfnetWriteProgramApi;
+
+// ── Manifest coverage assertion ─────────────────────────────────────────────
+// Compile-time proof that SurfnetCheatcodesApi covers exactly the methods in
+// the generated manifest. When a cheatcode is added or renamed in Rust, the
+// regenerated manifest changes and this fails the build until the Api types
+// above are updated.
+
+type StripSurfnetPrefix<T> = T extends `surfnet_${infer TMethod}` ? TMethod : never;
+type MutuallyAssignable<X, Y> = [X] extends [Y] ? ([Y] extends [X] ? true : false) : false;
+type AssertTrue<T extends true> = T;
+type _SurfnetApiCoversManifest = AssertTrue<
+    MutuallyAssignable<keyof SurfnetCheatcodesApi, StripSurfnetPrefix<SurfnetCheatcodeMethod>>
+>;

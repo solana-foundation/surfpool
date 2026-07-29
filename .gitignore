@@ -12,3 +12,6 @@ test-ledger
 
 # local
 txtx.yml
+
+# ts-rs default export dir (real output lives in crates/sdk-node/surfpool-sdk/kit/generated)
+crates/types/bindings/

@@ -245,7 +245,16 @@ pub enum AccountChange {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(
+    feature = "ts-bindings",
+    derive(ts_rs::TS),
+    ts(export, optional_fields)
+)]
 pub struct RpcProfileResultConfig {
+    #[cfg_attr(
+        feature = "ts-bindings",
+        ts(as = "Option<crate::ts_bindings::UiAccountEncodingDef>", optional)
+    )]
     pub encoding: Option<UiAccountEncoding>,
     pub depth: Option<RpcProfileDepth>,
 }
@@ -261,6 +270,7 @@ impl Default for RpcProfileResultConfig {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
 pub enum RpcProfileDepth {
     Transaction,
     #[default]
@@ -269,20 +279,32 @@ pub enum RpcProfileDepth {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
 pub struct UiKeyedProfileResult {
     pub slot: u64,
+    #[cfg_attr(feature = "ts-bindings", ts(as = "String"))]
     pub key: UuidOrSignature,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-bindings", ts(optional))]
     pub instruction_profiles: Option<Vec<UiProfileResult>>,
     pub transaction_profile: UiProfileResult,
     #[serde(with = "profile_state_map")]
+    #[cfg_attr(
+        feature = "ts-bindings",
+        ts(as = "std::collections::HashMap<String, crate::ts_bindings::UiAccountDef>")
+    )]
     pub readonly_account_states: IndexMap<Pubkey, UiAccount>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
 pub struct UiProfileResult {
     #[serde(with = "profile_state_map")]
+    #[cfg_attr(
+        feature = "ts-bindings",
+        ts(as = "std::collections::HashMap<String, crate::ts_bindings::UiAccountProfileStateDef>")
+    )]
     pub account_states: IndexMap<Pubkey, UiAccountProfileState>,
     pub compute_units_consumed: u64,
     pub log_messages: Option<Vec<String>>,
@@ -832,17 +854,26 @@ pub struct DeleteNetworkResponse;
 #[serde_as]
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(
+    feature = "ts-bindings",
+    derive(ts_rs::TS),
+    ts(export, optional_fields)
+)]
 pub struct AccountUpdate {
     /// providing this value sets the lamports in the account
+    #[cfg_attr(feature = "ts-bindings", ts(optional, type = "number | bigint"))]
     pub lamports: Option<u64>,
-    /// providing this value sets the data held in this account
+    /// providing this value sets the data held in this account, as a
+    /// hex-encoded string
     #[serde_as(as = "Option<BytesOrString>")]
+    #[cfg_attr(feature = "ts-bindings", ts(optional, type = "string"))]
     pub data: Option<Vec<u8>>,
     ///  providing this value sets the program that owns this account. If executable, the program that loads this account.
     pub owner: Option<String>,
     /// providing this value sets whether this account's data contains a loaded program (and is now read-only)
     pub executable: Option<bool>,
     /// providing this value sets the epoch at which this account will next owe rent
+    #[cfg_attr(feature = "ts-bindings", ts(optional, type = "number | bigint"))]
     pub rent_epoch: Option<Epoch>,
 }
 
@@ -896,16 +927,27 @@ impl Serialize for SetSomeAccount {
 #[serde_as]
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(
+    feature = "ts-bindings",
+    derive(ts_rs::TS),
+    ts(export, optional_fields)
+)]
 pub struct TokenAccountUpdate {
     /// providing this value sets the amount of the token in the account data
+    #[cfg_attr(feature = "ts-bindings", ts(optional, type = "number | bigint"))]
     pub amount: Option<u64>,
-    /// providing this value sets the delegate of the token account
+    /// providing this value sets the delegate of the token account: a base58
+    /// pubkey, or the literal string "null" to clear the delegate
+    #[cfg_attr(feature = "ts-bindings", ts(optional, type = "string"))]
     pub delegate: Option<SetSomeAccount>,
     /// providing this value sets the state of the token account
     pub state: Option<String>,
     /// providing this value sets the amount authorized to the delegate
+    #[cfg_attr(feature = "ts-bindings", ts(optional, type = "number | bigint"))]
     pub delegated_amount: Option<u64>,
-    /// providing this value sets the close authority of the token account
+    /// providing this value sets the close authority of the token account: a
+    /// base58 pubkey, or the literal string "null" to clear the authority
+    #[cfg_attr(feature = "ts-bindings", ts(optional, type = "string"))]
     pub close_authority: Option<SetSomeAccount>,
     /// providing this value configures the Token-2022 confidential-transfer
     /// extension on the account (Token-2022 only)
@@ -920,6 +962,11 @@ pub struct TokenAccountUpdate {
 /// configure / deposit / apply-pending-balance instruction flow.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(
+    feature = "ts-bindings",
+    derive(ts_rs::TS),
+    ts(export, optional_fields)
+)]
 pub struct ConfidentialTransferAccountUpdate {
     /// The owner's ElGamal public key (base58 or base64, 32 bytes). Required —
     /// the confidential balance is encrypted to this key, and confidential
@@ -932,8 +979,10 @@ pub struct ConfidentialTransferAccountUpdate {
     /// owner-side balance reads), so this is mandatory for every confidential
     /// account. Modeled as `Option` only so the field can be validated with a
     /// clear error message when omitted.
+    #[cfg_attr(feature = "ts-bindings", ts(as = "String"))]
     pub aes_key: Option<String>,
     /// The confidential available balance to set (default 0).
+    #[cfg_attr(feature = "ts-bindings", ts(optional, type = "number | bigint"))]
     pub amount: Option<u64>,
     /// Whether the account is approved for confidential transfers (default true).
     pub approved: Option<bool>,
@@ -943,14 +992,23 @@ pub struct ConfidentialTransferAccountUpdate {
     /// (default true).
     pub allow_non_confidential_credits: Option<bool>,
     /// The maximum pending-balance credit counter (default 65536).
+    #[cfg_attr(feature = "ts-bindings", ts(optional, type = "number | bigint"))]
     pub maximum_pending_balance_credit_counter: Option<u64>,
 }
 
 // token supply update for set supply method in SVM tricks
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[cfg_attr(
+    feature = "ts-bindings",
+    derive(ts_rs::TS),
+    ts(export, optional_fields)
+)]
 pub struct SupplyUpdate {
+    #[cfg_attr(feature = "ts-bindings", ts(optional, type = "number | bigint"))]
     pub total: Option<u64>,
+    #[cfg_attr(feature = "ts-bindings", ts(optional, type = "number | bigint"))]
     pub circulating: Option<u64>,
+    #[cfg_attr(feature = "ts-bindings", ts(optional, type = "number | bigint"))]
     pub non_circulating: Option<u64>,
     pub non_circulating_accounts: Option<Vec<String>>,
 }
@@ -1128,6 +1186,7 @@ impl<K: std::hash::Hash + Eq, V> FifoMap<K, V> {
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
 pub struct AccountSnapshot {
     pub lamports: u64,
     pub owner: String,
@@ -1136,6 +1195,10 @@ pub struct AccountSnapshot {
     /// Base64 encoded data
     pub data: String,
     /// Parsed account data if available
+    #[cfg_attr(
+        feature = "ts-bindings",
+        ts(as = "Option<crate::ts_bindings::ParsedAccountDef>")
+    )]
     pub parsed_data: Option<ParsedAccount>,
 }
 
@@ -1184,6 +1247,11 @@ impl AccountSnapshot {
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(
+    feature = "ts-bindings",
+    derive(ts_rs::TS),
+    ts(export, optional_fields)
+)]
 pub struct ExportSnapshotConfig {
     pub include_parsed_accounts: Option<bool>,
     pub filter: Option<ExportSnapshotFilter>,
@@ -1192,6 +1260,7 @@ pub struct ExportSnapshotConfig {
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
 pub enum ExportSnapshotScope {
     #[default]
     Network,
@@ -1200,6 +1269,11 @@ pub enum ExportSnapshotScope {
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(
+    feature = "ts-bindings",
+    derive(ts_rs::TS),
+    ts(export, optional_fields)
+)]
 pub struct ExportSnapshotFilter {
     pub include_program_accounts: Option<bool>,
     pub include_accounts: Option<Vec<String>>,
@@ -1215,6 +1289,11 @@ pub struct ExportSnapshotFilter {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(
+    feature = "ts-bindings",
+    derive(ts_rs::TS),
+    ts(export, optional_fields)
+)]
 pub struct ResetAccountConfig {
     pub include_owned_accounts: Option<bool>,
 }
@@ -1229,6 +1308,11 @@ impl Default for ResetAccountConfig {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(
+    feature = "ts-bindings",
+    derive(ts_rs::TS),
+    ts(export, optional_fields)
+)]
 pub struct StreamAccountConfig {
     pub include_owned_accounts: Option<bool>,
 }
@@ -1243,6 +1327,11 @@ impl Default for StreamAccountConfig {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(
+    feature = "ts-bindings",
+    derive(ts_rs::TS),
+    ts(export, optional_fields)
+)]
 pub struct StreamAccountsEntry {
     pub pubkey: String,
     #[serde(default)]
@@ -1251,6 +1340,11 @@ pub struct StreamAccountsEntry {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(
+    feature = "ts-bindings",
+    derive(ts_rs::TS),
+    ts(export, optional_fields)
+)]
 pub struct OfflineAccountConfig {
     pub include_owned_accounts: Option<bool>,
 }
@@ -1265,6 +1359,7 @@ impl Default for OfflineAccountConfig {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
 pub struct StreamedAccountInfo {
     pub pubkey: String,
     pub include_owned_accounts: bool,
@@ -1272,6 +1367,7 @@ pub struct StreamedAccountInfo {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
 pub struct GetSurfnetInfoResponse {
     runbook_executions: Vec<RunbookExecutionStatusReport>,
 }
@@ -1283,6 +1379,7 @@ impl GetSurfnetInfoResponse {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
 pub struct GetStreamedAccountsResponse {
     accounts: Vec<StreamedAccountInfo>,
 }
@@ -1304,8 +1401,11 @@ impl GetStreamedAccountsResponse {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
 pub struct RunbookExecutionStatusReport {
+    #[cfg_attr(feature = "ts-bindings", ts(type = "bigint"))]
     pub started_at: u32,
+    #[cfg_attr(feature = "ts-bindings", ts(type = "bigint | null"))]
     pub completed_at: Option<u32>,
     pub runbook_id: String,
     pub errors: Option<Vec<String>>,
@@ -1358,6 +1458,11 @@ pub struct CheatcodeConfig {
 }
 
 #[derive(Serialize, Deserialize, Default)]
+#[cfg_attr(
+    feature = "ts-bindings",
+    derive(ts_rs::TS),
+    ts(export, optional_fields)
+)]
 pub struct CheatcodeControlConfig {
     pub lockout: Option<bool>,
 }
@@ -1368,6 +1473,42 @@ pub enum CheatcodeFilter {
     All(String),
     List(Vec<String>), // disables cheatcodes in a named list
 }
+
+/// Canonical list of the `surfnet_*` cheatcode JSON-RPC methods.
+///
+/// This is the single source of truth for downstream bindings (e.g. the
+/// generated TypeScript method manifest). A test in
+/// `surfpool-core/src/rpc/surfnet_cheatcodes.rs` asserts it matches the
+/// methods actually registered by the `SurfnetCheatcodes` trait, so adding,
+/// removing, or renaming a cheatcode without updating this list fails CI.
+pub const SURFNET_CHEATCODE_METHODS: [&str; 26] = [
+    "surfnet_cloneProgramAccount",
+    "surfnet_disableCheatcode",
+    "surfnet_enableCheatcode",
+    "surfnet_exportSnapshot",
+    "surfnet_getActiveIdl",
+    "surfnet_getLocalSignatures",
+    "surfnet_getProfileResultsByTag",
+    "surfnet_getStreamedAccounts",
+    "surfnet_getSurfnetInfo",
+    "surfnet_getTransactionProfile",
+    "surfnet_offlineAccount",
+    "surfnet_pauseClock",
+    "surfnet_profileTransaction",
+    "surfnet_registerIdl",
+    "surfnet_registerScenario",
+    "surfnet_resetAccount",
+    "surfnet_resetNetwork",
+    "surfnet_resumeClock",
+    "surfnet_setAccount",
+    "surfnet_setProgramAuthority",
+    "surfnet_setSupply",
+    "surfnet_setTokenAccount",
+    "surfnet_streamAccount",
+    "surfnet_streamAccounts",
+    "surfnet_timeTravel",
+    "surfnet_writeProgram",
+];
 
 impl CheatcodeConfig {
     pub fn new() -> Arc<Mutex<Self>> {

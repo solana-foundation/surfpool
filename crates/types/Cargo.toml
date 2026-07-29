@@ -39,6 +39,7 @@ solana-transaction = { workspace = true }
 solana-transaction-context = { workspace = true, features = ["serde"] }
 solana-transaction-error = { workspace = true }
 thiserror = { workspace = true }
+ts-rs = { workspace = true, optional = true }
 uuid = { workspace = true }
 
 solana-transaction-status = { workspace = true }
@@ -53,3 +54,4 @@ test-case = { workspace = true }
 [features]
 default = []
 prometheus = []
+ts-bindings = ["dep:ts-rs"]

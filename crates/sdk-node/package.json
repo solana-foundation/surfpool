@@ -61,6 +61,7 @@
     "build:native:debug": "napi build --platform surfpool-sdk --dts internal.d.ts --js internal.js",
     "build:ts": "tsc && tsc -p tsconfig.kit.json && tsc -p tsconfig.kit.esm.json && node ./scripts/sync-dist.js",
     "create-npm-dir": "napi create-npm-dir -t .",
+    "generate:kit-types": "node ./scripts/generate-kit-types.js",
     "artifacts": "napi artifacts",
     "pack:dry-run": "npm pack --dry-run",
     "prepare-release": "node ./scripts/prepare-release.js",

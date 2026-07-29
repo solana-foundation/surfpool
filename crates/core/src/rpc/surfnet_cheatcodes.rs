@@ -2357,6 +2357,48 @@ mod tests {
     use super::*;
     use crate::{rpc::surfnet_cheatcodes::SurfnetCheatcodesRpc, tests::helpers::TestSetup};
 
+    /// Guards the canonical cheatcode method manifest in `surfpool-types`
+    /// against drift: adding, removing, or renaming a method on the
+    /// `SurfnetCheatcodes` trait without updating
+    /// `SURFNET_CHEATCODE_METHODS` (and regenerating the TypeScript bindings
+    /// via `npm run generate:kit-types` in `crates/sdk-node`) fails here.
+    #[test]
+    fn cheatcode_method_manifest_matches_registered_methods() {
+        let mut io: jsonrpc_core::MetaIoHandler<Option<RunloopContext>> =
+            jsonrpc_core::MetaIoHandler::default();
+        io.extend_with(SurfnetCheatcodesRpc::empty().to_delegate());
+
+        let mut registered: Vec<&str> = io.iter().map(|(name, _)| name.as_str()).collect();
+        registered.sort_unstable();
+        let mut manifest = surfpool_types::SURFNET_CHEATCODE_METHODS;
+        manifest.sort_unstable();
+        assert_eq!(registered, manifest);
+    }
+
+    /// Pins the wire shape of `TimeTravelConfig`, which is hand-mirrored in
+    /// the TypeScript bindings
+    /// (`crates/sdk-node/surfpool-sdk/kit/types/api.ts`). Update that mirror
+    /// when this serialization changes.
+    #[test]
+    fn time_travel_config_wire_keys_are_stable() {
+        for (config, expected) in [
+            (
+                TimeTravelConfig::AbsoluteEpoch(5),
+                serde_json::json!({ "absoluteEpoch": 5 }),
+            ),
+            (
+                TimeTravelConfig::AbsoluteSlot(6),
+                serde_json::json!({ "absoluteSlot": 6 }),
+            ),
+            (
+                TimeTravelConfig::AbsoluteTimestamp(7),
+                serde_json::json!({ "absoluteTimestamp": 7 }),
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(&config).unwrap(), expected);
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn test_get_transaction_profile() {
         // Create connection to local validator

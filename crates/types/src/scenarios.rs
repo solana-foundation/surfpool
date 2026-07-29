@@ -64,6 +64,7 @@ impl ConstantDefinition {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 #[doc = "Defines how an account address should be determined"]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
 pub enum AccountAddress {
     /// A specific public key
     #[doc = "A specific public key"]
@@ -81,6 +82,7 @@ pub enum AccountAddress {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 #[doc = "Seeds used for PDA derivation"]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
 pub enum PdaSeed {
     Pubkey(String),
     String(String),
@@ -465,6 +467,7 @@ impl OverrideTemplate {
 /// A concrete instance of an override template with specific values
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
 pub struct OverrideInstance {
     /// Unique identifier for this instance (UUID v4)
     #[schemars(description = "Unique identifier for this instance (UUID v4 format)")]
@@ -478,14 +481,17 @@ pub struct OverrideInstance {
     #[schemars(
         description = "JSON object mapping property names to values. Keys must be from template.properties. Example: {\"liquidity\": 1000000, \"sqrt_price_x64\": 18446744073709551616}"
     )]
+    #[cfg_attr(feature = "ts-bindings", ts(type = "Record<string, unknown>"))]
     pub values: HashMap<String, serde_json::Value>,
     /// Relative slot when this override should be applied (1 = 400ms after registration)
     #[schemars(
         description = "Slot offset from scenario registration (integer, e.g., 1, 2, 3). Each slot is ~400ms."
     )]
+    #[cfg_attr(feature = "ts-bindings", ts(type = "number | bigint"))]
     pub scenario_relative_slot: Slot,
     /// Optional human-readable label for this instance
     #[schemars(description = "Human-readable label describing what this override does")]
+    #[cfg_attr(feature = "ts-bindings", ts(optional))]
     pub label: Option<String>,
     /// Whether this override is enabled
     #[schemars(description = "Whether this override is active (true/false)")]
@@ -495,6 +501,7 @@ pub struct OverrideInstance {
         description = "If true, fetches fresh account data from mainnet before applying override"
     )]
     #[serde(default)]
+    #[cfg_attr(feature = "ts-bindings", ts(as = "Option<bool>", optional))]
     pub fetch_before_use: bool,
     /// Account address to override - use pubkey for known addresses or pda for derived addresses
     #[schemars(
@@ -531,6 +538,7 @@ impl OverrideInstance {
 /// A scenario containing a timeline of overrides
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
 pub struct Scenario {
     /// Unique identifier for the scenario (UUID v4 format)
     #[schemars(

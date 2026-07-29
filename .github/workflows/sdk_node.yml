@@ -8,8 +8,11 @@ on:
       - ".github/workflows/sdk_node.yml"
       - "Cargo.lock"
       - "Cargo.toml"
+      - "crates/core/src/rpc/surfnet_cheatcodes.rs"
+      - "crates/core/src/types.rs"
       - "crates/sdk/**"
       - "crates/sdk-node/**"
+      - "crates/types/**"
   pull_request:
     branches:
       - main
@@ -17,14 +20,41 @@ on:
       - ".github/workflows/sdk_node.yml"
       - "Cargo.lock"
       - "Cargo.toml"
+      - "crates/core/src/rpc/surfnet_cheatcodes.rs"
+      - "crates/core/src/types.rs"
       - "crates/sdk/**"
       - "crates/sdk-node/**"
+      - "crates/types/**"
 
 env:
   CARGO_TERM_COLOR: always
   SURFPOOL_WEB_UI_VERSION: 0.2.0-alpha.0
 
 jobs:
+  kit_types_fresh:
+    name: Generated kit RPC types are up to date
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-rust-types
+          cache-bin: false
+          workspaces: |
+            . -> target
+
+      - name: Regenerate kit type bindings
+        run: node crates/sdk-node/scripts/generate-kit-types.js
+
+      - name: Verify committed bindings are up to date
+        run: git diff --exit-code -- crates/sdk-node/surfpool-sdk/kit/generated
+
   validate:
     name: Validate (${{ matrix.name }})
     runs-on: ${{ matrix.os }}

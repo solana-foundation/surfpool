@@ -6,5 +6,5 @@ export type {
     SurfpoolEmbeddedConfig,
     SurfpoolRpcOptions,
 } from './surfpool.js';
+export * from './generated/index.js';
 export type * from './types/api.js';
-export type * from './types/generated.js';
