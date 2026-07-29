@@ -48,22 +48,35 @@ function surfpoolEmbedded(config: SurfpoolEmbeddedConfig = {}) {
             import('@solana/kit-plugin-signer'),
         ]);
         const surfnet = surfnetConfig ? Surfnet.startWithConfig(surfnetConfig) : Surfnet.start();
-        const payer = await createKeyPairSignerFromBytes(surfnet.payerSecretKey);
+        try {
+            const payer = await createKeyPairSignerFromBytes(surfnet.payerSecretKey);
 
-        return pipe(
-            extendClient(client, {
-                cheatcodes: createSurfnetCheatcodesRpc(surfnet.rpcUrl, { headers: extractHeaders(rpcOptions) }),
-                rpcUrl: surfnet.rpcUrl,
-                surfnet,
-                wsUrl: surfnet.wsUrl,
-            }),
-            payerPlugin(payer),
-            solanaLocalRpc({
-                ...rpcOptions,
-                rpcSubscriptionsUrl: surfnet.wsUrl,
-                rpcUrl: surfnet.rpcUrl,
-            }),
-        );
+            return pipe(
+                extendClient(client, {
+                    cheatcodes: createSurfnetCheatcodesRpc(surfnet.rpcUrl, { headers: extractHeaders(rpcOptions) }),
+                    rpcUrl: surfnet.rpcUrl,
+                    surfnet,
+                    wsUrl: surfnet.wsUrl,
+                }),
+                payerPlugin(payer),
+                solanaLocalRpc({
+                    ...rpcOptions,
+                    rpcSubscriptionsUrl: surfnet.wsUrl,
+                    rpcUrl: surfnet.rpcUrl,
+                }),
+            );
+        } catch (error) {
+            // If setup fails, the Surfnet handle never reaches the caller, so
+            // it must be stopped here to free its servers and ports. `stop()`
+            // can itself throw (shutdown timeout); the setup error is the one
+            // worth surfacing.
+            try {
+                surfnet.stop();
+            } catch {
+                // Ignored in favor of the setup error.
+            }
+            throw error;
+        }
     };
 }
 
