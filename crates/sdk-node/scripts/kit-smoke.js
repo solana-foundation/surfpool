@@ -60,3 +60,12 @@ test("embedded surfpool() boots a Surfnet and wires the full kit client", async 
   const funded = await client.rpc.getBalance(recipient).send();
   assert.equal(funded.value, 1_000_000_000n);
 });
+
+test("disposing the embedded client stops the Surfnet", async () => {
+  const client = await createClient().use(surfpool({ surfnet: { offline: true } }));
+  await client.rpc.getSlot().send();
+
+  client[Symbol.dispose]();
+
+  await assert.rejects(client.rpc.getSlot().send());
+});

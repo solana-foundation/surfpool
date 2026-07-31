@@ -50,6 +50,15 @@ const slot = await client.rpc.getSlot().send();
 client.surfnet.stop();
 ```
 
+The embedded client is `Disposable`: disposing it stops the Surfnet, so you can
+use `using` instead of calling `stop()` yourself and a recreated client boots a
+fresh instance.
+
+```ts
+using client = await createClient().use(surfpool());
+// Surfnet stops automatically when `client` goes out of scope.
+```
+
 Surfnet startup options go under the `surfnet` key; everything else is
 forwarded to the standard local RPC plugin:
 

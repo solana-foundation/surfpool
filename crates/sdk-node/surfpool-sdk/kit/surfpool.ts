@@ -1,4 +1,4 @@
-import { type ClientWithPayer, createKeyPairSignerFromBytes, extendClient, pipe } from '@solana/kit';
+import { type ClientWithPayer, createKeyPairSignerFromBytes, extendClient, pipe, withCleanup } from '@solana/kit';
 import { solanaLocalRpc, type SolanaRpcConfig } from '@solana/kit-plugin-rpc';
 import type { SurfnetConfig } from '@solana/surfpool';
 
@@ -51,7 +51,7 @@ function surfpoolEmbedded(config: SurfpoolEmbeddedConfig = {}) {
         try {
             const payer = await createKeyPairSignerFromBytes(surfnet.payerSecretKey);
 
-            return pipe(
+            const configuredClient = pipe(
                 extendClient(client, {
                     cheatcodes: createSurfnetCheatcodesRpc(surfnet.rpcUrl, { headers: extractHeaders(rpcOptions) }),
                     rpcUrl: surfnet.rpcUrl,
@@ -65,6 +65,10 @@ function surfpoolEmbedded(config: SurfpoolEmbeddedConfig = {}) {
                     rpcUrl: surfnet.rpcUrl,
                 }),
             );
+
+            // Disposing the client stops the in-process Surfnet so its servers
+            // and ports are freed; recreating the client boots a fresh one.
+            return withCleanup(configuredClient, () => surfnet.stop());
         } catch (error) {
             // If setup fails, the Surfnet handle never reaches the caller, so
             // it must be stopped here to free its servers and ports. `stop()`
@@ -111,6 +115,8 @@ function surfpoolAttach(config: SurfpoolAttachConfig) {
  * `client.surfnet` for in-process helpers (`fundSol`, `deploy`, …), and a
  * typed cheatcodes RPC covering all `surfnet_*` methods as `client.cheatcodes`.
  * `identity` is left untouched — install your own with `.use(identity(...))`.
+ * The client is {@link Disposable}: disposing it stops the Surfnet, so a
+ * recreated client boots a fresh one.
  *
  * **Attach mode** (when `rpcUrl` is set): connects to an already-running
  * Surfpool instance (e.g. `surfpool start`) instead of booting one. No native
