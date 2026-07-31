@@ -1,7 +1,7 @@
 use std::{str::FromStr, sync::Arc, time::Duration};
 
 use base64::Engine;
-use crossbeam_channel::{Sender, unbounded, unbounded as crossbeam_unbounded};
+use crossbeam_channel::{RecvTimeoutError, Sender, unbounded, unbounded as crossbeam_unbounded};
 use ed25519_dalek::Signer as DalekSigner;
 use jsonrpc_core::{
     Error, Result as JsonRpcResult,
@@ -85,24 +85,110 @@ use crate::{
     types::{TimeTravelConfig, TransactionLoadedAddresses},
 };
 
+/// How long a surfnet gets to announce itself before a test gives up on it.
+const READY_DEADLINE: Duration = Duration::from_secs(60);
+
+/// How long a runloop gets to stop once it has been told to.
+const STOP_DEADLINE: Duration = Duration::from_secs(5);
+
+/// The ways owning a runloop from a test can fail.
+///
+/// NotReady and NotStopped carry how long they waited, because a surfnet that
+/// never starts and a runloop that never stops present the same way: a test
+/// that does not finish.
+#[derive(Debug)]
+enum RunloopError {
+    /// The OS refused a thread. This is the shape thread exhaustion arrives
+    /// in, so it is the first thing to fail if the guards below stop working.
+    Spawn(std::io::Error),
+    /// No port was free to bind the surfnet to.
+    NoFreePort(String),
+    /// The event channel closed while waiting: the runloop stopped, or
+    /// panicked, before the surfnet announced itself.
+    Disconnected,
+    /// The surfnet never announced itself.
+    NotReady { waited: Duration },
+    /// The runloop was told to stop and was still running at the deadline.
+    NotStopped { waited: Duration },
+}
+
+impl std::fmt::Display for RunloopError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Spawn(error) => write!(f, "the OS refused a thread for the runloop: {error}"),
+            Self::NoFreePort(reason) => write!(f, "no free port for the surfnet: {reason}"),
+            Self::Disconnected => {
+                write!(f, "the runloop stopped before the surfnet was ready")
+            }
+            Self::NotReady { waited } => {
+                write!(f, "the surfnet was not ready within {waited:?}")
+            }
+            Self::NotStopped { waited } => {
+                write!(
+                    f,
+                    "the runloop was still running {waited:?} after Terminate"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for RunloopError {}
+
 /// A running surfnet and the thread it runs on. Dropping it stops the runloop.
 struct RunloopGuard {
     commands: Sender<SimnetCommand>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
+impl RunloopGuard {
+    /// Stops the runloop and waits for its thread to end, reporting whether it
+    /// did. Dropping the guard does the same thing; call this when the test
+    /// wants to assert the surfnet stopped rather than assume it.
+    fn stop(mut self) -> Result<(), RunloopError> {
+        self.terminate()
+    }
+
+    fn terminate(&mut self) -> Result<(), RunloopError> {
+        // Already stopped: `stop()` consumed the handle, and the drop that
+        // follows it has nothing left to do.
+        let Some(thread) = self.thread.take() else {
+            return Ok(());
+        };
+
+        // A closed channel means the runloop is already gone, which is what is
+        // being asked for here; the wait below is what decides.
+        let _ = self.commands.send(SimnetCommand::Terminate(None));
+
+        // Bounded rather than a plain join: a runloop that never reached its
+        // command loop would never see the Terminate, and a wait that blocks
+        // forever turns a failing test into a hanging one.
+        let deadline = std::time::Instant::now() + STOP_DEADLINE;
+        while !thread.is_finished() {
+            if std::time::Instant::now() >= deadline {
+                return Err(RunloopError::NotStopped {
+                    waited: STOP_DEADLINE,
+                });
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        Ok(())
+    }
+}
+
 impl Drop for RunloopGuard {
     fn drop(&mut self) {
-        let _ = self.commands.send(SimnetCommand::Terminate(None));
-        let Some(thread) = self.thread.take() else {
+        let Err(error) = self.terminate() else {
             return;
         };
-        // Bounded rather than a plain join: a runloop that never reached its
-        // command loop would never see the Terminate, and a drop that blocks
-        // forever turns a failing test into a hanging one.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while !thread.is_finished() && std::time::Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(20));
+        // Raising this while unwinding would abort the process, so a runloop
+        // that outlives a failing test is reported rather than raised: that
+        // test has a failure to show already. On the passing path it is a
+        // failure of its own.
+        if std::thread::panicking() {
+            eprintln!("{error}");
+        } else {
+            panic!("{error}");
         }
     }
 }
@@ -112,7 +198,6 @@ impl Drop for RunloopGuard {
 /// Bind the guard for as long as the test needs the surfnet, conventionally
 /// `let _runloop = spawn_runloop(...)`. A plain `let _ =` drops it there and
 /// then, which stops the runloop before the test has used it.
-#[must_use = "the runloop stops when the guard drops"]
 fn spawn_runloop(
     svm_locker: SurfnetSvmLocker,
     config: SurfpoolConfig,
@@ -121,7 +206,7 @@ fn spawn_runloop(
         crossbeam_channel::Receiver<SimnetCommand>,
     ),
     geyser_events_rx: crossbeam_channel::Receiver<GeyserEvent>,
-) -> RunloopGuard {
+) -> Result<RunloopGuard, RunloopError> {
     let (simnet_commands_tx, simnet_commands_rx) = commands;
     let stop = simnet_commands_tx.clone();
 
@@ -138,33 +223,62 @@ fn spawn_runloop(
                 panic!("{e:?}");
             }
         })
-        .expect("failed to spawn surfnet runloop");
+        .map_err(RunloopError::Spawn)?;
 
-    RunloopGuard {
+    Ok(RunloopGuard {
         commands: stop,
         thread: Some(thread),
-    }
+    })
 }
 
-fn wait_for_ready_and_connected(simnet_events_rx: &crossbeam_channel::Receiver<SimnetEvent>) {
+/// Waits for the surfnet to say it is ready and that it reached its
+/// datasource.
+fn wait_for_ready_and_connected(
+    simnet_events_rx: &crossbeam_channel::Receiver<SimnetEvent>,
+) -> Result<(), RunloopError> {
+    wait_for_startup(simnet_events_rx, Connection::Required)
+}
+
+/// Waits for the surfnet to say it is ready, with no datasource to reach.
+fn wait_for_ready(
+    simnet_events_rx: &crossbeam_channel::Receiver<SimnetEvent>,
+) -> Result<(), RunloopError> {
+    wait_for_startup(simnet_events_rx, Connection::NotExpected)
+}
+
+/// Whether a surfnet has a datasource to connect to, which decides what
+/// counts as having started.
+#[derive(PartialEq)]
+enum Connection {
+    Required,
+    NotExpected,
+}
+
+fn wait_for_startup(
+    simnet_events_rx: &crossbeam_channel::Receiver<SimnetEvent>,
+    connection: Connection,
+) -> Result<(), RunloopError> {
     let mut ready = false;
-    let mut connected = false;
-    loop {
-        match simnet_events_rx.recv() {
-            Ok(SimnetEvent::Ready(_)) => {
-                println!("Simnet is ready");
-                ready = true;
+    let mut connected = connection == Connection::NotExpected;
+    let deadline = std::time::Instant::now() + READY_DEADLINE;
+
+    while !(ready && connected) {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        match simnet_events_rx.recv_timeout(remaining) {
+            Ok(SimnetEvent::Ready(_)) => ready = true,
+            Ok(SimnetEvent::Connected(_)) => connected = true,
+            Ok(_) => (),
+            Err(RecvTimeoutError::Timeout) => {
+                return Err(RunloopError::NotReady {
+                    waited: READY_DEADLINE,
+                });
             }
-            Ok(SimnetEvent::Connected(_)) => {
-                println!("Simnet is connected");
-                connected = true;
-            }
-            _ => (),
-        }
-        if ready && connected {
-            break;
+            // recv returns from a closed channel immediately, so going
+            // round again here spins a core until the test ends.
+            Err(RecvTimeoutError::Disconnected) => return Err(RunloopError::Disconnected),
         }
     }
+    Ok(())
 }
 
 #[cfg_attr(feature = "ignore_tests_ci", ignore = "flaky CI tests")]
@@ -192,12 +306,12 @@ async fn test_simnet_ready(test_type: TestType) {
         config,
         (simnet_commands_tx, simnet_commands_rx),
         geyser_events_rx,
-    );
+    )
+    .expect("the runloop should start");
 
-    // One event, not a loop: both arms leave immediately, so what this asserts
-    // is that the first thing the runloop says is a startup event rather than
-    // an error. Waiting for a particular one would need the accumulating shape
-    // that `wait_for_ready_and_connected` uses.
+    // The assertion is that the first thing the runloop says is a startup
+    // event rather than an error. Waiting for a particular one needs the
+    // accumulating shape `wait_for_ready_and_connected` uses.
     match simnet_events_rx.recv() {
         Ok(SimnetEvent::Ready(_) | SimnetEvent::Connected(_) | SimnetEvent::EpochInfoUpdate(_)) => {
         }
@@ -240,7 +354,8 @@ async fn test_simnet_ticks(test_type: TestType) {
         config,
         (simnet_commands_tx, simnet_commands_rx),
         geyser_events_rx,
-    );
+    )
+    .expect("the runloop should start");
 
     let _ = hiro_system_kit::thread_named("ticks").spawn(move || {
         let mut ticks = 0;
@@ -248,9 +363,9 @@ async fn test_simnet_ticks(test_type: TestType) {
             match simnet_events_rx.recv() {
                 Ok(SimnetEvent::SystemClockUpdated(_)) => ticks += 1,
                 Ok(_) => (),
-                // The runloop has stopped and the channel is closed: recv()
-                // returns immediately from here on, so this loop would spin a
-                // core for the rest of the run.
+                // recv returns from a closed channel immediately, so
+                // going round again here spins a core for the rest of the
+                // run.
                 Err(_) => break,
             }
 
@@ -306,9 +421,10 @@ async fn test_simnet_some_sol_transfers(test_type: TestType) {
         config,
         (simnet_commands_tx, simnet_commands_rx),
         geyser_events_rx,
-    );
+    )
+    .expect("the runloop should start");
 
-    wait_for_ready_and_connected(&simnet_events_rx);
+    wait_for_ready_and_connected(&simnet_events_rx).expect("the surfnet should start");
 
     let minimal_client =
         http::connect::<MinimalClient>(format!("http://{bind_host}:{bind_port}").as_str())
@@ -458,10 +574,11 @@ async fn test_add_alt_entries_fetching(test_type: TestType) {
         config,
         (simnet_commands_tx, simnet_commands_rx),
         geyser_events_rx,
-    );
+    )
+    .expect("the runloop should start");
     let svm_locker = SurfnetSvmLocker(svm_locker);
 
-    wait_for_ready_and_connected(&simnet_events_rx);
+    wait_for_ready_and_connected(&simnet_events_rx).expect("the surfnet should start");
 
     let full_client =
         http::connect::<FullClient>(format!("http://{bind_host}:{bind_port}").as_str())
@@ -623,10 +740,11 @@ async fn test_simulate_add_alt_entries_fetching(test_type: TestType) {
         config,
         (simnet_commands_tx, simnet_commands_rx),
         geyser_events_rx,
-    );
+    )
+    .expect("the runloop should start");
     let svm_locker = SurfnetSvmLocker(svm_locker);
 
-    wait_for_ready_and_connected(&simnet_events_rx);
+    wait_for_ready_and_connected(&simnet_events_rx).expect("the surfnet should start");
 
     let full_client =
         http::connect::<FullClient>(format!("http://{bind_host}:{bind_port}").as_str())
@@ -751,10 +869,11 @@ async fn test_simulate_transaction_no_signers(test_type: TestType) {
         config,
         (simnet_commands_tx, simnet_commands_rx),
         geyser_events_rx,
-    );
+    )
+    .expect("the runloop should start");
     let svm_locker = SurfnetSvmLocker(svm_locker);
 
-    wait_for_ready_and_connected(&simnet_events_rx);
+    wait_for_ready_and_connected(&simnet_events_rx).expect("the surfnet should start");
 
     let full_client =
         http::connect::<FullClient>(format!("http://{bind_host}:{bind_port}").as_str())
@@ -940,7 +1059,8 @@ async fn test_load_snapshot_program_is_invokable() {
         config,
         (simnet_commands_tx, simnet_commands_rx),
         geyser_events_rx,
-    );
+    )
+    .expect("the runloop should start");
 
     loop {
         match simnet_events_rx.recv_timeout(Duration::from_secs(5)) {
@@ -4061,15 +4181,18 @@ fn boot_simnet(
     block_production_mode: BlockProductionMode,
     slot_time: Option<u64>,
     test_type: TestType,
-) -> (
-    SurfnetSvmLocker,
-    crossbeam_channel::Sender<SimnetCommand>,
-    crossbeam_channel::Receiver<SimnetEvent>,
-    RunloopGuard,
-) {
+) -> Result<
+    (
+        SurfnetSvmLocker,
+        crossbeam_channel::Sender<SimnetCommand>,
+        crossbeam_channel::Receiver<SimnetEvent>,
+        RunloopGuard,
+    ),
+    RunloopError,
+> {
     let bind_host = "127.0.0.1";
-    let bind_port = get_free_port().unwrap();
-    let ws_port = get_free_port().unwrap();
+    let bind_port = get_free_port().map_err(RunloopError::NoFreePort)?;
+    let ws_port = get_free_port().map_err(RunloopError::NoFreePort)?;
     let config = SurfpoolConfig {
         simnets: vec![SimnetConfig {
             slot_time: slot_time.unwrap_or(DEFAULT_SLOT_TIME_MS),
@@ -4098,17 +4221,26 @@ fn boot_simnet(
         config,
         (simnet_commands_tx.clone(), simnet_commands_rx),
         geyser_events_rx,
-    );
+    )?;
 
-    loop {
-        if let Ok(SimnetEvent::Ready(_)) =
-            simnet_events_rx.recv_timeout(Duration::from_millis(1000))
-        {
-            break;
-        }
-    }
+    wait_for_ready(&simnet_events_rx)?;
 
-    (svm_locker, simnet_commands_tx, simnet_events_rx, runloop)
+    Ok((svm_locker, simnet_commands_tx, simnet_events_rx, runloop))
+}
+
+/// The guard's claim, as a test: a surfnet that is told to stop does, within
+/// the deadline. Every other test leans on this happening silently at drop,
+/// where a failure has nowhere to go.
+#[test_case(TestType::in_memory(); "with in-memory sqlite db")]
+#[test_case(TestType::no_db(); "with no db")]
+fn a_surfnet_stops_when_it_is_told_to(test_type: TestType) {
+    let (_svm_locker, _simnet_commands_tx, _simnet_events_rx, runloop) =
+        boot_simnet(BlockProductionMode::Clock, Some(400), test_type)
+            .expect("the simnet should boot");
+
+    runloop
+        .stop()
+        .expect("the runloop should stop when told to");
 }
 
 #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
@@ -4118,7 +4250,8 @@ fn boot_simnet(
 fn test_time_travel_resume_paused_clock(test_type: TestType) {
     let rpc_server = SurfnetCheatcodesRpc::empty();
     let (svm_locker, simnet_cmd_tx, _, _runloop) =
-        boot_simnet(BlockProductionMode::Clock, Some(100), test_type);
+        boot_simnet(BlockProductionMode::Clock, Some(100), test_type)
+            .expect("the simnet should boot");
     let (plugin_commands_tx, _plugin_commands_rx) = crossbeam_channel::unbounded::<PluginCommand>();
 
     let runloop_context = RunloopContext {
@@ -4200,7 +4333,8 @@ fn test_time_travel_absolute_timestamp(test_type: TestType) {
         BlockProductionMode::Clock,
         Some(slot_time.clone()),
         test_type,
-    );
+    )
+    .expect("the simnet should boot");
     let (plugin_commands_tx, _plugin_commands_rx) = crossbeam_channel::unbounded::<PluginCommand>();
 
     let runloop_context = RunloopContext {
@@ -4284,7 +4418,8 @@ fn test_time_travel_absolute_timestamp(test_type: TestType) {
 fn test_time_travel_absolute_slot(test_type: TestType) {
     let rpc_server = SurfnetCheatcodesRpc::empty();
     let (svm_locker, simnet_cmd_tx, simnet_events_rx, _runloop) =
-        boot_simnet(BlockProductionMode::Clock, Some(400), test_type);
+        boot_simnet(BlockProductionMode::Clock, Some(400), test_type)
+            .expect("the simnet should boot");
     let (plugin_commands_tx, _plugin_commands_rx) = crossbeam_channel::unbounded::<PluginCommand>();
 
     let runloop_context = RunloopContext {
@@ -4362,7 +4497,8 @@ fn test_time_travel_absolute_slot(test_type: TestType) {
 fn test_time_travel_absolute_epoch(test_type: TestType) {
     let rpc_server = SurfnetCheatcodesRpc::empty();
     let (svm_locker, simnet_cmd_tx, simnet_events_rx, _runloop) =
-        boot_simnet(BlockProductionMode::Clock, Some(400), test_type);
+        boot_simnet(BlockProductionMode::Clock, Some(400), test_type)
+            .expect("the simnet should boot");
     let (plugin_commands_tx, _plugin_commands_rx) = crossbeam_channel::unbounded::<PluginCommand>();
 
     let runloop_context = RunloopContext {
@@ -4443,7 +4579,8 @@ fn test_time_travel_absolute_epoch(test_type: TestType) {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_ix_profiling_with_alt_tx(test_type: TestType) {
     let (svm_locker, _simnet_cmd_tx, _simnet_events_rx, _runloop) =
-        boot_simnet(BlockProductionMode::Clock, Some(400), test_type);
+        boot_simnet(BlockProductionMode::Clock, Some(400), test_type)
+            .expect("the simnet should boot");
 
     let p1 = Keypair::new();
     let p2 = Keypair::new();
@@ -4732,7 +4869,8 @@ async fn test_ix_profiling_with_alt_tx(test_type: TestType) {
 #[tokio::test(flavor = "multi_thread")]
 async fn it_should_delete_accounts_with_no_lamports(test_type: TestType) {
     let (svm_locker, _simnet_cmd_tx, _simnet_events_rx, _runloop) =
-        boot_simnet(BlockProductionMode::Clock, Some(400), test_type);
+        boot_simnet(BlockProductionMode::Clock, Some(400), test_type)
+            .expect("the simnet should boot");
     let p1 = Keypair::new();
     let p2 = Keypair::new();
 
@@ -4784,7 +4922,8 @@ async fn it_should_delete_accounts_with_no_lamports(test_type: TestType) {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_compute_budget_profiling(test_type: TestType) {
     let (svm_locker, _simnet_cmd_tx, _simnet_events_rx, _runloop) =
-        boot_simnet(BlockProductionMode::Clock, Some(400), test_type);
+        boot_simnet(BlockProductionMode::Clock, Some(400), test_type)
+            .expect("the simnet should boot");
     let p1 = Keypair::new();
     let p2 = Keypair::new();
 
@@ -5288,7 +5427,8 @@ fn test_reset_network_keeps_latest_blockhash_valid(test_type: TestType) {
 fn test_reset_network_time_travel_timestamp(test_type: TestType) {
     let rpc_server = SurfnetCheatcodesRpc::empty();
     let (svm_locker, simnet_cmd_tx, simnet_events_rx, _runloop) =
-        boot_simnet(BlockProductionMode::Clock, Some(400), test_type);
+        boot_simnet(BlockProductionMode::Clock, Some(400), test_type)
+            .expect("the simnet should boot");
     let (plugin_commands_tx, _plugin_commands_rx) = crossbeam_channel::unbounded::<PluginCommand>();
 
     let runloop_context = RunloopContext {
@@ -5341,7 +5481,8 @@ fn test_reset_network_time_travel_timestamp(test_type: TestType) {
 fn test_reset_network_time_travel_slot(test_type: TestType) {
     let rpc_server = SurfnetCheatcodesRpc::empty();
     let (svm_locker, simnet_cmd_tx, simnet_events_rx, _runloop) =
-        boot_simnet(BlockProductionMode::Clock, Some(400), test_type);
+        boot_simnet(BlockProductionMode::Clock, Some(400), test_type)
+            .expect("the simnet should boot");
     let (plugin_commands_tx, _plugin_commands_rx) = crossbeam_channel::unbounded::<PluginCommand>();
 
     let runloop_context = RunloopContext {
@@ -5398,7 +5539,8 @@ fn test_reset_network_time_travel_slot(test_type: TestType) {
 fn test_reset_network_time_travel_epoch(test_type: TestType) {
     let rpc_server = SurfnetCheatcodesRpc::empty();
     let (svm_locker, simnet_cmd_tx, simnet_events_rx, _runloop) =
-        boot_simnet(BlockProductionMode::Clock, Some(400), test_type);
+        boot_simnet(BlockProductionMode::Clock, Some(400), test_type)
+            .expect("the simnet should boot");
     let (plugin_commands_tx, _plugin_commands_rx) = crossbeam_channel::unbounded::<PluginCommand>();
 
     let runloop_context = RunloopContext {
@@ -5459,10 +5601,10 @@ fn start_surfnet(
     airdrop_addresses: Vec<Pubkey>,
     datasource_rpc_url: Option<String>,
     test_type: TestType,
-) -> Result<(String, SurfnetSvmLocker, RunloopGuard), String> {
+) -> Result<(String, SurfnetSvmLocker, RunloopGuard), RunloopError> {
     let bind_host = "127.0.0.1";
-    let bind_port = get_free_port().unwrap();
-    let ws_port = get_free_port().unwrap();
+    let bind_port = get_free_port().map_err(RunloopError::NoFreePort)?;
+    let ws_port = get_free_port().map_err(RunloopError::NoFreePort)?;
     let offline_mode = datasource_rpc_url.is_none();
 
     let config = SurfpoolConfig {
@@ -5491,24 +5633,14 @@ fn start_surfnet(
         config,
         (simnet_commands_tx, simnet_commands_rx),
         geyser_events_rx,
-    );
+    )?;
 
-    let mut ready = false;
-    // don't wait for connection in offline mode
-    let mut connected = offline_mode;
-    loop {
-        match simnet_events_rx.recv() {
-            Ok(SimnetEvent::Ready(_)) => {
-                ready = true;
-            }
-            Ok(SimnetEvent::Connected(_)) => {
-                connected = true;
-            }
-            _ => (),
-        }
-        if ready && connected {
-            break;
-        }
+    // An offline surfnet has no datasource to reach, so waiting for Connected
+    // would wait out the deadline.
+    if offline_mode {
+        wait_for_ready(&simnet_events_rx)?;
+    } else {
+        wait_for_ready_and_connected(&simnet_events_rx)?;
     }
 
     Ok((
@@ -6980,7 +7112,8 @@ async fn test_ws_slot_subscribe_basic(test_type: TestType) {
     use surfpool_types::types::BlockProductionMode;
 
     let (svm_locker, _simnet_commands_tx, _simnet_events_rx, _runloop) =
-        boot_simnet(BlockProductionMode::Clock, Some(100), test_type);
+        boot_simnet(BlockProductionMode::Clock, Some(100), test_type)
+            .expect("the simnet should boot");
 
     // subscribe to slot updates
     let slot_rx = svm_locker.subscribe_for_slot_updates();
@@ -7115,7 +7248,8 @@ async fn test_ws_slots_updates_subscribe_basic(test_type: TestType) {
     use surfpool_types::types::BlockProductionMode;
 
     let (svm_locker, _simnet_commands_tx, _simnet_events_rx, _runloop) =
-        boot_simnet(BlockProductionMode::Clock, Some(100), test_type);
+        boot_simnet(BlockProductionMode::Clock, Some(100), test_type)
+            .expect("the simnet should boot");
 
     // subscribe to slots updates
     let slots_updates_rx = svm_locker.subscribe_for_slots_updates();
@@ -9939,7 +10073,8 @@ async fn test_duplicate_transaction_rejected(test_type: TestType) {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_account_loaded_twice_rejected(test_type: TestType) {
     let (svm_locker, _simnet_cmd_tx, _simnet_events_rx, _runloop) =
-        boot_simnet(BlockProductionMode::Clock, Some(400), test_type);
+        boot_simnet(BlockProductionMode::Clock, Some(400), test_type)
+            .expect("the simnet should boot");
 
     let payer = Keypair::new();
     svm_locker
@@ -10169,9 +10304,10 @@ async fn test_send_transaction_skip_sig_verify_processes_and_updates_state(test_
         config,
         (simnet_commands_tx, simnet_commands_rx),
         geyser_events_rx,
-    );
+    )
+    .expect("the runloop should start");
 
-    wait_for_ready_and_connected(&simnet_events_rx);
+    wait_for_ready_and_connected(&simnet_events_rx).expect("the surfnet should start");
 
     let minimal_client =
         http::connect::<MinimalClient>(format!("http://{bind_host}:{bind_port}").as_str())
@@ -10316,11 +10452,12 @@ async fn test_airdrop_amount_zero_skips_airdrops(test_type: TestType) {
         config,
         (simnet_commands_tx, simnet_commands_rx),
         geyser_events_rx,
-    );
+    )
+    .expect("the runloop should start");
 
     // Startup must reach Ready without panicking. This is the core regression
     // assertion for https://github.com/solana-foundation/surfpool/issues/651.
-    wait_for_ready_and_connected(&simnet_events_rx);
+    wait_for_ready_and_connected(&simnet_events_rx).expect("the surfnet should start");
 
     let minimal_client =
         http::connect::<MinimalClient>(format!("http://{bind_host}:{bind_port}").as_str())
@@ -10373,9 +10510,10 @@ async fn test_airdrop_amount_below_rent_skips_airdrops(test_type: TestType) {
         config,
         (simnet_commands_tx, simnet_commands_rx),
         geyser_events_rx,
-    );
+    )
+    .expect("the runloop should start");
 
-    wait_for_ready_and_connected(&simnet_events_rx);
+    wait_for_ready_and_connected(&simnet_events_rx).expect("the surfnet should start");
 
     let minimal_client =
         http::connect::<MinimalClient>(format!("http://{bind_host}:{bind_port}").as_str())
