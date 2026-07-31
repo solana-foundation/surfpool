@@ -68,20 +68,20 @@ function surfpoolEmbedded(config: SurfpoolEmbeddedConfig = {}) {
 
             // Disposing the client stops the in-process Surfnet so its servers
             // and ports are freed; recreating the client boots a fresh one.
-            if (typeof (globalThis as { DisposableStack?: unknown }).DisposableStack !== 'undefined') {
+            if (typeof DisposableStack !== 'undefined') {
                 return withCleanup(configuredClient, () => surfnet.stop());
             }
             // `withCleanup` needs the `DisposableStack` global (Node 24+). On
             // older runtimes register the disposer on `Symbol.dispose` directly,
             // chaining any existing one. Below Node 20 the symbol is absent and
             // the client is returned without a disposer.
-            const disposeSymbol = (Symbol as { dispose?: symbol }).dispose;
+            const disposeSymbol: symbol | undefined = (Symbol as { dispose?: symbol }).dispose;
             if (!disposeSymbol) {
                 return configuredClient;
             }
-            const existingDispose = (configuredClient as Record<symbol, (() => void) | undefined>)[disposeSymbol];
+            const existingDispose = (configuredClient as { [Symbol.dispose]?: () => void })[Symbol.dispose];
             return extendClient(configuredClient, {
-                [disposeSymbol]() {
+                [Symbol.dispose]() {
                     existingDispose?.call(configuredClient);
                     surfnet.stop();
                 },

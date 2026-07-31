@@ -1,6 +1,7 @@
 {
   "extends": "./tsconfig.json",
   "compilerOptions": {
+    "lib": ["ES2022", "DOM", "ESNext.Disposable"],
     "rootDir": "surfpool-sdk/kit",
     "outDir": "dist/kit",
     "baseUrl": ".",
