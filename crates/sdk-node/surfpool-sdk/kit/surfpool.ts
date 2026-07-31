@@ -1,4 +1,4 @@
-import { type ClientWithPayer, createKeyPairSignerFromBytes, extendClient, pipe } from '@solana/kit';
+import { type ClientWithPayer, createKeyPairSignerFromBytes, extendClient, pipe, withCleanup } from '@solana/kit';
 import { solanaLocalRpc, type SolanaRpcConfig } from '@solana/kit-plugin-rpc';
 import type { SurfnetConfig } from '@solana/surfpool';
 
@@ -68,8 +68,13 @@ function surfpoolEmbedded(config: SurfpoolEmbeddedConfig = {}) {
 
             // Disposing the client stops the in-process Surfnet so its servers
             // and ports are freed; recreating the client boots a fresh one.
-            // Any existing disposer is chained ahead of the stop. Runtimes
-            // without `Symbol.dispose` (Node < 20) simply get no disposer.
+            if (typeof (globalThis as { DisposableStack?: unknown }).DisposableStack !== 'undefined') {
+                return withCleanup(configuredClient, () => surfnet.stop());
+            }
+            // `withCleanup` needs the `DisposableStack` global (Node 24+). On
+            // older runtimes register the disposer on `Symbol.dispose` directly,
+            // chaining any existing one. Below Node 20 the symbol is absent and
+            // the client is returned without a disposer.
             const disposeSymbol = (Symbol as { dispose?: symbol }).dispose;
             if (!disposeSymbol) {
                 return configuredClient;
