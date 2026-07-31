@@ -33,7 +33,10 @@ jobs:
       - name: Run Cargo fmt
         run: cargo +nightly fmt --all -- --check
       - name: Run Cargo clippy
-        run: cargo clippy --all-targets
+        # --workspace, because default-members is crates/cli: without it the
+        # other eight crates are linted only as libraries, and their test code
+        # not at all.
+        run: cargo clippy --workspace --all-targets
   build:
     runs-on: ubuntu-latest
     services:

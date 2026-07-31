@@ -139,13 +139,14 @@ async fn test_simnet_ready(test_type: TestType) {
         }
     });
 
-    loop {
-        match simnet_events_rx.recv() {
-            Ok(SimnetEvent::Ready(_))
-            | Ok(SimnetEvent::Connected(_))
-            | Ok(SimnetEvent::EpochInfoUpdate(_)) => break,
-            e => panic!("Expected startup event: {e:?}"),
+    // One event, not a loop: both arms leave immediately, so what this asserts
+    // is that the first thing the runloop says is a startup event rather than
+    // an error. Waiting for a particular one would need the accumulating shape
+    // that `wait_for_ready_and_connected` uses.
+    match simnet_events_rx.recv() {
+        Ok(SimnetEvent::Ready(_) | SimnetEvent::Connected(_) | SimnetEvent::EpochInfoUpdate(_)) => {
         }
+        event => panic!("Expected startup event: {event:?}"),
     }
 }
 
