@@ -160,6 +160,10 @@ impl SurfnetBuilder {
         startup_airdrop_addresses.extend(airdrop_addresses);
         let startup_airdrop_addresses_for_rpc = startup_airdrop_addresses.clone();
 
+        // The default StartupPlanner::None makes the runloop seal an empty
+        // startup plan before announcing Ready, so wait_for_ready below
+        // implies a publicly ready surfnet (getSurfnetInfo reports phase
+        // ready with no pending compat entry).
         let surfpool_config = SurfpoolConfig {
             simnets: vec![SimnetConfig {
                 offline_mode,

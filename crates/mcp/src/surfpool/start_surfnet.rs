@@ -83,6 +83,9 @@ pub fn run_headless(surfnet_id: u16, rpc_port: u16, ws_port: u16) -> StartSurfne
 
     let simnet_events_tx = surfnet_svm.simnet_events_tx.clone();
 
+    // The default StartupPlanner::None makes the runloop seal an empty
+    // startup plan before announcing Ready, so this embedded surfnet reads
+    // as publicly ready without any sealing choreography here.
     let mut config = SurfpoolConfig::default();
     config.rpc.bind_port = rpc_port;
     config.rpc.ws_port = ws_port;
@@ -193,4 +196,93 @@ pub fn run_headless(surfnet_id: u16, rpc_port: u16, ws_port: u16) -> StartSurfne
     });
 
     res
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        io::{Read, Write},
+        net::{TcpListener, TcpStream},
+        time::{Duration, Instant},
+    };
+
+    use super::*;
+
+    fn free_port() -> u16 {
+        TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    /// Minimal JSON-RPC POST over a raw socket: HTTP/1.0 so the response is
+    /// unchunked and terminated by connection close.
+    fn get_surfnet_info(rpc_port: u16) -> serde_json::Value {
+        let address = format!("127.0.0.1:{rpc_port}");
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"surfnet_getSurfnetInfo"}"#;
+        let request = format!(
+            "POST / HTTP/1.0\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let attempt = TcpStream::connect(&address).and_then(|mut stream| {
+                stream.write_all(request.as_bytes())?;
+                let mut response = String::new();
+                stream.read_to_string(&mut response)?;
+                Ok(response)
+            });
+            match attempt {
+                Ok(response) => {
+                    let json_start =
+                        response.find("\r\n\r\n").expect("malformed HTTP response") + 4;
+                    return serde_json::from_str(&response[json_start..])
+                        .expect("response body should be JSON");
+                }
+                Err(error) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "getSurfnetInfo unreachable at {address}: {error}"
+                    );
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+        }
+    }
+
+    // run_headless used to leave the startup plan unsealed, which projected
+    // a forever-pending surfpool-startup execution into getSurfnetInfo and
+    // starved readiness-checking clients (legacy Anchor's readiness loop has
+    // no timeout). This pins the empty-plan seal in place.
+    #[test]
+    fn headless_surfnets_report_a_ready_startup() {
+        let rpc_port = free_port();
+        let ws_port = free_port();
+
+        let response = run_headless(1, rpc_port, ws_port);
+        assert!(
+            response.error.is_none(),
+            "surfnet failed to start: {:?}",
+            response.error
+        );
+
+        let info = get_surfnet_info(rpc_port);
+        let value = &info["result"]["value"];
+        assert_eq!(
+            value["startup"]["phase"], "ready",
+            "startup should be sealed and ready: {info}"
+        );
+        assert_eq!(value["startup"]["planSealed"], true);
+        // The legacy-Anchor-visible part: no phantom pending execution.
+        assert_eq!(
+            value["runbookExecutions"]
+                .as_array()
+                .expect("runbookExecutions should be an array")
+                .len(),
+            0,
+            "no compat entry should remain once startup is ready: {info}"
+        );
+    }
 }
