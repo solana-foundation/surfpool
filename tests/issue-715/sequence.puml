@@ -1,0 +1,78 @@
+@startuml
+' The full happy-path trace from process-model.md, section 3, on one
+' canvas; the doc itself shows the same trace split into episodes.
+' Render with a PlantUML server, e.g.:
+'   http://localhost:8080/svg/{encoded}
+' or the plantuml CLI: plantuml -tsvg sequence.puml
+
+title Issue 715 startup happy path (clones plus deployment required)
+
+autonumber
+skinparam shadowing false
+skinparam sequenceMessageAlign left
+skinparam BoxPadding 12
+skinparam note {
+  BackgroundColor #fefce8
+  BorderColor #ca8a04
+}
+
+box "client process" #eceff1
+  participant "Anchor CLI" as anchor
+end box
+box "surfpool process" #f3e8ff
+  participant "RPC servers" as rpcsrv
+  participant "CLI orchestration" as cli
+  participant "Runloop" as runloop
+  participant "Deployment\nexecutor" as deployer
+  participant "Watchdog" as watchdog
+end box
+box "remote RPC process" #ffedd5
+  participant "mainnet / devnet" as remote
+end box
+
+note over rpcsrv, runloop
+  core startup done, RPC bound,
+  phase = Planning, plan unsealed
+end note
+
+anchor -> rpcsrv: getSurfnetInfo (polling starts immediately)
+rpcsrv --> anchor: phase Planning,\none pending ""surfpool-startup"" entry
+
+group#16a34a #dcfce7 seal boundary
+  cli -> runloop: SealStartupPlan([RemoteAccounts, Deployment], reply_tx)
+  runloop --> cli: Ok (bounded reply channel)\nphase = Initializing
+end
+
+cli -> runloop: StartStartupTask(RemoteAccounts)
+cli -> runloop: FetchRemoteAccounts(clone_pubkeys, url)
+cli -> runloop: StartStartupTask(Deployment)
+cli -> deployer: spawn thread with runbook futures
+
+runloop -> remote: getMultipleAccounts (HTTPS)
+note over remote
+  the reproducer's mock
+  delays this response
+end note
+remote --> runloop: account batch
+
+note over runloop
+  install whole batch under one write guard,
+  CompleteStartupTask(RemoteAccounts, Ok),
+  phase = Deploying
+end note
+
+deployer -> rpcsrv: deployment transactions\n(loopback JSON-RPC)
+deployer -> runloop: CompleteStartupTask(Deployment, Ok)
+
+note over runloop
+  phase = Ready (the join:
+  every required task succeeded)
+end note
+runloop ->> watchdog: watch channel observes Ready,\nexits quietly
+
+anchor -> rpcsrv: getSurfnetInfo
+rpcsrv --> anchor: phase Ready, no pending entries
+anchor -> rpcsrv: getAccountInfo(clone)
+rpcsrv --> anchor: account present
+
+@enduml

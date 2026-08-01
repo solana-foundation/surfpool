@@ -1,0 +1,5 @@
+[test.validator]
+url = "http://127.0.0.1:18898"
+
+[[test.validator.clone]]
+address = "AqH29mZfQFgRpfwaPoTMWSKJ5kqauoc1FwVBRksZyQrt"
