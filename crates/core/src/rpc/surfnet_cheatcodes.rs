@@ -16,10 +16,10 @@ use solana_system_interface::program as system_program;
 use solana_transaction::versioned::VersionedTransaction;
 use spl_associated_token_account_interface::address::get_associated_token_address_with_program_id;
 use surfpool_types::{
-    AccountSnapshot, CheatcodeControlConfig, CheatcodeFilter, ClockCommand, ExportSnapshotConfig,
-    GetStreamedAccountsResponse, GetSurfnetInfoResponse, Idl, OfflineAccountConfig,
-    ResetAccountConfig, RpcProfileResultConfig, Scenario, SimnetCommand, SimnetEvent,
-    StreamAccountConfig, StreamAccountsEntry, UiKeyedProfileResult,
+    AccountSnapshot, CheatcodeControlConfig, CheatcodeFilter, ClientAnswer, ClockCommand,
+    ExportSnapshotConfig, GetStreamedAccountsResponse, GetSurfnetInfoResponse, Idl,
+    OfflineAccountConfig, ResetAccountConfig, RpcProfileResultConfig, Scenario, SimnetCommand,
+    SimnetEvent, StreamAccountConfig, StreamAccountsEntry, UiKeyedProfileResult,
     types::{AccountUpdate, SetSomeAccount, SupplyUpdate, TokenAccountUpdate, UuidOrSignature},
 };
 
@@ -1187,7 +1187,19 @@ pub trait SurfnetCheatcodes {
     ///           "completedAt": 1758747828,
     ///           "runbookId": "deployment"
     ///         }
-    ///       ]
+    ///       ],
+    ///       "startup": {
+    ///         "phase": "ready",
+    ///         "planSealed": true,
+    ///         "tasks": [
+    ///           {
+    ///             "task": "remoteAccounts",
+    ///             "state": "succeeded",
+    ///             "error": null
+    ///           }
+    ///         ],
+    ///         "error": null
+    ///       }
     ///     }
     ///   },
     ///   "id": 1
@@ -2202,9 +2214,43 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
     ) -> Result<RpcResponse<GetSurfnetInfoResponse>> {
         let svm_locker = meta.get_svm_locker()?;
         let runbook_executions = svm_locker.runbook_executions();
+        // Status and start time under one guard: the compat entry projected
+        // from them must be self-consistent within a response.
+        let (startup_status, started_at) = svm_locker.with_svm_reader(|svm_reader| {
+            let started_at = svm_reader
+                .start_time
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_secs() as u32)
+                .unwrap_or_default();
+            (svm_reader.startup_status.clone(), started_at)
+        });
+        let value =
+            GetSurfnetInfoResponse::with_startup(runbook_executions, startup_status, started_at);
+
+        // The predicate is the client's own conclusion from this response, not
+        // the surfnet's internal phase: Anchor reads readiness as "every
+        // execution reports complete", and an empty list satisfies it. Deriving
+        // it from what was answered keeps the event meaningful for any build,
+        // including one whose readiness rule differs.
+        // try_send: this runs on every poll, and the bounded events channel
+        // may belong to an embedder that never drains it. A full channel
+        // costs one ordering-evidence event; a blocking send would park an
+        // RPC worker for as long as the channel stays full.
+        let _ = svm_locker
+            .simnet_events_tx()
+            .try_send(SimnetEvent::AnsweredClient {
+                method: "surfnet_getSurfnetInfo",
+                answer: ClientAnswer::Readiness {
+                    ready: value
+                        .runbook_executions
+                        .iter()
+                        .all(|execution| execution.completed_at.is_some()),
+                },
+            });
+
         Ok(RpcResponse {
             context: RpcResponseContext::new(svm_locker.get_latest_absolute_slot()),
-            value: GetSurfnetInfoResponse::new(runbook_executions),
+            value,
         })
     }
 
@@ -2398,6 +2444,7 @@ mod tests {
             assert_eq!(serde_json::to_value(&config).unwrap(), expected);
         }
     }
+
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_get_transaction_profile() {
