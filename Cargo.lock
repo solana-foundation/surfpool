@@ -11950,6 +11950,7 @@ dependencies = [
  "agave-geyser-plugin-interface",
  "agave-reserved-account-keys",
  "anchor-lang-idl",
+ "async-trait",
  "axum",
  "base64 0.22.1",
  "bincode",

@@ -35,6 +35,7 @@ agave-reserved-account-keys = { version = "4.0", default-features = false }
 anchor-lang-idl = "0.1.2"
 ansi_term = "0.12.1"
 anyhow = { version = "1.0.95", default-features = false }
+async-trait = "0.1.89"
 atty = "0.2.13"
 base58 = "0.2.0"
 base64 = { version = "0.22.1", default-features = false }

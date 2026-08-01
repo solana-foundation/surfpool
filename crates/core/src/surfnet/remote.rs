@@ -1,5 +1,6 @@
-use std::{collections::HashMap, str::FromStr};
+use std::{collections::HashMap, str::FromStr, time::Duration};
 
+use async_trait::async_trait;
 use serde_json::json;
 use solana_account::Account;
 use solana_account_decoder::UiAccount;
@@ -24,6 +25,11 @@ use solana_epoch_schedule::EpochSchedule;
 use solana_hash::Hash;
 use solana_loader_v3_interface::get_program_data_address;
 use solana_pubkey::Pubkey;
+use solana_rpc_client::{
+    http_sender::HttpSender,
+    rpc_sender::{RpcSender, RpcTransportStats},
+};
+use solana_rpc_client_api::client_error::{ErrorKind as ClientErrorKind, Result as ClientResult};
 use solana_signature::Signature;
 use solana_transaction_status::UiConfirmedBlock;
 
@@ -34,6 +40,51 @@ use crate::{
     surfnet::{GetAccountResult, locker::is_supported_token_program},
     types::{RemoteRpcResult, TokenAccount},
 };
+
+/// How long one call to the datasource gets, start to finish.
+///
+/// The HTTP client's timeout bounds a single attempt rather than a call:
+/// solana's sender retries a 429 up to five times and honours `Retry-After`
+/// for as much as 120 seconds each time, so a throttled datasource can hold a
+/// call for ten minutes with no individual attempt ever timing out. The value
+/// sits comfortably above that 30 second per-attempt timeout, since a deadline
+/// at or below it would cut off attempts that were going to succeed.
+const DATASOURCE_DEADLINE: Duration = Duration::from_secs(60);
+
+/// Bounds how long the sender it wraps may take, so a datasource that stops
+/// answering surfaces as an error rather than as a surfnet that appears stuck.
+struct DeadlineSender<S> {
+    inner: S,
+    deadline: Duration,
+}
+
+#[async_trait]
+impl<S: RpcSender + Send + Sync> RpcSender for DeadlineSender<S> {
+    async fn send(
+        &self,
+        request: RpcRequest,
+        params: serde_json::Value,
+    ) -> ClientResult<serde_json::Value> {
+        match tokio::time::timeout(self.deadline, self.inner.send(request, params)).await {
+            Ok(response) => response,
+            Err(_) => Err(ClientErrorKind::Custom(format!(
+                "{:?} to {} did not answer within {:?}",
+                request,
+                self.inner.url(),
+                self.deadline
+            ))
+            .into()),
+        }
+    }
+
+    fn get_transport_stats(&self) -> RpcTransportStats {
+        self.inner.get_transport_stats()
+    }
+
+    fn url(&self) -> String {
+        self.inner.url()
+    }
+}
 
 pub struct SurfnetRemoteClient {
     pub client: RpcClient,
@@ -59,13 +110,19 @@ impl SomeRemoteCtx for Option<SurfnetRemoteClient> {
 
 impl SurfnetRemoteClient {
     pub fn new<U: ToString>(remote_rpc_url: U) -> Self {
-        let client = RpcClient::new(remote_rpc_url.to_string());
+        let sender = DeadlineSender {
+            inner: HttpSender::new(remote_rpc_url.to_string()),
+            deadline: DATASOURCE_DEADLINE,
+        };
+        let client = RpcClient::new_sender(
+            sender,
+            RpcClientConfig::with_commitment(CommitmentConfig::default()),
+        );
         SurfnetRemoteClient { client }
     }
 
     pub fn new_unsafe<U: ToString>(remote_rpc_url: U) -> Option<Self> {
         use reqwest;
-        use solana_rpc_client::http_sender::HttpSender;
 
         // Retry HTTP client initialization to handle potential fork-related issues
         let client = match reqwest::Client::builder()
@@ -84,7 +141,10 @@ impl SurfnetRemoteClient {
                 return None;
             }
         };
-        let http_sender = HttpSender::new_with_client(remote_rpc_url, client);
+        let http_sender = DeadlineSender {
+            inner: HttpSender::new_with_client(remote_rpc_url, client),
+            deadline: DATASOURCE_DEADLINE,
+        };
         let client = RpcClient::new_sender(http_sender, RpcClientConfig::default());
         Some(SurfnetRemoteClient { client })
     }
@@ -472,5 +532,61 @@ where
         Ok(val) => Ok(RemoteRpcResult::Ok(val)),
         Err(e) if is_method_not_supported_error(&e) => Ok(RemoteRpcResult::MethodNotSupported),
         Err(e) => Err(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A call that never completes, whether because the endpoint went quiet
+    /// or because its retry policy never gave control back. The deadline does
+    /// not need to know which.
+    struct NeverAnswers;
+
+    #[async_trait]
+    impl RpcSender for NeverAnswers {
+        async fn send(
+            &self,
+            _request: RpcRequest,
+            _params: serde_json::Value,
+        ) -> ClientResult<serde_json::Value> {
+            std::future::pending().await
+        }
+
+        fn get_transport_stats(&self) -> RpcTransportStats {
+            RpcTransportStats::default()
+        }
+
+        fn url(&self) -> String {
+            "http://never.example".to_string()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_datasource_that_never_answers_is_an_error_rather_than_a_wait() {
+        let sender = DeadlineSender {
+            inner: NeverAnswers,
+            deadline: Duration::from_millis(50),
+        };
+
+        let error = sender
+            .send(RpcRequest::GetSlot, serde_json::Value::Null)
+            .await
+            .expect_err("a datasource that never answers should not succeed");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("did not answer"),
+            "the failure should say what happened: {message}"
+        );
+        assert!(
+            message.contains("http://never.example"),
+            "the failure should identify the datasource: {message}"
+        );
+        assert!(
+            message.contains("GetSlot"),
+            "the failure should identify the request: {message}"
+        );
     }
 }
