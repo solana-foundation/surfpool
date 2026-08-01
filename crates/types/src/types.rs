@@ -430,10 +430,52 @@ pub mod pubkey_option_account_map {
     }
 }
 
+/// What the surfnet told a client, reduced to the predicate a property names
+/// rather than the payload it answered with.
+///
+/// A served response is output: it is asserted on or read in a report, never
+/// fed back into a surfnet. Reduced to a predicate so the event stream does
+/// not carry a second copy of the wire format.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClientAnswer {
+    /// A readiness question, and whether the answer conveyed readiness.
+    ///
+    /// Monotone: readiness does not regress, so the first answer carrying
+    /// `ready: true` is the moment a client could have been misled, and an
+    /// ordering assertion about it is well posed.
+    Readiness { ready: bool },
+}
+
 #[derive(Debug)]
 pub enum SimnetEvent {
-    /// Surfnet is ready, with the initial count of processed transactions from storage
+    /// Core startup completed: RPC servers are bound and stored transactions
+    /// have been replayed (the payload is their count). This is *not* public
+    /// readiness: with an external startup planner (the CLI), it fires while
+    /// the startup phase is still `Planning`, before clones are hydrated or
+    /// deployment runbooks run. Public readiness is
+    /// [`SurfnetStartupPhase::Ready`], observable via
+    /// `surfnet_getSurfnetInfo` or the startup watch channel. With no
+    /// external planner the two coincide: the runloop seals the empty plan
+    /// immediately before emitting this event.
     Ready(u64),
+    /// The surfnet answered a client, carrying what the answer conveyed.
+    ///
+    /// Reports what a client was told, so a test can assert on the answer a
+    /// client received rather than infer it from internal state. Issue 715 is
+    /// defined by client observation, which is why the answer is recorded.
+    AnsweredClient {
+        method: &'static str,
+        answer: ClientAnswer,
+    },
+    /// The startup machine accepted a transition, carrying the status it
+    /// produced. One event per accepted transition, in the order they were
+    /// applied, so readiness can be observed as a position in a sequence.
+    /// Rejections are not events: nothing
+    /// changed, and the caller already holds the [`StartupError`].
+    ///
+    /// The startup watch channel carries the same status but coalesces, so a
+    /// reader that wants every step reads it here.
+    StartupStatusChanged(SurfnetStartupStatus),
     Connected(String),
     Aborted(String),
     Shutdown,
@@ -568,6 +610,12 @@ pub enum SimnetCommand {
     UpdateInternalClock(Option<(Hash, String)>, Clock),
     UpdateInternalClockWithConfirmation(Option<(Hash, String)>, Clock, Sender<EpochInfo>),
     UpdateBlockProductionMode(BlockProductionMode),
+    /// Executes a transaction. `sendTransaction` enqueues this on the same
+    /// channel as the startup commands below, so channel order decides which
+    /// accounts the transaction sees: enqueued before
+    /// `CompleteStartupTask(RemoteAccounts, ..)`, it runs against unhydrated
+    /// state. The readiness gate exists so clients wait for `Ready` rather
+    /// than race that window.
     ProcessTransaction(
         Option<(Hash, String)>,
         VersionedTransaction,
@@ -576,6 +624,23 @@ pub enum SimnetCommand {
         Option<bool>,
     ),
     Terminate(Option<(Hash, String)>),
+    /// Fixes the startup task list; `Ready` is unreachable until a plan is
+    /// sealed. The only startup command with a reply channel: the planner
+    /// must not dispatch tasks against an unsealed plan, so it blocks on the
+    /// outcome. The startup commands below are fire-and-forget
+    /// because no caller decision hangs on them; their failures are machine
+    /// rejections, which the runloop reports as error events.
+    SealStartupPlan(Vec<SurfnetStartupTask>, Sender<Result<(), StartupError>>),
+    /// Reports a failure discovered while the plan was still unsealed
+    /// (project inspection failed); drives the phase to `Failed`.
+    FailStartupPlanning(String),
+    /// Marks a sealed task `Running`. The submitter sends this before
+    /// dispatching the task's work, on the same channel, so the transition
+    /// is applied first.
+    StartStartupTask(SurfnetStartupTask),
+    /// Reports a task's outcome, mapping `Ok`/`Err` onto
+    /// `Succeeded`/`Failed`.
+    CompleteStartupTask(SurfnetStartupTask, Result<(), String>),
     StartRunbookExecution(String),
     CompleteRunbookExecution(String, Option<Vec<String>>),
     FetchRemoteAccounts(Vec<Pubkey>, String),
@@ -614,6 +679,28 @@ pub struct SurfpoolConfig {
     pub subgraph: SubgraphConfig,
     pub studio: StudioConfig,
     pub plugin_config_path: Vec<PathBuf>,
+    #[serde(default)]
+    pub startup_planner: StartupPlanner,
+}
+
+/// Who seals the startup plan for this surfnet.
+///
+/// Sealing fixes the task list, and `Ready` is unreachable without it, so
+/// every surfnet needs exactly one sealer. The default hands that obligation
+/// to the runloop, so embedders with no startup tasks need not set it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum StartupPlanner {
+    /// No external planner exists: the runloop seals an empty plan itself,
+    /// right before announcing readiness, so the surfnet becomes publicly
+    /// ready as soon as core startup completes.
+    #[default]
+    None,
+    /// An external planner (the CLI) inspects the project and seals the plan
+    /// via [`SimnetCommand::SealStartupPlan`]; the runloop must not seal. If
+    /// the planner dies before sealing, the surfnet stays un-ready forever,
+    /// which is the safe direction.
+    External,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1372,11 +1459,66 @@ pub struct StreamedAccountInfo {
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
 pub struct GetSurfnetInfoResponse {
-    runbook_executions: Vec<RunbookExecutionStatusReport>,
+    pub runbook_executions: Vec<RunbookExecutionStatusReport>,
+    /// Kept out of the generated TypeScript bindings. `SurfnetStartupStatus`
+    /// serializes through a hand-written impl that flattens the sum type onto
+    /// `{ phase, planSealed, tasks, error }`, and ts-rs derives from the Rust
+    /// shape rather than from that impl, so exporting it would need a
+    /// hand-maintained `ts(type = ...)` mirroring the wire format in a second
+    /// place. TypeScript clients read readiness from `runbookExecutions`,
+    /// which is the compatibility path this field exists to make safe.
+    #[serde(default)]
+    #[cfg_attr(feature = "ts-bindings", ts(skip))]
+    pub startup: SurfnetStartupStatus,
 }
 impl GetSurfnetInfoResponse {
-    pub fn new(runbook_executions: Vec<RunbookExecutionStatusReport>) -> Self {
-        Self { runbook_executions }
+    /// Runbook id of the compatibility entry projected into
+    /// `runbook_executions` while startup is in flight. Part of the wire
+    /// contract with legacy Anchor; do not rename.
+    pub const STARTUP_COMPAT_RUNBOOK_ID: &'static str = "surfpool-startup";
+
+    /// `started_at` is the surfnet's startup time (unix seconds), used to
+    /// timestamp the compatibility entry. It must be stable across calls:
+    /// clients diff `runbook_executions` between polls, and stamping "now"
+    /// on each response made the synthetic entry read as a new execution
+    /// every time.
+    pub fn with_startup(
+        mut runbook_executions: Vec<RunbookExecutionStatusReport>,
+        startup: SurfnetStartupStatus,
+        started_at: u32,
+    ) -> Self {
+        // Anchor versions that predate the explicit startup field infer
+        // readiness by checking that every runbook execution is complete,
+        // in a loop with no timeout that never inspects `errors`. Project
+        // the lifecycle into that vocabulary: one pending compatibility
+        // entry while startup is in flight, completed with errors on
+        // Failed. Leaving the entry pending on Failed would starve that
+        // loop forever; completing it means a legacy client proceeds and
+        // fails visibly, with the reason recorded for anyone who looks.
+        //
+        // On Failed, completed_at reuses started_at: the machine does not
+        // track the failure instant, the entry is synthetic, and the only
+        // contract is non-null; reusing the stable value avoids the same
+        // per-poll churn that started_at is guarding against.
+        let compat = |completed_at, errors| RunbookExecutionStatusReport {
+            started_at,
+            completed_at,
+            runbook_id: Self::STARTUP_COMPAT_RUNBOOK_ID.into(),
+            errors,
+        };
+        match startup.phase() {
+            SurfnetStartupPhase::Ready => {}
+            SurfnetStartupPhase::Failed => {
+                runbook_executions.push(compat(Some(started_at), Some(startup.failure_messages())))
+            }
+            SurfnetStartupPhase::Planning
+            | SurfnetStartupPhase::Initializing
+            | SurfnetStartupPhase::Deploying => runbook_executions.push(compat(None, None)),
+        }
+        Self {
+            runbook_executions,
+            startup,
+        }
     }
 }
 
@@ -1427,6 +1569,687 @@ impl RunbookExecutionStatusReport {
         self.errors = error;
     }
 }
+
+/// Public readiness lifecycle for a surfnet. `Ready` here means the sealed
+/// startup plan completed: clones hydrated, deployment runbooks succeeded.
+/// Not to be confused with [`SimnetEvent::Ready`], which fires when core
+/// startup completes (RPC bound) and can precede this by the entire
+/// clone-and-deploy window.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SurfnetStartupPhase {
+    #[default]
+    Planning,
+    Initializing,
+    Deploying,
+    Ready,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SurfnetStartupTask {
+    RemoteAccounts,
+    Deployment,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SurfnetStartupTaskState {
+    Pending,
+    Running,
+    Succeeded,
+    Failed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SurfnetStartupTaskStatus {
+    pub task: SurfnetStartupTask,
+    pub state: SurfnetStartupTaskState,
+    pub error: Option<String>,
+}
+
+/// The move a caller tried to make on a task, which a rejection names so the
+/// failure says what was attempted rather than only what state blocked it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StartupTaskTransition {
+    Start,
+    Complete,
+    Fail,
+}
+
+impl std::fmt::Display for StartupTaskTransition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Start => write!(f, "start"),
+            Self::Complete => write!(f, "complete"),
+            Self::Fail => write!(f, "fail"),
+        }
+    }
+}
+
+/// Why the startup machine refused a transition.
+///
+/// Each variant carries what the caller needs to decide what to do next: a
+/// phase, a task, or the state that blocked the move. Callers that only want
+/// to report a rejection can use the `Display` text, which is what the trace
+/// and the event log carry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StartupError {
+    /// The plan is already sealed, and sealing happens once.
+    AlreadySealed { phase: SurfnetStartupPhase },
+    /// Nothing can move until the plan is sealed.
+    NotSealed,
+    /// Startup has already finished, in one direction or the other.
+    AlreadyTerminal { phase: SurfnetStartupPhase },
+    /// The task is not one the sealed plan declared.
+    TaskNotPlanned { task: SurfnetStartupTask },
+    /// The task cannot make that move from the state it is in.
+    TaskState {
+        task: SurfnetStartupTask,
+        attempted: StartupTaskTransition,
+        from: SurfnetStartupTaskState,
+    },
+    /// Planning has already finished, so it cannot fail now.
+    NotPlanning { phase: SurfnetStartupPhase },
+}
+
+impl std::fmt::Display for StartupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AlreadySealed { phase } => write!(
+                f,
+                "startup plan can only be sealed once while planning (phase: {phase:?})"
+            ),
+            Self::NotSealed => write!(f, "startup plan has not been sealed"),
+            Self::AlreadyTerminal { phase } => {
+                write!(f, "startup is already terminal ({phase:?})")
+            }
+            Self::TaskNotPlanned { task } => {
+                write!(f, "startup task {task:?} is not part of the sealed plan")
+            }
+            Self::TaskState {
+                task,
+                attempted,
+                from,
+            } => write!(f, "startup task {task:?} cannot {attempted} from {from:?}"),
+            Self::NotPlanning { phase } => {
+                write!(f, "startup planning cannot fail from phase {phase:?}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for StartupError {}
+
+/// Lifecycle read model for surfnet startup. The representation carries the
+/// issue-715 invariant structurally: the phase is a projection of the
+/// variant, and only a sealed plan has a task table to derive `Ready` from,
+/// so an unsealed status cannot represent readiness at all. The wire shape
+/// is unchanged: the manual `Serialize` impl below projects the same flat
+/// `{ phase, planSealed, tasks, error }` object the struct form produced.
+///
+/// The lifecycle in full, from the spec beside this file. The reachability
+/// tests hold the machine to it, and the include anchors the document, so
+/// renaming it breaks the build rather than leaving a dead reference:
+///
+/// ---
+///
+#[doc = include_str!("startup-lifecycle.md")]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum SurfnetStartupStatus {
+    /// Unsealed: the required task set is not known yet. Never ready.
+    #[default]
+    Planning,
+    /// Planning failed before a plan was sealed. Terminal.
+    PlanningFailed { error: String },
+    /// The task set is closed; the phase derives from the task states. An
+    /// empty sealed plan derives `Ready` immediately.
+    Sealed(SealedStartupPlan),
+}
+
+/// The flat wire form of [`SurfnetStartupStatus`]. `phase` and `error` are
+/// projections of the variant: serialization computes them, and
+/// deserialization rebuilds the variant from the authoritative fields
+/// (`planSealed`, `tasks`, `error`), ignoring the `phase` a response
+/// claims. A client must never manufacture readiness from a malformed
+/// response, so an unsealed status deserializes to planning (or to a
+/// planning failure when it carries an error) regardless of its phase
+/// field.
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct SurfnetStartupStatusWire {
+    #[allow(dead_code)]
+    phase: SurfnetStartupPhase,
+    plan_sealed: bool,
+    tasks: Vec<SurfnetStartupTaskStatus>,
+    error: Option<String>,
+}
+
+impl Serialize for SurfnetStartupStatus {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("SurfnetStartupStatus", 4)?;
+        state.serialize_field("phase", &self.phase())?;
+        state.serialize_field("planSealed", &self.plan_sealed())?;
+        state.serialize_field("tasks", self.tasks())?;
+        state.serialize_field("error", &self.error())?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for SurfnetStartupStatus {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = SurfnetStartupStatusWire::deserialize(deserializer)?;
+        Ok(if wire.plan_sealed {
+            Self::Sealed(SealedStartupPlan::from_task_statuses(wire.tasks))
+        } else if let Some(error) = wire.error {
+            Self::PlanningFailed { error }
+        } else {
+            Self::Planning
+        })
+    }
+}
+
+/// A startup plan whose task set is fixed.
+///
+/// The task operations live here rather than on [`SurfnetStartupStatus`], so
+/// holding one of these is proof the plan was sealed. Callers reach it through
+/// [`SurfnetStartupStatus::sealed_mut`], which is the single place the seal is
+/// checked; nothing downstream re-derives it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SealedStartupPlan {
+    tasks: Vec<SurfnetStartupTaskStatus>,
+}
+
+impl SealedStartupPlan {
+    /// Seals `tasks`, dropping repeats: a task named twice is one obligation.
+    fn new(tasks: Vec<SurfnetStartupTask>) -> Self {
+        let mut statuses: Vec<SurfnetStartupTaskStatus> = vec![];
+        for task in tasks {
+            if statuses.iter().any(|status| status.task == task) {
+                continue;
+            }
+            statuses.push(SurfnetStartupTaskStatus {
+                task,
+                state: SurfnetStartupTaskState::Pending,
+                error: None,
+            });
+        }
+        Self { tasks: statuses }
+    }
+
+    /// Rebuilds a plan from a wire payload, which may say anything. Callers
+    /// deriving readiness from it get whatever the task states imply, which is
+    /// the point: the phase is never taken on trust.
+    fn from_task_statuses(tasks: Vec<SurfnetStartupTaskStatus>) -> Self {
+        Self { tasks }
+    }
+
+    pub fn tasks(&self) -> &[SurfnetStartupTaskStatus] {
+        &self.tasks
+    }
+
+    // Phase derivation encodes task ordering: a non-succeeded RemoteAccounts
+    // pins the phase at Initializing, and Deploying is the residual case.
+    // Adding a task variant requires deciding where it sits in this ordering.
+    fn phase(&self) -> SurfnetStartupPhase {
+        if self
+            .tasks
+            .iter()
+            .any(|status| status.state == SurfnetStartupTaskState::Failed)
+        {
+            SurfnetStartupPhase::Failed
+        } else if self
+            .tasks
+            .iter()
+            .all(|status| status.state == SurfnetStartupTaskState::Succeeded)
+        {
+            SurfnetStartupPhase::Ready
+        } else if self.tasks.iter().any(|status| {
+            status.task == SurfnetStartupTask::RemoteAccounts
+                && status.state != SurfnetStartupTaskState::Succeeded
+        }) {
+            SurfnetStartupPhase::Initializing
+        } else {
+            SurfnetStartupPhase::Deploying
+        }
+    }
+
+    fn error(&self) -> Option<&str> {
+        self.tasks
+            .iter()
+            .find(|status| status.state == SurfnetStartupTaskState::Failed)
+            .and_then(|status| status.error.as_deref())
+    }
+
+    fn failure_messages(&self) -> Vec<String> {
+        self.tasks
+            .iter()
+            .filter_map(|status| status.error.clone())
+            .collect()
+    }
+
+    /// A terminal plan accepts no further transitions. Sealing is not checked
+    /// here: this type only exists sealed.
+    fn ensure_active(&self) -> Result<(), StartupError> {
+        let phase = self.phase();
+        if matches!(
+            phase,
+            SurfnetStartupPhase::Ready | SurfnetStartupPhase::Failed
+        ) {
+            return Err(StartupError::AlreadyTerminal { phase });
+        }
+        Ok(())
+    }
+
+    fn task_mut(
+        &mut self,
+        task: SurfnetStartupTask,
+    ) -> Result<&mut SurfnetStartupTaskStatus, StartupError> {
+        self.tasks
+            .iter_mut()
+            .find(|status| status.task == task)
+            .ok_or(StartupError::TaskNotPlanned { task })
+    }
+
+    pub fn start_task(&mut self, task: SurfnetStartupTask) -> Result<(), StartupError> {
+        self.ensure_active()?;
+        let status = self.task_mut(task)?;
+        if status.state != SurfnetStartupTaskState::Pending {
+            return Err(StartupError::TaskState {
+                task,
+                attempted: StartupTaskTransition::Start,
+                from: status.state,
+            });
+        }
+        status.state = SurfnetStartupTaskState::Running;
+        Ok(())
+    }
+
+    pub fn complete_task(&mut self, task: SurfnetStartupTask) -> Result<(), StartupError> {
+        self.ensure_active()?;
+        let status = self.task_mut(task)?;
+        if status.state != SurfnetStartupTaskState::Running {
+            return Err(StartupError::TaskState {
+                task,
+                attempted: StartupTaskTransition::Complete,
+                from: status.state,
+            });
+        }
+        status.state = SurfnetStartupTaskState::Succeeded;
+        Ok(())
+    }
+
+    pub fn fail_task(
+        &mut self,
+        task: SurfnetStartupTask,
+        error: impl Into<String>,
+    ) -> Result<(), StartupError> {
+        let error = error.into();
+        self.ensure_active()?;
+        let status = self.task_mut(task)?;
+        if !matches!(
+            status.state,
+            SurfnetStartupTaskState::Pending | SurfnetStartupTaskState::Running
+        ) {
+            return Err(StartupError::TaskState {
+                task,
+                attempted: StartupTaskTransition::Fail,
+                from: status.state,
+            });
+        }
+        status.state = SurfnetStartupTaskState::Failed;
+        status.error = Some(error);
+        Ok(())
+    }
+}
+
+impl SurfnetStartupStatus {
+    pub fn phase(&self) -> SurfnetStartupPhase {
+        match self {
+            Self::Planning => SurfnetStartupPhase::Planning,
+            Self::PlanningFailed { .. } => SurfnetStartupPhase::Failed,
+            Self::Sealed(plan) => plan.phase(),
+        }
+    }
+
+    pub fn plan_sealed(&self) -> bool {
+        matches!(self, Self::Sealed(_))
+    }
+
+    /// The sealed task table; empty until the plan is sealed.
+    pub fn tasks(&self) -> &[SurfnetStartupTaskStatus] {
+        match self {
+            Self::Sealed(plan) => plan.tasks(),
+            _ => &[],
+        }
+    }
+
+    /// The machine-level failure, when the phase is `Failed`: the planning
+    /// error, or the failed task's error (at most one task can fail; the
+    /// first failure is terminal).
+    pub fn error(&self) -> Option<&str> {
+        match self {
+            Self::Planning => None,
+            Self::PlanningFailed { error } => Some(error),
+            Self::Sealed(plan) => plan.error(),
+        }
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.phase() == SurfnetStartupPhase::Ready
+    }
+
+    /// Failure messages for presentation: each failed task's error; a
+    /// planning failure has no task, so its error stands alone.
+    pub fn failure_messages(&self) -> Vec<String> {
+        match self {
+            Self::Planning => vec![],
+            Self::PlanningFailed { error } => vec![error.clone()],
+            Self::Sealed(plan) => plan.failure_messages(),
+        }
+    }
+
+    /// The one place the seal is checked. Everything a caller can do to a
+    /// sealed plan happens through the returned handle, so no task operation
+    /// re-derives sealedness.
+    pub fn sealed_mut(&mut self) -> Result<&mut SealedStartupPlan, StartupError> {
+        match self {
+            Self::Sealed(plan) => Ok(plan),
+            _ => Err(StartupError::NotSealed),
+        }
+    }
+
+    pub fn seal_plan(&mut self, tasks: Vec<SurfnetStartupTask>) -> Result<(), StartupError> {
+        if !matches!(self, Self::Planning) {
+            return Err(StartupError::AlreadySealed {
+                phase: self.phase(),
+            });
+        }
+        *self = Self::Sealed(SealedStartupPlan::new(tasks));
+        Ok(())
+    }
+
+    pub fn start_task(&mut self, task: SurfnetStartupTask) -> Result<(), StartupError> {
+        self.sealed_mut()?.start_task(task)
+    }
+
+    pub fn complete_task(&mut self, task: SurfnetStartupTask) -> Result<(), StartupError> {
+        self.sealed_mut()?.complete_task(task)
+    }
+
+    pub fn fail_task(
+        &mut self,
+        task: SurfnetStartupTask,
+        error: impl Into<String>,
+    ) -> Result<(), StartupError> {
+        self.sealed_mut()?.fail_task(task, error)
+    }
+
+    pub fn fail_planning(&mut self, error: impl Into<String>) -> Result<(), StartupError> {
+        let error = error.into();
+        if !matches!(self, Self::Planning) {
+            return Err(StartupError::NotPlanning {
+                phase: self.phase(),
+            });
+        }
+        *self = Self::PlanningFailed { error };
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod surfnet_startup_status_tests {
+    use super::*;
+
+    #[test]
+    fn an_unsealed_empty_plan_is_not_ready() {
+        let status = SurfnetStartupStatus::default();
+        assert_eq!(status.phase(), SurfnetStartupPhase::Planning);
+        assert!(!status.is_ready());
+    }
+
+    #[test]
+    fn a_sealed_empty_plan_is_ready() {
+        let mut status = SurfnetStartupStatus::default();
+        status.seal_plan(vec![]).unwrap();
+        assert!(status.is_ready());
+    }
+
+    #[test]
+    fn required_tasks_enforce_initialization_then_deployment() {
+        let mut status = SurfnetStartupStatus::default();
+        status
+            .seal_plan(vec![
+                SurfnetStartupTask::RemoteAccounts,
+                SurfnetStartupTask::Deployment,
+            ])
+            .unwrap();
+        assert_eq!(status.phase(), SurfnetStartupPhase::Initializing);
+
+        status
+            .start_task(SurfnetStartupTask::RemoteAccounts)
+            .unwrap();
+        status
+            .complete_task(SurfnetStartupTask::RemoteAccounts)
+            .unwrap();
+        assert_eq!(status.phase(), SurfnetStartupPhase::Deploying);
+
+        status.start_task(SurfnetStartupTask::Deployment).unwrap();
+        status
+            .complete_task(SurfnetStartupTask::Deployment)
+            .unwrap();
+        assert!(status.is_ready());
+    }
+
+    #[test]
+    fn failed_tasks_are_terminal() {
+        let mut status = SurfnetStartupStatus::default();
+        status
+            .seal_plan(vec![SurfnetStartupTask::RemoteAccounts])
+            .unwrap();
+        status
+            .start_task(SurfnetStartupTask::RemoteAccounts)
+            .unwrap();
+        status
+            .fail_task(SurfnetStartupTask::RemoteAccounts, "datasource unavailable")
+            .unwrap();
+
+        assert_eq!(status.phase(), SurfnetStartupPhase::Failed);
+        assert_eq!(status.error(), Some("datasource unavailable"));
+        assert_eq!(
+            status.complete_task(SurfnetStartupTask::RemoteAccounts),
+            Err(StartupError::AlreadyTerminal {
+                phase: SurfnetStartupPhase::Failed
+            })
+        );
+    }
+
+    /// Each rejection names why, so a test that stops holding is one that
+    /// changed which rule fired rather than one that merely still refuses.
+    #[test]
+    fn illegal_transitions_are_rejected() {
+        let mut status = SurfnetStartupStatus::default();
+        assert_eq!(
+            status.start_task(SurfnetStartupTask::RemoteAccounts),
+            Err(StartupError::NotSealed)
+        );
+
+        status
+            .seal_plan(vec![SurfnetStartupTask::RemoteAccounts])
+            .unwrap();
+        assert_eq!(
+            status.complete_task(SurfnetStartupTask::RemoteAccounts),
+            Err(StartupError::TaskState {
+                task: SurfnetStartupTask::RemoteAccounts,
+                attempted: StartupTaskTransition::Complete,
+                from: SurfnetStartupTaskState::Pending
+            })
+        );
+        assert_eq!(
+            status.seal_plan(vec![SurfnetStartupTask::Deployment]),
+            Err(StartupError::AlreadySealed {
+                phase: SurfnetStartupPhase::Initializing
+            })
+        );
+    }
+
+    // The flat wire shape is contract: clients read `planSealed` and
+    // `phase` as plain fields (the sdk and mcp integration tests pin the
+    // same shape end to end). The representation is an enum, so the manual
+    // Serialize impl must keep projecting the object the struct form
+    // produced.
+    #[test]
+    fn serializes_to_the_flat_wire_shape() {
+        let mut sealed = SurfnetStartupStatus::default();
+        sealed
+            .seal_plan(vec![SurfnetStartupTask::RemoteAccounts])
+            .unwrap();
+        let json = serde_json::to_value(&sealed).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "phase": "initializing",
+                "planSealed": true,
+                "tasks": [
+                    { "task": "remoteAccounts", "state": "pending", "error": null }
+                ],
+                "error": null,
+            })
+        );
+    }
+
+    #[test]
+    fn deserializes_from_the_shape_it_serializes() {
+        let mut sealed_failed = SurfnetStartupStatus::default();
+        sealed_failed
+            .seal_plan(vec![SurfnetStartupTask::RemoteAccounts])
+            .unwrap();
+        sealed_failed
+            .start_task(SurfnetStartupTask::RemoteAccounts)
+            .unwrap();
+        sealed_failed
+            .fail_task(SurfnetStartupTask::RemoteAccounts, "boom")
+            .unwrap();
+
+        let mut planning_failed = SurfnetStartupStatus::default();
+        planning_failed.fail_planning("boom").unwrap();
+
+        let mut ready = SurfnetStartupStatus::default();
+        ready.seal_plan(vec![]).unwrap();
+
+        for status in [
+            SurfnetStartupStatus::default(),
+            planning_failed,
+            sealed_failed,
+            ready,
+        ] {
+            let json = serde_json::to_string(&status).unwrap();
+            let back: SurfnetStartupStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, status, "round trip changed the status: {json}");
+        }
+    }
+
+    // The wire `phase` is derived output, so deserialization rebuilds the
+    // variant from `planSealed` and the task table and ignores the phase a
+    // response claims. The safe direction matters: a malformed unsealed
+    // response must never manufacture readiness on the client side.
+    #[test]
+    fn deserialization_never_manufactures_readiness_from_an_unsealed_status() {
+        let json = r#"{"phase":"ready","planSealed":false,"tasks":[],"error":null}"#;
+        let status: SurfnetStartupStatus = serde_json::from_str(json).unwrap();
+        assert_eq!(status.phase(), SurfnetStartupPhase::Planning);
+        assert!(!status.is_ready());
+    }
+
+    const STARTED_AT: u32 = 1_753_000_000;
+
+    #[test]
+    fn legacy_anchor_sees_startup_as_pending_until_ready() {
+        let planning = GetSurfnetInfoResponse::with_startup(
+            vec![],
+            SurfnetStartupStatus::default(),
+            STARTED_AT,
+        );
+        assert_eq!(planning.runbook_executions.len(), 1);
+        assert_eq!(
+            planning.runbook_executions[0].runbook_id,
+            GetSurfnetInfoResponse::STARTUP_COMPAT_RUNBOOK_ID
+        );
+        assert!(planning.runbook_executions[0].completed_at.is_none());
+
+        let mut ready = SurfnetStartupStatus::default();
+        ready.seal_plan(vec![]).unwrap();
+        let ready_response = GetSurfnetInfoResponse::with_startup(vec![], ready, STARTED_AT);
+        assert!(ready_response.runbook_executions.is_empty());
+    }
+
+    // The compat entry must be identical from poll to poll: clients diff
+    // runbook_executions between responses, and a churning timestamp made
+    // the synthetic entry read as a new execution every 500ms.
+    #[test]
+    fn compat_entry_is_stable_across_polls() {
+        let mut failed = SurfnetStartupStatus::default();
+        failed.fail_planning("boom").unwrap();
+
+        for status in [SurfnetStartupStatus::default(), failed] {
+            let first = GetSurfnetInfoResponse::with_startup(vec![], status.clone(), STARTED_AT);
+            let second = GetSurfnetInfoResponse::with_startup(vec![], status, STARTED_AT);
+            assert_eq!(first.runbook_executions, second.runbook_executions);
+            assert_eq!(first.runbook_executions[0].started_at, STARTED_AT);
+        }
+    }
+
+    // A pending compat entry on Failed would starve legacy Anchor's readiness
+    // loop, which has no timeout; the entry must complete, with the reason
+    // recorded in `errors`.
+    #[test]
+    fn legacy_anchor_sees_startup_failure_as_completed_with_errors() {
+        let mut failed = SurfnetStartupStatus::default();
+        failed
+            .seal_plan(vec![SurfnetStartupTask::RemoteAccounts])
+            .unwrap();
+        failed
+            .start_task(SurfnetStartupTask::RemoteAccounts)
+            .unwrap();
+        failed
+            .fail_task(SurfnetStartupTask::RemoteAccounts, "datasource unavailable")
+            .unwrap();
+
+        let response = GetSurfnetInfoResponse::with_startup(vec![], failed, STARTED_AT);
+        assert_eq!(response.runbook_executions.len(), 1);
+        let compat = &response.runbook_executions[0];
+        assert_eq!(
+            compat.runbook_id,
+            GetSurfnetInfoResponse::STARTUP_COMPAT_RUNBOOK_ID
+        );
+        assert_eq!(compat.completed_at, Some(STARTED_AT));
+        assert_eq!(
+            compat.errors,
+            Some(vec!["datasource unavailable".to_string()])
+        );
+    }
+
+    // fail_planning has no task to carry the error, so the machine-level
+    // error must reach the compat entry on its own.
+    #[test]
+    fn legacy_anchor_sees_planning_failure_as_completed_with_errors() {
+        let mut failed = SurfnetStartupStatus::default();
+        failed.fail_planning("could not detect framework").unwrap();
+
+        let response = GetSurfnetInfoResponse::with_startup(vec![], failed, STARTED_AT);
+        assert_eq!(response.runbook_executions.len(), 1);
+        let compat = &response.runbook_executions[0];
+        assert_eq!(compat.completed_at, Some(STARTED_AT));
+        assert_eq!(
+            compat.errors,
+            Some(vec!["could not detect framework".to_string()])
+        );
+    }
+}
+
 /// WebSocket subscription counts
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
 pub struct WsSubscriptions {
@@ -2064,5 +2887,20 @@ mod tests {
 
         let config: SimnetConfig = serde_json::from_value(config_json).unwrap();
         assert!(!config.skip_blockhash_check);
+    }
+
+    // Configs written before the startup planner existed must keep working;
+    // the runloop-seals default is also the correct reading of them, since
+    // none of their writers seal a plan.
+    #[test]
+    fn test_surfpool_config_startup_planner_defaults_on_deserialize() {
+        let mut config_json = serde_json::to_value(SurfpoolConfig::default()).unwrap();
+        config_json
+            .as_object_mut()
+            .unwrap()
+            .remove("startup_planner");
+
+        let config: SurfpoolConfig = serde_json::from_value(config_json).unwrap();
+        assert_eq!(config.startup_planner, StartupPlanner::None);
     }
 }
