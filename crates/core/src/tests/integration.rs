@@ -86,10 +86,19 @@ use crate::{
 };
 
 /// How long a surfnet gets to announce itself before a test gives up on it.
-const READY_DEADLINE: Duration = Duration::from_secs(60);
+///
+/// The value has to exceed the worst case of the remote calls underneath it:
+/// reaching a datasource means asking it for epoch info, the epoch schedule and
+/// the declared clones, each bounded separately. A ready deadline set to what a
+/// single call may take fails a startup whose first call was merely slow.
+const READY_DEADLINE: Duration = Duration::from_secs(180);
 
 /// How long a runloop gets to stop once it has been told to.
-const STOP_DEADLINE: Duration = Duration::from_secs(5);
+///
+/// Generous on purpose. Exceeding this fails the test, so the value leaves room
+/// for a loaded machine rather than sitting near what a healthy shutdown takes,
+/// which is tens of milliseconds.
+const STOP_DEADLINE: Duration = Duration::from_secs(15);
 
 /// The ways owning a runloop from a test can fail.
 ///
@@ -4173,23 +4182,24 @@ async fn test_get_local_signatures_with_limit(test_type: TestType) {
 // Clock Control Tests (pauseClock, resumeClock, timeTravel)
 // ============================================================================
 
-/// Boots a simnet and waits for it to be ready.
+/// A booted simnet, with the handles a test drives it through.
 ///
-/// The [`RunloopGuard`] comes back with the handles because it has to outlive
-/// them: held here, it would stop the runloop as this function returns.
+/// The guard rides along rather than being handed back separately, so holding
+/// the simnet is what keeps its runloop alive; there is no fourth element to
+/// forget to bind.
+struct BootedSimnet {
+    locker: SurfnetSvmLocker,
+    commands: Sender<SimnetCommand>,
+    events: crossbeam_channel::Receiver<SimnetEvent>,
+    runloop: RunloopGuard,
+}
+
+/// Boots a simnet and waits for it to be ready.
 fn boot_simnet(
     block_production_mode: BlockProductionMode,
     slot_time: Option<u64>,
     test_type: TestType,
-) -> Result<
-    (
-        SurfnetSvmLocker,
-        crossbeam_channel::Sender<SimnetCommand>,
-        crossbeam_channel::Receiver<SimnetEvent>,
-        RunloopGuard,
-    ),
-    RunloopError,
-> {
+) -> Result<BootedSimnet, RunloopError> {
     let bind_host = "127.0.0.1";
     let bind_port = get_free_port().map_err(RunloopError::NoFreePort)?;
     let ws_port = get_free_port().map_err(RunloopError::NoFreePort)?;
@@ -4225,7 +4235,12 @@ fn boot_simnet(
 
     wait_for_ready(&simnet_events_rx)?;
 
-    Ok((svm_locker, simnet_commands_tx, simnet_events_rx, runloop))
+    Ok(BootedSimnet {
+        locker: svm_locker,
+        commands: simnet_commands_tx,
+        events: simnet_events_rx,
+        runloop,
+    })
 }
 
 /// The guard's claim, as a test: a surfnet that is told to stop does, within
@@ -4234,11 +4249,11 @@ fn boot_simnet(
 #[test_case(TestType::in_memory(); "with in-memory sqlite db")]
 #[test_case(TestType::no_db(); "with no db")]
 fn a_surfnet_stops_when_it_is_told_to(test_type: TestType) {
-    let (_svm_locker, _simnet_commands_tx, _simnet_events_rx, runloop) =
-        boot_simnet(BlockProductionMode::Clock, Some(400), test_type)
-            .expect("the simnet should boot");
+    let simnet = boot_simnet(BlockProductionMode::Clock, Some(400), test_type)
+        .expect("the simnet should boot");
 
-    runloop
+    simnet
+        .runloop
         .stop()
         .expect("the runloop should stop when told to");
 }
@@ -4249,9 +4264,10 @@ fn a_surfnet_stops_when_it_is_told_to(test_type: TestType) {
 #[cfg_attr(feature = "postgres", test_case(TestType::postgres(); "with postgres db"))]
 fn test_time_travel_resume_paused_clock(test_type: TestType) {
     let rpc_server = SurfnetCheatcodesRpc::empty();
-    let (svm_locker, simnet_cmd_tx, _, _runloop) =
-        boot_simnet(BlockProductionMode::Clock, Some(100), test_type)
-            .expect("the simnet should boot");
+    let simnet = boot_simnet(BlockProductionMode::Clock, Some(100), test_type)
+        .expect("the simnet should boot");
+    let svm_locker = simnet.locker.clone();
+    let simnet_cmd_tx = simnet.commands.clone();
     let (plugin_commands_tx, _plugin_commands_rx) = crossbeam_channel::unbounded::<PluginCommand>();
 
     let runloop_context = RunloopContext {
@@ -4329,12 +4345,15 @@ fn test_time_travel_resume_paused_clock(test_type: TestType) {
 fn test_time_travel_absolute_timestamp(test_type: TestType) {
     let rpc_server = SurfnetCheatcodesRpc::empty();
     let slot_time = 100;
-    let (svm_locker, simnet_cmd_tx, simnet_events_rx, _runloop) = boot_simnet(
+    let simnet = boot_simnet(
         BlockProductionMode::Clock,
         Some(slot_time.clone()),
         test_type,
     )
     .expect("the simnet should boot");
+    let svm_locker = simnet.locker.clone();
+    let simnet_cmd_tx = simnet.commands.clone();
+    let simnet_events_rx = simnet.events.clone();
     let (plugin_commands_tx, _plugin_commands_rx) = crossbeam_channel::unbounded::<PluginCommand>();
 
     let runloop_context = RunloopContext {
@@ -4417,9 +4436,11 @@ fn test_time_travel_absolute_timestamp(test_type: TestType) {
 #[cfg_attr(feature = "postgres", test_case(TestType::postgres(); "with postgres db"))]
 fn test_time_travel_absolute_slot(test_type: TestType) {
     let rpc_server = SurfnetCheatcodesRpc::empty();
-    let (svm_locker, simnet_cmd_tx, simnet_events_rx, _runloop) =
-        boot_simnet(BlockProductionMode::Clock, Some(400), test_type)
-            .expect("the simnet should boot");
+    let simnet = boot_simnet(BlockProductionMode::Clock, Some(400), test_type)
+        .expect("the simnet should boot");
+    let svm_locker = simnet.locker.clone();
+    let simnet_cmd_tx = simnet.commands.clone();
+    let simnet_events_rx = simnet.events.clone();
     let (plugin_commands_tx, _plugin_commands_rx) = crossbeam_channel::unbounded::<PluginCommand>();
 
     let runloop_context = RunloopContext {
@@ -4496,9 +4517,11 @@ fn test_time_travel_absolute_slot(test_type: TestType) {
 #[cfg_attr(feature = "postgres", test_case(TestType::postgres(); "with postgres db"))]
 fn test_time_travel_absolute_epoch(test_type: TestType) {
     let rpc_server = SurfnetCheatcodesRpc::empty();
-    let (svm_locker, simnet_cmd_tx, simnet_events_rx, _runloop) =
-        boot_simnet(BlockProductionMode::Clock, Some(400), test_type)
-            .expect("the simnet should boot");
+    let simnet = boot_simnet(BlockProductionMode::Clock, Some(400), test_type)
+        .expect("the simnet should boot");
+    let svm_locker = simnet.locker.clone();
+    let simnet_cmd_tx = simnet.commands.clone();
+    let simnet_events_rx = simnet.events.clone();
     let (plugin_commands_tx, _plugin_commands_rx) = crossbeam_channel::unbounded::<PluginCommand>();
 
     let runloop_context = RunloopContext {
@@ -4578,9 +4601,9 @@ fn test_time_travel_absolute_epoch(test_type: TestType) {
 #[cfg_attr(feature = "postgres", test_case(TestType::postgres(); "with postgres db"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_ix_profiling_with_alt_tx(test_type: TestType) {
-    let (svm_locker, _simnet_cmd_tx, _simnet_events_rx, _runloop) =
-        boot_simnet(BlockProductionMode::Clock, Some(400), test_type)
-            .expect("the simnet should boot");
+    let simnet = boot_simnet(BlockProductionMode::Clock, Some(400), test_type)
+        .expect("the simnet should boot");
+    let svm_locker = simnet.locker.clone();
 
     let p1 = Keypair::new();
     let p2 = Keypair::new();
@@ -4868,9 +4891,9 @@ async fn test_ix_profiling_with_alt_tx(test_type: TestType) {
 #[cfg_attr(feature = "postgres", test_case(TestType::postgres(); "with postgres db"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn it_should_delete_accounts_with_no_lamports(test_type: TestType) {
-    let (svm_locker, _simnet_cmd_tx, _simnet_events_rx, _runloop) =
-        boot_simnet(BlockProductionMode::Clock, Some(400), test_type)
-            .expect("the simnet should boot");
+    let simnet = boot_simnet(BlockProductionMode::Clock, Some(400), test_type)
+        .expect("the simnet should boot");
+    let svm_locker = simnet.locker.clone();
     let p1 = Keypair::new();
     let p2 = Keypair::new();
 
@@ -4921,9 +4944,9 @@ async fn it_should_delete_accounts_with_no_lamports(test_type: TestType) {
 #[cfg_attr(feature = "postgres", test_case(TestType::postgres(); "with postgres db"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_compute_budget_profiling(test_type: TestType) {
-    let (svm_locker, _simnet_cmd_tx, _simnet_events_rx, _runloop) =
-        boot_simnet(BlockProductionMode::Clock, Some(400), test_type)
-            .expect("the simnet should boot");
+    let simnet = boot_simnet(BlockProductionMode::Clock, Some(400), test_type)
+        .expect("the simnet should boot");
+    let svm_locker = simnet.locker.clone();
     let p1 = Keypair::new();
     let p2 = Keypair::new();
 
@@ -5426,9 +5449,10 @@ fn test_reset_network_keeps_latest_blockhash_valid(test_type: TestType) {
 #[cfg_attr(feature = "postgres", test_case(TestType::postgres(); "with postgres db"))]
 fn test_reset_network_time_travel_timestamp(test_type: TestType) {
     let rpc_server = SurfnetCheatcodesRpc::empty();
-    let (svm_locker, simnet_cmd_tx, simnet_events_rx, _runloop) =
-        boot_simnet(BlockProductionMode::Clock, Some(400), test_type)
-            .expect("the simnet should boot");
+    let simnet = boot_simnet(BlockProductionMode::Clock, Some(400), test_type)
+        .expect("the simnet should boot");
+    let svm_locker = simnet.locker.clone();
+    let simnet_cmd_tx = simnet.commands.clone();
     let (plugin_commands_tx, _plugin_commands_rx) = crossbeam_channel::unbounded::<PluginCommand>();
 
     let runloop_context = RunloopContext {
@@ -5480,9 +5504,10 @@ fn test_reset_network_time_travel_timestamp(test_type: TestType) {
 #[cfg_attr(feature = "postgres", test_case(TestType::postgres(); "with postgres db"))]
 fn test_reset_network_time_travel_slot(test_type: TestType) {
     let rpc_server = SurfnetCheatcodesRpc::empty();
-    let (svm_locker, simnet_cmd_tx, simnet_events_rx, _runloop) =
-        boot_simnet(BlockProductionMode::Clock, Some(400), test_type)
-            .expect("the simnet should boot");
+    let simnet = boot_simnet(BlockProductionMode::Clock, Some(400), test_type)
+        .expect("the simnet should boot");
+    let svm_locker = simnet.locker.clone();
+    let simnet_cmd_tx = simnet.commands.clone();
     let (plugin_commands_tx, _plugin_commands_rx) = crossbeam_channel::unbounded::<PluginCommand>();
 
     let runloop_context = RunloopContext {
@@ -5538,9 +5563,10 @@ fn test_reset_network_time_travel_slot(test_type: TestType) {
 #[cfg_attr(feature = "postgres", test_case(TestType::postgres(); "with postgres db"))]
 fn test_reset_network_time_travel_epoch(test_type: TestType) {
     let rpc_server = SurfnetCheatcodesRpc::empty();
-    let (svm_locker, simnet_cmd_tx, simnet_events_rx, _runloop) =
-        boot_simnet(BlockProductionMode::Clock, Some(400), test_type)
-            .expect("the simnet should boot");
+    let simnet = boot_simnet(BlockProductionMode::Clock, Some(400), test_type)
+        .expect("the simnet should boot");
+    let svm_locker = simnet.locker.clone();
+    let simnet_cmd_tx = simnet.commands.clone();
     let (plugin_commands_tx, _plugin_commands_rx) = crossbeam_channel::unbounded::<PluginCommand>();
 
     let runloop_context = RunloopContext {
@@ -7111,9 +7137,9 @@ async fn test_ws_account_subscribe_account_closure(test_type: TestType) {
 async fn test_ws_slot_subscribe_basic(test_type: TestType) {
     use surfpool_types::types::BlockProductionMode;
 
-    let (svm_locker, _simnet_commands_tx, _simnet_events_rx, _runloop) =
-        boot_simnet(BlockProductionMode::Clock, Some(100), test_type)
-            .expect("the simnet should boot");
+    let simnet = boot_simnet(BlockProductionMode::Clock, Some(100), test_type)
+        .expect("the simnet should boot");
+    let svm_locker = simnet.locker.clone();
 
     // subscribe to slot updates
     let slot_rx = svm_locker.subscribe_for_slot_updates();
@@ -7247,9 +7273,9 @@ async fn test_ws_slot_subscribe_multiple_slot_changes(test_type: TestType) {
 async fn test_ws_slots_updates_subscribe_basic(test_type: TestType) {
     use surfpool_types::types::BlockProductionMode;
 
-    let (svm_locker, _simnet_commands_tx, _simnet_events_rx, _runloop) =
-        boot_simnet(BlockProductionMode::Clock, Some(100), test_type)
-            .expect("the simnet should boot");
+    let simnet = boot_simnet(BlockProductionMode::Clock, Some(100), test_type)
+        .expect("the simnet should boot");
+    let svm_locker = simnet.locker.clone();
 
     // subscribe to slots updates
     let slots_updates_rx = svm_locker.subscribe_for_slots_updates();
@@ -10072,9 +10098,9 @@ async fn test_duplicate_transaction_rejected(test_type: TestType) {
 #[cfg_attr(feature = "postgres", test_case(TestType::postgres(); "with postgres db"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_account_loaded_twice_rejected(test_type: TestType) {
-    let (svm_locker, _simnet_cmd_tx, _simnet_events_rx, _runloop) =
-        boot_simnet(BlockProductionMode::Clock, Some(400), test_type)
-            .expect("the simnet should boot");
+    let simnet = boot_simnet(BlockProductionMode::Clock, Some(400), test_type)
+        .expect("the simnet should boot");
+    let svm_locker = simnet.locker.clone();
 
     let payer = Keypair::new();
     svm_locker
