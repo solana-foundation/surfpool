@@ -662,20 +662,25 @@ impl Default for SimnetConfig {
     }
 }
 
+/// A datasource URL reduced to scheme and host, for anywhere a client or a log
+/// can see it.
+///
+/// Datasource URLs carry credentials in three places: a query parameter
+/// (`?api-key=`), a path segment, and userinfo (`https://user:pass@host`).
+/// Parsing and rebuilding from the host drops all three. A URL that will not
+/// parse yields `None`, so a caller substitutes rather than falling back to
+/// the raw string.
+pub fn sanitized_datasource_url(raw: &str) -> Option<String> {
+    let url = url::Url::parse(raw).ok()?;
+    Some(format!("{}://{}", url.scheme(), url.host_str()?))
+}
+
 impl SimnetConfig {
     /// Returns a sanitized version of the datasource URL safe for display.
     /// Only returns scheme and host (e.g., "https://example.com") to prevent
     /// leaking API keys in paths or query parameters.
     pub fn get_sanitized_datasource_url(&self) -> Option<String> {
-        let raw = self.remote_rpc_url.as_ref()?;
-
-        if let Ok(url) = url::Url::parse(raw) {
-            let scheme = url.scheme();
-            let host = url.host_str()?;
-            Some(format!("{}://{}", scheme, host))
-        } else {
-            None
-        }
+        sanitized_datasource_url(self.remote_rpc_url.as_ref()?)
     }
 }
 

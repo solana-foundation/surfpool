@@ -32,6 +32,7 @@ use solana_rpc_client::{
 use solana_rpc_client_api::client_error::{ErrorKind as ClientErrorKind, Result as ClientResult};
 use solana_signature::Signature;
 use solana_transaction_status::UiConfirmedBlock;
+use surfpool_types::sanitized_datasource_url;
 
 use super::GetTransactionResult;
 use crate::{
@@ -67,10 +68,15 @@ impl<S: RpcSender + Send + Sync> RpcSender for DeadlineSender<S> {
     ) -> ClientResult<serde_json::Value> {
         match tokio::time::timeout(self.deadline, self.inner.send(request, params)).await {
             Ok(response) => response,
+            // Scheme and host only. This message reaches a client through
+            // JSON-RPC error data, and a datasource URL carries credentials in
+            // its query, its path, and its userinfo. A URL that will not parse
+            // is named generically rather than printed raw.
             Err(_) => Err(ClientErrorKind::Custom(format!(
                 "{:?} to {} did not answer within {:?}",
                 request,
-                self.inner.url(),
+                sanitized_datasource_url(&self.inner.url())
+                    .unwrap_or_else(|| "the datasource".to_string()),
                 self.deadline
             ))
             .into()),
@@ -542,7 +548,7 @@ mod tests {
     /// A call that never completes, whether because the endpoint went quiet
     /// or because its retry policy never gave control back. The deadline does
     /// not need to know which.
-    struct NeverAnswers;
+    struct NeverAnswers(String);
 
     #[async_trait]
     impl RpcSender for NeverAnswers {
@@ -559,14 +565,49 @@ mod tests {
         }
 
         fn url(&self) -> String {
-            "http://never.example".to_string()
+            self.0.clone()
+        }
+    }
+
+    /// A datasource URL is a credential: the key can sit in the query, the
+    /// path, or the userinfo, and this message reaches a client through
+    /// JSON-RPC error data. The failure has to name the host without carrying
+    /// the secret along with it.
+    #[tokio::test]
+    async fn a_timeout_does_not_disclose_the_datasource_credentials() {
+        let secrets = [
+            "https://rpc.example.com/?api-key=SUPERSECRET",
+            "https://rpc.example.com/SUPERSECRET",
+            "https://user:SUPERSECRET@rpc.example.com",
+        ];
+
+        for url in secrets {
+            let sender = DeadlineSender {
+                inner: NeverAnswers(url.to_string()),
+                deadline: Duration::from_millis(50),
+            };
+
+            let message = sender
+                .send(RpcRequest::GetSlot, serde_json::Value::Null)
+                .await
+                .expect_err("a datasource that never answers should not succeed")
+                .to_string();
+
+            assert!(
+                !message.contains("SUPERSECRET"),
+                "the failure disclosed the datasource credential: {message}"
+            );
+            assert!(
+                message.contains("rpc.example.com"),
+                "the failure should still name the host: {message}"
+            );
         }
     }
 
     #[tokio::test]
     async fn a_datasource_that_never_answers_is_an_error_rather_than_a_wait() {
         let sender = DeadlineSender {
-            inner: NeverAnswers,
+            inner: NeverAnswers("http://never.example".to_string()),
             deadline: Duration::from_millis(50),
         };
 
