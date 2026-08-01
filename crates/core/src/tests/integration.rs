@@ -119,6 +119,9 @@ enum RunloopError {
     NotReady { waited: Duration },
     /// The runloop was told to stop and was still running at the deadline.
     NotStopped { waited: Duration },
+    /// The runloop thread ended by panicking, which is finished rather than
+    /// stopped.
+    Panicked,
 }
 
 impl std::fmt::Display for RunloopError {
@@ -138,6 +141,7 @@ impl std::fmt::Display for RunloopError {
                     "the runloop was still running {waited:?} after Terminate"
                 )
             }
+            Self::Panicked => write!(f, "the runloop thread panicked"),
         }
     }
 }
@@ -181,6 +185,12 @@ impl RunloopGuard {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+
+        // The thread has finished, so this join returns at once; what it adds
+        // is the thread's verdict. A runloop that ended by panicking has
+        // finished without having stopped, and `is_finished` cannot tell the
+        // two apart.
+        thread.join().map_err(|_| RunloopError::Panicked)?;
         Ok(())
     }
 }
@@ -4241,6 +4251,23 @@ fn boot_simnet(
         events: simnet_events_rx,
         runloop,
     })
+}
+
+/// A runloop that ends by panicking has finished without having stopped, and
+/// the guard tells the difference. The panic message this prints is the
+/// spawned thread's own, and is expected output.
+#[test]
+fn a_panicking_runloop_is_not_a_clean_stop() {
+    let (commands, _keep_open) = unbounded();
+    let guard = RunloopGuard {
+        commands,
+        thread: Some(std::thread::spawn(|| panic!("the runloop fell over"))),
+    };
+
+    assert!(
+        matches!(guard.stop(), Err(RunloopError::Panicked)),
+        "a panicked runloop should not report a clean stop"
+    );
 }
 
 /// The guard's claim, as a test: a surfnet that is told to stop does, within
