@@ -2445,6 +2445,50 @@ mod tests {
         }
     }
 
+    /// Readiness as the client would read it, on the event stream. The
+    /// property issue 715 turns on is an ordering between this and the clone
+    /// landing, so an assertion needs which side of that line an answer fell
+    /// on.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_readiness_answer_reaches_the_event_stream() {
+        let (setup, events) = TestSetup::new_with_events(SurfnetCheatcodesRpc::empty());
+
+        setup
+            .rpc
+            .get_surfnet_info(Some(setup.context.clone()))
+            .expect("the surfnet should answer");
+
+        // Sealing an empty plan is immediate readiness, so the second answer
+        // must carry the opposite verdict to the first. Counting events would
+        // pass just as well if the predicate were a constant.
+        setup
+            .context
+            .svm_locker
+            .seal_startup_plan(vec![])
+            .expect("sealing an unsealed plan should be accepted");
+
+        setup
+            .rpc
+            .get_surfnet_info(Some(setup.context.clone()))
+            .expect("the surfnet should answer");
+
+        let answers: Vec<bool> = events
+            .try_iter()
+            .filter_map(|event| match event {
+                SimnetEvent::AnsweredClient {
+                    method: "surfnet_getSurfnetInfo",
+                    answer: ClientAnswer::Readiness { ready },
+                } => Some(ready),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            answers,
+            vec![false, true],
+            "each answer should carry the verdict the client would read from it"
+        );
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_get_transaction_profile() {

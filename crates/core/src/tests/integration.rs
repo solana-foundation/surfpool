@@ -1,7 +1,9 @@
 use std::{str::FromStr, sync::Arc, time::Duration};
 
 use base64::Engine;
-use crossbeam_channel::{RecvTimeoutError, Sender, unbounded, unbounded as crossbeam_unbounded};
+use crossbeam_channel::{
+    RecvTimeoutError, Sender, bounded, unbounded, unbounded as crossbeam_unbounded,
+};
 use ed25519_dalek::Signer as DalekSigner;
 use jsonrpc_core::{
     Error, Result as JsonRpcResult,
@@ -56,7 +58,8 @@ use spl_token_2022_interface::{
 use surfpool_types::{
     AccountSnapshot, CheatcodeConfig, CheatcodeControlConfig, CheatcodeFilter,
     DEFAULT_SLOT_TIME_MS, Idl, RpcProfileDepth, RpcProfileResultConfig, SimnetCommand, SimnetEvent,
-    SurfpoolConfig, UiAccountChange, UiAccountProfileState, UiKeyedProfileResult,
+    StartupPlanner, SurfnetStartupTask, SurfpoolConfig, UiAccountChange, UiAccountProfileState,
+    UiKeyedProfileResult,
     types::{
         BlockProductionMode, RpcConfig, SimnetConfig, SubgraphConfig, TransactionStatusEvent,
         UuidOrSignature,
@@ -4191,6 +4194,122 @@ async fn test_get_local_signatures_with_limit(test_type: TestType) {
 // ============================================================================
 // Clock Control Tests (pauseClock, resumeClock, timeTravel)
 // ============================================================================
+
+/// Reproduces the case reported in issue 715.
+///
+/// The startup state machine cannot represent the reported state: readiness
+/// derives from a sealed plan, and an unsealed status carries no task table to
+/// derive it from. That property is internal, and a client never reads the
+/// machine. It reads a projection, which is separate code and can report a
+/// readiness the machine does not hold.
+///
+/// This drives the machine to a legally derivable state, sealed with a declared
+/// clone outstanding, and asserts what a client is told there. The opposite
+/// direction, forging a projection the machine could not have produced and
+/// confirming it is rejected, is covered by the negative test in
+/// `surfpool-types`.
+///
+/// The assertion uses Anchor's vocabulary because the claim is about what a
+/// client observes. Anchor treats the validator as ready when every entry in
+/// `runbookExecutions` is complete, then requests its declared clones. Reaching
+/// that conclusion while a clone is outstanding means it requests too early.
+///
+/// `StartupPlanner::External` stops the runloop sealing on its own, so the plan
+/// declares `RemoteAccounts` and readiness has something to wait for. Under the
+/// default policy the runloop seals an empty plan, which is ready at once, and
+/// the window under test never opens.
+///
+/// The window comes from the plan rather than from a fetch. A sealed plan whose
+/// `RemoteAccounts` task has not succeeded is `Initializing` regardless of what
+/// any datasource is doing, so sealing and then asking reaches the state under
+/// test. The surfnet runs offline because nothing needs to be held open and no
+/// clock is involved.
+#[test_case(TestType::in_memory(); "with in-memory sqlite db")]
+#[tokio::test(flavor = "multi_thread")]
+async fn readiness_is_withheld_while_a_declared_clone_is_outstanding(test_type: TestType) {
+    // Held so the surfnet's event sends keep a receiver; nothing reads it.
+    let (surfnet_svm, _simnet_events_rx, geyser_events_rx) = test_type.initialize_svm();
+
+    let config = SurfpoolConfig {
+        simnets: vec![SimnetConfig {
+            block_production_mode: BlockProductionMode::Manual,
+            offline_mode: true,
+            ..SimnetConfig::default()
+        }],
+        // This test acts as the planner, which is the CLI's role in production.
+        startup_planner: StartupPlanner::External,
+        rpc: RpcConfig {
+            bind_port: get_free_port().unwrap(),
+            ws_port: get_free_port().unwrap(),
+            ..Default::default()
+        },
+        ..SurfpoolConfig::default()
+    };
+
+    let svm_locker = SurfnetSvmLocker::new(surfnet_svm);
+    let observer = svm_locker.clone();
+    let (commands_tx, commands_rx) = unbounded();
+    let _runloop = spawn_runloop(
+        svm_locker,
+        config,
+        (commands_tx.clone(), commands_rx),
+        geyser_events_rx,
+    )
+    .expect("the runloop should start");
+
+    let (reply_tx, reply_rx) = bounded(1);
+    commands_tx
+        .send(SimnetCommand::SealStartupPlan(
+            vec![SurfnetStartupTask::RemoteAccounts],
+            reply_tx,
+        ))
+        .unwrap();
+    reply_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the runloop should answer the seal")
+        .expect("sealing an unsealed plan should be accepted");
+
+    let rpc = SurfnetCheatcodesRpc::empty();
+    let context = RunloopContext {
+        id: None,
+        svm_locker: observer.clone(),
+        simnet_commands_tx: commands_tx.clone(),
+        remote_rpc_client: None,
+        rpc_config: RpcConfig::default(),
+        cheatcode_config: CheatcodeConfig::new(),
+        plugin_commands_tx: crossbeam_channel::unbounded().0,
+    };
+    // Ask exactly what Anchor asks, through the same method it calls.
+    let answered = rpc
+        .get_surfnet_info(Some(context))
+        .expect("the surfnet should answer");
+
+    // Anchor reads readiness as "every execution is complete", so "not ready"
+    // is "at least one is not". An empty list has nothing incomplete in it, so
+    // it reads as ready: that is how the bug used to happen, with no entries
+    // during the whole clone window.
+    //
+    // The lifecycle keeps an empty list safe. A pending
+    // compatibility entry is projected for every in-flight phase and dropped
+    // only at Ready, which a sealed plan reaches when its tasks have all
+    // succeeded, so emptiness means sealed and finished rather than nothing
+    // yet started. This assertion holds that.
+    //
+    // The message prints the list because the two ways to fail want telling
+    // apart: no entry at all, or one marked complete while the declared clone
+    // has not landed.
+    assert!(
+        answered
+            .value
+            .runbook_executions
+            .iter()
+            .any(|execution| execution.completed_at.is_none()),
+        "the surfnet reported itself ready while a declared clone was still \
+         outstanding: {:?}",
+        answered.value.runbook_executions
+    );
+}
+
 
 /// A booted simnet, with the handles a test drives it through.
 ///

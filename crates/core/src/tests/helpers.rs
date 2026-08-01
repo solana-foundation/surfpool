@@ -1,11 +1,11 @@
 #![allow(dead_code)]
 use std::net::TcpListener;
 
-use crossbeam_channel::Sender;
+use crossbeam_channel::{Receiver, Sender};
 use solana_clock::Clock;
 use solana_epoch_info::EpochInfo;
 use solana_transaction::versioned::VersionedTransaction;
-use surfpool_types::{CheatcodeConfig, RpcConfig, SimnetCommand};
+use surfpool_types::{CheatcodeConfig, RpcConfig, SimnetCommand, SimnetEvent};
 
 use crate::{
     rpc::RunloopContext,
@@ -37,9 +37,15 @@ where
     T: Clone,
 {
     pub fn new(rpc: T) -> Self {
+        Self::new_with_events(rpc).0
+    }
+
+    /// The same setup, keeping the event receiver, for tests that read what
+    /// the surfnet emitted rather than only what it returned.
+    pub fn new_with_events(rpc: T) -> (Self, Receiver<SimnetEvent>) {
         let (simnet_commands_tx, _rx) = crossbeam_channel::unbounded();
 
-        let (mut surfnet_svm, _, _) = SurfnetSvm::default();
+        let (mut surfnet_svm, simnet_events_rx, _) = SurfnetSvm::default();
         let clock = Clock {
             slot: 123,
             epoch_start_timestamp: 123,
@@ -60,7 +66,7 @@ where
 
         let (plugin_commands_tx, _plugin_commands_rx) =
             crossbeam_channel::unbounded::<PluginCommand>();
-        TestSetup {
+        let setup = TestSetup {
             context: RunloopContext {
                 simnet_commands_tx: simnet_commands_tx.clone(),
                 id: None,
@@ -71,7 +77,8 @@ where
                 plugin_commands_tx,
             },
             rpc,
-        }
+        };
+        (setup, simnet_events_rx)
     }
 
     pub fn new_with_epoch_info(rpc: T, epoch_info: EpochInfo) -> Self {
