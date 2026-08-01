@@ -9,7 +9,7 @@ use std::{
 };
 
 use actix_web::dev::ServerHandle;
-use crossbeam::channel::{Select, Sender};
+use crossbeam::channel::{Select, Sender, bounded};
 use indicatif::{MultiProgress, ProgressBar};
 use log::{debug, error, info, warn};
 use notify::{
@@ -18,9 +18,13 @@ use notify::{
 };
 use serde::{Deserialize, Serialize};
 use solana_keypair::Keypair;
+use solana_pubkey::Pubkey;
 use solana_signer::Signer;
 use surfpool_core::{start_local_surfnet, surfnet::svm::SurfnetSvm};
-use surfpool_types::{SanitizedConfig, SimnetCommand, SimnetEvent, SubgraphEvent};
+use surfpool_types::{
+    SanitizedConfig, SimnetCommand, SimnetEvent, StartupError, SubgraphEvent, SurfnetStartupPhase,
+    SurfnetStartupTask,
+};
 use txtx_core::{
     kit::{
         channel::Receiver, futures::future::join_all, helpers::fs::FileLocation,
@@ -102,6 +106,9 @@ pub async fn handle_start_local_surfnet_command(
     let (simnet_commands_tx, simnet_commands_rx) = crossbeam::channel::unbounded();
     let (subgraph_events_tx, subgraph_events_rx) = crossbeam::channel::unbounded();
     let simnet_events_tx = surfnet_svm.simnet_events_tx.clone();
+    // Subscribe before the SVM moves into the simnet thread; the receiver
+    // stays valid, and subscribing this early means no transition is missed.
+    let startup_status_rx = surfnet_svm.subscribe_startup_status();
 
     // Check aidrop addresses
     let (mut airdrop_addresses, airdrop_events) = cmd.get_airdrop_addresses();
@@ -257,15 +264,44 @@ pub async fn handle_start_local_surfnet_command(
     let simnet_commands_tx_copy = simnet_commands_tx.clone();
     let mut deploy_progress_rx = vec![];
     if !cmd.project.no_deploy {
-        match write_and_execute_iac(&cmd, &simnet_events_tx, &simnet_commands_tx_copy).await {
+        match plan_and_dispatch_startup(&cmd, &simnet_events_tx, &simnet_commands_tx_copy).await {
             Ok(rx) => deploy_progress_rx.push(rx),
-            Err(e) => {
+            // Planning failed before the plan was sealed. Drive the machine
+            // to Failed (from Planning-unsealed this always applies) and
+            // keep going: whether a failed startup is fatal is the
+            // watchdog's decision, headless aborts while the TUI stays
+            // alive and displays it.
+            Err(StartupPlanFailure::Planning(e)) => {
+                let _ = simnet_commands_tx_copy.send(SimnetCommand::FailStartupPlanning(e.clone()));
                 let _ = simnet_events_tx.send(SimnetEvent::warn(format!(
                     "Automatic protocol deployment failed: {e}"
                 )));
             }
+            // The command loop is dead or wedged, so the machine is
+            // unreachable and no session can ever become ready. Nothing left
+            // to display; exit.
+            Err(StartupPlanFailure::Sealing(SealFailure::Unreachable(e))) => return Err(e),
+            // The machine answered and declined. The loop is alive and the
+            // state is knowable, but a plan the CLI could not seal is one it
+            // cannot dispatch against, so this is fatal too. The reason names
+            // which rule declined rather than reading as unreachability.
+            Err(StartupPlanFailure::Sealing(SealFailure::Refused(error))) => {
+                return Err(format!("Startup plan refused: {error}"));
+            }
         }
-    };
+    } else {
+        // Same policy as the Sealing arm above: an unresponsive command
+        // loop is fatal in both the deploy and no-deploy paths.
+        seal_startup_plan(&simnet_commands_tx_copy, vec![])
+            .map_err(|failure| failure.to_string())?;
+    }
+
+    spawn_startup_watchdog(
+        cmd.runtime.daemon || cmd.runtime.no_tui,
+        startup_status_rx,
+        simnet_events_tx.clone(),
+        simnet_commands_tx.clone(),
+    )?;
 
     // Non blocking check for new versions
     #[cfg(feature = "version_check")]
@@ -294,7 +330,10 @@ pub async fn handle_start_local_surfnet_command(
 
     let runloop_terminator = Arc::new(AtomicBool::new(false));
 
-    let _ = start_service(
+    // Propagated after the join below: an Aborted event (startup failure
+    // included) must reach the caller so the process exits nonzero, which is
+    // the only failure signal a legacy Anchor readiness loop can perceive.
+    let service_result = start_service(
         cmd_cc,
         simnet_events_rx,
         subgraph_events_rx,
@@ -312,7 +351,7 @@ pub async fn handle_start_local_surfnet_command(
     // Wait for the simnet thread to finish cleanup (including Drop/checkpoint)
     let _ = simnet_handle.join();
 
-    Ok(())
+    service_result
 }
 
 #[cfg(test)]
@@ -359,6 +398,147 @@ mod tests {
             public_service_url(None, None, "http", "0.0.0.0", 8899),
             "http://127.0.0.1:8899"
         );
+    }
+
+    mod startup_watchdog {
+        use std::time::{Duration, Instant};
+
+        use crossbeam::channel::{Receiver, unbounded};
+        use surfpool_types::{
+            SimnetCommand, SimnetEvent, SurfnetStartupStatus, SurfnetStartupTask,
+        };
+        use tokio::sync::watch;
+
+        use super::super::{spawn_startup_watchdog, watch_startup_until_terminal};
+
+        const TIMEOUT: Duration = Duration::from_secs(5);
+
+        fn failed_status(error: &str) -> SurfnetStartupStatus {
+            let mut status = SurfnetStartupStatus::default();
+            status
+                .seal_plan(vec![SurfnetStartupTask::RemoteAccounts])
+                .unwrap();
+            status
+                .start_task(SurfnetStartupTask::RemoteAccounts)
+                .unwrap();
+            status
+                .fail_task(SurfnetStartupTask::RemoteAccounts, error)
+                .unwrap();
+            status
+        }
+
+        fn ready_status() -> SurfnetStartupStatus {
+            let mut status = SurfnetStartupStatus::default();
+            status.seal_plan(vec![]).unwrap();
+            status
+        }
+
+        fn assert_channels_stay_empty(
+            events_rx: &Receiver<SimnetEvent>,
+            commands_rx: &Receiver<SimnetCommand>,
+        ) {
+            assert!(events_rx.try_recv().is_err(), "unexpected simnet event");
+            assert!(commands_rx.try_recv().is_err(), "unexpected simnet command");
+        }
+
+        #[test]
+        fn headless_watchdog_aborts_and_terminates_on_failed_startup() {
+            let (status_tx, status_rx) = watch::channel(SurfnetStartupStatus::default());
+            let (events_tx, events_rx) = unbounded();
+            let (commands_tx, commands_rx) = unbounded();
+
+            let watchdog = std::thread::spawn(move || {
+                watch_startup_until_terminal(status_rx, events_tx, commands_tx)
+            });
+            status_tx.send_replace(failed_status("datasource unavailable"));
+
+            match events_rx.recv_timeout(TIMEOUT) {
+                Ok(SimnetEvent::Aborted(error)) => {
+                    assert!(
+                        error.contains("datasource unavailable"),
+                        "abort lost the failure reason: {error}"
+                    );
+                }
+                other => panic!("expected Aborted, got {other:?}"),
+            }
+            assert!(matches!(
+                commands_rx.recv_timeout(TIMEOUT),
+                Ok(SimnetCommand::Terminate(_))
+            ));
+            watchdog.join().unwrap();
+        }
+
+        #[test]
+        fn headless_watchdog_stays_quiet_when_startup_reaches_ready() {
+            let (status_tx, status_rx) = watch::channel(SurfnetStartupStatus::default());
+            let (events_tx, events_rx) = unbounded();
+            let (commands_tx, commands_rx) = unbounded();
+
+            let watchdog = std::thread::spawn(move || {
+                watch_startup_until_terminal(status_rx, events_tx, commands_tx)
+            });
+            status_tx.send_replace(ready_status());
+
+            // The join proves the watchdog saw the terminal phase, so an
+            // empty channel afterwards is not a timing artifact.
+            watchdog.join().unwrap();
+            assert_channels_stay_empty(&events_rx, &commands_rx);
+        }
+
+        #[test]
+        fn headless_watchdog_stays_quiet_when_the_surfnet_shuts_down_first() {
+            let (status_tx, status_rx) = watch::channel(SurfnetStartupStatus::default());
+            let (events_tx, events_rx) = unbounded();
+            let (commands_tx, commands_rx) = unbounded();
+
+            let watchdog = std::thread::spawn(move || {
+                watch_startup_until_terminal(status_rx, events_tx, commands_tx)
+            });
+            // The watchdog sees shutdown as a dropped sender, and must not
+            // report it as a failure.
+            drop(status_tx);
+
+            watchdog.join().unwrap();
+            assert_channels_stay_empty(&events_rx, &commands_rx);
+        }
+
+        #[test]
+        fn tui_mode_spawns_no_watchdog() {
+            let (status_tx, status_rx) = watch::channel(SurfnetStartupStatus::default());
+            let (events_tx, events_rx) = unbounded();
+            let (commands_tx, commands_rx) = unbounded();
+
+            spawn_startup_watchdog(false, status_rx, events_tx, commands_tx).unwrap();
+
+            // The receiver was dropped rather than parked in a thread, so
+            // nobody is watching: a later failure cannot trigger an abort.
+            // No sleep needed; with zero receivers there is no race to lose.
+            assert_eq!(status_tx.receiver_count(), 0);
+            status_tx.send_replace(failed_status("boom"));
+            assert_channels_stay_empty(&events_rx, &commands_rx);
+        }
+
+        #[test]
+        fn headless_mode_spawns_a_watchdog_that_exits_after_ready() {
+            let (status_tx, status_rx) = watch::channel(SurfnetStartupStatus::default());
+            let (events_tx, events_rx) = unbounded();
+            let (commands_tx, commands_rx) = unbounded();
+
+            spawn_startup_watchdog(true, status_rx, events_tx, commands_tx).unwrap();
+
+            // The spawned thread holds the receiver, distinguishing headless
+            // from TUI mode above.
+            assert_eq!(status_tx.receiver_count(), 1);
+
+            // Ready releases the watchdog; the receiver drops with it.
+            status_tx.send_replace(ready_status());
+            let deadline = Instant::now() + TIMEOUT;
+            while status_tx.receiver_count() != 0 {
+                assert!(Instant::now() < deadline, "watchdog did not exit on Ready");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_channels_stay_empty(&events_rx, &commands_rx);
+        }
     }
 }
 
@@ -466,6 +646,11 @@ fn log_events(
                     SimnetEvent::AccountUpdate(_dt, _) => {
                         info!("{}", event.account_update_msg());
                     }
+                    // A headless run reports readiness through the watchdog,
+                    // which reads the status directly.
+                    SimnetEvent::StartupStatusChanged(_) => {}
+                    // Ordering evidence for tests; nothing for an operator to read.
+                    SimnetEvent::AnsweredClient { .. } => {}
                     SimnetEvent::PluginLoaded(_) => {
                         info!("{}", event.plugin_loaded_msg());
                     }
@@ -617,11 +802,135 @@ impl RunbookExecutionMode {
     }
 }
 
-async fn write_and_execute_iac(
+/// Spawns the startup watchdog when running headless (`--no-tui` or daemon).
+/// Legacy Anchor's readiness loop can only perceive `completed_at` and
+/// process death (it has no timeout and never reads `errors`), so a headless
+/// surfnet whose startup failed must abort rather than serve forever. The
+/// TUI instead stays alive and displays the failure; killing an interactive
+/// session would be wrong, so in TUI mode this spawns nothing and drops the
+/// receiver.
+fn spawn_startup_watchdog(
+    headless: bool,
+    startup_status_rx: tokio::sync::watch::Receiver<surfpool_types::SurfnetStartupStatus>,
+    events_tx: Sender<SimnetEvent>,
+    commands_tx: Sender<SimnetCommand>,
+) -> Result<(), String> {
+    if !headless {
+        return Ok(());
+    }
+    hiro_system_kit::thread_named("Startup Watchdog")
+        .spawn(move || {
+            watch_startup_until_terminal(startup_status_rx, events_tx, commands_tx);
+            Ok::<(), String>(())
+        })
+        .map(|_| ())
+        .map_err(|e| format!("Thread to watch startup status exited: {e}"))
+}
+
+/// Blocks until the startup lifecycle reaches a terminal phase. On `Failed`,
+/// sends `Aborted` first (so the event loop exits with the error before the
+/// shutdown reaches it) and then `Terminate` (so the runloop shuts down
+/// gracefully, WAL checkpoint included). `Ready`, or a dropped sender because
+/// the surfnet is already shutting down, requires nothing.
+fn watch_startup_until_terminal(
+    mut startup_status_rx: tokio::sync::watch::Receiver<surfpool_types::SurfnetStartupStatus>,
+    events_tx: Sender<SimnetEvent>,
+    commands_tx: Sender<SimnetCommand>,
+) {
+    let terminal = hiro_system_kit::nestable_block_on(startup_status_rx.wait_for(|status| {
+        matches!(
+            status.phase(),
+            SurfnetStartupPhase::Ready | SurfnetStartupPhase::Failed
+        )
+    }));
+    let failure = match terminal {
+        Ok(status) if status.phase() == SurfnetStartupPhase::Failed => {
+            Some(status.failure_messages().join("; "))
+        }
+        _ => None,
+    };
+    if let Some(error) = failure {
+        let _ = events_tx.send(SimnetEvent::Aborted(format!(
+            "Surfpool startup failed: {error}"
+        )));
+        let _ = commands_tx.send(SimnetCommand::Terminate(None));
+    }
+}
+
+/// Bounded wait for the seal round-trip. Generous rather than tight: the
+/// runloop emits `SimnetEvent::Ready` immediately before entering the
+/// command loop on the same task, and the CLI waits for Ready before
+/// planning, so the loop is provably alive at every call site. A timeout
+/// here means the loop died or wedged, not that it is merely slow.
+const SEAL_STARTUP_PLAN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How startup planning failed, split at the seal boundary because the two
+/// halves demand different responses from the caller.
+enum StartupPlanFailure {
+    /// Planning failed before the plan was sealed. The startup machine is
+    /// reachable and still in Planning-unsealed, so the caller can (and
+    /// must) drive it to Failed; the watchdog policy then decides fatality.
+    Planning(String),
+    /// The seal did not take. Which half failed decides what is knowable
+    /// afterwards, so the two arrive separately.
+    Sealing(SealFailure),
+}
+
+/// The two ways sealing fails, which differ in what they leave known.
+enum SealFailure {
+    /// The round trip did not complete: the command loop is dead or wedged,
+    /// so the machine's state is unknowable and no session can become ready.
+    Unreachable(String),
+    /// The machine answered, and refused. Its state is known, and the reason
+    /// says which rule declined.
+    Refused(StartupError),
+}
+
+impl std::fmt::Display for SealFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unreachable(reason) => write!(f, "{reason}"),
+            Self::Refused(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+fn seal_startup_plan(
+    simnet_commands_tx: &Sender<SimnetCommand>,
+    tasks: Vec<SurfnetStartupTask>,
+) -> Result<(), SealFailure> {
+    let (response_tx, response_rx) = bounded(1);
+    simnet_commands_tx
+        .send(SimnetCommand::SealStartupPlan(tasks, response_tx))
+        .map_err(|e| SealFailure::Unreachable(format!("Failed to submit startup plan: {e}")))?;
+    response_rx
+        .recv_timeout(SEAL_STARTUP_PLAN_TIMEOUT)
+        .map_err(|e| SealFailure::Unreachable(format!("Timed out sealing startup plan: {e}")))?
+        .map_err(SealFailure::Refused)
+}
+
+/// Everything the planner learned about the project before sealing: the task
+/// list to seal, the work to dispatch, and the context the artifact watcher
+/// needs to re-execute runbooks later.
+struct DeploymentPlan {
+    progress_tx: Sender<BlockEvent>,
+    progress_rx: Receiver<BlockEvent>,
+    futures: RunbookExecutionFutures,
+    clone_pubkeys: Vec<Pubkey>,
+    startup_tasks: Vec<SurfnetStartupTask>,
+    base_location: FileLocation,
+    on_disk_runbook_data: Option<(FileLocation, Vec<String>)>,
+    in_memory_runbook_data: Option<(String, RunbookSources, WorkspaceManifest)>,
+    runbook_input: Vec<String>,
+}
+
+/// Inspects the project, scaffolds runbooks as the execution mode requires,
+/// and assembles the deployment plan. Never touches the startup machine: a
+/// failure leaves it in Planning-unsealed for the caller to fail explicitly.
+async fn plan_deployment(
     cmd: &StartSimnet,
     simnet_events_tx: &Sender<SimnetEvent>,
-    simnet_commands_tx: &Sender<SimnetCommand>,
-) -> Result<Receiver<BlockEvent>, String> {
+) -> Result<DeploymentPlan, String> {
     let (progress_tx, progress_rx) = crossbeam::channel::unbounded();
 
     let base_location =
@@ -632,6 +941,7 @@ async fn write_and_execute_iac(
 
     let mut on_disk_runbook_data = None;
     let mut in_memory_runbook_data = None;
+    let mut clone_pubkeys = vec![];
     let runbook_input = cmd.project.runbook_input.clone();
 
     let mode = RunbookExecutionMode::from_inputs(
@@ -644,163 +954,298 @@ async fn write_and_execute_iac(
         on_disk_runbook_data = Some((txtx_manifest_location.clone(), cmd.project.runbooks.clone()));
     }
 
-    // Are we in a project directory?
-    if let Ok(deployment) = detect_program_frameworks(
+    let deployment = detect_program_frameworks(
         &cmd.project.manifest_path,
         &cmd.project.anchor_test_config_paths,
         cmd.project.artifacts_path.as_deref(),
     )
     .await
+    .map_err(|e| format!("Failed to detect project framework: {e}"))?;
+
+    if let Some(ProgramFrameworkData {
+        framework,
+        programs,
+        genesis_accounts,
+        accounts,
+        accounts_dir,
+        clones,
+    }) = deployment
     {
-        if let Some(ProgramFrameworkData {
-            framework,
-            programs,
-            genesis_accounts,
-            accounts,
-            accounts_dir,
-            clones,
-        }) = deployment
-        {
-            if let Some(clones) = clones.as_ref() {
-                if !clones.is_empty() {
-                    let _ = simnet_commands_tx.try_send(SimnetCommand::FetchRemoteAccounts(
-                        clones
-                            .iter()
-                            .map(|c| {
-                                c.parse().map_err(|e| {
-                                    format!("Failed to parse clone address {}: {}", c, e)
-                                })
-                            })
-                            .collect::<Result<Vec<_>, _>>()?,
-                        cmd.datasource_rpc_url(),
-                    ));
-                }
-            }
-
-            match mode {
-                RunbookExecutionMode::ScaffoldOnDisk => {
-                    scaffold_iac_layout(
-                        &framework,
-                        &programs,
-                        &base_location,
-                        cmd.project.skip_runbook_generation_prompts,
-                    )?;
-                    on_disk_runbook_data =
-                        Some((txtx_manifest_location.clone(), cmd.project.runbooks.clone()));
-                }
-                RunbookExecutionMode::InMemory => {
-                    in_memory_runbook_data = Some(scaffold_in_memory_iac(
-                        &framework,
-                        &programs,
-                        &genesis_accounts,
-                        &accounts,
-                        &accounts_dir,
-                        cmd.project.artifacts_path.as_deref(),
-                    )?);
-                }
-                RunbookExecutionMode::ExistingOnDisk => {}
-            }
-        }
-
-        let futures = assemble_runbook_execution_futures(
-            &progress_tx,
-            simnet_events_tx,
-            &on_disk_runbook_data,
-            &in_memory_runbook_data,
-            &runbook_input,
-        );
-
-        let simnet_events_tx = simnet_events_tx.clone();
-        let _handle = hiro_system_kit::thread_named("Deployment Runbook Executions")
-            .spawn(move || {
-                let _ = hiro_system_kit::nestable_block_on(join_all(futures.into_iter()));
-                Ok::<(), String>(())
+        clone_pubkeys = clones
+            .unwrap_or_default()
+            .iter()
+            .map(|clone| {
+                clone
+                    .parse()
+                    .map_err(|e| format!("Failed to parse clone address {clone}: {e}"))
             })
-            .map_err(|e| format!("Thread to execute runbooks exited: {}", e))?;
+            .collect::<Result<Vec<_>, _>>()?;
 
-        if cmd.project.watch {
-            let artifacts_path_for_watch = cmd.project.artifacts_path.clone();
-            let _handle = hiro_system_kit::thread_named("Watch Filesystem")
-                .spawn(move || {
-                    let mut target_path = base_location.clone();
-                    if let Some(ref path) = artifacts_path_for_watch {
-                        let _ = target_path.append_path(path);
-                    } else {
-                        let _ = target_path.append_path("target");
-                        let _ = target_path.append_path("deploy");
-                    }
-                    let (tx, rx) = mpsc::channel::<NotifyResult<Event>>();
-                    let mut watcher = notify::recommended_watcher(tx).map_err(|e| e.to_string())?;
-                    watcher
-                        .watch(
-                            Path::new(&target_path.to_string()),
-                            RecursiveMode::NonRecursive,
-                        )
-                        .map_err(|e| e.to_string())?;
-                    let _ = watcher.configure(
-                        Config::default()
-                            .with_poll_interval(Duration::from_secs(1))
-                            .with_compare_contents(true),
-                    );
-                    for res in rx {
-                        // Disregard any event that would not create or modify a .so file
-                        let mut found_candidates = false;
-                        match res {
-                            Ok(Event {
-                                kind: EventKind::Modify(ModifyKind::Data(DataChange::Content)),
-                                paths,
-                                attrs: _,
-                            })
-                            | Ok(Event {
-                                kind: EventKind::Create(CreateKind::File),
-                                paths,
-                                attrs: _,
-                            })
-                            // Linux: inotify reports Data(Any) instead of Data(Content)
-                            | Ok(Event {
-                                kind: EventKind::Modify(ModifyKind::Data(DataChange::Any)),
-                                paths,
-                                attrs: _,
-                            })
-                            // Linux: atomic file replacement via rename
-                            | Ok(Event {
-                                kind: EventKind::Modify(ModifyKind::Name(_)),
-                                paths,
-                                attrs: _,
-                            }) => {
-                                for path in paths.iter() {
-                                    if path.to_string_lossy().ends_with(".so") {
-                                        found_candidates = true;
-                                    }
-                                }
-                            }
-                            _ => continue,
-                        }
-
-                        if !found_candidates {
-                            continue;
-                        }
-
-                        let futures = assemble_runbook_execution_futures(
-                            &progress_tx,
-                            &simnet_events_tx,
-                            &on_disk_runbook_data,
-                            &in_memory_runbook_data,
-                            &runbook_input,
-                        );
-
-                        // Catch panics to keep the watch thread alive
-                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            hiro_system_kit::nestable_block_on(join_all(futures))
-                        }));
-                    }
-                    Ok::<(), String>(())
-                })
-                .map_err(|e| format!("Thread to watch filesystem exited: {}", e))?;
+        match mode {
+            RunbookExecutionMode::ScaffoldOnDisk => {
+                scaffold_iac_layout(
+                    &framework,
+                    &programs,
+                    &base_location,
+                    cmd.project.skip_runbook_generation_prompts,
+                )?;
+                on_disk_runbook_data =
+                    Some((txtx_manifest_location.clone(), cmd.project.runbooks.clone()));
+            }
+            RunbookExecutionMode::InMemory => {
+                in_memory_runbook_data = Some(scaffold_in_memory_iac(
+                    &framework,
+                    &programs,
+                    &genesis_accounts,
+                    &accounts,
+                    &accounts_dir,
+                    cmd.project.artifacts_path.as_deref(),
+                )?);
+            }
+            RunbookExecutionMode::ExistingOnDisk => {}
         }
     }
+
+    let futures = assemble_runbook_execution_futures(
+        &progress_tx,
+        simnet_events_tx,
+        &on_disk_runbook_data,
+        &in_memory_runbook_data,
+        &runbook_input,
+    );
+    let mut startup_tasks = vec![];
+    if !clone_pubkeys.is_empty() {
+        startup_tasks.push(SurfnetStartupTask::RemoteAccounts);
+    }
+    if !futures.is_empty() {
+        startup_tasks.push(SurfnetStartupTask::Deployment);
+    }
+
+    Ok(DeploymentPlan {
+        progress_tx,
+        progress_rx,
+        futures,
+        clone_pubkeys,
+        startup_tasks,
+        base_location,
+        on_disk_runbook_data,
+        in_memory_runbook_data,
+        runbook_input,
+    })
+}
+
+/// Plans the project's startup tasks, seals the plan, and dispatches the
+/// work. Formerly `write_and_execute_iac`, but the IaC part (scaffolding and
+/// executing txtx runbooks) now lives in [`plan_deployment`] and the
+/// runbook-execution futures; this function's job is the startup
+/// choreography around them.
+async fn plan_and_dispatch_startup(
+    cmd: &StartSimnet,
+    simnet_events_tx: &Sender<SimnetEvent>,
+    simnet_commands_tx: &Sender<SimnetCommand>,
+) -> Result<Receiver<BlockEvent>, StartupPlanFailure> {
+    let DeploymentPlan {
+        progress_tx,
+        progress_rx,
+        futures,
+        clone_pubkeys,
+        startup_tasks,
+        base_location,
+        on_disk_runbook_data,
+        in_memory_runbook_data,
+        runbook_input,
+    } = plan_deployment(cmd, simnet_events_tx)
+        .await
+        .map_err(StartupPlanFailure::Planning)?;
+
+    // Sealing happens before any task is submitted. From this point forward,
+    // readiness is derived solely from the registered task transitions.
+    seal_startup_plan(simnet_commands_tx, startup_tasks).map_err(StartupPlanFailure::Sealing)?;
+
+    // One choreography for all startup tasks: the submitter sends
+    // StartStartupTask before dispatching the work, and the worker reports
+    // the outcome via CompleteStartupTask. Nothing past the seal fails
+    // startup from here: the machine owns failure reporting through task
+    // transitions, and a command send can only fail once the command loop
+    // is gone, when the session is already coming down.
+    if !clone_pubkeys.is_empty() {
+        let _ = simnet_commands_tx.send(SimnetCommand::StartStartupTask(
+            SurfnetStartupTask::RemoteAccounts,
+        ));
+        let _ = simnet_commands_tx.send(SimnetCommand::FetchRemoteAccounts(
+            clone_pubkeys,
+            cmd.datasource_rpc_url(),
+        ));
+    }
+
+    if !futures.is_empty() {
+        let _ = simnet_commands_tx.send(SimnetCommand::StartStartupTask(
+            SurfnetStartupTask::Deployment,
+        ));
+
+        let startup_commands_tx = simnet_commands_tx.clone();
+        if let Err(error) =
+            hiro_system_kit::thread_named("Deployment Runbook Executions").spawn(move || {
+                // catch_unwind, like the artifact watcher below: a panicking
+                // runbook future must still complete the Deployment task, or
+                // the phase pins at Deploying and readiness never resolves.
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    hiro_system_kit::nestable_block_on(join_all(futures))
+                }));
+                let result = match outcome {
+                    Ok(results) => {
+                        let errors = results
+                            .into_iter()
+                            .filter_map(Result::err)
+                            .collect::<Vec<_>>();
+                        if errors.is_empty() {
+                            Ok(())
+                        } else {
+                            Err(errors.join("\n"))
+                        }
+                    }
+                    Err(panic) => {
+                        let message = panic
+                            .downcast_ref::<String>()
+                            .map(String::as_str)
+                            .or_else(|| panic.downcast_ref::<&str>().copied())
+                            .unwrap_or("deployment runbook execution panicked");
+                        Err(format!("deployment runbook execution panicked: {message}"))
+                    }
+                };
+                let _ = startup_commands_tx.send(SimnetCommand::CompleteStartupTask(
+                    SurfnetStartupTask::Deployment,
+                    result,
+                ));
+                Ok::<(), String>(())
+            })
+        {
+            // The spawn failure is the task's outcome; report it through
+            // the machine (Failed) and let the watchdog policy decide
+            // fatality. The error event covers the TUI, which has no other
+            // channel announcing the failed phase.
+            let error = format!("Thread to execute runbooks exited: {error}");
+            let _ = simnet_events_tx.send(SimnetEvent::error(error.clone()));
+            let _ = simnet_commands_tx.send(SimnetCommand::CompleteStartupTask(
+                SurfnetStartupTask::Deployment,
+                Err(error),
+            ));
+        }
+    }
+
+    if cmd.project.watch {
+        // The watcher is a dev convenience; the deployment tasks are
+        // already dispatched and may legitimately reach Ready, so a watcher
+        // failure must not fail startup.
+        if let Err(error) = spawn_artifact_watcher(
+            base_location,
+            cmd.project.artifacts_path.clone(),
+            progress_tx,
+            simnet_events_tx.clone(),
+            on_disk_runbook_data,
+            in_memory_runbook_data,
+            runbook_input,
+        ) {
+            let _ = simnet_events_tx.send(SimnetEvent::warn(format!(
+                "Failed to watch deploy artifacts for changes: {error}"
+            )));
+        }
+    }
+
     Ok(progress_rx)
 }
+
+/// Watches the deploy-artifacts directory and re-executes the deployment
+/// runbooks whenever a `.so` file is created or modified.
+fn spawn_artifact_watcher(
+    base_location: FileLocation,
+    artifacts_path: Option<String>,
+    progress_tx: Sender<BlockEvent>,
+    simnet_events_tx: Sender<SimnetEvent>,
+    on_disk_runbook_data: Option<(FileLocation, Vec<String>)>,
+    in_memory_runbook_data: Option<(String, RunbookSources, WorkspaceManifest)>,
+    runbook_input: Vec<String>,
+) -> Result<(), String> {
+    let _handle = hiro_system_kit::thread_named("Watch Filesystem")
+        .spawn(move || {
+            let mut target_path = base_location;
+            if let Some(ref path) = artifacts_path {
+                let _ = target_path.append_path(path);
+            } else {
+                let _ = target_path.append_path("target");
+                let _ = target_path.append_path("deploy");
+            }
+            let (tx, rx) = mpsc::channel::<NotifyResult<Event>>();
+            let mut watcher = notify::recommended_watcher(tx).map_err(|e| e.to_string())?;
+            watcher
+                .watch(
+                    Path::new(&target_path.to_string()),
+                    RecursiveMode::NonRecursive,
+                )
+                .map_err(|e| e.to_string())?;
+            let _ = watcher.configure(
+                Config::default()
+                    .with_poll_interval(Duration::from_secs(1))
+                    .with_compare_contents(true),
+            );
+            for res in rx {
+                // Disregard any event that would not create or modify a .so file
+                let mut found_candidates = false;
+                match res {
+                    Ok(Event {
+                        kind: EventKind::Modify(ModifyKind::Data(DataChange::Content)),
+                        paths,
+                        attrs: _,
+                    })
+                    | Ok(Event {
+                        kind: EventKind::Create(CreateKind::File),
+                        paths,
+                        attrs: _,
+                    })
+                    // Linux: inotify reports Data(Any) instead of Data(Content)
+                    | Ok(Event {
+                        kind: EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+                        paths,
+                        attrs: _,
+                    })
+                    // Linux: atomic file replacement via rename
+                    | Ok(Event {
+                        kind: EventKind::Modify(ModifyKind::Name(_)),
+                        paths,
+                        attrs: _,
+                    }) => {
+                        for path in paths.iter() {
+                            if path.to_string_lossy().ends_with(".so") {
+                                found_candidates = true;
+                            }
+                        }
+                    }
+                    _ => continue,
+                }
+
+                if !found_candidates {
+                    continue;
+                }
+
+                let futures = assemble_runbook_execution_futures(
+                    &progress_tx,
+                    &simnet_events_tx,
+                    &on_disk_runbook_data,
+                    &in_memory_runbook_data,
+                    &runbook_input,
+                );
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    hiro_system_kit::nestable_block_on(join_all(futures))
+                }));
+            }
+            Ok::<(), String>(())
+        })
+        .map_err(|e| format!("Thread to watch filesystem exited: {}", e))?;
+    Ok(())
+}
+
+type RunbookExecutionFutures =
+    Vec<std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>>;
 
 fn assemble_runbook_execution_futures(
     progress_tx: &Sender<BlockEvent>,
@@ -808,7 +1253,7 @@ fn assemble_runbook_execution_futures(
     on_disk_runbook_data: &Option<(FileLocation, Vec<String>)>,
     in_memory_runbook_data: &Option<(String, RunbookSources, WorkspaceManifest)>,
     runbook_input: &Vec<String>,
-) -> Vec<std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>> {
+) -> RunbookExecutionFutures {
     let mut futures: Vec<
         std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>,
     > = vec![];

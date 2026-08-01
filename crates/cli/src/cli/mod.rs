@@ -23,8 +23,8 @@ use surfpool_types::{
     AccountSnapshot, BlockProductionMode, CHANGE_TO_DEFAULT_STUDIO_PORT_ONCE_SUPERVISOR_MERGED,
     DEFAULT_DEVNET_RPC_URL, DEFAULT_GOSSIP_PORT, DEFAULT_MAINNET_RPC_URL, DEFAULT_NETWORK_HOST,
     DEFAULT_RPC_PORT, DEFAULT_SLOT_TIME_MS, DEFAULT_TESTNET_RPC_URL, DEFAULT_TPU_PORT,
-    DEFAULT_TPU_QUIC_PORT, DEFAULT_WS_PORT, RpcConfig, SimnetConfig, SimnetEvent, StudioConfig,
-    SubgraphConfig, SurfpoolConfig, SvmFeatureConfig, parse_feature_pubkey,
+    DEFAULT_TPU_QUIC_PORT, DEFAULT_WS_PORT, RpcConfig, SimnetConfig, SimnetEvent, StartupPlanner,
+    StudioConfig, SubgraphConfig, SurfpoolConfig, SvmFeatureConfig, parse_feature_pubkey,
 };
 use txtx_core::manifest::WorkspaceManifest;
 use txtx_gql::kit::{helpers::fs::FileLocation, types::frontend::LogLevel};
@@ -725,6 +725,10 @@ impl StartSimnet {
             subgraph: self.subgraph_config(),
             studio: self.studio_config(),
             plugin_config_path,
+            // The CLI inspects the project (clones, deployment runbooks)
+            // after the runloop starts and seals the plan itself; the
+            // runloop must not seal an empty one out from under it.
+            startup_planner: StartupPlanner::External,
         }
     }
 }
