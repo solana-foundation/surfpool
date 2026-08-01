@@ -57,8 +57,9 @@ use surfpool_types::{
     AccountChange, AccountProfileState, AccountSnapshot, DEFAULT_PROFILING_MAP_CAPACITY,
     DEFAULT_SLOT_TIME_MS, ExportSnapshotConfig, ExportSnapshotScope, FifoMap, Idl,
     OverrideInstance, ProfileResult, RpcProfileDepth, RpcProfileResultConfig,
-    RunbookExecutionStatusReport, SimnetEvent, SvmFeatureConfig, TransactionConfirmationStatus,
-    TransactionStatusEvent, UiAccountChange, UiAccountProfileState, UiProfileResult, VersionedIdl,
+    RunbookExecutionStatusReport, SimnetEvent, StartupError, SurfnetStartupStatus,
+    SurfnetStartupTask, SvmFeatureConfig, TransactionConfirmationStatus, TransactionStatusEvent,
+    UiAccountChange, UiAccountProfileState, UiProfileResult, VersionedIdl,
     types::{
         ComputeUnitsEstimationResult, KeyedProfileResult, UiKeyedProfileResult, UuidOrSignature,
     },
@@ -311,6 +312,11 @@ pub struct SurfnetSvm {
     pub max_profiles: usize,
     pub skip_blockhash_check: bool,
     pub runbook_executions: Vec<RunbookExecutionStatusReport>,
+    pub startup_status: SurfnetStartupStatus,
+    /// Publishes accepted startup transitions to watch subscribers. Kept
+    /// private so that all writes go through the state machine; subscribe via
+    /// [`Self::subscribe_startup_status`].
+    startup_status_watch_tx: tokio::sync::watch::Sender<SurfnetStartupStatus>,
     pub account_update_slots: HashMap<Pubkey, Slot>,
     pub streamed_accounts: Box<dyn Storage<String, bool>>,
     pub recent_blockhashes: VecDeque<(SyntheticBlockhash, i64)>,
@@ -583,6 +589,11 @@ impl SurfnetSvm {
             max_profiles: self.max_profiles,
             skip_blockhash_check: self.skip_blockhash_check,
             runbook_executions: self.runbook_executions.clone(),
+            startup_status: self.startup_status.clone(),
+            // Same rule as the dummy event channels above: the sandbox gets a
+            // fresh watch channel so nothing it does can reach live startup
+            // subscribers.
+            startup_status_watch_tx: tokio::sync::watch::channel(self.startup_status.clone()).0,
             account_update_slots: self.account_update_slots.clone(),
             recent_blockhashes: self.recent_blockhashes.clone(),
             offline_accounts: OverlayStorage::wrap(self.offline_accounts.clone_box()),
@@ -1036,6 +1047,8 @@ impl SurfnetSvm {
             max_profiles: config.max_profiles,
             skip_blockhash_check: config.skip_blockhash_check,
             runbook_executions: Vec::new(),
+            startup_status: SurfnetStartupStatus::default(),
+            startup_status_watch_tx: tokio::sync::watch::channel(SurfnetStartupStatus::default()).0,
             account_update_slots: HashMap::new(),
             streamed_accounts: streamed_accounts_db,
             recent_blockhashes: VecDeque::new(),
@@ -3838,6 +3851,67 @@ impl SurfnetSvm {
             .push(RunbookExecutionStatusReport::new(runbook_id));
     }
 
+    pub fn seal_startup_plan(
+        &mut self,
+        tasks: Vec<SurfnetStartupTask>,
+    ) -> Result<(), StartupError> {
+        self.startup_status.seal_plan(tasks)?;
+        self.publish_startup_status();
+        Ok(())
+    }
+
+    pub fn fail_startup_planning(&mut self, error: String) -> Result<(), StartupError> {
+        self.startup_status.fail_planning(error)?;
+        self.publish_startup_status();
+        Ok(())
+    }
+
+    pub fn start_startup_task(&mut self, task: SurfnetStartupTask) -> Result<(), StartupError> {
+        self.startup_status.start_task(task)?;
+        self.publish_startup_status();
+        Ok(())
+    }
+
+    pub fn complete_startup_task(
+        &mut self,
+        task: SurfnetStartupTask,
+        result: Result<(), String>,
+    ) -> Result<(), StartupError> {
+        match result {
+            Ok(()) => self.startup_status.complete_task(task)?,
+            Err(error) => self.startup_status.fail_task(task, error)?,
+        }
+        self.publish_startup_status();
+        Ok(())
+    }
+
+    /// Subscribes to startup lifecycle changes. Returns a watch receiver whose
+    /// `borrow()` returns the current status and whose `changed()` future
+    /// resolves after each accepted transition. Rejected transitions are not
+    /// published.
+    pub fn subscribe_startup_status(&self) -> tokio::sync::watch::Receiver<SurfnetStartupStatus> {
+        self.startup_status_watch_tx.subscribe()
+    }
+
+    // send_replace rather than send: the status must publish even while no
+    // subscriber exists yet, so a late subscriber's first borrow() is current.
+    /// Publishes an accepted transition on both channels: the watch channel
+    /// for readers that want the current status, and the event channel for
+    /// readers that want the sequence.
+    fn publish_startup_status(&self) {
+        self.startup_status_watch_tx
+            .send_replace(self.startup_status.clone());
+        // try_send: callers hold the SVM write guard, and the bounded events
+        // channel may belong to an embedder that never drains it. The watch
+        // channel above is the reliable path; the event stream is a best
+        // effort sequence, and dropping an entry must not wedge the SVM.
+        let _ = self
+            .simnet_events_tx
+            .try_send(SimnetEvent::StartupStatusChanged(
+                self.startup_status.clone(),
+            ));
+    }
+
     pub fn complete_runbook_execution(&mut self, runbook_id: &str, error: Option<Vec<String>>) {
         if let Some(execution) = self
             .runbook_executions
@@ -4056,6 +4130,36 @@ mod tests {
 
     use super::*;
     use crate::storage::tests::TestType;
+
+    #[test]
+    fn startup_status_subscription_tracks_accepted_transitions() {
+        use surfpool_types::SurfnetStartupPhase;
+
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let mut startup = svm.subscribe_startup_status();
+        assert!(!startup.borrow().is_ready());
+
+        svm.seal_startup_plan(vec![SurfnetStartupTask::RemoteAccounts])
+            .unwrap();
+        assert!(startup.has_changed().unwrap());
+        assert_eq!(
+            startup.borrow_and_update().phase(),
+            SurfnetStartupPhase::Initializing
+        );
+
+        svm.start_startup_task(SurfnetStartupTask::RemoteAccounts)
+            .unwrap();
+        svm.complete_startup_task(SurfnetStartupTask::RemoteAccounts, Ok(()))
+            .unwrap();
+        assert!(startup.borrow_and_update().is_ready());
+
+        // Rejected transitions publish nothing.
+        assert!(
+            svm.start_startup_task(SurfnetStartupTask::RemoteAccounts)
+                .is_err()
+        );
+        assert!(!startup.has_changed().unwrap());
+    }
 
     fn build_transfer_transaction(
         payer: &Keypair,

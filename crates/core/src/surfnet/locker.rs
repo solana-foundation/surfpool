@@ -55,8 +55,9 @@ use solana_transaction_status::{
 use surfpool_types::{
     AccountSnapshot, ComputeUnitsEstimationResult, ExecutionCapture, ExportSnapshotConfig, Idl,
     KeyedProfileResult, ProfileResult, RpcProfileResultConfig, RunbookExecutionStatusReport,
-    SimnetCommand, SimnetEvent, TransactionConfirmationStatus, TransactionStatusEvent,
-    UiKeyedProfileResult, UuidOrSignature, VersionedIdl,
+    SimnetCommand, SimnetEvent, StartupError, SurfnetStartupStatus, SurfnetStartupTask,
+    TransactionConfirmationStatus, TransactionStatusEvent, UiKeyedProfileResult, UuidOrSignature,
+    VersionedIdl,
 };
 use tokio::sync::RwLock;
 use txtx_addon_kit::indexmap::IndexSet;
@@ -3986,6 +3987,38 @@ impl SurfnetSvmLocker {
 
     pub fn runbook_executions(&self) -> Vec<RunbookExecutionStatusReport> {
         self.with_svm_reader(|svm_reader| svm_reader.runbook_executions.clone())
+    }
+
+    pub fn startup_status(&self) -> SurfnetStartupStatus {
+        self.with_svm_reader(|svm_reader| svm_reader.startup_status.clone())
+    }
+
+    /// Subscribes to startup lifecycle changes. Returns a watch receiver whose
+    /// `borrow()` returns the current status and whose `changed()` future
+    /// resolves after each accepted transition, allowing callers to await
+    /// readiness instead of polling. Rejected transitions are not published.
+    pub fn subscribe_startup_status(&self) -> tokio::sync::watch::Receiver<SurfnetStartupStatus> {
+        self.with_svm_reader(|svm_reader| svm_reader.subscribe_startup_status())
+    }
+
+    pub fn seal_startup_plan(&self, tasks: Vec<SurfnetStartupTask>) -> Result<(), StartupError> {
+        self.with_svm_writer(|svm_writer| svm_writer.seal_startup_plan(tasks))
+    }
+
+    pub fn fail_startup_planning(&self, error: String) -> Result<(), StartupError> {
+        self.with_svm_writer(|svm_writer| svm_writer.fail_startup_planning(error))
+    }
+
+    pub fn start_startup_task(&self, task: SurfnetStartupTask) -> Result<(), StartupError> {
+        self.with_svm_writer(|svm_writer| svm_writer.start_startup_task(task))
+    }
+
+    pub fn complete_startup_task(
+        &self,
+        task: SurfnetStartupTask,
+        result: Result<(), String>,
+    ) -> Result<(), StartupError> {
+        self.with_svm_writer(|svm_writer| svm_writer.complete_startup_task(task, result))
     }
 
     pub fn start_runbook_execution(&self, runbook_id: String) {
