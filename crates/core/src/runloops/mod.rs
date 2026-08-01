@@ -29,7 +29,7 @@ use solana_transaction::sanitized::{MessageHash, SanitizedTransaction};
 use solana_transaction_status::RewardsAndNumPartitions;
 use surfpool_types::{
     BlockProductionMode, ClockCommand, ClockEvent, DEFAULT_MAINNET_RPC_URL, DataIndexingCommand,
-    SimnetCommand, SimnetConfig, SimnetEvent, SurfpoolConfig,
+    SimnetCommand, SimnetConfig, SimnetEvent, StartupPlanner, SurfnetStartupTask, SurfpoolConfig,
 };
 type PluginConstructor = unsafe fn() -> *mut dyn GeyserPlugin;
 use txtx_addon_kit::helpers::fs::FileLocation;
@@ -158,6 +158,7 @@ pub async fn start_local_surfnet_runloop(
     let Some(simnet) = config.simnets.first() else {
         return Ok(());
     };
+    let startup_planner = config.startup_planner;
     let block_production_mode = simnet.block_production_mode.clone();
 
     let remote_rpc_client = match simnet.offline_mode {
@@ -299,6 +300,18 @@ pub async fn start_local_surfnet_runloop(
 
         count
     });
+    // With no external planner, the empty startup plan is known by
+    // construction; seal it here, before the Ready event, so an embedder
+    // that waits for Ready observes a publicly ready surfnet. With an
+    // external planner (the CLI), Ready only means "RPC bound": the planner
+    // inspects the project after this and seals the plan itself.
+    if startup_planner == StartupPlanner::None {
+        if let Err(error) = svm_locker.seal_startup_plan(vec![]) {
+            let _ = simnet_events_tx_cc.try_send(SimnetEvent::error(format!(
+                "Failed to seal startup plan: {error}"
+            )));
+        }
+    }
     let _ = simnet_events_tx_cc.send(SimnetEvent::Ready(initial_transaction_count));
 
     // Notify geyser plugins that startup is complete
@@ -493,6 +506,41 @@ pub async fn start_block_production_runloop(
                         }
                         break;
                     }
+                    SimnetCommand::SealStartupPlan(tasks, response_tx) => {
+                        let result = svm_locker.seal_startup_plan(tasks);
+                        if let Err(error) = &result {
+                            let _ = svm_locker.simnet_events_tx().try_send(SimnetEvent::error(
+                                format!("Failed to seal startup plan: {error}"),
+                            ));
+                        }
+                        let _ = response_tx.send(result);
+                    }
+                    SimnetCommand::FailStartupPlanning(error) => {
+                        if let Err(transition_error) =
+                            svm_locker.fail_startup_planning(error.clone())
+                        {
+                            let _ = svm_locker.simnet_events_tx().try_send(SimnetEvent::error(
+                                format!("Failed to transition startup to Failed: {transition_error}"),
+                            ));
+                        }
+                        let _ = svm_locker
+                            .simnet_events_tx()
+                            .try_send(SimnetEvent::error(format!("Surfpool startup failed: {error}")));
+                    }
+                    SimnetCommand::StartStartupTask(task) => {
+                        if let Err(error) = svm_locker.start_startup_task(task) {
+                            let _ = svm_locker.simnet_events_tx().try_send(SimnetEvent::error(
+                                format!("Failed to start startup task {task:?}: {error}"),
+                            ));
+                        }
+                    }
+                    SimnetCommand::CompleteStartupTask(task, result) => {
+                        if let Err(error) = svm_locker.complete_startup_task(task, result) {
+                            let _ = svm_locker.simnet_events_tx().try_send(SimnetEvent::error(
+                                format!("Failed to complete startup task {task:?}: {error}"),
+                            ));
+                        }
+                    }
                     SimnetCommand::StartRunbookExecution(runbook_id) => {
                         svm_locker.start_runbook_execution(runbook_id);
                     }
@@ -501,16 +549,43 @@ pub async fn start_block_production_runloop(
                         svm_locker.complete_runbook_execution(runbook_id, error, ix_profiling_initially_enabled);
                     }
                     SimnetCommand::FetchRemoteAccounts(pubkeys, remote_url) => {
-                        let remote_client = SurfnetRemoteClient::new_unsafe(&remote_url);
-                        if let Some(remote_client) = remote_client {
-                              match svm_locker.get_multiple_accounts_with_remote_fallback(&remote_client, &pubkeys, CommitmentConfig::confirmed()).await {
-                                 Ok(account_updates) => {
-                                     svm_locker.write_multiple_account_updates(&account_updates.inner);
-                                 }
-                                 Err(e) => {
-                                     svm_locker.simnet_events_tx().try_send(SimnetEvent::error(format!("Failed to fetch remote accounts {:?}: {}", pubkeys, e))).ok();
-                                 }
-                             };
+                        // The submitter already marked RemoteAccounts as started;
+                        // StartStartupTask precedes this command on the same channel.
+                        let fetch_result = match SurfnetRemoteClient::new_unsafe(&remote_url) {
+                            Some(remote_client) => match svm_locker
+                                .get_multiple_accounts_with_remote_fallback(
+                                    &remote_client,
+                                    &pubkeys,
+                                    CommitmentConfig::confirmed(),
+                                )
+                                .await
+                            {
+                                Ok(account_updates) => {
+                                    // The locker holds one write guard while applying the complete
+                                    // batch, so Ready cannot expose a partially installed clone set.
+                                    svm_locker
+                                        .write_multiple_account_updates(&account_updates.inner);
+                                    Ok(())
+                                }
+                                Err(error) => Err(format!(
+                                    "Failed to fetch remote accounts {pubkeys:?}: {error}"
+                                )),
+                            },
+                            None => Err(format!("Invalid remote RPC URL: {remote_url}")),
+                        };
+
+                        if let Err(error) = &fetch_result {
+                            let _ = svm_locker
+                                .simnet_events_tx()
+                                .try_send(SimnetEvent::error(error.clone()));
+                        }
+                        if let Err(error) = svm_locker.complete_startup_task(
+                            SurfnetStartupTask::RemoteAccounts,
+                            fetch_result,
+                        ) {
+                            let _ = svm_locker.simnet_events_tx().try_send(SimnetEvent::error(
+                                format!("Failed to finish remote account hydration: {error}"),
+                            ));
                         }
                     }
                     SimnetCommand::AirdropProcessed => {
