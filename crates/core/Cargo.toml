@@ -89,6 +89,9 @@ solana-version = { workspace = true }
 spl-associated-token-account-interface = { workspace = true }
 spl-token-interface = { workspace = true }
 spl-token-2022-interface = { workspace = true }
+# r2d2's scheduler, named directly so every pool can share one. See
+# storage::pool_scheduler.
+scheduled-thread-pool = "0.2"
 thiserror = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }

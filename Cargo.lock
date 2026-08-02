@@ -11987,6 +11987,7 @@ dependencies = [
  "p256",
  "prometheus",
  "reqwest 0.12.28",
+ "scheduled-thread-pool",
  "serde",
  "serde_derive",
  "serde_json",

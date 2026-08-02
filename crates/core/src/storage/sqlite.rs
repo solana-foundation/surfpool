@@ -78,6 +78,7 @@ impl SqliteBackend {
         let is_file_based = database_url != ":memory:";
         let manager = CountingSqliteManager::new(&connection_string);
         let pool = Pool::builder()
+            .thread_pool(crate::storage::pool_scheduler())
             .max_size(10)
             .connection_customizer(Box::new(SqlitePragmaCustomizer { is_file_based }))
             .build(manager)

@@ -48,6 +48,7 @@ fn get_or_create_shared_pool(
     );
     let manager = ConnectionManager::<diesel::PgConnection>::new(database_url);
     let pool = Pool::builder()
+        .thread_pool(crate::storage::pool_scheduler())
         .max_size(10) // Limit total connections across all tests
         .min_idle(Some(1))
         .build(manager)

@@ -20,6 +20,31 @@ pub use surfpool_types::FifoMap as StorageFifoMap;
 
 use crate::error::SurfpoolError;
 
+/// The scheduler every connection pool runs its housekeeping on.
+///
+/// r2d2 builds its own `ScheduledThreadPool` when none is supplied, three
+/// threads per pool. Pools are held per surfnet (sqlite) or per database URL
+/// (postgres), so a process running many surfnets pays three threads for each,
+/// spent on work that is periodic and short: reaping idle connections and
+/// enforcing lifetimes. One scheduler serves any number of pools, so this is
+/// three threads for the process instead of three per pool.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+pub(crate) fn pool_scheduler() -> std::sync::Arc<scheduled_thread_pool::ScheduledThreadPool> {
+    use std::sync::{Arc, OnceLock};
+
+    static SCHEDULER: OnceLock<Arc<scheduled_thread_pool::ScheduledThreadPool>> = OnceLock::new();
+    SCHEDULER
+        .get_or_init(|| {
+            Arc::new(
+                scheduled_thread_pool::ScheduledThreadPool::builder()
+                    .num_threads(3)
+                    .thread_name_pattern("r2d2-worker-{}")
+                    .build(),
+            )
+        })
+        .clone()
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
     #[error("Sqlite storage is not enabled in this build")]
