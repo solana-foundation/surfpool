@@ -3,3 +3,6 @@ surfpool-install = "install --path crates/cli --locked --force --features superv
 surfpool-install-dev = "install --path crates/cli --locked --force --features supervisor_ui --features sqlite"
 # useful for local builds that point to local txtx crates - prevents conflicts with the supervisor_ui feature
 surfpool-install-minimal = "install --path crates/cli --locked --force"
+
+# regenerate every table in crates/types/src/startup-lifecycle.md
+surfpool-update-startup-spec = "test -p surfpool-types regenerate_the_startup_spec_tables -- --ignored --nocapture"

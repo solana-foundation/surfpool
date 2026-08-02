@@ -4310,7 +4310,6 @@ async fn readiness_is_withheld_while_a_declared_clone_is_outstanding(test_type: 
     );
 }
 
-
 /// A booted simnet, with the handles a test drives it through.
 ///
 /// The guard rides along rather than being handed back separately, so holding

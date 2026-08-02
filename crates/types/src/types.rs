@@ -2250,6 +2250,484 @@ mod surfnet_startup_status_tests {
     }
 }
 
+/// Exhaustive model check of the startup state machine. The reachable state
+/// space is finite and small (two task kinds, four task states, five phases),
+/// so a breadth-first search from the default state can verify the startup
+/// invariants at every reachable state and along every accepted transition,
+/// with no sampling involved.
+///
+/// The race in issue 715 was a history property: no sequence of transitions
+/// may let a client observe readiness while declared work is outstanding.
+/// This sweep checks state invariants instead, which suffices because the
+/// projection a client reads is a pure function of the current state and
+/// every reachable state is visited. If readiness ever acquires memory of
+/// its own (a cache, a debounce, an asynchronous publish), that reduction
+/// stops holding, and forbidden histories need checking directly.
+#[cfg(test)]
+mod surfnet_startup_reachability_tests {
+    use std::collections::{BTreeMap, BTreeSet, HashSet};
+
+    use super::*;
+
+    /// A command's display label, the spec event it maps to, and its
+    /// application.
+    type Command = (
+        String,
+        &'static str,
+        Box<dyn Fn(&mut SurfnetStartupStatus) -> Result<(), StartupError>>,
+    );
+
+    /// Any fixed instant. The projection check below cares whether an entry
+    /// is present, not when it started.
+    const STARTED_AT: u32 = 1_753_000_000;
+
+    /// Checks the compatibility projection against the startup phase, using
+    /// the rule Anchor applies: it proceeds when every entry in
+    /// `runbookExecutions` is complete. It may proceed exactly when startup is
+    /// over.
+    ///
+    /// `Failed` counts as over. A pending entry there would park a client in a
+    /// readiness loop that has no timeout, so the entry completes and the
+    /// reason is reported in `errors`.
+    ///
+    /// Stated in terms of Anchor's predicate rather than an empty list,
+    /// because an empty list is only one way to satisfy it. An entry marked
+    /// complete regardless of phase satisfies it too, and a check written
+    /// against emptiness does not detect that.
+    ///
+    /// Used by the model check on every reachable state and by
+    /// `the_forbidden_pairing_is_one_we_can_build` on a hand-built violation.
+    fn compat_list_agrees_with_phase(
+        runbook_executions: &[RunbookExecutionStatusReport],
+        phase: SurfnetStartupPhase,
+    ) -> bool {
+        let anchor_would_proceed = runbook_executions
+            .iter()
+            .all(|execution| execution.completed_at.is_some());
+        let startup_is_over = matches!(
+            phase,
+            SurfnetStartupPhase::Ready | SurfnetStartupPhase::Failed
+        );
+        anchor_would_proceed == startup_is_over
+    }
+
+    /// The full command alphabet. Plans cover every subset of the two task
+    /// kinds, both orderings of the two-task plan, and a duplicate entry to
+    /// exercise deduplication. Failure commands use a fixed error string so
+    /// the reachable state space stays finite.
+    fn commands() -> Vec<Command> {
+        use SurfnetStartupTask::*;
+
+        let plans: [&[SurfnetStartupTask]; 6] = [
+            &[],
+            &[RemoteAccounts],
+            &[Deployment],
+            &[RemoteAccounts, Deployment],
+            &[Deployment, RemoteAccounts],
+            &[RemoteAccounts, RemoteAccounts],
+        ];
+
+        let mut commands: Vec<Command> = vec![];
+        for plan in plans {
+            let plan = plan.to_vec();
+            commands.push((
+                format!("seal_plan({plan:?})"),
+                "StartupPlanSealed",
+                Box::new(move |status| status.seal_plan(plan.clone())),
+            ));
+        }
+        for task in [RemoteAccounts, Deployment] {
+            commands.push((
+                format!("start_task({task:?})"),
+                "StartupTaskStarted",
+                Box::new(move |status| status.start_task(task)),
+            ));
+            commands.push((
+                format!("complete_task({task:?})"),
+                "StartupTaskSucceeded",
+                Box::new(move |status| status.complete_task(task)),
+            ));
+            commands.push((
+                format!("fail_task({task:?})"),
+                "StartupTaskFailed",
+                Box::new(move |status| status.fail_task(task, "boom")),
+            ));
+        }
+        commands.push((
+            "fail_planning".to_string(),
+            "StartupFailed",
+            Box::new(|status| status.fail_planning("boom")),
+        ));
+        commands
+    }
+
+    /// Progress order for the monotonicity check. `Failed` is handled
+    /// separately: it is reachable from any non-terminal phase.
+    fn phase_rank(phase: SurfnetStartupPhase) -> u8 {
+        match phase {
+            SurfnetStartupPhase::Planning => 0,
+            SurfnetStartupPhase::Initializing => 1,
+            SurfnetStartupPhase::Deploying => 2,
+            SurfnetStartupPhase::Ready => 3,
+            SurfnetStartupPhase::Failed => u8::MAX,
+        }
+    }
+
+    /// Spec oracle: the phase a state must be in, written from the projection
+    /// in `startup-lifecycle.md`, the SOT, so the assertion below enforces
+    /// "implementation matches spec", not "code matches itself":
+    ///
+    /// 1. A failure at any stage is terminal.
+    /// 2. An unsealed plan is still planning; it can never be ready, even
+    ///    when its task collection is empty.
+    /// 3. A sealed plan with every required task succeeded is ready (the
+    ///    empty plan is ready immediately).
+    /// 4. Otherwise, pending hydration means initializing; after hydration,
+    ///    deploying.
+    fn expected_phase(status: &SurfnetStartupStatus) -> SurfnetStartupPhase {
+        let failed = status.error().is_some()
+            || status
+                .tasks()
+                .iter()
+                .any(|task| task.state == SurfnetStartupTaskState::Failed);
+        if failed {
+            return SurfnetStartupPhase::Failed;
+        }
+        if !status.plan_sealed() {
+            return SurfnetStartupPhase::Planning;
+        }
+        if status
+            .tasks()
+            .iter()
+            .all(|task| task.state == SurfnetStartupTaskState::Succeeded)
+        {
+            return SurfnetStartupPhase::Ready;
+        }
+        if status.tasks().iter().any(|task| {
+            task.task == SurfnetStartupTask::RemoteAccounts
+                && task.state != SurfnetStartupTaskState::Succeeded
+        }) {
+            return SurfnetStartupPhase::Initializing;
+        }
+        SurfnetStartupPhase::Deploying
+    }
+
+    fn assert_state_invariants(status: &SurfnetStartupStatus) {
+        // The oracle equation is total: every state has exactly one expected
+        // phase, so no state slips through unchecked. This subsumes the
+        // headline issue-715 invariant (Ready requires a sealed plan with
+        // every required task succeeded).
+        //
+        // Two former assertions have no runtime check anymore because the
+        // sum-type representation makes their violations unrepresentable:
+        // the machine-level error is now derived (so it cannot disagree
+        // with the Failed phase), and an unsealed status has no task table
+        // (so tasks cannot be registered before sealing).
+        assert_eq!(
+            status.phase(),
+            expected_phase(status),
+            "phase disagrees with the spec oracle: {status:?}"
+        );
+
+        // The projection a client reads, checked at every reachable state. The
+        // oracle above ties Ready to a sealed plan with every task succeeded;
+        // this ties what Anchor concludes to the phase. Together they make a
+        // sealed plan with clones declared unable to report itself finished.
+        let projected = GetSurfnetInfoResponse::with_startup(vec![], status.clone(), STARTED_AT);
+        assert!(
+            compat_list_agrees_with_phase(&projected.runbook_executions, status.phase()),
+            "the compatibility list disagrees with the phase, so a client \
+             would read readiness from {status:?}"
+        );
+
+        // Task-level error bookkeeping is still two stored fields, so the
+        // biconditional remains a real check.
+        for task in status.tasks() {
+            assert_eq!(
+                task.error.is_some(),
+                task.state == SurfnetStartupTaskState::Failed,
+                "task error and task state disagree: {status:?}"
+            );
+        }
+
+        let tasks = status.tasks();
+        for (index, task) in tasks.iter().enumerate() {
+            assert!(
+                tasks[..index]
+                    .iter()
+                    .all(|earlier| earlier.task != task.task),
+                "duplicate task kind in plan: {status:?}"
+            );
+        }
+    }
+
+    /// Rewrites the observed block in `startup-lifecycle.md` from a fresh
+    /// sweep. Ignored so a plain test run never writes to the source tree;
+    /// `cargo surfpool-update-startup-spec` runs it explicitly.
+    #[test]
+    #[ignore = "writes startup-lifecycle.md; run via cargo surfpool-update-startup-spec"]
+    fn regenerate_the_observed_block() {
+        sweep().write_to_spec();
+    }
+
+    /// Walks every reachable startup state, asserting the invariants along
+    /// the way, and returns what the walk observed.
+    fn sweep() -> Observed {
+        let commands = commands();
+        let initial = SurfnetStartupStatus::default();
+
+        let mut seen = HashSet::new();
+        seen.insert(format!("{initial:?}"));
+        let mut frontier = vec![initial];
+        let mut visited = 0usize;
+        let mut accepted = 0usize;
+        let mut reached = HashSet::new();
+        let mut events: BTreeMap<String, BTreeSet<&'static str>> = BTreeMap::new();
+        let mut successors: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+
+        while let Some(state) = frontier.pop() {
+            visited += 1;
+            assert_state_invariants(&state);
+            reached.insert(format!("{:?}", state.phase()));
+            let terminal = matches!(
+                state.phase(),
+                SurfnetStartupPhase::Ready | SurfnetStartupPhase::Failed
+            );
+
+            for (label, event, apply) in &commands {
+                let mut next = state.clone();
+                match apply(&mut next) {
+                    Ok(()) => {
+                        accepted += 1;
+                        let phase = format!("{:?}", state.phase());
+                        events.entry(phase.clone()).or_default().insert(event);
+                        successors
+                            .entry(phase)
+                            .or_default()
+                            .insert(format!("{:?}", next.phase()));
+                        assert!(!terminal, "{label} accepted from terminal state: {state:?}");
+                        if next.phase() != SurfnetStartupPhase::Failed {
+                            assert!(
+                                phase_rank(next.phase()) >= phase_rank(state.phase()),
+                                "{label} regressed the phase: {state:?} -> {next:?}"
+                            );
+                        }
+                        if seen.insert(format!("{next:?}")) {
+                            frontier.push(next);
+                        }
+                    }
+                    Err(_) => {
+                        // A rejected transition must leave the state untouched;
+                        // the watch-channel publisher relies on this.
+                        assert_eq!(next, state, "{label} was rejected but mutated the state");
+                    }
+                }
+            }
+        }
+
+        // A shrunken search would pass every assertion above while checking
+        // nothing, so require the full space: every phase reachable, and the
+        // spec's observed block equal to what this sweep just observed.
+        for phase in [
+            SurfnetStartupPhase::Planning,
+            SurfnetStartupPhase::Initializing,
+            SurfnetStartupPhase::Deploying,
+            SurfnetStartupPhase::Ready,
+            SurfnetStartupPhase::Failed,
+        ] {
+            assert!(
+                reached.contains(&format!("{phase:?}")),
+                "model check never reached {phase:?}"
+            );
+        }
+        Observed {
+            visited,
+            attempted: visited * commands.len(),
+            accepted,
+            events,
+            successors,
+        }
+    }
+
+    /// What one full sweep observed, in the vocabulary the spec's tables use.
+    struct Observed {
+        visited: usize,
+        attempted: usize,
+        accepted: usize,
+        events: BTreeMap<String, BTreeSet<&'static str>>,
+        successors: BTreeMap<String, BTreeSet<String>>,
+    }
+
+    impl Observed {
+        /// Renders the observed block of `startup-lifecycle.md`: the phase
+        /// transition table and the counts line. An empty event set renders
+        /// as "nothing" and an empty successor set as "terminal", so the
+        /// terminal rows are derived rather than declared.
+        fn render(&self) -> String {
+            const PHASES: [&str; 5] =
+                ["Planning", "Initializing", "Deploying", "Ready", "Failed"];
+            let join = |set: Option<Vec<String>>, empty: &str| {
+                set.filter(|items| !items.is_empty())
+                    .map(|items| items.join(", "))
+                    .unwrap_or_else(|| empty.to_string())
+            };
+
+            let headers = ["Phase", "Accepts", "Can lead to"];
+            let rows: Vec<[String; 3]> = PHASES
+                .iter()
+                .map(|phase| {
+                    [
+                        phase.to_string(),
+                        join(
+                            self.events
+                                .get(*phase)
+                                .map(|set| set.iter().map(|event| event.to_string()).collect()),
+                            "nothing",
+                        ),
+                        join(
+                            self.successors.get(*phase).map(|set| set.iter().cloned().collect()),
+                            "terminal",
+                        ),
+                    ]
+                })
+                .collect();
+
+            let mut widths = headers.map(str::len);
+            for row in &rows {
+                for (column, cell) in row.iter().enumerate() {
+                    widths[column] = widths[column].max(cell.len());
+                }
+            }
+            let format_row = |cells: [&str; 3]| {
+                format!(
+                    "| {:<w0$} | {:<w1$} | {:<w2$} |\n",
+                    cells[0],
+                    cells[1],
+                    cells[2],
+                    w0 = widths[0],
+                    w1 = widths[1],
+                    w2 = widths[2],
+                )
+            };
+
+            let mut block = format_row(headers);
+            block.push_str(&format!(
+                "|{}|{}|{}|\n",
+                "-".repeat(widths[0] + 2),
+                "-".repeat(widths[1] + 2),
+                "-".repeat(widths[2] + 2),
+            ));
+            for row in &rows {
+                block.push_str(&format_row([&row[0], &row[1], &row[2]]));
+            }
+            block.push_str(&format!(
+                "\n{} reachable states, {} attempted transitions, {} accepted.\n",
+                self.visited, self.attempted, self.accepted,
+            ));
+            block
+        }
+
+        /// Compares the rendered block with the one recorded in the spec.
+        /// The spec claims the block is derived from this sweep; holding the
+        /// two equal is what keeps that claim true.
+        fn check_against_spec(&self) {
+            let (spec, start, end) = spec_region();
+            let rendered = self.render();
+            assert!(
+                spec[start..end] == rendered,
+                "the observed block in startup-lifecycle.md disagrees with \
+                 the sweep. Expected:\n\n{rendered}\nRun `cargo \
+                 surfpool-update-startup-spec` to regenerate it."
+            );
+        }
+
+        /// Rewrites the recorded block in place from this sweep's
+        /// observations, leaving everything outside the markers untouched.
+        fn write_to_spec(&self) {
+            let (spec, start, end) = spec_region();
+            let updated = format!("{}{}{}", &spec[..start], self.render(), &spec[end..]);
+            std::fs::write(SPEC_PATH, updated)
+                .unwrap_or_else(|error| panic!("could not write {SPEC_PATH}: {error}"));
+            eprintln!("regenerated the observed block in {SPEC_PATH}");
+        }
+    }
+
+    const SPEC_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/startup-lifecycle.md");
+
+    /// Reads the spec and locates the observed block, returning the file's
+    /// content and the byte range between the block's markers.
+    fn spec_region() -> (String, usize, usize) {
+        const BEGIN: &str = "<!-- BEGIN GENERATED: observed -->\n";
+        const END: &str = "<!-- END GENERATED: observed -->";
+
+        let spec = std::fs::read_to_string(SPEC_PATH)
+            .unwrap_or_else(|error| panic!("could not read {SPEC_PATH}: {error}"));
+        let start = spec
+            .find(BEGIN)
+            .unwrap_or_else(|| panic!("{SPEC_PATH} has no {BEGIN:?} marker"))
+            + BEGIN.len();
+        let end = spec[start..]
+            .find(END)
+            .unwrap_or_else(|| panic!("{SPEC_PATH} has no {END:?} marker"))
+            + start;
+        (spec, start, end)
+    }
+
+    /// Forges a state the machine cannot derive, to demonstrate the rule
+    /// rejects it.
+    ///
+    /// The machine makes illegal startup states unrepresentable, so a rule
+    /// applied only to machine-derived states never meets a violation and
+    /// cannot be shown to discriminate. `with_startup` cannot produce this
+    /// pairing; a struct literal can, because the response's fields are public.
+    /// Rejecting the forged pairing establishes that a client sees only
+    /// legally derivable states.
+    #[test]
+    fn the_forbidden_pairing_is_one_we_can_build() {
+        let mut outstanding = SurfnetStartupStatus::default();
+        outstanding
+            .seal_plan(vec![SurfnetStartupTask::RemoteAccounts])
+            .expect("an unsealed plan should accept a seal");
+        assert_eq!(outstanding.phase(), SurfnetStartupPhase::Initializing);
+
+        // The response a client received during the clone window before the
+        // fix: a sealed plan with the clone outstanding, and an empty list.
+        let forbidden = GetSurfnetInfoResponse {
+            runbook_executions: vec![],
+            startup: outstanding.clone(),
+        };
+
+        // Anchor's readiness rule, applied to that response.
+        assert!(
+            forbidden
+                .runbook_executions
+                .iter()
+                .all(|execution| execution.completed_at.is_some()),
+            "a legacy client reads this response as startup finished"
+        );
+        assert!(
+            !forbidden.startup.is_ready(),
+            "and it reads that from a surfnet that is not ready"
+        );
+
+        assert!(
+            !compat_list_agrees_with_phase(
+                &forbidden.runbook_executions,
+                forbidden.startup.phase()
+            ),
+            "the rule accepted the pairing issue 715 was reported as"
+        );
+
+        // The projection the surfnet actually answers through never builds it.
+        let answered =
+            GetSurfnetInfoResponse::with_startup(vec![], outstanding.clone(), STARTED_AT);
+        assert!(
+            compat_list_agrees_with_phase(&answered.runbook_executions, outstanding.phase()),
+            "the projection produced the forbidden pairing: {answered:?}"
+        );
+    }
+}
+
 /// WebSocket subscription counts
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
 pub struct WsSubscriptions {
