@@ -58,7 +58,8 @@ use spl_token_2022_interface::{
 use surfpool_types::{
     AccountSnapshot, CheatcodeConfig, CheatcodeControlConfig, CheatcodeFilter,
     DEFAULT_SLOT_TIME_MS, Idl, RpcProfileDepth, RpcProfileResultConfig, SimnetCommand, SimnetEvent,
-    StartupPlanner, SurfnetStartupTask, SurfpoolConfig, UiAccountChange, UiAccountProfileState,
+    StartupPlanner, SurfnetStartupPhase, SurfnetStartupStatus, SurfnetStartupTask,
+    SurfnetStartupTaskState, SurfpoolConfig, UiAccountChange, UiAccountProfileState,
     UiKeyedProfileResult,
     types::{
         BlockProductionMode, RpcConfig, SimnetConfig, SubgraphConfig, TransactionStatusEvent,
@@ -4307,6 +4308,232 @@ async fn readiness_is_withheld_while_a_declared_clone_is_outstanding(test_type: 
         "the surfnet reported itself ready while a declared clone was still \
          outstanding: {:?}",
         answered.value.runbook_executions
+    );
+}
+
+/// Starts a runloop that seals nothing on its own, so a test can play planner.
+///
+/// The caller holds the returned guard: dropping it stops the runloop.
+fn start_runloop_awaiting_a_planner(
+    test_type: TestType,
+) -> (SurfnetSvmLocker, Sender<SimnetCommand>, RunloopGuard) {
+    let config = SurfpoolConfig {
+        simnets: vec![SimnetConfig {
+            block_production_mode: BlockProductionMode::Manual, // Prevent ticks
+            offline_mode: true,
+            ..SimnetConfig::default()
+        }],
+        // The CLI's role, without the CLI: nobody seals but the test.
+        startup_planner: StartupPlanner::External,
+        // Ports per scenario: these run concurrently, and two runloops on the
+        // default ports means the second dies at bind time.
+        rpc: RpcConfig {
+            bind_port: get_free_port().unwrap(),
+            ws_port: get_free_port().unwrap(),
+            ..Default::default()
+        },
+        ..SurfpoolConfig::default()
+    };
+
+    let (surfnet_svm, _simnet_events_rx, geyser_events_rx) = test_type.initialize_svm();
+    let (commands_tx, commands_rx) = unbounded();
+    let svm_locker = SurfnetSvmLocker::new(surfnet_svm);
+    let observer = svm_locker.clone();
+
+    let runloop = spawn_runloop(
+        svm_locker,
+        config,
+        (commands_tx.clone(), commands_rx),
+        geyser_events_rx,
+    )
+    .expect("the runloop should start");
+
+    (observer, commands_tx, runloop)
+}
+
+/// Waits for the startup status to satisfy `predicate`, polling rather than
+/// watching: a watch channel keeps only its latest value, so a sequence of
+/// fast transitions would arrive as one.
+async fn await_startup<F>(observer: &SurfnetSvmLocker, what: &str, predicate: F)
+where
+    F: Fn(&SurfnetStartupStatus) -> bool,
+{
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let status = observer.startup_status();
+        if predicate(&status) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {what}; status is {status:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// The ordering guarantee the CLI relies on: a task cannot start before the
+/// plan containing it is sealed. The runloop must refuse the early command and
+/// carry on, rather than registering a task nobody planned.
+// Multi-threaded flavor: the locker reads through a blocking guard, which
+// panics on a current-thread runtime.
+#[test_case(TestType::in_memory(); "with in-memory sqlite db")]
+#[tokio::test(flavor = "multi_thread")]
+async fn startup_refuses_tasks_dispatched_before_the_seal(test_type: TestType) {
+    let (observer, commands, _runloop) = start_runloop_awaiting_a_planner(test_type);
+
+    // Out of order on purpose: nothing is sealed, so this must be refused.
+    commands
+        .send(SimnetCommand::StartStartupTask(
+            SurfnetStartupTask::RemoteAccounts,
+        ))
+        .unwrap();
+
+    let (reply_tx, reply_rx) = bounded(1);
+    commands
+        .send(SimnetCommand::SealStartupPlan(
+            vec![SurfnetStartupTask::RemoteAccounts],
+            reply_tx,
+        ))
+        .unwrap();
+    reply_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the runloop should answer the seal")
+        .expect("sealing an unsealed plan should be accepted");
+
+    // Had the early command been registered, the task would be Running here.
+    let status = observer.startup_status();
+    assert_eq!(status.phase(), SurfnetStartupPhase::Initializing);
+    assert!(
+        status
+            .tasks()
+            .iter()
+            .all(|task| task.state == SurfnetStartupTaskState::Pending),
+        "the refused command must not have started anything: {status:?}"
+    );
+}
+
+/// Deployment can finish while hydration is still in flight, because the
+/// planner dispatches them concurrently. The phase must hold at Initializing
+/// until the clones land.
+// Multi-threaded flavor: the locker reads through a blocking guard, which
+// panics on a current-thread runtime.
+#[test_case(TestType::in_memory(); "with in-memory sqlite db")]
+#[tokio::test(flavor = "multi_thread")]
+async fn startup_holds_initializing_when_deployment_finishes_first(test_type: TestType) {
+    let (observer, commands, _runloop) = start_runloop_awaiting_a_planner(test_type);
+
+    let (reply_tx, reply_rx) = bounded(1);
+    commands
+        .send(SimnetCommand::SealStartupPlan(
+            vec![
+                SurfnetStartupTask::RemoteAccounts,
+                SurfnetStartupTask::Deployment,
+            ],
+            reply_tx,
+        ))
+        .unwrap();
+    reply_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the runloop should answer the seal")
+        .expect("sealing an unsealed plan should be accepted");
+
+    for command in [
+        SimnetCommand::StartStartupTask(SurfnetStartupTask::Deployment),
+        SimnetCommand::CompleteStartupTask(SurfnetStartupTask::Deployment, Ok(())),
+    ] {
+        commands.send(command).unwrap();
+    }
+    await_startup(&observer, "deployment to succeed", |status| {
+        status.tasks().iter().any(|task| {
+            task.task == SurfnetStartupTask::Deployment
+                && task.state == SurfnetStartupTaskState::Succeeded
+        })
+    })
+    .await;
+
+    // The interleaving under test: deployment is done, hydration is not, and
+    // the phase must not have moved.
+    assert_eq!(
+        observer.startup_status().phase(),
+        SurfnetStartupPhase::Initializing,
+        "deployment finishing first must not move the phase"
+    );
+
+    for command in [
+        SimnetCommand::StartStartupTask(SurfnetStartupTask::RemoteAccounts),
+        SimnetCommand::CompleteStartupTask(SurfnetStartupTask::RemoteAccounts, Ok(())),
+    ] {
+        commands.send(command).unwrap();
+    }
+    await_startup(&observer, "readiness", |status| status.is_ready()).await;
+}
+
+/// A datasource that cannot be reached fails the hydration task, and a failed
+/// task is terminal: the phase goes to Failed and stays there.
+///
+/// The datasource here is a closed port, which models the failure without a
+/// mock. `get_free_port` binds an address and releases it, so nothing is
+/// listening: the connection is refused immediately and identically on every
+/// machine. A stub server would need its own lifecycle and could drift from
+/// what a real client does; a timeout would make the test wait. Refusal is the
+/// cheapest reliable way to make a fetch fail, and which failure it is does not
+/// matter here, only that the task reports one.
+// Multi-threaded flavor: the locker reads through a blocking guard, which
+// panics on a current-thread runtime.
+#[test_case(TestType::in_memory(); "with in-memory sqlite db")]
+#[tokio::test(flavor = "multi_thread")]
+async fn startup_fails_when_the_datasource_cannot_be_reached(test_type: TestType) {
+    let dead_port = get_free_port().expect("a port to leave closed");
+    let unreachable = format!("http://127.0.0.1:{dead_port}");
+
+    let (observer, commands, _runloop) = start_runloop_awaiting_a_planner(test_type);
+
+    let (reply_tx, reply_rx) = bounded(1);
+    commands
+        .send(SimnetCommand::SealStartupPlan(
+            // Deployment is here to stay untouched: after the failure it is the
+            // task a resurrection would move, and the one this test watches to
+            // prove nothing does.
+            vec![
+                SurfnetStartupTask::RemoteAccounts,
+                SurfnetStartupTask::Deployment,
+            ],
+            reply_tx,
+        ))
+        .unwrap();
+    reply_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the runloop should answer the seal")
+        .expect("sealing an unsealed plan should be accepted");
+
+    for command in [
+        SimnetCommand::StartStartupTask(SurfnetStartupTask::RemoteAccounts),
+        SimnetCommand::FetchRemoteAccounts(vec![Pubkey::new_unique()], unreachable),
+    ] {
+        commands.send(command).unwrap();
+    }
+
+    await_startup(&observer, "the failed phase", |status| {
+        status.phase() == SurfnetStartupPhase::Failed
+    })
+    .await;
+
+    let status = observer.startup_status();
+    assert!(
+        status.tasks().iter().any(|task| {
+            task.task == SurfnetStartupTask::RemoteAccounts
+                && task.state == SurfnetStartupTaskState::Failed
+                && task.error.is_some()
+        }),
+        "the unreachable datasource should fail the task and record why: {status:?}"
+    );
+    assert!(
+        status.tasks().iter().any(|task| {
+            task.task == SurfnetStartupTask::Deployment
+                && task.state == SurfnetStartupTaskState::Pending
+        }),
+        "a failure is terminal; nothing should move the other task: {status:?}"
     );
 }
 
