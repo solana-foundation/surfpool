@@ -25,6 +25,7 @@ use libloading::{Library, Symbol};
 use serde::Serialize;
 use solana_commitment_config::CommitmentConfig;
 use solana_message::SimpleAddressLoader;
+use solana_pubkey::Pubkey;
 use solana_transaction::sanitized::{MessageHash, SanitizedTransaction};
 use solana_transaction_status::RewardsAndNumPartitions;
 use surfpool_types::{
@@ -42,8 +43,29 @@ use crate::{
         admin::AdminRpc, bank_data::BankData, full::Full, jito::Jito, minimal::Minimal,
         surfnet_cheatcodes::SurfnetCheatcodes, ws::Rpc,
     },
-    surfnet::{GeyserEvent, PluginCommand, locker::SurfnetSvmLocker, remote::SurfnetRemoteClient},
+    surfnet::{
+        GetAccountResult, GeyserEvent, PluginCommand, locker::SurfnetSvmLocker,
+        remote::SurfnetRemoteClient,
+    },
 };
+
+/// The accounts a hydration batch could not produce: requested, not found
+/// remotely, and not deliberately kept offline. Offline accounts are absent by
+/// configuration rather than by accident, so they are not reported.
+fn absent_after_hydration(
+    svm_locker: &SurfnetSvmLocker,
+    results: &[GetAccountResult],
+) -> Vec<Pubkey> {
+    results
+        .iter()
+        .filter_map(|result| match result {
+            GetAccountResult::None(pubkey) if !svm_locker.is_account_offline(pubkey) => {
+                Some(*pubkey)
+            }
+            _ => None,
+        })
+        .collect()
+}
 
 /// A loaded geyser plugin with all metadata needed for lifecycle management.
 /// Field order matters: `plugin` must be declared before `_library` so it drops first,
@@ -565,6 +587,24 @@ pub async fn start_block_production_runloop(
                                     // batch, so Ready cannot expose a partially installed clone set.
                                     svm_locker
                                         .write_multiple_account_updates(&account_updates.inner);
+
+                                    // A declared account the datasource does not have is not a
+                                    // failure: hydration did complete, and some workflows clone
+                                    // addresses that do not exist yet. It is worth saying out
+                                    // loud, though, because the surfnet reaches Ready with the
+                                    // account absent, which looks exactly like the readiness race
+                                    // this plan exists to prevent.
+                                    let absent =
+                                        absent_after_hydration(&svm_locker, &account_updates.inner);
+                                    if !absent.is_empty() {
+                                        let _ = svm_locker.simnet_events_tx().try_send(
+                                            SimnetEvent::warn(format!(
+                                                "Cloned accounts not found on the datasource, and \
+                                                 absent locally: {}",
+                                                absent.iter().map(|key| key.to_string()).join(", ")
+                                            )),
+                                        );
+                                    }
                                     Ok(())
                                 }
                                 Err(error) => Err(format!(
@@ -1116,4 +1156,43 @@ async fn start_ws_rpc_server_runloop(
         .map_err(|_| "Failed to receive WebSocket RPC server startup result".to_string())??;
 
     Ok((_ws_handle, close_handle))
+}
+
+#[cfg(test)]
+mod absent_after_hydration_tests {
+    use solana_account::Account;
+
+    use super::*;
+    use crate::surfnet::svm::SurfnetSvm;
+
+    /// A hydration batch reports absence two ways that must not be conflated:
+    /// the datasource did not have the account, or the account was marked
+    /// offline and never asked for. Only the first is worth a warning.
+    // Multi-threaded flavor: the locker reads through a blocking guard, which
+    // panics on a current-thread runtime.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn only_unexpectedly_absent_accounts_are_reported() {
+        let (surfnet_svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let locker = SurfnetSvmLocker::new(surfnet_svm);
+
+        let missing = Pubkey::new_unique();
+        let offline = Pubkey::new_unique();
+        let found = Pubkey::new_unique();
+        locker
+            .insert_offline_account(offline, false)
+            .await
+            .expect("marking an account offline should succeed");
+
+        let results = vec![
+            GetAccountResult::None(missing),
+            GetAccountResult::None(offline),
+            GetAccountResult::FoundAccount(found, Account::default(), true),
+        ];
+
+        assert_eq!(
+            absent_after_hydration(&locker, &results),
+            vec![missing],
+            "an account kept offline on purpose is not a surprise; a missing one is"
+        );
+    }
 }
