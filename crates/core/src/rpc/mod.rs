@@ -479,4 +479,49 @@ mod middleware_tests {
             ])
         );
     }
+
+    #[test]
+    fn http_middleware_enforces_cheatcode_policy_per_batch_call() {
+        let (surfnet_svm, _, _) = SurfnetSvm::default();
+        let (simnet_commands_tx, _) = unbounded();
+        let (plugin_commands_tx, _) = unbounded::<PluginCommand>();
+        let middleware = SurfpoolMiddleware::new(
+            SurfnetSvmLocker::new(surfnet_svm),
+            &simnet_commands_tx,
+            &RpcConfig::default(),
+            &None,
+            plugin_commands_tx,
+        );
+        middleware
+            .cheatcode_config
+            .lock()
+            .unwrap()
+            .disable_cheatcode(&"surfnet_test".to_string())
+            .unwrap();
+        let mut io = MetaIoHandler::with_middleware(middleware);
+        io.add_sync_method("getSlot", |_| Ok(Value::from(123)));
+        io.add_sync_method("surfnet_test", |_| Ok(Value::Bool(true)));
+
+        let response = io
+            .handle_request_sync(
+                r#"[{"jsonrpc":"2.0","id":1,"method":"getSlot"},{"jsonrpc":"2.0","id":2,"method":"surfnet_test"}]"#,
+                None,
+            )
+            .expect("a disabled cheatcode must not discard other batch responses");
+
+        assert_eq!(
+            serde_json::from_str::<Value>(&response).unwrap(),
+            serde_json::json!([
+                {"jsonrpc": "2.0", "result": 123, "id": 1},
+                {
+                    "jsonrpc": "2.0",
+                    "error": {
+                        "code": -32600,
+                        "message": "Cheatcode rpc method: surfnet_test is currently disabled"
+                    },
+                    "id": 2
+                }
+            ])
+        );
+    }
 }
