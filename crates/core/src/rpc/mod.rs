@@ -444,4 +444,39 @@ mod middleware_tests {
             serde_json::json!([{"jsonrpc": "2.0", "result": 123, "id": 2}])
         );
     }
+
+    #[test]
+    fn http_middleware_isolates_errors_within_json_rpc_batches() {
+        let (surfnet_svm, _, _) = SurfnetSvm::default();
+        let (simnet_commands_tx, _) = unbounded();
+        let (plugin_commands_tx, _) = unbounded::<PluginCommand>();
+        let middleware = SurfpoolMiddleware::new(
+            SurfnetSvmLocker::new(surfnet_svm),
+            &simnet_commands_tx,
+            &RpcConfig::default(),
+            &None,
+            plugin_commands_tx,
+        );
+        let mut io = MetaIoHandler::with_middleware(middleware);
+        io.add_sync_method("getSlot", |_| Ok(Value::from(123)));
+
+        let response = io
+            .handle_request_sync(
+                r#"[{"jsonrpc":"2.0","id":1,"method":"getSlot"},{"jsonrpc":"2.0","id":2,"method":"unknownMethod"}]"#,
+                None,
+            )
+            .expect("one unknown method must not discard successful batch responses");
+
+        assert_eq!(
+            serde_json::from_str::<Value>(&response).unwrap(),
+            serde_json::json!([
+                {"jsonrpc": "2.0", "result": 123, "id": 1},
+                {
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32601, "message": "Method not found"},
+                    "id": 2
+                }
+            ])
+        );
+    }
 }
