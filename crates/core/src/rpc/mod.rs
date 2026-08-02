@@ -6,7 +6,8 @@ use std::{
 use blake3::Hash;
 use crossbeam_channel::Sender;
 use jsonrpc_core::{
-    BoxFuture, Error, ErrorCode, FutureResponse, Metadata, Middleware, Request, Response,
+    BoxFuture, Call, Error, ErrorCode, FutureResponse, Metadata, Middleware, Output, Request,
+    Response,
     futures::{FutureExt, future::Either},
     middleware,
 };
@@ -154,23 +155,6 @@ impl Middleware<Option<RunloopContext>> for SurfpoolMiddleware {
         F: FnOnce(Request, Option<RunloopContext>) -> X + Send,
         X: Future<Output = Option<Response>> + Send + 'static,
     {
-        let Request::Single(jsonrpc_core::Call::MethodCall(ref method_call)) = request else {
-            let error = Response::from(
-                Error {
-                    code: ErrorCode::InvalidRequest,
-                    message: "Only method calls are supported".into(),
-                    data: None,
-                },
-                None,
-            );
-            warn!("Request rejected due to not being a single method call");
-
-            return Either::Left(Box::pin(async move { Some(error) }));
-        };
-
-        let method_name = method_call.method.clone();
-        debug!("Processing request '{}'", method_name);
-
         let meta = Some(RunloopContext {
             id: None,
             svm_locker: self.surfnet_svm.clone(),
@@ -181,50 +165,62 @@ impl Middleware<Option<RunloopContext>> for SurfpoolMiddleware {
             plugin_commands_tx: self.plugin_commands_tx.clone(),
         });
 
-        // All surfnet cheatcodes will start with surfnet. If the request is a cheatcode, make sure it isn't disabled.
-        if method_name.starts_with("surfnet_")
-            && let Some(meta_val) = meta.clone()
-        {
-            let Ok(meta_val) = meta_val.cheatcode_config.lock() else {
-                let error = Response::from(
-                    Error {
-                        code: ErrorCode::InternalError,
-                        message: "An internal server error occured".to_string(),
-                        data: None,
-                    },
-                    None,
-                );
-                warn!("Request rejected due to cheatcode being disabled");
+        Either::Right(next(request, meta))
+    }
 
-                return Either::Left(Box::pin(async move { Some(error) }));
-            };
-            if meta_val.is_cheatcode_disabled(&method_name) {
-                let error = Response::from(
-                    Error {
+    fn on_call<F, X>(
+        &self,
+        call: Call,
+        meta: Option<RunloopContext>,
+        next: F,
+    ) -> Either<Self::CallFuture, X>
+    where
+        F: Fn(Call, Option<RunloopContext>) -> X + Send + Sync,
+        X: Future<Output = Option<Output>> + Send + 'static,
+    {
+        let (method_name, id, version) = match &call {
+            Call::MethodCall(call) => (call.method.clone(), Some(call.id.clone()), call.jsonrpc),
+            Call::Notification(call) => (call.method.clone(), None, call.jsonrpc),
+            Call::Invalid { .. } => return Either::Right(next(call, meta)),
+        };
+
+        debug!("Processing request '{}'", method_name);
+
+        let error = if method_name.starts_with("surfnet_") {
+            meta.as_ref()
+                .and_then(|meta| match meta.cheatcode_config.lock() {
+                    Ok(config) if config.is_cheatcode_disabled(&method_name) => Some(Error {
                         code: ErrorCode::InvalidRequest,
                         message: format!(
                             "Cheatcode rpc method: {method_name} is currently disabled"
                         ),
                         data: None,
-                    },
-                    None,
-                );
-                warn!("Request rejected due to cheatcode rpc method being disabled");
+                    }),
+                    Ok(_) => None,
+                    Err(_) => Some(Error {
+                        code: ErrorCode::InternalError,
+                        message: "An internal server error occured".to_string(),
+                        data: None,
+                    }),
+                })
+        } else {
+            None
+        };
 
-                return Either::Left(Box::pin(async move { Some(error) }));
-            }
+        if let Some(error) = error {
+            warn!("Request rejected due to cheatcode rpc method being disabled");
+            let output = id.map(|id| Output::from(Err(error), id, version));
+            return Either::Left(Box::pin(async move { output }));
         }
 
-        Either::Left(Box::pin(next(request, meta).map(move |res| {
-            if let Some(Response::Single(output)) = &res {
-                if let jsonrpc_core::Output::Failure(failure) = output {
-                    debug!(
-                        "RPC error for method '{}': code={:?}, message={}",
-                        method_name, failure.error.code, failure.error.message
-                    );
-                }
+        Either::Left(Box::pin(next(call, meta).map(move |output| {
+            if let Some(Output::Failure(failure)) = &output {
+                debug!(
+                    "RPC error for method '{}': code={:?}, message={}",
+                    method_name, failure.error.code, failure.error.message
+                );
             }
-            res
+            output
         })))
     }
 }
@@ -378,4 +374,74 @@ pub fn not_implemented_err_async<T>(method: &str) -> BoxFuture<Result<T, Error>>
             data: None,
         })
     })
+}
+
+#[cfg(test)]
+mod middleware_tests {
+    use crossbeam_channel::unbounded;
+    use jsonrpc_core::MetaIoHandler;
+    use serde_json::Value;
+    use surfpool_types::RpcConfig;
+
+    use super::SurfpoolMiddleware;
+    use crate::surfnet::{PluginCommand, locker::SurfnetSvmLocker, svm::SurfnetSvm};
+
+    #[test]
+    fn http_middleware_preserves_json_rpc_batch_responses() {
+        let (surfnet_svm, _, _) = SurfnetSvm::default();
+        let (simnet_commands_tx, _) = unbounded();
+        let (plugin_commands_tx, _) = unbounded::<PluginCommand>();
+        let middleware = SurfpoolMiddleware::new(
+            SurfnetSvmLocker::new(surfnet_svm),
+            &simnet_commands_tx,
+            &RpcConfig::default(),
+            &None,
+            plugin_commands_tx,
+        );
+        let mut io = MetaIoHandler::with_middleware(middleware);
+        io.add_sync_method("getSlot", |_| Ok(Value::from(123)));
+
+        let response = io
+            .handle_request_sync(
+                r#"[{"jsonrpc":"2.0","id":1,"method":"getSlot"},{"jsonrpc":"2.0","id":2,"method":"getSlot"}]"#,
+                None,
+            )
+            .expect("a JSON-RPC batch must return one response per method call");
+
+        assert_eq!(
+            serde_json::from_str::<Value>(&response).unwrap(),
+            serde_json::json!([
+                {"jsonrpc": "2.0", "result": 123, "id": 1},
+                {"jsonrpc": "2.0", "result": 123, "id": 2}
+            ])
+        );
+    }
+
+    #[test]
+    fn http_middleware_omits_batch_notification_responses() {
+        let (surfnet_svm, _, _) = SurfnetSvm::default();
+        let (simnet_commands_tx, _) = unbounded();
+        let (plugin_commands_tx, _) = unbounded::<PluginCommand>();
+        let middleware = SurfpoolMiddleware::new(
+            SurfnetSvmLocker::new(surfnet_svm),
+            &simnet_commands_tx,
+            &RpcConfig::default(),
+            &None,
+            plugin_commands_tx,
+        );
+        let mut io = MetaIoHandler::with_middleware(middleware);
+        io.add_sync_method("getSlot", |_| Ok(Value::from(123)));
+
+        let response = io
+            .handle_request_sync(
+                r#"[{"jsonrpc":"2.0","method":"getSlot"},{"jsonrpc":"2.0","id":2,"method":"getSlot"}]"#,
+                None,
+            )
+            .expect("the method call in a mixed batch must return a response");
+
+        assert_eq!(
+            serde_json::from_str::<Value>(&response).unwrap(),
+            serde_json::json!([{"jsonrpc": "2.0", "result": 123, "id": 2}])
+        );
+    }
 }
