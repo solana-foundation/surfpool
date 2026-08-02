@@ -354,9 +354,76 @@ pub async fn handle_start_local_surfnet_command(
     service_result
 }
 
+/// Parses declared clone addresses, keeping the ones that parse and describing
+/// the ones that do not.
+///
+/// No runbook is built from this list: the addresses are handed to the surfnet
+/// to hydrate, and everything else proceeds without them. So a malformed entry
+/// costs that one account rather than the startup, and the rejected addresses
+/// are named so a user can fix the typo.
+fn parse_clone_addresses(clones: &[String]) -> (Vec<Pubkey>, Vec<String>) {
+    let mut parsed = vec![];
+    let mut rejected = vec![];
+    for clone in clones {
+        match clone.parse() {
+            Ok(pubkey) => parsed.push(pubkey),
+            Err(e) => rejected.push(format!("{clone}: {e}")),
+        }
+    }
+    (parsed, rejected)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{default_public_host, public_service_url};
+    use super::{RunbookExecutionMode, default_public_host, public_service_url};
+
+    /// A project that already has a `txtx.yml` executes it as written. Framework
+    /// detection contributes clone addresses on that path, but nothing the
+    /// runbook needs, so a project whose `Anchor.toml` or `Cargo.toml` cannot be
+    /// read still starts. Treating that read as fatal would strand a working
+    /// project on a file it does not depend on.
+    #[test]
+    fn an_existing_runbook_does_not_depend_on_framework_detection() {
+        assert!(
+            !RunbookExecutionMode::ExistingOnDisk.requires_framework_detection(),
+            "an on-disk runbook is authoritative; detection only adds clones"
+        );
+    }
+
+    /// One malformed address should not cost a project the rest of its clones,
+    /// nor its startup. No runbook is built from the clone list, so a typo in
+    /// `test.validator.clone` is reported and the valid addresses still load.
+    #[test]
+    fn a_malformed_clone_address_does_not_discard_the_valid_ones() {
+        let (parsed, rejected) = super::parse_clone_addresses(&[
+            "AqH29mZfQFgRpfwaPoTMWSKJ5kqauoc1FwVBRksZyQrt".to_string(),
+            "not-a-pubkey".to_string(),
+            "SysvarC1ock11111111111111111111111111111111".to_string(),
+        ]);
+
+        assert_eq!(parsed.len(), 2, "both valid addresses should survive");
+        assert_eq!(rejected.len(), 1, "the malformed one should be reported");
+        assert!(
+            rejected[0].contains("not-a-pubkey"),
+            "the report should name the address a user has to fix: {}",
+            rejected[0]
+        );
+    }
+
+    /// The other two modes build the runbook out of what detection finds, so a
+    /// failure there leaves nothing to execute and must surface.
+    #[test]
+    fn scaffolded_and_in_memory_runbooks_require_framework_detection() {
+        for mode in [
+            RunbookExecutionMode::ScaffoldOnDisk,
+            RunbookExecutionMode::InMemory,
+        ] {
+            assert!(
+                mode.requires_framework_detection(),
+                "{mode:?} has no runbook without detection"
+            );
+        }
+    }
 
     #[test]
     fn default_public_host_maps_wildcard_binds_to_loopback() {
@@ -785,6 +852,16 @@ enum RunbookExecutionMode {
 }
 
 impl RunbookExecutionMode {
+    /// Whether the runbook this mode executes is built from what framework
+    /// detection finds. When it is not, a detection failure costs at most the
+    /// clone addresses, and the runbook on disk is still executable.
+    fn requires_framework_detection(&self) -> bool {
+        match self {
+            Self::ExistingOnDisk => false,
+            Self::ScaffoldOnDisk | Self::InMemory => true,
+        }
+    }
+
     fn from_inputs(
         has_custom_artifacts_path: bool,
         anchor_compat: bool,
@@ -954,13 +1031,29 @@ async fn plan_deployment(
         on_disk_runbook_data = Some((txtx_manifest_location.clone(), cmd.project.runbooks.clone()));
     }
 
-    let deployment = detect_program_frameworks(
+    // A detection failure is fatal only when the runbook is built from what it
+    // finds. With a `txtx.yml` already on disk the manifest is authoritative,
+    // and an unreadable `Anchor.toml` or `Cargo.toml` costs the clone addresses
+    // rather than the whole startup, so it is reported and startup continues.
+    let deployment = match detect_program_frameworks(
         &cmd.project.manifest_path,
         &cmd.project.anchor_test_config_paths,
         cmd.project.artifacts_path.as_deref(),
     )
     .await
-    .map_err(|e| format!("Failed to detect project framework: {e}"))?;
+    {
+        Ok(deployment) => deployment,
+        Err(e) if mode.requires_framework_detection() => {
+            return Err(format!("Failed to detect project framework: {e}"));
+        }
+        Err(e) => {
+            let _ = simnet_events_tx.send(SimnetEvent::warn(format!(
+                "Could not detect the project framework, continuing with the runbook on disk. \
+                 Declared clones, if any, were not loaded: {e}"
+            )));
+            None
+        }
+    };
 
     if let Some(ProgramFrameworkData {
         framework,
@@ -971,15 +1064,16 @@ async fn plan_deployment(
         clones,
     }) = deployment
     {
-        clone_pubkeys = clones
-            .unwrap_or_default()
-            .iter()
-            .map(|clone| {
-                clone
-                    .parse()
-                    .map_err(|e| format!("Failed to parse clone address {clone}: {e}"))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let (parsed, rejected) = parse_clone_addresses(&clones.unwrap_or_default());
+        clone_pubkeys = parsed;
+        if !rejected.is_empty() {
+            let _ = simnet_events_tx.send(SimnetEvent::warn(format!(
+                "Ignoring {} declared clone address(es) that could not be parsed; \
+                 the rest were loaded. {}",
+                rejected.len(),
+                rejected.join("; ")
+            )));
+        }
 
         match mode {
             RunbookExecutionMode::ScaffoldOnDisk => {
