@@ -478,10 +478,17 @@ pub async fn start_block_production_runloop(
                         block_production_mode = update;
                         continue
                     }
-                    SimnetCommand::ProcessTransaction(_key, transaction, status_tx, skip_preflight, skip_sig_verify_override) => {
-                       let skip_sig_verify = skip_sig_verify_override.unwrap_or(global_skip_sig_verify);
+                    SimnetCommand::ProcessTransaction(request) => {
+                       let skip_sig_verify = request.skip_sig_verify.unwrap_or(global_skip_sig_verify);
                        let sigverify = !skip_sig_verify;
-                       if let Err(e) = svm_locker.process_transaction(&remote_client_with_commitment, transaction, status_tx, skip_preflight, sigverify).await {
+                       if let Err(e) = svm_locker.process_transaction_with_blockhash_validation(
+                            &remote_client_with_commitment,
+                            request.transaction,
+                            request.status_tx,
+                            request.skip_preflight,
+                            sigverify,
+                            request.blockhash_validation,
+                        ).await {
                             let _ = svm_locker.simnet_events_tx().send(SimnetEvent::error(format!("Failed to process transaction: {}", e)));
                        }
                        if block_production_mode.eq(&BlockProductionMode::Transaction) {

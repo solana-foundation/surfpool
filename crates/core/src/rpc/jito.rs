@@ -13,7 +13,7 @@ use solana_transaction_status::{TransactionConfirmationStatus, UiTransactionEnco
 use surfpool_types::{
     JitoBundleStatus, RpcBundleExecutionError, RpcBundleRequest, RpcBundleSimulationSummary,
     RpcSimulateBundleConfig, RpcSimulateBundleResult, RpcSimulateBundleTransactionResult,
-    TransactionStatusEvent,
+    TransactionBlockhashValidationMode, TransactionStatusEvent,
 };
 
 use super::{RunloopContext, utils::decode_and_deserialize};
@@ -336,12 +336,13 @@ impl Jito for SurfpoolJitoRpc {
                 // HTTP worker thread is already inside a tokio runtime and `block_on` on the
                 // current handle panics with "Cannot start a runtime from within a runtime".
                 let process_res = sandbox_locker
-                    .process_transaction(
+                    .process_transaction_with_blockhash_validation(
                         remote_ctx,
                         tx.clone(),
                         status_tx,
                         skip_preflight,
                         sigverify,
+                        TransactionBlockhashValidationMode::ValidateAtExecution,
                     )
                     .await;
 
@@ -825,6 +826,7 @@ impl Jito for SurfpoolJitoRpc {
                         // caller asked for it. Avoids double-work on the hot path.
                         false,
                         true, // do_propagate -> status_rx receives typed errors
+                        TransactionBlockhashValidationMode::ValidateAtExecution,
                     )
                     .await;
 
@@ -1451,7 +1453,9 @@ mod tests {
                         continue;
                     };
                     match cmd {
-                        SimnetCommand::ProcessTransaction(_, tx, status_tx, _, _) => {
+                        SimnetCommand::ProcessTransaction(request) => {
+                            let tx = request.transaction;
+                            let status_tx = request.status_tx;
                             observed_process_tx_clone.fetch_add(1, Ordering::SeqCst);
 
                             // Minimal bookkeeping (mirrors other bundle tests) + unblock the RPC.

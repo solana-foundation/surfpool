@@ -54,8 +54,8 @@ use solana_transaction_status::{
 use surfpool_types::{
     AccountSnapshot, ComputeUnitsEstimationResult, ExecutionCapture, ExportSnapshotConfig, Idl,
     KeyedProfileResult, ProfileResult, RpcProfileResultConfig, RunbookExecutionStatusReport,
-    SimnetCommand, SimnetEvent, TransactionConfirmationStatus, TransactionStatusEvent,
-    UiKeyedProfileResult, UuidOrSignature, VersionedIdl,
+    SimnetCommand, SimnetEvent, TransactionBlockhashValidationMode, TransactionConfirmationStatus,
+    TransactionStatusEvent, UiKeyedProfileResult, UuidOrSignature, VersionedIdl,
 };
 use tokio::sync::RwLock;
 use txtx_addon_kit::indexmap::IndexSet;
@@ -81,6 +81,11 @@ enum ProcessTransactionResult {
     Success(TransactionMetadata),
     SimulationFailure(FailedTransactionMetadata),
     ExecutionFailure(FailedTransactionMetadata),
+}
+
+pub enum TransactionPreflightError {
+    SimulationFailure(FailedTransactionMetadata),
+    VerificationFailure(String),
 }
 
 pub struct SvmAccessContext<T> {
@@ -1166,6 +1171,73 @@ impl SurfnetSvmLocker {
         })
     }
 
+    pub async fn preflight_transaction(
+        &self,
+        remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
+        transaction: VersionedTransaction,
+        sigverify: bool,
+        blockhash_validation: TransactionBlockhashValidationMode,
+    ) -> Result<(), TransactionPreflightError> {
+        let tx_loaded_addresses = self
+            .get_loaded_addresses(remote_ctx, &transaction.message)
+            .await
+            .map_err(|e| TransactionPreflightError::VerificationFailure(e.to_string()))?;
+
+        if let Some(ref loaded) = tx_loaded_addresses {
+            let static_keys: HashSet<&Pubkey> =
+                transaction.message.static_account_keys().iter().collect();
+            for loaded_key in loaded.all_loaded_addresses() {
+                if static_keys.contains(loaded_key) {
+                    return Err(TransactionPreflightError::SimulationFailure(
+                        FailedTransactionMetadata {
+                            err: TransactionError::AccountLoadedTwice,
+                            meta: TransactionMetadata::default(),
+                        },
+                    ));
+                }
+            }
+        }
+
+        let transaction_accounts = self.get_pubkeys_from_message(
+            &transaction.message,
+            tx_loaded_addresses
+                .as_ref()
+                .map(|loaded| loaded.all_loaded_addresses()),
+        );
+
+        let account_updates = self
+            .get_multiple_accounts(remote_ctx, &transaction_accounts, None)
+            .await
+            .map_err(|e| TransactionPreflightError::VerificationFailure(e.to_string()))?
+            .inner;
+
+        let alt_account_updates = self
+            .get_multiple_accounts(
+                remote_ctx,
+                &tx_loaded_addresses
+                    .as_ref()
+                    .map(|loaded| loaded.alt_addresses())
+                    .unwrap_or_default(),
+                None,
+            )
+            .await
+            .map_err(|e| TransactionPreflightError::VerificationFailure(e.to_string()))?
+            .inner;
+
+        self.write_multiple_account_updates(&account_updates);
+        self.write_multiple_account_updates(&alt_account_updates);
+
+        self.with_svm_reader(|svm_reader| {
+            svm_reader.simulate_transaction_with_blockhash_validation(
+                transaction,
+                sigverify,
+                blockhash_validation,
+            )
+        })
+        .map(|_| ())
+        .map_err(TransactionPreflightError::SimulationFailure)
+    }
+
     pub fn is_instruction_profiling_enabled(&self) -> bool {
         self.with_svm_reader(|svm_reader| svm_reader.instruction_profiling_enabled)
     }
@@ -1182,6 +1254,26 @@ impl SurfnetSvmLocker {
         skip_preflight: bool,
         sigverify: bool,
     ) -> SurfpoolResult<()> {
+        self.process_transaction_with_blockhash_validation(
+            remote_ctx,
+            transaction,
+            status_tx,
+            skip_preflight,
+            sigverify,
+            TransactionBlockhashValidationMode::ValidateAtExecution,
+        )
+        .await
+    }
+
+    pub async fn process_transaction_with_blockhash_validation(
+        &self,
+        remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
+        transaction: VersionedTransaction,
+        status_tx: Sender<TransactionStatusEvent>,
+        skip_preflight: bool,
+        sigverify: bool,
+        blockhash_validation: TransactionBlockhashValidationMode,
+    ) -> SurfpoolResult<()> {
         let do_propagate_status_updates = true;
         let signature = transaction.signatures[0];
         let profile_result = match self
@@ -1192,6 +1284,7 @@ impl SurfnetSvmLocker {
                 skip_preflight,
                 sigverify,
                 do_propagate_status_updates,
+                blockhash_validation,
             )
             .await
         {
@@ -1250,6 +1343,7 @@ impl SurfnetSvmLocker {
                 skip_preflight,
                 sigverify,
                 do_propagate_status_updates,
+                TransactionBlockhashValidationMode::ValidateAtExecution,
             )
             .await?;
 
@@ -1271,6 +1365,7 @@ impl SurfnetSvmLocker {
         skip_preflight: bool,
         sigverify: bool,
         do_propagate: bool,
+        blockhash_validation: TransactionBlockhashValidationMode,
     ) -> SurfpoolResult<KeyedProfileResult> {
         let signature = transaction.signatures[0];
 
@@ -1465,6 +1560,7 @@ impl SurfnetSvmLocker {
                 pre_execution_capture,
                 &status_tx,
                 do_propagate,
+                blockhash_validation,
             )
             .await?;
 
@@ -1563,6 +1659,7 @@ impl SurfnetSvmLocker {
                     pre_execution_capture_cursor,
                     status_tx,
                     do_propagate,
+                    TransactionBlockhashValidationMode::ValidateAtExecution,
                 )
                 .await?;
 
@@ -1985,9 +2082,15 @@ impl SurfnetSvmLocker {
         pre_execution_capture: ExecutionCapture,
         status_tx: &Sender<TransactionStatusEvent>,
         do_propagate: bool,
+        blockhash_validation: TransactionBlockhashValidationMode,
     ) -> SurfpoolResult<ProfileResult> {
         let res = match self
-            .do_process_transaction_internal(transaction.clone(), skip_preflight, sigverify)
+            .do_process_transaction_internal(
+                transaction.clone(),
+                skip_preflight,
+                sigverify,
+                blockhash_validation,
+            )
             .await
         {
             ProcessTransactionResult::Success(transaction_metadata) => self
@@ -2035,12 +2138,17 @@ impl SurfnetSvmLocker {
         transaction: VersionedTransaction,
         skip_preflight: bool,
         sigverify: bool,
+        blockhash_validation: TransactionBlockhashValidationMode,
     ) -> ProcessTransactionResult {
         // if not skipping preflight, simulate the transaction
         if !skip_preflight {
             if let Err(e) = self.with_svm_reader(|svm_reader| {
                 svm_reader
-                    .simulate_transaction(transaction.clone(), sigverify)
+                    .simulate_transaction_with_blockhash_validation(
+                        transaction.clone(),
+                        sigverify,
+                        blockhash_validation,
+                    )
                     .map_err(ProcessTransactionResult::SimulationFailure)
             }) {
                 return e;
@@ -2049,7 +2157,12 @@ impl SurfnetSvmLocker {
 
         match self.with_svm_writer(|svm_writer| {
             svm_writer
-                .send_transaction(transaction, false /* cu_analysis_enabled */, sigverify)
+                .send_transaction_with_blockhash_validation(
+                    transaction,
+                    false, /* cu_analysis_enabled */
+                    sigverify,
+                    blockhash_validation,
+                )
                 .map_err(|e| {
                     debug!("Transaction execution failure: {:?}", e.meta);
                     ProcessTransactionResult::ExecutionFailure(e)

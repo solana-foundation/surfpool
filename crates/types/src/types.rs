@@ -561,6 +561,22 @@ pub enum TransactionStatusEvent {
     VerificationFailure(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransactionBlockhashValidationMode {
+    ValidateAtExecution,
+    ValidatedRecentBlockhashAtAdmission,
+}
+
+#[derive(Debug)]
+pub struct ProcessTransactionRequest {
+    pub id: Option<(Hash, String)>,
+    pub transaction: VersionedTransaction,
+    pub status_tx: Sender<TransactionStatusEvent>,
+    pub skip_preflight: bool,
+    pub skip_sig_verify: Option<bool>,
+    pub blockhash_validation: TransactionBlockhashValidationMode,
+}
+
 #[derive(Debug)]
 pub enum SimnetCommand {
     SlotForward(Option<Hash>),
@@ -569,13 +585,7 @@ pub enum SimnetCommand {
     UpdateInternalClock(Option<(Hash, String)>, Clock),
     UpdateInternalClockWithConfirmation(Option<(Hash, String)>, Clock, Sender<EpochInfo>),
     UpdateBlockProductionMode(BlockProductionMode),
-    ProcessTransaction(
-        Option<(Hash, String)>,
-        VersionedTransaction,
-        Sender<TransactionStatusEvent>,
-        bool,
-        Option<bool>,
-    ),
+    ProcessTransaction(ProcessTransactionRequest),
     Terminate(Option<(Hash, String)>),
     StartRunbookExecution(String),
     CompleteRunbookExecution(String, Option<Vec<String>>),

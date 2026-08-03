@@ -614,6 +614,7 @@ impl StartSimnet {
                 Some(self.observability.log_bytes_limit)
             },
             skip_blockhash_check: self.svm.skip_blockhash_check,
+            skip_signature_verification: self.svm.skip_signature_verification,
         }
     }
 

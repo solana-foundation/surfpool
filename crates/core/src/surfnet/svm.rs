@@ -28,7 +28,7 @@ use solana_client::{
     rpc_filter::RpcFilterType,
     rpc_response::{RpcKeyedAccount, RpcLogsResponse, RpcPerfSample},
 };
-use solana_clock::{Clock, Slot};
+use solana_clock::{Clock, MAX_PROCESSING_AGE, Slot};
 use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_epoch_info::EpochInfo;
 use solana_epoch_schedule::EpochSchedule;
@@ -57,8 +57,9 @@ use surfpool_types::{
     AccountChange, AccountProfileState, AccountSnapshot, DEFAULT_PROFILING_MAP_CAPACITY,
     DEFAULT_SLOT_TIME_MS, ExportSnapshotConfig, ExportSnapshotScope, FifoMap, Idl,
     OverrideInstance, ProfileResult, RpcProfileDepth, RpcProfileResultConfig,
-    RunbookExecutionStatusReport, SimnetEvent, SvmFeatureConfig, TransactionConfirmationStatus,
-    TransactionStatusEvent, UiAccountChange, UiAccountProfileState, UiProfileResult, VersionedIdl,
+    RunbookExecutionStatusReport, SimnetEvent, SvmFeatureConfig,
+    TransactionBlockhashValidationMode, TransactionConfirmationStatus, TransactionStatusEvent,
+    UiAccountChange, UiAccountProfileState, UiProfileResult, VersionedIdl,
     types::{
         ComputeUnitsEstimationResult, KeyedProfileResult, UiKeyedProfileResult, UuidOrSignature,
     },
@@ -226,6 +227,7 @@ pub struct SurfnetSvmConfig {
     pub max_profiles: usize,
     pub log_bytes_limit: Option<usize>,
     pub skip_blockhash_check: bool,
+    pub skip_signature_verification: bool,
 }
 
 impl Default for SurfnetSvmConfig {
@@ -238,6 +240,7 @@ impl Default for SurfnetSvmConfig {
             max_profiles: DEFAULT_PROFILING_MAP_CAPACITY,
             log_bytes_limit: DEFAULT_LOG_BYTES_LIMIT,
             skip_blockhash_check: false,
+            skip_signature_verification: false,
         }
     }
 }
@@ -310,6 +313,7 @@ pub struct SurfnetSvm {
     pub instruction_profiling_enabled: bool,
     pub max_profiles: usize,
     pub skip_blockhash_check: bool,
+    pub skip_signature_verification: bool,
     pub runbook_executions: Vec<RunbookExecutionStatusReport>,
     pub account_update_slots: HashMap<Pubkey, Slot>,
     pub streamed_accounts: Box<dyn Storage<String, bool>>,
@@ -582,6 +586,7 @@ impl SurfnetSvm {
             instruction_profiling_enabled: self.instruction_profiling_enabled,
             max_profiles: self.max_profiles,
             skip_blockhash_check: self.skip_blockhash_check,
+            skip_signature_verification: self.skip_signature_verification,
             runbook_executions: self.runbook_executions.clone(),
             account_update_slots: self.account_update_slots.clone(),
             recent_blockhashes: self.recent_blockhashes.clone(),
@@ -1035,6 +1040,7 @@ impl SurfnetSvm {
             instruction_profiling_enabled: config.instruction_profiling_enabled,
             max_profiles: config.max_profiles,
             skip_blockhash_check: config.skip_blockhash_check,
+            skip_signature_verification: config.skip_signature_verification,
             runbook_executions: Vec::new(),
             account_update_slots: HashMap::new(),
             streamed_accounts: streamed_accounts_db,
@@ -1472,6 +1478,58 @@ impl SurfnetSvm {
             .any(|entry| entry.blockhash == *recent_blockhash)
     }
 
+    /// Returns the age of a recent blockhash in Surfpool's recent-blockhash window.
+    ///
+    /// Age 0 is the current blockhash, age 1 is the previous blockhash, and so on.
+    pub fn recent_blockhash_age(&self, recent_blockhash: &Hash) -> Option<u64> {
+        #[allow(deprecated)]
+        self.inner
+            .get_sysvar::<solana_sysvar::recent_blockhashes::RecentBlockhashes>()
+            .iter()
+            .position(|entry| entry.blockhash == *recent_blockhash)
+            .map(|age| age as u64)
+    }
+
+    pub fn last_valid_block_height_for_hash(&self, recent_blockhash: &Hash) -> Option<u64> {
+        let remaining_block_heights = (MAX_PROCESSING_AGE as u64)
+            .checked_sub(self.recent_blockhash_age(recent_blockhash)?)?;
+        Some(
+            self.latest_epoch_info
+                .block_height
+                .saturating_add(remaining_block_heights),
+        )
+    }
+
+    pub fn is_recent_blockhash_valid_for_processing(&self, recent_blockhash: &Hash) -> bool {
+        self.recent_blockhash_age(recent_blockhash)
+            .is_some_and(|age| age <= MAX_PROCESSING_AGE as u64)
+    }
+
+    pub fn transaction_uses_durable_nonce(&self, tx: &VersionedTransaction) -> bool {
+        self.nonce_account_pubkey(tx).is_some()
+    }
+
+    fn nonce_account_pubkey<'a>(&self, tx: &'a VersionedTransaction) -> Option<&'a Pubkey> {
+        let instruction = tx
+            .message
+            .instructions()
+            .get(solana_nonce::NONCED_TX_MARKER_IX_INDEX as usize)?;
+
+        let program_id = tx
+            .message
+            .static_account_keys()
+            .get(instruction.program_id_index as usize)?;
+        if !system_program::check_id(program_id)
+            || !is_advance_nonce_instruction_data(&instruction.data)
+        {
+            return None;
+        }
+
+        tx.message
+            .static_account_keys()
+            .get(*instruction.accounts.first()? as usize)
+    }
+
     /// Validates the blockhash of a transaction, considering nonce accounts if present.
     /// If the transaction uses a nonce account, the blockhash is validated against the nonce account's stored blockhash.
     /// Otherwise, it is validated against the RecentBlockhashes sysvar.
@@ -1482,50 +1540,32 @@ impl SurfnetSvm {
     /// # Returns
     /// `true` if the transaction blockhash is valid, `false` otherwise.
     pub fn validate_transaction_blockhash(&self, tx: &VersionedTransaction) -> bool {
+        self.validate_transaction_blockhash_with_mode(
+            tx,
+            TransactionBlockhashValidationMode::ValidateAtExecution,
+        )
+    }
+
+    pub fn validate_transaction_blockhash_with_mode(
+        &self,
+        tx: &VersionedTransaction,
+        blockhash_validation: TransactionBlockhashValidationMode,
+    ) -> bool {
         if self.skip_blockhash_check {
             return true;
         }
 
         let recent_blockhash = tx.message.recent_blockhash();
 
-        let some_nonce_account_index = tx
-            .message
-            .instructions()
-            .get(solana_nonce::NONCED_TX_MARKER_IX_INDEX as usize)
-            .filter(|instruction| {
-                matches!(
-                    tx.message.static_account_keys().get(instruction.program_id_index as usize),
-                    Some(program_id) if system_program::check_id(program_id)
-                ) && is_advance_nonce_instruction_data(&instruction.data)
-            })
-            .map(|instruction| {
-                // nonce account is the first account in the instruction
-                instruction.accounts.get(0)
-            });
+        let nonce_account_pubkey = self.nonce_account_pubkey(tx);
 
         debug!(
             "Validating tx blockhash: {}; is nonce tx?: {}",
             recent_blockhash,
-            some_nonce_account_index.is_some()
+            nonce_account_pubkey.is_some()
         );
 
-        if let Some(nonce_account_index) = some_nonce_account_index {
-            trace!(
-                "Nonce tx detected. Nonce account index: {:?}",
-                nonce_account_index
-            );
-            let Some(nonce_account_index) = nonce_account_index else {
-                return false;
-            };
-
-            let Some(nonce_account_pubkey) = tx
-                .message
-                .static_account_keys()
-                .get(*nonce_account_index as usize)
-            else {
-                return false;
-            };
-
+        if let Some(nonce_account_pubkey) = nonce_account_pubkey {
             trace!("Nonce account pubkey: {:?}", nonce_account_pubkey,);
 
             // Here we're swallowing errors in the storage - if we fail to fetch the account because of a storage error,
@@ -1548,9 +1588,15 @@ impl SurfnetSvm {
                 solana_nonce::state::State::Initialized(data) => data,
             };
             return initialized_state.blockhash() == *recent_blockhash;
-        } else {
-            self.check_blockhash_is_recent(recent_blockhash)
         }
+
+        if blockhash_validation
+            == TransactionBlockhashValidationMode::ValidatedRecentBlockhashAtAdmission
+        {
+            return true;
+        }
+
+        self.is_recent_blockhash_valid_for_processing(recent_blockhash)
     }
 
     /// Verifies the signature of a transaction and validates that it hasn't already been processed.
@@ -2019,6 +2065,22 @@ impl SurfnetSvm {
         cu_analysis_enabled: bool,
         sigverify: bool,
     ) -> TransactionResult {
+        self.send_transaction_with_blockhash_validation(
+            tx,
+            cu_analysis_enabled,
+            sigverify,
+            TransactionBlockhashValidationMode::ValidateAtExecution,
+        )
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub fn send_transaction_with_blockhash_validation(
+        &mut self,
+        tx: VersionedTransaction,
+        cu_analysis_enabled: bool,
+        sigverify: bool,
+        blockhash_validation: TransactionBlockhashValidationMode,
+    ) -> TransactionResult {
         if sigverify {
             self.sigverify(&tx)?;
         }
@@ -2038,7 +2100,7 @@ impl SurfnetSvm {
         }
         self.transactions_processed += 1;
 
-        if !self.validate_transaction_blockhash(&tx) {
+        if !self.validate_transaction_blockhash_with_mode(&tx, blockhash_validation) {
             let meta = TransactionMetadata::default();
             let err = solana_transaction_error::TransactionError::BlockhashNotFound;
 
@@ -2123,11 +2185,25 @@ impl SurfnetSvm {
         tx: VersionedTransaction,
         sigverify: bool,
     ) -> Result<SimulatedTransactionInfo, FailedTransactionMetadata> {
+        self.simulate_transaction_with_blockhash_validation(
+            tx,
+            sigverify,
+            TransactionBlockhashValidationMode::ValidateAtExecution,
+        )
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub fn simulate_transaction_with_blockhash_validation(
+        &self,
+        tx: VersionedTransaction,
+        sigverify: bool,
+        blockhash_validation: TransactionBlockhashValidationMode,
+    ) -> Result<SimulatedTransactionInfo, FailedTransactionMetadata> {
         if sigverify {
             self.sigverify(&tx)?;
         }
 
-        if !self.validate_transaction_blockhash(&tx) {
+        if !self.validate_transaction_blockhash_with_mode(&tx, blockhash_validation) {
             let meta = TransactionMetadata::default();
             let err = TransactionError::BlockhashNotFound;
 
@@ -4966,6 +5042,7 @@ mod tests {
             max_profiles: 17,
             log_bytes_limit: None,
             skip_blockhash_check: true,
+            skip_signature_verification: true,
         };
         let (svm, _events_rx, _geyser_rx) = SurfnetSvm::new(config).unwrap();
 
@@ -4988,6 +5065,7 @@ mod tests {
             assert!(svm.registered_idls.get(&program_id).unwrap().is_some());
         }
         assert!(svm.skip_blockhash_check);
+        assert!(svm.skip_signature_verification);
     }
 
     #[test]
@@ -5000,6 +5078,7 @@ mod tests {
             max_profiles: 23,
             log_bytes_limit: None,
             skip_blockhash_check: false,
+            skip_signature_verification: false,
         };
         let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::new(config).unwrap();
         let epoch_info = EpochInfo {

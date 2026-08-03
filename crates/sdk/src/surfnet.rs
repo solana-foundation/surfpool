@@ -191,6 +191,7 @@ impl SurfnetBuilder {
             log_bytes_limit: surfpool_config.simnets[0].log_bytes_limit,
             feature_config,
             skip_blockhash_check,
+            skip_signature_verification: surfpool_config.simnets[0].skip_signature_verification,
         };
         let (surfnet_svm, simnet_events_rx, geyser_events_rx) = SurfnetSvm::new(svm_config)
             .map_err(|e| SurfnetError::Runtime(format!("failed to initialize Surfnet SVM: {e}")))?;
