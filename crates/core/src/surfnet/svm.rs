@@ -2598,7 +2598,7 @@ impl SurfnetSvm {
                 .account
                 .resolve(Some(&override_instance.values))
             {
-                Some(pubkey) => {
+                Ok(pubkey) => {
                     if matches!(
                         &override_instance.account,
                         surfpool_types::AccountAddress::Pda { .. }
@@ -2610,10 +2610,10 @@ impl SurfnetSvm {
                     }
                     pubkey
                 }
-                None => {
+                Err(e) => {
                     warn!(
-                        "Failed to resolve account address for override {}",
-                        override_instance.id
+                        "Failed to resolve account address for override {}: {}",
+                        override_instance.id, e
                     );
                     continue;
                 }
@@ -4045,6 +4045,24 @@ impl SurfnetSvm {
             scenario.overrides.len(),
             base_slot
         );
+
+        // Validate enabled overrides before scheduling
+        let mut failures = Vec::new();
+        for override_instance in &scenario.overrides {
+            if !override_instance.enabled {
+                continue;
+            }
+            if let Err(e) = override_instance
+                .account
+                .resolve(Some(&override_instance.values))
+            {
+                failures.push((override_instance.id.clone(), e));
+            }
+        }
+
+        if !failures.is_empty() {
+            return Err(SurfpoolError::invalid_scenario(&scenario.name, &failures));
+        }
 
         // Schedule overrides by adding base slot to their scenario-relative slots
         for override_instance in scenario.overrides {
@@ -6002,7 +6020,7 @@ mod tests {
         };
 
         let result = address.resolve_simple();
-        assert!(result.is_some(), "Should derive PDA with string seed");
+        assert!(result.is_ok(), "Should derive PDA with string seed");
 
         // Verify it matches direct derivation
         let program_pubkey = Pubkey::from_str(program_id).unwrap();
@@ -6022,7 +6040,7 @@ mod tests {
         };
 
         let result = address.resolve_simple();
-        assert!(result.is_some(), "Should derive PDA with pubkey seed");
+        assert!(result.is_ok(), "Should derive PDA with pubkey seed");
 
         // Verify it matches direct derivation
         let program_pubkey = Pubkey::from_str(program_id).unwrap();
@@ -6048,7 +6066,7 @@ mod tests {
         };
 
         let result = address.resolve_simple();
-        assert!(result.is_some(), "Should derive PDA with multiple seeds");
+        assert!(result.is_ok(), "Should derive PDA with multiple seeds");
 
         // Verify it matches direct derivation
         let program_pubkey = Pubkey::from_str(program_id).unwrap();
@@ -6073,7 +6091,7 @@ mod tests {
         };
 
         let result = address.resolve_simple();
-        assert!(result.is_some(), "Should derive PDA with bytes seed");
+        assert!(result.is_ok(), "Should derive PDA with bytes seed");
 
         // Verify it matches direct derivation
         let program_pubkey = Pubkey::from_str(program_id).unwrap();
@@ -6101,10 +6119,7 @@ mod tests {
         );
 
         let result = address.resolve(Some(&values));
-        assert!(
-            result.is_some(),
-            "Should derive PDA with property ref pubkey"
-        );
+        assert!(result.is_ok(), "Should derive PDA with property ref pubkey");
 
         // Verify it matches direct derivation
         let program_pubkey = Pubkey::from_str(program_id).unwrap();
@@ -6133,7 +6148,7 @@ mod tests {
         );
 
         let result = address.resolve(Some(&values));
-        assert!(result.is_some(), "Should derive PDA with property ref u64");
+        assert!(result.is_ok(), "Should derive PDA with property ref u64");
 
         // Verify it matches direct derivation
         let program_pubkey = Pubkey::from_str(program_id).unwrap();
@@ -6151,7 +6166,7 @@ mod tests {
         };
 
         let result = address.resolve_simple();
-        assert!(result.is_none(), "Should fail with invalid program ID");
+        assert!(result.is_err(), "Should fail with invalid program ID");
     }
 
     #[test]
@@ -6166,7 +6181,7 @@ mod tests {
         };
 
         let result = address.resolve_simple();
-        assert!(result.is_none(), "Should fail with invalid pubkey seed");
+        assert!(result.is_err(), "Should fail with invalid pubkey seed");
     }
 
     #[test]
@@ -6181,7 +6196,7 @@ mod tests {
         };
 
         let result = address.resolve_simple(); // No values provided
-        assert!(result.is_none(), "Should fail with missing property ref");
+        assert!(result.is_err(), "Should fail with missing property ref");
     }
 
     #[test]
@@ -6191,7 +6206,7 @@ mod tests {
         let address = surfpool_types::AccountAddress::Pubkey(pubkey_str.to_string());
 
         let result = address.resolve_simple();
-        assert!(result.is_some(), "Should resolve pubkey address");
+        assert!(result.is_ok(), "Should resolve pubkey address");
         assert_eq!(result.unwrap(), Pubkey::from_str(pubkey_str).unwrap());
     }
 
@@ -6217,7 +6232,7 @@ mod tests {
         let result2 = address.resolve_simple();
         let result3 = address.resolve_simple();
 
-        assert!(result1.is_some());
+        assert!(result1.is_ok());
         assert_eq!(result1, result2, "PDA derivation should be deterministic");
         assert_eq!(result2, result3, "PDA derivation should be deterministic");
     }
@@ -6257,7 +6272,7 @@ mod tests {
         };
 
         let result = address.resolve_simple();
-        assert!(result.is_some(), "Should derive Raydium CLMM pool PDA");
+        assert!(result.is_ok(), "Should derive Raydium CLMM pool PDA");
 
         // Verify it matches the known pool address
         let expected_pool =
@@ -6301,10 +6316,7 @@ mod tests {
         );
 
         let result = address.resolve(Some(&values));
-        assert!(
-            result.is_some(),
-            "Should derive pool PDA with property refs"
-        );
+        assert!(result.is_ok(), "Should derive pool PDA with property refs");
 
         let expected_pool =
             Pubkey::from_str("3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv").unwrap();
@@ -6350,7 +6362,7 @@ mod tests {
 
             let result = address.resolve_simple();
             assert!(
-                result.is_some(),
+                result.is_ok(),
                 "Should derive pool for {} fee tier",
                 tier_name
             );
@@ -6473,7 +6485,7 @@ mod tests {
 
             let result = address.resolve_simple();
             assert!(
-                result.is_some(),
+                result.is_ok(),
                 "Should derive AMM config for index {}",
                 index
             );
@@ -6519,7 +6531,7 @@ mod tests {
         };
 
         let result = address.resolve_simple();
-        assert!(result.is_some(), "Should derive pool with nested PDA");
+        assert!(result.is_ok(), "Should derive pool with nested PDA");
 
         // Should match the known SOL/USDC pool
         let expected_pool =
@@ -6569,7 +6581,7 @@ mod tests {
         );
 
         let result = address.resolve(Some(&values));
-        assert!(result.is_some(), "Should derive pool with property refs");
+        assert!(result.is_ok(), "Should derive pool with property refs");
 
         let expected_pool =
             Pubkey::from_str("3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv").unwrap();
@@ -6577,6 +6589,71 @@ mod tests {
             result.unwrap(),
             expected_pool,
             "Property ref dynamic derivation should match known SOL/USDC pool"
+        );
+    }
+
+    #[test]
+    fn register_scenario_rejects_unresolvable_override() {
+        // Test that register_scenario rejects scenarios with unresolvable override addresses
+        let (mut svm, _events_rx, _geyser_rx) =
+            SurfnetSvm::new(SurfnetSvmConfig::default()).unwrap();
+
+        let mut scenario = surfpool_types::Scenario::new(
+            "test_unresolvable".to_string(),
+            "Test scenario with invalid pubkey".to_string(),
+        );
+
+        let override_instance = surfpool_types::OverrideInstance::new(
+            "test-template".to_string(),
+            0,
+            surfpool_types::AccountAddress::Pubkey("not-a-pubkey".to_string()),
+        );
+
+        scenario.add_override(override_instance.clone());
+
+        let result = svm.register_scenario(scenario.clone(), Some(0));
+
+        assert!(
+            result.is_err(),
+            "Should reject scenario with invalid pubkey address"
+        );
+        let error_msg = format!("{}", result.unwrap_err());
+        assert!(
+            error_msg.contains(&override_instance.id),
+            "Error message should contain the override ID"
+        );
+        assert!(
+            error_msg.contains("not a valid pubkey") || error_msg.contains("invalid"),
+            "Error message should indicate invalid pubkey"
+        );
+    }
+
+    #[test]
+    fn register_scenario_accepts_resolvable_override() {
+        // Test that register_scenario accepts scenarios with resolvable override addresses
+        let (mut svm, _events_rx, _geyser_rx) =
+            SurfnetSvm::new(SurfnetSvmConfig::default()).unwrap();
+
+        let mut scenario = surfpool_types::Scenario::new(
+            "test_resolvable".to_string(),
+            "Test scenario with valid pubkey".to_string(),
+        );
+
+        // Use a valid base58 pubkey
+        let valid_pubkey = solana_pubkey::Pubkey::new_unique().to_string();
+        let override_instance = surfpool_types::OverrideInstance::new(
+            "test-template".to_string(),
+            0,
+            surfpool_types::AccountAddress::Pubkey(valid_pubkey.clone()),
+        );
+
+        scenario.add_override(override_instance);
+
+        let result = svm.register_scenario(scenario, Some(0));
+
+        assert!(
+            result.is_ok(),
+            "Should accept scenario with valid pubkey address"
         );
     }
 
