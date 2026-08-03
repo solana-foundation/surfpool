@@ -223,7 +223,7 @@ mod tests {
             )]);
             let bytes = derived_pda_seed
                 .to_bytes(Some(&values))
-                .unwrap_or_else(|| panic!("option {} did not resolve", option.id));
+                .unwrap_or_else(|e| panic!("option {} did not resolve: {e}", option.id));
 
             assert_eq!(
                 Pubkey::try_from(bytes.as_slice()).expect("32 bytes"),
@@ -313,14 +313,13 @@ mod tests {
         ]);
 
         assert!(
-            template.address.resolve(Some(&values)).is_some(),
+            template.address.resolve(Some(&values)).is_ok(),
             "every seed resolves, so the pool address does too"
         );
 
         values.remove("config_index");
-        assert_eq!(
-            template.address.resolve(Some(&values)),
-            None,
+        assert!(
+            template.address.resolve(Some(&values)).is_err(),
             "a seed that cannot resolve must not derive a shorter address"
         );
     }

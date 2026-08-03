@@ -60,6 +60,48 @@ impl ConstantDefinition {
 // Core Scenarios Types
 // ========================================
 
+/// Why a single PDA seed could not be converted to bytes.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum SeedError {
+    #[error("'{0}' is not a valid pubkey")]
+    InvalidPubkey(String),
+    #[error("seed references property '{0}' but no values were provided")]
+    NoValues(String),
+    #[error("property '{0}' not found in values")]
+    UnknownProperty(String),
+    #[error("property '{name}' is {found}, expected {expected}")]
+    WrongType {
+        name: String,
+        expected: &'static str,
+        found: &'static str,
+    },
+    #[error("property '{name}' value {value} does not fit in u16")]
+    U16OutOfRange { name: String, value: u64 },
+    #[error("'{0}' is not a 32-byte hex string")]
+    InvalidBytes32(String),
+    #[error("seed {index} of derived PDA for program {program_id}: {source}")]
+    DerivedSeed {
+        program_id: String,
+        index: usize,
+        source: Box<SeedError>,
+    },
+}
+
+/// Why an account address could not be resolved to a pubkey.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum ScenarioError {
+    #[error("invalid account address: {0}")]
+    InvalidAddress(#[from] SeedError),
+    #[error("invalid program id '{0}'")]
+    InvalidProgramId(String),
+    #[error("PDA for program {program_id}, seed {index}: {source}")]
+    Seed {
+        program_id: String,
+        index: usize,
+        source: SeedError,
+    },
+}
+
 /// Defines how an account address should be determined
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -105,77 +147,136 @@ pub enum PdaSeed {
     },
 }
 
+/// Look up a property referenced by a seed, distinguishing a missing values
+/// map from a missing key.
+fn property_value<'a>(
+    values: Option<&'a HashMap<String, serde_json::Value>>,
+    prop: &str,
+) -> Result<&'a serde_json::Value, SeedError> {
+    values
+        .ok_or_else(|| SeedError::NoValues(prop.to_string()))?
+        .get(prop)
+        .ok_or_else(|| SeedError::UnknownProperty(prop.to_string()))
+}
+
+fn json_type_name(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
 impl PdaSeed {
     /// Convert a seed to bytes, optionally using values for PropertyRef resolution
-    pub fn to_bytes(&self, values: Option<&HashMap<String, serde_json::Value>>) -> Option<Vec<u8>> {
+    pub fn to_bytes(
+        &self,
+        values: Option<&HashMap<String, serde_json::Value>>,
+    ) -> Result<Vec<u8>, SeedError> {
         match self {
             PdaSeed::Pubkey(pk_str) => Pubkey::from_str(pk_str)
-                .ok()
-                .map(|pk| pk.to_bytes().to_vec()),
-            PdaSeed::String(s) => Some(s.as_bytes().to_vec()),
-            PdaSeed::Bytes(b) => Some(b.clone()),
+                .map(|pk| pk.to_bytes().to_vec())
+                .map_err(|_| SeedError::InvalidPubkey(pk_str.clone())),
+            PdaSeed::String(s) => Ok(s.as_bytes().to_vec()),
+            PdaSeed::Bytes(b) => Ok(b.clone()),
             PdaSeed::PropertyRef(prop) => {
-                values?.get(prop).and_then(|v| {
-                    // Handle string values (could be pubkey or raw string)
-                    if let Some(s) = v.as_str() {
-                        if let Ok(pk) = Pubkey::from_str(s) {
-                            return Some(pk.to_bytes().to_vec());
-                        }
-                        return Some(s.as_bytes().to_vec());
+                let v = property_value(values, prop)?;
+
+                // Handle string values (could be pubkey or raw string)
+                if let Some(s) = v.as_str() {
+                    if let Ok(pk) = Pubkey::from_str(s) {
+                        return Ok(pk.to_bytes().to_vec());
                     }
-                    // Handle numeric values (u64)
-                    if let Some(n) = v.as_u64() {
-                        return Some(n.to_le_bytes().to_vec());
-                    }
-                    None
+                    return Ok(s.as_bytes().to_vec());
+                }
+                // Handle numeric values (u64)
+                if let Some(n) = v.as_u64() {
+                    return Ok(n.to_le_bytes().to_vec());
+                }
+                Err(SeedError::WrongType {
+                    name: prop.clone(),
+                    expected: "string or u64",
+                    found: json_type_name(v),
                 })
             }
-            PdaSeed::U16Be(n) => Some(n.to_be_bytes().to_vec()),
-            PdaSeed::U16BeRef(prop) => values?.get(prop).and_then(|v| {
-                let index = match v {
-                    serde_json::Value::String(s) => s.parse::<u16>().ok()?,
-                    _ => u16::try_from(v.as_u64()?).ok()?,
-                };
-                Some(index.to_be_bytes().to_vec())
-            }),
-            PdaSeed::U16Le(n) => Some(n.to_le_bytes().to_vec()),
+            PdaSeed::U16Be(n) => Ok(n.to_be_bytes().to_vec()),
+            PdaSeed::U16BeRef(prop) => {
+                let v = property_value(values, prop)?;
+
+                // A scenario file may carry the index as a JSON number or as a
+                // decimal string; both mean the same two big-endian bytes.
+                if let serde_json::Value::String(s) = v {
+                    let index = s.parse::<u16>().map_err(|_| SeedError::WrongType {
+                        name: prop.clone(),
+                        expected: "u16",
+                        found: json_type_name(v),
+                    })?;
+                    return Ok(index.to_be_bytes().to_vec());
+                }
+
+                // Handle numeric values - convert to u16 big-endian
+                if let Some(n) = v.as_u64() {
+                    let n16 = u16::try_from(n).map_err(|_| SeedError::U16OutOfRange {
+                        name: prop.clone(),
+                        value: n,
+                    })?;
+                    return Ok(n16.to_be_bytes().to_vec());
+                }
+                Err(SeedError::WrongType {
+                    name: prop.clone(),
+                    expected: "u64",
+                    found: json_type_name(v),
+                })
+            }
+            PdaSeed::U16Le(n) => Ok(n.to_le_bytes().to_vec()),
             PdaSeed::Bytes32Ref(prop) => {
-                values?.get(prop).and_then(|v| {
-                    // Handle hex string values (e.g., "0xef0d8b6f..." for Pyth feed IDs)
-                    if let Some(s) = v.as_str() {
-                        // Remove 0x prefix if present
-                        let hex_str = s.strip_prefix("0x").unwrap_or(s);
-                        // Parse as 32-byte hex
-                        if let Ok(bytes) = hex::decode(hex_str) {
-                            if bytes.len() == 32 {
-                                return Some(bytes);
-                            }
+                let v = property_value(values, prop)?;
+
+                // Handle hex string values (e.g., "0xef0d8b6f..." for Pyth feed IDs)
+                if let Some(s) = v.as_str() {
+                    // Remove 0x prefix if present
+                    let hex_str = s.strip_prefix("0x").unwrap_or(s);
+                    // Parse as 32-byte hex
+                    match hex::decode(hex_str) {
+                        Ok(bytes) if bytes.len() == 32 => return Ok(bytes),
+                        _ => {
+                            return Err(SeedError::InvalidBytes32(hex_str.to_string()));
                         }
                     }
-                    None
+                }
+                Err(SeedError::WrongType {
+                    name: prop.clone(),
+                    expected: "hex string",
+                    found: json_type_name(v),
                 })
             }
             PdaSeed::DerivedPda { program_id, seeds } => {
                 // Derive a nested PDA and use its pubkey as the seed
-                let program_pubkey = Pubkey::from_str(program_id).ok()?;
+                let program_pubkey = Pubkey::from_str(program_id)
+                    .map_err(|_| SeedError::InvalidPubkey(program_id.clone()))?;
 
                 // Convert inner seeds to bytes
                 let seed_bytes: Vec<Vec<u8>> = seeds
                     .iter()
-                    .filter_map(|seed| seed.to_bytes(values))
-                    .collect();
-
-                // Ensure all seeds were converted successfully
-                if seed_bytes.len() != seeds.len() {
-                    return None;
-                }
+                    .enumerate()
+                    .map(|(i, seed)| {
+                        seed.to_bytes(values).map_err(|e| SeedError::DerivedSeed {
+                            program_id: program_id.clone(),
+                            index: i,
+                            source: Box::new(e),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
 
                 // Create seed slices for find_program_address
                 let seed_slices: Vec<&[u8]> = seed_bytes.iter().map(|s| s.as_slice()).collect();
 
                 // Derive the nested PDA
                 let (pda, _bump) = Pubkey::find_program_address(&seed_slices, &program_pubkey);
-                Some(pda.to_bytes().to_vec())
+                Ok(pda.to_bytes().to_vec())
             }
         }
     }
@@ -185,36 +286,44 @@ impl AccountAddress {
     /// Resolve the account address to a Pubkey
     /// For PDA addresses, this derives the address from the program_id and seeds
     /// For PropertyRef seeds, values map is used to resolve the reference
-    pub fn resolve(&self, values: Option<&HashMap<String, serde_json::Value>>) -> Option<Pubkey> {
+    pub fn resolve(
+        &self,
+        values: Option<&HashMap<String, serde_json::Value>>,
+    ) -> Result<Pubkey, ScenarioError> {
         match self {
-            AccountAddress::Pubkey(pubkey_str) => Pubkey::from_str(pubkey_str).ok(),
+            AccountAddress::Pubkey(pubkey_str) => Pubkey::from_str(pubkey_str).map_err(|_| {
+                ScenarioError::InvalidAddress(SeedError::InvalidPubkey(pubkey_str.clone()))
+            }),
             AccountAddress::Pda { program_id, seeds } => {
-                let program_pubkey = Pubkey::from_str(program_id).ok()?;
+                let program_pubkey = Pubkey::from_str(program_id)
+                    .map_err(|_| ScenarioError::InvalidProgramId(program_id.clone()))?;
 
                 // Convert all seeds to bytes
                 let seed_bytes: Vec<Vec<u8>> = seeds
                     .iter()
-                    .filter_map(|seed| seed.to_bytes(values))
-                    .collect();
-
-                // Ensure all seeds were converted successfully
-                if seed_bytes.len() != seeds.len() {
-                    return None;
-                }
+                    .enumerate()
+                    .map(|(i, seed)| {
+                        seed.to_bytes(values).map_err(|e| ScenarioError::Seed {
+                            program_id: program_id.clone(),
+                            index: i,
+                            source: e,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
 
                 // Create seed slices for find_program_address
                 let seed_slices: Vec<&[u8]> = seed_bytes.iter().map(|s| s.as_slice()).collect();
 
                 // Derive the PDA
                 let (pda, _bump) = Pubkey::find_program_address(&seed_slices, &program_pubkey);
-                Some(pda)
+                Ok(pda)
             }
         }
     }
 
     /// Resolve the account address to a Pubkey without any values for PropertyRef
     /// This is a convenience method when no PropertyRef seeds are expected
-    pub fn resolve_simple(&self) -> Option<Pubkey> {
+    pub fn resolve_simple(&self) -> Result<Pubkey, ScenarioError> {
         self.resolve(None)
     }
 
@@ -1099,17 +1208,25 @@ impl From<YamlPdaSeed> for PdaSeed {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::str::FromStr;
 
     use serde_json::json;
+    use solana_pubkey::Pubkey;
 
-    use super::PdaSeed;
+    use super::{AccountAddress, PdaSeed, ScenarioError, SeedError};
 
     #[test]
     fn u16_be_ref_rejects_out_of_range_values() {
         let seed = PdaSeed::U16BeRef("index".to_string());
         let values = HashMap::from([("index".to_string(), json!(70_000))]);
 
-        assert_eq!(seed.to_bytes(Some(&values)), None);
+        assert_eq!(
+            seed.to_bytes(Some(&values)),
+            Err(SeedError::U16OutOfRange {
+                name: "index".to_string(),
+                value: 70_000,
+            })
+        );
     }
 
     #[test]
@@ -1117,7 +1234,156 @@ mod tests {
         let seed = PdaSeed::U16BeRef("index".to_string());
         let values = HashMap::from([("index".to_string(), json!(513))]);
 
-        assert_eq!(seed.to_bytes(Some(&values)), Some(vec![2, 1]));
+        assert_eq!(seed.to_bytes(Some(&values)), Ok(vec![2, 1]));
+    }
+
+    #[test]
+    fn pubkey_seed_with_garbage_string() {
+        let seed = PdaSeed::Pubkey("not-a-pubkey".to_string());
+        assert_eq!(
+            seed.to_bytes(None),
+            Err(SeedError::InvalidPubkey("not-a-pubkey".to_string()))
+        );
+    }
+
+    #[test]
+    fn property_ref_with_no_values() {
+        let seed = PdaSeed::PropertyRef("some_prop".to_string());
+        assert_eq!(
+            seed.to_bytes(None),
+            Err(SeedError::NoValues("some_prop".to_string()))
+        );
+    }
+
+    #[test]
+    fn property_ref_with_missing_key() {
+        let seed = PdaSeed::PropertyRef("missing_key".to_string());
+        let values = HashMap::from([("other_key".to_string(), json!("value"))]);
+        assert_eq!(
+            seed.to_bytes(Some(&values)),
+            Err(SeedError::UnknownProperty("missing_key".to_string()))
+        );
+    }
+
+    #[test]
+    fn property_ref_with_wrong_type() {
+        let seed = PdaSeed::PropertyRef("my_prop".to_string());
+        let values = HashMap::from([("my_prop".to_string(), json!(true))]);
+        assert_eq!(
+            seed.to_bytes(Some(&values)),
+            Err(SeedError::WrongType {
+                name: "my_prop".to_string(),
+                expected: "string or u64",
+                found: "bool",
+            })
+        );
+    }
+
+    #[test]
+    fn bytes32_ref_with_invalid_hex() {
+        let seed = PdaSeed::Bytes32Ref("feed_id".to_string());
+        let values = HashMap::from([("feed_id".to_string(), json!("0xzz"))]);
+        assert_eq!(
+            seed.to_bytes(Some(&values)),
+            Err(SeedError::InvalidBytes32("zz".to_string()))
+        );
+    }
+
+    #[test]
+    fn derived_pda_with_bad_inner_seed() {
+        let seed = PdaSeed::DerivedPda {
+            program_id: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_string(),
+            seeds: vec![
+                PdaSeed::String("valid_string".to_string()),
+                PdaSeed::Pubkey("not-a-pubkey".to_string()),
+            ],
+        };
+
+        match seed.to_bytes(None) {
+            Ok(_) => panic!("expected error"),
+            Err(SeedError::DerivedSeed {
+                program_id,
+                index,
+                source,
+            }) => {
+                assert_eq!(program_id, "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+                assert_eq!(index, 1);
+                assert_eq!(
+                    *source,
+                    SeedError::InvalidPubkey("not-a-pubkey".to_string())
+                );
+            }
+            Err(e) => panic!("wrong error: {:?}", e),
+        }
+    }
+
+    #[test]
+    fn account_address_pubkey_with_garbage_resolve_simple() {
+        let addr = AccountAddress::Pubkey("garbage".to_string());
+        assert_eq!(
+            addr.resolve_simple(),
+            Err(ScenarioError::InvalidAddress(SeedError::InvalidPubkey(
+                "garbage".to_string()
+            )))
+        );
+    }
+
+    #[test]
+    fn account_address_pda_with_invalid_program_id() {
+        let addr = AccountAddress::Pda {
+            program_id: "invalid-program".to_string(),
+            seeds: vec![PdaSeed::String("test".to_string())],
+        };
+
+        match addr.resolve_simple() {
+            Ok(_) => panic!("expected error"),
+            Err(ScenarioError::InvalidProgramId(id)) => {
+                assert_eq!(id, "invalid-program");
+            }
+            Err(e) => panic!("wrong error: {:?}", e),
+        }
+    }
+
+    #[test]
+    fn account_address_pda_with_property_ref_no_values() {
+        let addr = AccountAddress::Pda {
+            program_id: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_string(),
+            seeds: vec![PdaSeed::PropertyRef("owner".to_string())],
+        };
+
+        match addr.resolve_simple() {
+            Ok(_) => panic!("expected error"),
+            Err(ScenarioError::Seed {
+                program_id,
+                index,
+                source,
+            }) => {
+                assert_eq!(program_id, "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+                assert_eq!(index, 0);
+                assert_eq!(source, SeedError::NoValues("owner".to_string()));
+            }
+            Err(e) => panic!("wrong error: {:?}", e),
+        }
+    }
+
+    #[test]
+    fn account_address_pda_success() {
+        let seed_str = "test_seed";
+        let addr = AccountAddress::Pda {
+            program_id: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_string(),
+            seeds: vec![PdaSeed::String(seed_str.to_string())],
+        };
+
+        let resolved = addr.resolve_simple();
+        assert!(resolved.is_ok());
+
+        // Verify it matches the expected PDA computed via find_program_address
+        let expected_program =
+            Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap();
+        let (expected_pda, _) =
+            Pubkey::find_program_address(&[seed_str.as_bytes()], &expected_program);
+
+        assert_eq!(resolved.ok(), Some(expected_pda));
     }
 
     #[test]
