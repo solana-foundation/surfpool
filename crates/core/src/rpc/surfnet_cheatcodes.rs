@@ -1286,6 +1286,13 @@ pub trait SurfnetCheatcodes {
     /// ## Returns
     /// A `RpcResponse<()>` indicating whether the Scenario registration was successful.
     ///
+    /// Registration validates every enabled override before scheduling anything: each
+    /// override's account address must resolve with the provided values. If any address
+    /// cannot resolve (a malformed pubkey, a PDA seed referencing a missing property, a
+    /// value of the wrong type), the request is rejected with an error message listing
+    /// each failing override id and its cause, and no overrides are scheduled. Disabled
+    /// overrides are not validated, since they are never materialized.
+    ///
     /// ## Example Request (with slot)
     /// ```json
     /// {

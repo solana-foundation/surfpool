@@ -613,6 +613,7 @@ impl Surfpool {
         2. `values` keys MUST be from the template's `properties` array
         3. For PDA addresses, DO NOT provide `account` - it will be generated from template + values
         4. For constant_ref properties (like feed_id), the value MUST come from search_constant_options results
+        5. Every enabled override's account address is validated at registration: if it cannot be resolved from the values (bad pubkey, missing property, wrong type), the whole scenario is rejected with a message naming each failing override and its cause - fix the values and retry
 
         CORRECT JSON STRUCTURE FOR PYTH PRICE FEED:
         {
