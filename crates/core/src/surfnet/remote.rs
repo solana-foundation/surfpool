@@ -59,6 +59,12 @@ struct DeadlineSender<S> {
     deadline: Duration,
 }
 
+impl<S> DeadlineSender<S> {
+    fn new(inner: S, deadline: Duration) -> Self {
+        DeadlineSender { inner, deadline }
+    }
+}
+
 #[async_trait]
 impl<S: RpcSender + Send + Sync> RpcSender for DeadlineSender<S> {
     async fn send(
@@ -92,6 +98,58 @@ impl<S: RpcSender + Send + Sync> RpcSender for DeadlineSender<S> {
     }
 }
 
+/// The RPC client a surfnet reaches its datasource through: an HTTP transport
+/// wrapped in a [`DeadlineSender`], assembled behind one constructor so that
+/// layers added later (tracing, recording, a retry policy) land here without
+/// touching a public signature.
+struct SurfpoolRpcClient {
+    client: RpcClient,
+}
+
+impl SurfpoolRpcClient {
+    fn new<U: ToString>(remote_rpc_url: U) -> Self {
+        let sender = DeadlineSender::new(
+            HttpSender::new(remote_rpc_url.to_string()),
+            DATASOURCE_DEADLINE,
+        );
+        let client = RpcClient::new_sender(
+            sender,
+            RpcClientConfig::with_commitment(CommitmentConfig::default()),
+        );
+        SurfpoolRpcClient { client }
+    }
+
+    /// A variant that accepts invalid TLS certificates, for datasources
+    /// behind self-signed certs.
+    fn new_unsafe<U: ToString>(remote_rpc_url: U) -> Option<Self> {
+        use reqwest;
+
+        // Retry HTTP client initialization to handle potential fork-related issues
+        let client = match reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .tls_built_in_root_certs(false)
+            .tls_built_in_webpki_certs(false)
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+        {
+            Ok(client) => client,
+            Err(e) => {
+                error!(
+                    "unable to initialize datasource client after retries: {}",
+                    e
+                );
+                return None;
+            }
+        };
+        let sender = DeadlineSender::new(
+            HttpSender::new_with_client(remote_rpc_url, client),
+            DATASOURCE_DEADLINE,
+        );
+        let client = RpcClient::new_sender(sender, RpcClientConfig::default());
+        Some(SurfpoolRpcClient { client })
+    }
+}
+
 pub struct SurfnetRemoteClient {
     pub client: RpcClient,
 }
@@ -116,43 +174,15 @@ impl SomeRemoteCtx for Option<SurfnetRemoteClient> {
 
 impl SurfnetRemoteClient {
     pub fn new<U: ToString>(remote_rpc_url: U) -> Self {
-        let sender = DeadlineSender {
-            inner: HttpSender::new(remote_rpc_url.to_string()),
-            deadline: DATASOURCE_DEADLINE,
-        };
-        let client = RpcClient::new_sender(
-            sender,
-            RpcClientConfig::with_commitment(CommitmentConfig::default()),
-        );
-        SurfnetRemoteClient { client }
+        SurfnetRemoteClient {
+            client: SurfpoolRpcClient::new(remote_rpc_url).client,
+        }
     }
 
     pub fn new_unsafe<U: ToString>(remote_rpc_url: U) -> Option<Self> {
-        use reqwest;
-
-        // Retry HTTP client initialization to handle potential fork-related issues
-        let client = match reqwest::Client::builder()
-            .danger_accept_invalid_certs(true)
-            .tls_built_in_root_certs(false)
-            .tls_built_in_webpki_certs(false)
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-        {
-            Ok(client) => client,
-            Err(e) => {
-                error!(
-                    "unable to initialize datasource client after retries: {}",
-                    e
-                );
-                return None;
-            }
-        };
-        let http_sender = DeadlineSender {
-            inner: HttpSender::new_with_client(remote_rpc_url, client),
-            deadline: DATASOURCE_DEADLINE,
-        };
-        let client = RpcClient::new_sender(http_sender, RpcClientConfig::default());
-        Some(SurfnetRemoteClient { client })
+        SurfpoolRpcClient::new_unsafe(remote_rpc_url).map(|rpc_client| SurfnetRemoteClient {
+            client: rpc_client.client,
+        })
     }
 
     pub async fn get_epoch_info(&self) -> SurfpoolResult<EpochInfo> {
@@ -582,10 +612,8 @@ mod tests {
         ];
 
         for url in secrets {
-            let sender = DeadlineSender {
-                inner: NeverAnswers(url.to_string()),
-                deadline: Duration::from_millis(50),
-            };
+            let sender =
+                DeadlineSender::new(NeverAnswers(url.to_string()), Duration::from_millis(50));
 
             let message = sender
                 .send(RpcRequest::GetSlot, serde_json::Value::Null)
@@ -606,10 +634,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_datasource_that_never_answers_is_an_error_rather_than_a_wait() {
-        let sender = DeadlineSender {
-            inner: NeverAnswers("http://never.example".to_string()),
-            deadline: Duration::from_millis(50),
-        };
+        let sender = DeadlineSender::new(
+            NeverAnswers("http://never.example".to_string()),
+            Duration::from_millis(50),
+        );
 
         let error = sender
             .send(RpcRequest::GetSlot, serde_json::Value::Null)
