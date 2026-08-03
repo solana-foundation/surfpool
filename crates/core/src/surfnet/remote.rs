@@ -124,7 +124,8 @@ impl SurfpoolRpcClient {
     fn new_unsafe<U: ToString>(remote_rpc_url: U) -> Option<Self> {
         use reqwest;
 
-        // Retry HTTP client initialization to handle potential fork-related issues
+        // Construction can fail after a fork (the daemonize path), so a
+        // failure logs and surfaces as None rather than a panic.
         let client = match reqwest::Client::builder()
             .danger_accept_invalid_certs(true)
             .tls_built_in_root_certs(false)
@@ -134,10 +135,7 @@ impl SurfpoolRpcClient {
         {
             Ok(client) => client,
             Err(e) => {
-                error!(
-                    "unable to initialize datasource client after retries: {}",
-                    e
-                );
+                error!("unable to initialize datasource client: {}", e);
                 return None;
             }
         };
