@@ -107,6 +107,23 @@ pub enum ScenarioError {
     },
 }
 
+/// Why a scheduled override could not be applied at its slot.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum OverrideError {
+    #[error("{0}")]
+    Resolve(#[from] ScenarioError),
+    #[error(
+        "account {account} does not exist locally; overrides patch existing accounts (enable fetchBeforeUse or create the account first)"
+    )]
+    AccountNotFound { account: String },
+    #[error("account {account} has {len} byte(s), too small for an 8-byte discriminator")]
+    AccountTooSmall { account: String, len: usize },
+    #[error("no IDL registered for program {program_id} (owner of account {account})")]
+    NoIdlForOwner { program_id: String, account: String },
+    #[error("failed to forge account data for {account}: {message}")]
+    Forge { account: String, message: String },
+}
+
 /// Defines how an account address should be determined
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
