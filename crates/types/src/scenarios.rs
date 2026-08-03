@@ -100,6 +100,11 @@ pub enum ScenarioError {
         index: usize,
         source: SeedError,
     },
+    #[error("template '{template_id}': {source}")]
+    Template {
+        template_id: String,
+        source: Box<ScenarioError>,
+    },
 }
 
 /// Defines how an account address should be determined
@@ -171,6 +176,30 @@ fn json_type_name(v: &serde_json::Value) -> &'static str {
 }
 
 impl PdaSeed {
+    /// Check that literal pubkey content parses. Reference seeds are not
+    /// validated here; they depend on instance values.
+    pub(crate) fn validate_literals(&self) -> Result<(), SeedError> {
+        match self {
+            PdaSeed::Pubkey(s) => Pubkey::from_str(s)
+                .map(|_| ())
+                .map_err(|_| SeedError::InvalidPubkey(s.clone())),
+            PdaSeed::DerivedPda { program_id, seeds } => {
+                Pubkey::from_str(program_id)
+                    .map_err(|_| SeedError::InvalidPubkey(program_id.clone()))?;
+                for (i, seed) in seeds.iter().enumerate() {
+                    seed.validate_literals()
+                        .map_err(|e| SeedError::DerivedSeed {
+                            program_id: program_id.clone(),
+                            index: i,
+                            source: Box::new(e),
+                        })?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Convert a seed to bytes, optionally using values for PropertyRef resolution
     pub fn to_bytes(
         &self,
@@ -747,16 +776,29 @@ pub struct YamlOverrideTemplateFile {
     pub llm_context: Option<String>,
 }
 
+/// Convert a template's YAML address, attaching the template id to any failure.
+fn template_address(
+    template_id: &str,
+    address: YamlAccountAddress,
+) -> Result<AccountAddress, ScenarioError> {
+    AccountAddress::try_from(address).map_err(|e| ScenarioError::Template {
+        template_id: template_id.to_string(),
+        source: Box::new(e),
+    })
+}
+
 impl YamlOverrideTemplateFile {
     /// Convert file-based template to runtime OverrideTemplate with loaded IDL
-    pub fn to_override_template(self, idl: Idl) -> OverrideTemplate {
-        OverrideTemplate {
+    pub fn to_override_template(self, idl: Idl) -> Result<OverrideTemplate, ScenarioError> {
+        let address = template_address(&self.id, self.address)?;
+
+        Ok(OverrideTemplate {
             id: self.id,
             name: self.name,
             description: self.description,
             protocol: self.protocol,
             idl,
-            address: self.address.into(),
+            address,
             account_type: self.account_type,
             properties: self.properties.into_iter().map(Into::into).collect(),
             constants: self
@@ -766,7 +808,7 @@ impl YamlOverrideTemplateFile {
                 .collect(),
             tags: self.tags,
             llm_context: self.llm_context,
-        }
+        })
     }
 }
 
@@ -1041,8 +1083,8 @@ pub struct YamlOverrideTemplateEntry {
 }
 
 impl YamlOverrideTemplateCollection {
-    /// Convert collection to runtime OverrideTemplates with loaded IDL
-    pub fn to_override_templates(self, idl: Idl) -> Vec<OverrideTemplate> {
+    /// Convert collection to runtime OverrideTemplates with loaded IDL, validating addresses
+    pub fn to_override_templates(self, idl: Idl) -> Result<Vec<OverrideTemplate>, ScenarioError> {
         // Convert constants once for sharing
         let constants: HashMap<String, ConstantDefinition> = self
             .constants
@@ -1052,15 +1094,17 @@ impl YamlOverrideTemplateCollection {
 
         let default_account_type = self.account_type.clone().unwrap_or_default();
 
-        self.templates
-            .into_iter()
-            .map(|entry| OverrideTemplate {
+        let mut templates = Vec::new();
+        for entry in self.templates {
+            let address = template_address(&entry.id, entry.address)?;
+
+            templates.push(OverrideTemplate {
                 id: entry.id,
                 name: entry.name,
                 description: entry.description,
                 protocol: self.protocol.clone(),
                 idl: idl.clone(),
-                address: entry.address.into(),
+                address,
                 account_type: entry
                     .idl_account_name
                     .unwrap_or_else(|| default_account_type.clone()),
@@ -1068,8 +1112,10 @@ impl YamlOverrideTemplateCollection {
                 constants: constants.clone(),
                 tags: self.tags.clone(),
                 llm_context: entry.llm_context,
-            })
-            .collect()
+            });
+        }
+
+        Ok(templates)
     }
 }
 
@@ -1098,14 +1144,16 @@ pub struct YamlOverrideTemplate {
 
 impl YamlOverrideTemplate {
     /// Convert to runtime OverrideTemplate
-    pub fn to_override_template(self) -> OverrideTemplate {
-        OverrideTemplate {
+    pub fn to_override_template(self) -> Result<OverrideTemplate, ScenarioError> {
+        let address = template_address(&self.id, self.address)?;
+
+        Ok(OverrideTemplate {
             id: self.id,
             name: self.name,
             description: self.description,
             protocol: self.protocol,
             idl: self.idl,
-            address: self.address.into(),
+            address,
             account_type: self.account_type,
             properties: self.properties.into_iter().map(Into::into).collect(),
             constants: self
@@ -1115,7 +1163,7 @@ impl YamlOverrideTemplate {
                 .collect(),
             tags: self.tags,
             llm_context: self.llm_context,
-        }
+        })
     }
 }
 
@@ -1133,16 +1181,41 @@ pub enum YamlAccountAddress {
     },
 }
 
-impl From<YamlAccountAddress> for AccountAddress {
-    fn from(yaml: YamlAccountAddress) -> Self {
+impl std::convert::TryFrom<YamlAccountAddress> for AccountAddress {
+    type Error = ScenarioError;
+
+    fn try_from(yaml: YamlAccountAddress) -> Result<Self, Self::Error> {
         match yaml {
-            YamlAccountAddress::Pubkey { value } => {
-                AccountAddress::Pubkey(value.unwrap_or_default())
+            // The empty string is the established wire placeholder for "address
+            // supplied per override instance" (the spl-token templates rely on
+            // it), so it stays until templates model the absent address
+            // explicitly.
+            YamlAccountAddress::Pubkey { value: None } => Ok(AccountAddress::Pubkey(String::new())),
+            YamlAccountAddress::Pubkey { value: Some(s) } => {
+                if Pubkey::from_str(&s).is_err() {
+                    return Err(ScenarioError::InvalidAddress(SeedError::InvalidPubkey(s)));
+                }
+                Ok(AccountAddress::Pubkey(s))
             }
-            YamlAccountAddress::Pda { program_id, seeds } => AccountAddress::Pda {
-                program_id,
-                seeds: seeds.into_iter().map(|s| s.into()).collect(),
-            },
+            YamlAccountAddress::Pda { program_id, seeds } => {
+                Pubkey::from_str(&program_id)
+                    .map_err(|_| ScenarioError::InvalidProgramId(program_id.clone()))?;
+
+                let converted_seeds: Vec<PdaSeed> = seeds.into_iter().map(|s| s.into()).collect();
+
+                for (i, seed) in converted_seeds.iter().enumerate() {
+                    seed.validate_literals().map_err(|e| ScenarioError::Seed {
+                        program_id: program_id.clone(),
+                        index: i,
+                        source: e,
+                    })?;
+                }
+
+                Ok(AccountAddress::Pda {
+                    program_id,
+                    seeds: converted_seeds,
+                })
+            }
         }
     }
 }
@@ -1213,7 +1286,10 @@ mod tests {
     use serde_json::json;
     use solana_pubkey::Pubkey;
 
-    use super::{AccountAddress, PdaSeed, ScenarioError, SeedError};
+    use super::{
+        AccountAddress, Idl, OverrideError, PdaSeed, ScenarioError, SeedError, YamlAccountAddress,
+        YamlOverrideTemplateCollection, YamlOverrideTemplateEntry, YamlPdaSeed,
+    };
 
     #[test]
     fn u16_be_ref_rejects_out_of_range_values() {
@@ -1391,7 +1467,7 @@ mod tests {
         let seed = PdaSeed::U16BeRef("index".to_string());
         let values = HashMap::from([("index".to_string(), json!("513"))]);
 
-        assert_eq!(seed.to_bytes(Some(&values)), Some(vec![2, 1]));
+        assert_eq!(seed.to_bytes(Some(&values)), Ok(vec![2, 1]));
     }
 
     #[test]
@@ -1400,7 +1476,7 @@ mod tests {
 
         for value in [json!("65536"), json!("abc"), json!("-1"), json!("")] {
             let values = HashMap::from([("index".to_string(), value.clone())]);
-            assert_eq!(seed.to_bytes(Some(&values)), None, "value {value}");
+            assert!(seed.to_bytes(Some(&values)).is_err(), "value {value}");
         }
     }
 
@@ -1410,7 +1486,168 @@ mod tests {
 
         for value in [json!(1.5), json!(true), json!(null), json!([1]), json!({})] {
             let values = HashMap::from([("index".to_string(), value.clone())]);
-            assert_eq!(seed.to_bytes(Some(&values)), None, "value {value}");
+            assert!(seed.to_bytes(Some(&values)).is_err(), "value {value}");
+        }
+    }
+
+    #[test]
+    fn yaml_account_address_pubkey_valid_base58_converts() {
+        let yaml_addr = YamlAccountAddress::Pubkey {
+            value: Some("So11111111111111111111111111111111111111112".to_string()),
+        };
+
+        let result = AccountAddress::try_from(yaml_addr);
+        assert!(result.is_ok());
+
+        if let Ok(AccountAddress::Pubkey(s)) = result {
+            assert_eq!(s, "So11111111111111111111111111111111111111112");
+        } else {
+            panic!("Expected Pubkey variant");
+        }
+    }
+
+    #[test]
+    fn yaml_account_address_pubkey_invalid_string_errors() {
+        let yaml_addr = YamlAccountAddress::Pubkey {
+            value: Some("not-a-pubkey".to_string()),
+        };
+
+        let result = AccountAddress::try_from(yaml_addr);
+        assert!(result.is_err());
+
+        if let Err(ScenarioError::InvalidAddress(SeedError::InvalidPubkey(s))) = result {
+            assert_eq!(s, "not-a-pubkey");
+        } else {
+            panic!("Expected InvalidAddress error with InvalidPubkey");
+        }
+    }
+
+    #[test]
+    fn yaml_account_address_pubkey_none_stays_empty_string() {
+        let yaml_addr = YamlAccountAddress::Pubkey { value: None };
+
+        let result = AccountAddress::try_from(yaml_addr);
+        assert!(result.is_ok());
+
+        if let Ok(AccountAddress::Pubkey(s)) = result {
+            assert_eq!(s, "");
+        } else {
+            panic!("Expected Pubkey variant with empty string");
+        }
+    }
+
+    #[test]
+    fn yaml_account_address_pda_bad_program_id_errors() {
+        let yaml_addr = YamlAccountAddress::Pda {
+            program_id: "not-a-pubkey".to_string(),
+            seeds: vec![],
+        };
+
+        let result = AccountAddress::try_from(yaml_addr);
+        assert!(result.is_err());
+
+        if let Err(ScenarioError::InvalidProgramId(id)) = result {
+            assert_eq!(id, "not-a-pubkey");
+        } else {
+            panic!("Expected InvalidProgramId error");
+        }
+    }
+
+    #[test]
+    fn yaml_account_address_pda_bad_literal_pubkey_seed_errors() {
+        let yaml_addr = YamlAccountAddress::Pda {
+            program_id: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_string(),
+            seeds: vec![
+                YamlPdaSeed::String {
+                    value: "seed0".to_string(),
+                },
+                YamlPdaSeed::Pubkey {
+                    value: "oops".to_string(),
+                },
+            ],
+        };
+
+        let result = AccountAddress::try_from(yaml_addr);
+        assert!(result.is_err());
+
+        if let Err(ScenarioError::Seed {
+            program_id,
+            index,
+            source,
+        }) = result
+        {
+            assert_eq!(program_id, "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+            assert_eq!(index, 1);
+            assert_eq!(source, SeedError::InvalidPubkey("oops".to_string()));
+        } else {
+            panic!("Expected Seed error at index 1");
+        }
+    }
+
+    #[test]
+    fn yaml_account_address_pda_property_ref_seed_not_validated() {
+        use std::convert::TryFrom;
+
+        let yaml_addr = YamlAccountAddress::Pda {
+            program_id: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_string(),
+            seeds: vec![YamlPdaSeed::PropertyRef {
+                value: "some_property".to_string(),
+            }],
+        };
+
+        let result = AccountAddress::try_from(yaml_addr);
+        assert!(
+            result.is_ok(),
+            "PropertyRef seeds should not be validated at load time"
+        );
+    }
+
+    #[test]
+    fn yaml_override_template_collection_with_bad_address_wraps_error() {
+        let entry = YamlOverrideTemplateEntry {
+            id: "test-template".to_string(),
+            name: "Test".to_string(),
+            description: "Test template".to_string(),
+            idl_account_name: None,
+            properties: vec![],
+            address: YamlAccountAddress::Pubkey {
+                value: Some("invalid-pubkey".to_string()),
+            },
+            llm_context: None,
+        };
+
+        let collection = YamlOverrideTemplateCollection {
+            protocol: "Test".to_string(),
+            version: "1.0".to_string(),
+            account_type: None,
+            idl_file_path: "test.json".to_string(),
+            tags: vec![],
+            constants: HashMap::new(),
+            templates: vec![entry],
+        };
+
+        let idl_json = r#"{
+            "address": "11111111111111111111111111111111",
+            "instructions": [],
+            "accounts": [],
+            "types": [],
+            "errors": [],
+            "metadata": {"name": "test", "version": "0.1.0", "spec": "0.1.0"}
+        }"#;
+
+        let idl: Idl = serde_json::from_str(idl_json).expect("Valid minimal IDL");
+
+        let result = collection.to_override_templates(idl);
+        assert!(result.is_err());
+
+        if let Err(ScenarioError::Template {
+            template_id,
+            source: _,
+        }) = result
+        {
+            assert_eq!(template_id, "test-template");
+        } else {
+            panic!("Expected Template error wrapper");
         }
     }
 }

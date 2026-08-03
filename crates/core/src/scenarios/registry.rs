@@ -129,7 +129,10 @@ impl TemplateRegistry {
             };
 
         // Convert all templates in the collection
-        let templates = collection.to_override_templates(idl);
+        let templates = match collection.to_override_templates(idl) {
+            Ok(t) => t,
+            Err(e) => panic!("unable to convert {} templates: {}", protocol_name, e),
+        };
 
         // Register each template
         for template in templates {
