@@ -1308,6 +1308,126 @@ mod tests {
         YamlOverrideTemplateCollection, YamlOverrideTemplateEntry, YamlPdaSeed,
     };
 
+    /// Pin the rendered message of every error variant. Run with
+    /// `--nocapture` to view them.
+    #[test]
+    fn error_messages_render_with_full_context() {
+        let program = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
+        let account = "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM";
+        let cases: Vec<(String, String)> = vec![
+            (
+                SeedError::InvalidPubkey("garbage".to_string()).to_string(),
+                "'garbage' is not a valid pubkey".to_string(),
+            ),
+            (
+                SeedError::NoValues("owner".to_string()).to_string(),
+                "seed references property 'owner' but no values were provided".to_string(),
+            ),
+            (
+                SeedError::UnknownProperty("owner".to_string()).to_string(),
+                "property 'owner' not found in values".to_string(),
+            ),
+            (
+                SeedError::WrongType {
+                    name: "owner".to_string(),
+                    expected: "string",
+                    found: "bool",
+                }
+                .to_string(),
+                "property 'owner' is bool, expected string".to_string(),
+            ),
+            (
+                SeedError::U16OutOfRange {
+                    name: "index".to_string(),
+                    value: 70_000,
+                }
+                .to_string(),
+                "property 'index' value 70000 does not fit in u16".to_string(),
+            ),
+            (
+                SeedError::InvalidBytes32("zz".to_string()).to_string(),
+                "'zz' is not a 32-byte hex string".to_string(),
+            ),
+            (
+                SeedError::DerivedSeed {
+                    program_id: program.to_string(),
+                    index: 1,
+                    source: Box::new(SeedError::InvalidPubkey("garbage".to_string())),
+                }
+                .to_string(),
+                format!("seed 1 of derived PDA for program {program}: 'garbage' is not a valid pubkey"),
+            ),
+            (
+                ScenarioError::InvalidAddress(SeedError::InvalidPubkey("garbage".to_string()))
+                    .to_string(),
+                "invalid account address: 'garbage' is not a valid pubkey".to_string(),
+            ),
+            (
+                ScenarioError::InvalidProgramId("garbage".to_string()).to_string(),
+                "invalid program id 'garbage'".to_string(),
+            ),
+            (
+                ScenarioError::Seed {
+                    program_id: program.to_string(),
+                    index: 2,
+                    source: SeedError::UnknownProperty("owner".to_string()),
+                }
+                .to_string(),
+                format!("PDA for program {program}, seed 2: property 'owner' not found in values"),
+            ),
+            (
+                ScenarioError::Template {
+                    template_id: "spl-token".to_string(),
+                    source: Box::new(ScenarioError::InvalidProgramId("garbage".to_string())),
+                }
+                .to_string(),
+                "template 'spl-token': invalid program id 'garbage'".to_string(),
+            ),
+            (
+                OverrideError::Resolve(ScenarioError::InvalidProgramId("garbage".to_string()))
+                    .to_string(),
+                "invalid program id 'garbage'".to_string(),
+            ),
+            (
+                OverrideError::AccountNotFound {
+                    account: account.to_string(),
+                }
+                .to_string(),
+                format!(
+                    "account {account} does not exist locally; overrides patch existing accounts (enable fetchBeforeUse or create the account first)"
+                ),
+            ),
+            (
+                OverrideError::AccountTooSmall {
+                    account: account.to_string(),
+                    len: 4,
+                }
+                .to_string(),
+                format!("account {account} has 4 byte(s), too small for an 8-byte discriminator"),
+            ),
+            (
+                OverrideError::NoIdlForOwner {
+                    program_id: program.to_string(),
+                    account: account.to_string(),
+                }
+                .to_string(),
+                format!("no IDL registered for program {program} (owner of account {account})"),
+            ),
+            (
+                OverrideError::Forge {
+                    account: account.to_string(),
+                    message: "borsh decode failed".to_string(),
+                }
+                .to_string(),
+                format!("failed to forge account data for {account}: borsh decode failed"),
+            ),
+        ];
+        for (rendered, expected) in cases {
+            println!("{rendered}");
+            assert_eq!(rendered, expected);
+        }
+    }
+
     #[test]
     fn u16_be_ref_rejects_out_of_range_values() {
         let seed = PdaSeed::U16BeRef("index".to_string());
