@@ -9,6 +9,36 @@ Startup is modeled as two state machines:
 `startup.phase` is a projection of those machines. It is derived from the
 current state and is never stored.
 
+The shape at a glance: sealing is the single exit from planning, the plan's
+tasks run concurrently inside initializing, and leaving it is a join.
+
+<!-- BEGIN MERMAID: lifecycle -->
+```mermaid
+stateDiagram-v2
+    [*] --> Planning
+    Planning : inspect project configuration,<br/>compute and seal the required task set
+    Planning --> Initializing : StartupPlanSealed
+    Planning --> Failed : StartupFailed
+
+    state "Initializing (plan tasks run concurrently)" as Initializing {
+        [*] --> Hydrating
+        Hydrating : fetch and install clones
+        Hydrating --> [*]
+        --
+        [*] --> Deploying
+        Deploying : run deployment runbooks
+        Deploying --> [*]
+    }
+
+    Initializing --> Ready : every required task succeeded
+    Initializing --> Failed : any task failed
+
+    Ready : first publicly observable state
+    Failed : terminal, reason recorded
+```
+<!-- END MERMAID: lifecycle -->
+
+
 ## Plan lifecycle
 
 The startup plan defines the required work. Once sealed, its task set is fixed.

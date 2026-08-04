@@ -326,7 +326,7 @@ impl std::fmt::Display for StartupErrorKind {
 ///
 /// ---
 ///
-#[doc = include_str!("startup-lifecycle.md")]
+#[doc = include_str!(concat!(env!("OUT_DIR"), "/startup-lifecycle.rustdoc.md"))]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum SurfnetStartupStatus {
     /// Unsealed: the required task set is not known yet. Never ready.
