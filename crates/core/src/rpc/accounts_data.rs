@@ -696,6 +696,7 @@ impl AccountsData for SurfpoolAccountsDataRpc {
 #[cfg(test)]
 mod tests {
     use solana_account::Account;
+    use solana_account_decoder::{UiAccountData, UiAccountEncoding};
     use solana_keypair::Keypair;
     use solana_program_option::COption;
     use solana_program_pack::Pack;
@@ -716,6 +717,53 @@ mod tests {
         tests::helpers::TestSetup,
         types::SyntheticBlockhash,
     };
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_account_info_base64_zstd() {
+        let setup = TestSetup::new(SurfpoolAccountsDataRpc);
+        let pubkey = Pubkey::new_unique();
+        let expected_account = Account {
+            lamports: 1_000_000,
+            data: b"surfpool-zstd-account-data".to_vec(),
+            owner: solana_system_interface::program::id(),
+            executable: false,
+            rent_epoch: 0,
+        };
+
+        setup
+            .context
+            .svm_locker
+            .write_account_update(GetAccountResult::FoundAccount(
+                pubkey,
+                expected_account.clone(),
+                true,
+            ));
+
+        let response = setup
+            .rpc
+            .get_account_info(
+                Some(setup.context),
+                pubkey.to_string(),
+                Some(RpcAccountInfoConfig {
+                    encoding: Some(UiAccountEncoding::Base64Zstd),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+
+        let ui_account = response.value.expect("account should be returned");
+        assert!(matches!(
+            &ui_account.data,
+            UiAccountData::Binary(_, UiAccountEncoding::Base64Zstd)
+        ));
+        assert_eq!(
+            ui_account
+                .to_account()
+                .expect("base64+zstd account data should decode"),
+            expected_account
+        );
+    }
 
     #[ignore = "connection-required"]
     #[tokio::test(flavor = "multi_thread")]

@@ -108,7 +108,9 @@ serde_with = { version = "3.14.0", default-features = false }
 strum = { version = "0.26", default-features = false, features = ["derive"] }
 solana-account = { version = "4.3", default-features = false }
 solana-account-decoder = { version = "4.0", default-features = false }
-solana-account-decoder-client-types = { version = "4.0", default-features = false }
+solana-account-decoder-client-types = { version = "4.0", default-features = false, features = [
+    "zstd",
+] }
 solana-address-lookup-table-interface = { version = "3.0", default-features = false }
 solana-client = { version = "4.0", default-features = false }
 solana-clock = { version = "3.0", default-features = false }
