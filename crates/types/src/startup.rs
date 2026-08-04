@@ -696,4 +696,7 @@ mod spec;
 mod surfnet_startup_status_tests;
 
 #[cfg(test)]
+mod startup_regression_scenarios;
+
+#[cfg(test)]
 mod surfnet_startup_reachability_tests;
