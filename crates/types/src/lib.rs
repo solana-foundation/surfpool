@@ -4,6 +4,7 @@ pub mod constants;
 pub mod features;
 pub mod jito_bundles;
 pub mod scenarios;
+pub mod startup;
 #[cfg(feature = "ts-bindings")]
 pub mod ts_bindings;
 pub mod types;
