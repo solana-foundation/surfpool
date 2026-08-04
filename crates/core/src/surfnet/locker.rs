@@ -4699,6 +4699,79 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn test_transaction_fee_includes_priority_fee() {
+        use crossbeam_channel::unbounded;
+        use solana_compute_budget_interface::ComputeBudgetInstruction;
+        use solana_keypair::Keypair;
+        use solana_message::{Message, VersionedMessage};
+        use solana_signer::Signer;
+        use solana_system_interface::instruction as system_instruction;
+        use solana_transaction::versioned::VersionedTransaction;
+
+        const CU_LIMIT: u32 = 100_000;
+        const CU_PRICE_MICRO_LAMPORTS: u64 = 1_000_000;
+        const TRANSFER_LAMPORTS: u64 = 1_000_000;
+        // priority fee = compute unit limit * price / 1_000_000 micro-lamports
+        const PRIORITY_FEE: u64 = 100_000;
+        const BASE_FEE: u64 = 5_000;
+
+        let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let locker = SurfnetSvmLocker::new(svm);
+
+        let payer = Keypair::new();
+        let payer_pubkey = payer.pubkey();
+        let recipient = Pubkey::new_unique();
+        let _ = locker
+            .airdrop(&payer_pubkey, 1_000_000_000)
+            .expect("airdrop should succeed");
+
+        let message = Message::new_with_blockhash(
+            &[
+                ComputeBudgetInstruction::set_compute_unit_limit(CU_LIMIT),
+                ComputeBudgetInstruction::set_compute_unit_price(CU_PRICE_MICRO_LAMPORTS),
+                system_instruction::transfer(&payer_pubkey, &recipient, TRANSFER_LAMPORTS),
+            ],
+            Some(&payer_pubkey),
+            &locker.latest_absolute_blockhash(),
+        );
+        let tx = VersionedTransaction::try_new(
+            VersionedMessage::Legacy(message),
+            &[payer.insecure_clone()],
+        )
+        .expect("transaction should sign");
+        let signature = tx.signatures[0];
+
+        let (status_tx, _status_rx) = unbounded();
+        locker
+            .process_transaction(&None, tx, status_tx, true, true)
+            .await
+            .expect("transaction processing should succeed");
+
+        let (fee, payer_pre, payer_post) = locker.with_svm_reader(|svm_reader| {
+            let entry = svm_reader
+                .transactions
+                .get(&signature.to_string())
+                .expect("transaction lookup should succeed")
+                .expect("transaction should be stored");
+            let (transaction_with_status_meta, _) = entry.expect_processed();
+            let meta = &transaction_with_status_meta.meta;
+            // The fee payer is always the first account key.
+            (meta.fee, meta.pre_balances[0], meta.post_balances[0])
+        });
+
+        assert_eq!(
+            fee,
+            BASE_FEE + PRIORITY_FEE,
+            "reported fee must include the priority fee, not just the per-signature base fee"
+        );
+        assert_eq!(
+            payer_pre - payer_post,
+            fee + TRANSFER_LAMPORTS,
+            "reported fee must reconcile with the payer's balance delta"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_get_signatures_for_address_local_populates_memo_and_block_time() {
         use std::str::FromStr;
 

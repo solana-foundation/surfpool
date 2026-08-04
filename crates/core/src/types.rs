@@ -466,13 +466,12 @@ impl TransactionWithStatusMeta {
         post_token_program_ids: &[Pubkey],
         loaded_addresses: LoadedAddresses,
     ) -> Self {
-        let signatures_len = transaction.signatures.len();
         Self {
             slot,
             transaction,
             meta: TransactionStatusMeta {
                 status: Ok(()),
-                fee: 5000 * signatures_len as u64,
+                fee: transaction_meta.fee,
                 pre_balances: accounts_before
                     .iter()
                     .map(|a| a.clone().map(|a| a.lamports).unwrap_or(0))
@@ -715,7 +714,7 @@ impl TransactionWithStatusMeta {
             .map(|a| a.as_ref().map(|a| a.lamports).unwrap_or(0))
             .collect();
 
-        let fee = 5000 * transaction.signatures.len() as u64;
+        let fee = failure.meta.fee;
 
         let post_balances: Vec<u64> = accounts_after
             .iter()
