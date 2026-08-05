@@ -2251,47 +2251,11 @@ impl SurfnetSvm {
     /// # Arguments
     /// * `account_update` - The account update result to process.
     pub fn write_account_update(&mut self, account_update: GetAccountResult) {
-        let init_programdata_account = |program_account: &Account| {
-            if !program_account.executable {
-                return None;
-            }
-            if !program_account
-                .owner
-                .eq(&solana_sdk_ids::bpf_loader_upgradeable::id())
-            {
-                return None;
-            }
-            let Ok(UpgradeableLoaderState::Program {
-                programdata_address,
-            }) = bincode::deserialize::<UpgradeableLoaderState>(&program_account.data)
-            else {
-                return None;
-            };
-
-            let programdata_state = UpgradeableLoaderState::ProgramData {
-                upgrade_authority_address: Some(system_program::id()),
-                slot: self.get_latest_absolute_slot(),
-            };
-            let mut data = bincode::serialize(&programdata_state).unwrap();
-
-            data.extend_from_slice(crate::surfnet::noop_program::NOOP_PROGRAM_ELF);
-            let lamports = self.inner.minimum_balance_for_rent_exemption(data.len());
-            Some((
-                programdata_address,
-                Account {
-                    lamports,
-                    data,
-                    owner: solana_sdk_ids::bpf_loader_upgradeable::id(),
-                    executable: false,
-                    rent_epoch: 0,
-                },
-            ))
-        };
         match account_update {
             GetAccountResult::FoundAccount(pubkey, account, do_update_account) => {
                 if do_update_account {
                     if let Some((programdata_address, programdata_account)) =
-                        init_programdata_account(&account)
+                        self.default_programdata_account(&account)
                     {
                         match self.get_account(&programdata_address) {
                             Ok(None) => {
@@ -2320,7 +2284,7 @@ impl SurfnetSvm {
             }
             GetAccountResult::FoundProgramAccount((pubkey, account), (_, None)) => {
                 if let Some((programdata_address, programdata_account)) =
-                    init_programdata_account(&account)
+                    self.default_programdata_account(&account)
                 {
                     match self.get_account(&programdata_address) {
                         Ok(None) => {
@@ -2375,6 +2339,182 @@ impl SurfnetSvm {
             }
             GetAccountResult::None(_) => {}
         }
+    }
+
+    /// Hydrates an account fetched from a remote RPC without replacing local fork state.
+    ///
+    /// The local lookup and conditional insert happen while the caller holds the SVM write lock.
+    /// This closes the check/fetch/write race: a remote response can initialize an account that is
+    /// still absent, but it cannot replace an account written locally while the request was in
+    /// flight. Companion mint and program-data accounts are merged independently.
+    pub fn hydrate_account_update(&mut self, account_update: GetAccountResult) -> GetAccountResult {
+        let requested_pubkey = match &account_update {
+            GetAccountResult::None(pubkey) | GetAccountResult::FoundAccount(pubkey, _, _) => {
+                *pubkey
+            }
+            GetAccountResult::FoundProgramAccount((pubkey, _), _)
+            | GetAccountResult::FoundTokenAccount((pubkey, _), _) => *pubkey,
+        };
+        let remote_read_result = match &account_update {
+            GetAccountResult::None(pubkey) => GetAccountResult::None(*pubkey),
+            GetAccountResult::FoundAccount(pubkey, account, _) => {
+                GetAccountResult::FoundAccount(*pubkey, account.clone(), false)
+            }
+            GetAccountResult::FoundProgramAccount((pubkey, account), _)
+            | GetAccountResult::FoundTokenAccount((pubkey, account), _) => {
+                GetAccountResult::FoundAccount(*pubkey, account.clone(), false)
+            }
+        };
+
+        // The requested account may have been written while the remote request was in flight.
+        // Re-read it under the write lock and materialize that complete local result (including
+        // any DB-backed companion accounts) instead of applying any part of the remote result.
+        match self.inner.get_account_result(&requested_pubkey) {
+            Ok(local_update) if !local_update.is_none() => {
+                self.write_account_update(local_update);
+                return match self.inner.get_account_result(&requested_pubkey) {
+                    Ok(local_result) if !local_result.is_none() => local_result,
+                    _ => remote_read_result,
+                };
+            }
+            Ok(_) => {}
+            Err(e) => {
+                let _ = self
+                    .simnet_events_tx
+                    .send(SimnetEvent::error(e.to_string()));
+                return remote_read_result;
+            }
+        }
+
+        match account_update {
+            GetAccountResult::FoundAccount(pubkey, account, do_update_account) => {
+                if do_update_account {
+                    if let Some((programdata_address, programdata_account)) =
+                        self.default_programdata_account(&account)
+                    {
+                        self.hydrate_account_if_missing(programdata_address, programdata_account);
+                    }
+                    self.hydrate_account_if_missing(pubkey, account);
+                }
+            }
+            GetAccountResult::FoundProgramAccount((pubkey, account), (_, None)) => {
+                if let Some((programdata_address, programdata_account)) =
+                    self.default_programdata_account(&account)
+                {
+                    self.hydrate_account_if_missing(programdata_address, programdata_account);
+                }
+                self.hydrate_account_if_missing(pubkey, account);
+            }
+            GetAccountResult::FoundTokenAccount((pubkey, account), (_, None)) => {
+                self.hydrate_account_if_missing(pubkey, account);
+            }
+            GetAccountResult::FoundProgramAccount(
+                (pubkey, account),
+                (coupled_pubkey, Some(coupled_account)),
+            )
+            | GetAccountResult::FoundTokenAccount(
+                (pubkey, account),
+                (coupled_pubkey, Some(coupled_account)),
+            ) => {
+                self.hydrate_account_if_missing(coupled_pubkey, coupled_account);
+                self.hydrate_account_if_missing(pubkey, account);
+            }
+            GetAccountResult::None(_) => {}
+        }
+
+        match self.inner.get_account_result(&requested_pubkey) {
+            Ok(local_result) if !local_result.is_none() => local_result,
+            _ => remote_read_result,
+        }
+    }
+
+    fn hydrate_account_if_missing(&mut self, pubkey: Pubkey, remote_account: Account) {
+        if self.inner.get_account_no_db(&pubkey).is_some() {
+            debug!("Keeping local account {} during remote hydration", pubkey);
+            return;
+        }
+
+        match self.inner.get_account(&pubkey) {
+            Ok(Some(local_account)) => {
+                // The account survived in the backing store after LiteSVM garbage collection.
+                // Materialize that local value rather than replacing it with remote state.
+                if let Err(e) = self.set_account(&pubkey, local_account) {
+                    let _ = self
+                        .simnet_events_tx
+                        .send(SimnetEvent::error(e.to_string()));
+                }
+            }
+            Ok(None) => {
+                if self.is_remote_hydration_blocked(&pubkey, &remote_account) {
+                    return;
+                }
+                if let Err(e) = self.set_account(&pubkey, remote_account) {
+                    let _ = self
+                        .simnet_events_tx
+                        .send(SimnetEvent::error(e.to_string()));
+                }
+            }
+            Err(e) => {
+                let _ = self
+                    .simnet_events_tx
+                    .send(SimnetEvent::error(e.to_string()));
+            }
+        }
+    }
+
+    fn is_remote_hydration_blocked(&self, pubkey: &Pubkey, account: &Account) -> bool {
+        if self
+            .offline_accounts
+            .contains_key(&pubkey.to_string())
+            .unwrap_or(false)
+        {
+            return true;
+        }
+
+        self.offline_accounts
+            .into_iter()
+            .map(|mut entries| {
+                entries.any(|(offline_pubkey, config)| {
+                    config.include_owned_accounts
+                        && Pubkey::from_str(&offline_pubkey)
+                            .map(|owner| owner == account.owner)
+                            .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false)
+    }
+
+    fn default_programdata_account(&self, program_account: &Account) -> Option<(Pubkey, Account)> {
+        if !program_account.executable
+            || program_account.owner != solana_sdk_ids::bpf_loader_upgradeable::id()
+        {
+            return None;
+        }
+        let Ok(UpgradeableLoaderState::Program {
+            programdata_address,
+        }) = bincode::deserialize::<UpgradeableLoaderState>(&program_account.data)
+        else {
+            return None;
+        };
+
+        let programdata_state = UpgradeableLoaderState::ProgramData {
+            upgrade_authority_address: Some(system_program::id()),
+            slot: self.get_latest_absolute_slot(),
+        };
+        let mut data = bincode::serialize(&programdata_state).unwrap();
+
+        data.extend_from_slice(crate::surfnet::noop_program::NOOP_PROGRAM_ELF);
+        let lamports = self.inner.minimum_balance_for_rent_exemption(data.len());
+        Some((
+            programdata_address,
+            Account {
+                lamports,
+                data,
+                owner: solana_sdk_ids::bpf_loader_upgradeable::id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        ))
     }
 
     pub fn confirm_current_block(&mut self) -> SurfpoolResult<()> {
@@ -4412,6 +4552,97 @@ mod tests {
             program_data_address,
             program_data_account,
         )
+    }
+
+    #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
+    #[test_case(TestType::in_memory(); "with in-memory sqlite db")]
+    #[test_case(TestType::no_db(); "with no db")]
+    #[cfg_attr(feature = "postgres", test_case(TestType::postgres(); "with postgres db"))]
+    fn test_remote_hydration_preserves_local_account_state(test_type: TestType) {
+        let (mut svm, _events_rx, _geyser_rx) = test_type.initialize_svm();
+        let pubkey = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let local_account = Account {
+            lamports: 2,
+            data: b"local-state".to_vec(),
+            owner,
+            executable: false,
+            rent_epoch: 0,
+        };
+        let remote_account = Account {
+            lamports: 1,
+            data: b"remote-state".to_vec(),
+            owner,
+            executable: false,
+            rent_epoch: 0,
+        };
+
+        svm.set_account(&pubkey, local_account.clone()).unwrap();
+        svm.hydrate_account_update(GetAccountResult::FoundAccount(pubkey, remote_account, true));
+
+        assert_eq!(svm.get_account(&pubkey).unwrap(), Some(local_account));
+    }
+
+    #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
+    #[test_case(TestType::in_memory(); "with in-memory sqlite db")]
+    #[test_case(TestType::no_db(); "with no db")]
+    #[cfg_attr(feature = "postgres", test_case(TestType::postgres(); "with postgres db"))]
+    fn test_remote_hydration_merges_companion_accounts_independently(test_type: TestType) {
+        let (mut svm, _events_rx, _geyser_rx) = test_type.initialize_svm();
+
+        let token_pubkey = Pubkey::new_unique();
+        let mint_pubkey = Pubkey::new_unique();
+        let local_mint = Account {
+            lamports: 2,
+            data: b"local-mint".to_vec(),
+            owner: spl_token_interface::id(),
+            executable: false,
+            rent_epoch: 0,
+        };
+        let remote_mint = Account {
+            lamports: 1,
+            data: b"remote-mint".to_vec(),
+            ..local_mint.clone()
+        };
+        let remote_token = Account {
+            lamports: 1,
+            data: b"remote-token".to_vec(),
+            owner: spl_token_interface::id(),
+            executable: false,
+            rent_epoch: 0,
+        };
+
+        svm.set_account(&mint_pubkey, local_mint.clone()).unwrap();
+        svm.hydrate_account_update(GetAccountResult::FoundTokenAccount(
+            (token_pubkey, remote_token.clone()),
+            (mint_pubkey, Some(remote_mint)),
+        ));
+
+        assert_eq!(svm.get_account(&token_pubkey).unwrap(), Some(remote_token));
+        assert_eq!(svm.get_account(&mint_pubkey).unwrap(), Some(local_mint));
+
+        let (program_pubkey, remote_program, programdata_pubkey, remote_programdata) =
+            create_program_accounts();
+        let local_programdata = Account {
+            lamports: remote_programdata.lamports + 1,
+            ..remote_programdata.clone()
+        };
+
+        svm.set_account(&programdata_pubkey, local_programdata.clone())
+            .unwrap();
+        svm.hydrate_account_update(GetAccountResult::FoundProgramAccount(
+            (program_pubkey, remote_program.clone()),
+            (programdata_pubkey, Some(remote_programdata)),
+        ));
+
+        assert_eq!(
+            svm.get_account(&program_pubkey).unwrap(),
+            Some(remote_program)
+        );
+        assert_eq!(
+            svm.get_account(&programdata_pubkey).unwrap(),
+            Some(local_programdata)
+        );
     }
 
     #[test_case(TestType::sqlite(); "with on-disk sqlite db")]

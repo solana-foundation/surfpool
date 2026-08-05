@@ -69,13 +69,15 @@ use super::{
 use crate::{
     error::{AirdropError, SurfpoolError, SurfpoolResult},
     helpers::time_travel::calculate_time_travel_clock,
-    rpc::full::{
-        ComparisonFilter, RpcGetTransactionsForAddressConfig, RpcTransactionForAddressEntry,
-        RpcTransactionForAddressFullInfo, RpcTransactionForAddressSignatureInfo,
-        RpcTransactionsForAddressResult, SortOrder, TransactionsForAddressDetails,
-        TransactionsForAddressStatusFilter, TransactionsForAddressTokenFilter,
+    rpc::{
+        full::{
+            ComparisonFilter, RpcGetTransactionsForAddressConfig, RpcTransactionForAddressEntry,
+            RpcTransactionForAddressFullInfo, RpcTransactionForAddressSignatureInfo,
+            RpcTransactionsForAddressResult, SortOrder, TransactionsForAddressDetails,
+            TransactionsForAddressStatusFilter, TransactionsForAddressTokenFilter,
+        },
+        utils::{convert_transaction_metadata_from_canonical, verify_pubkey},
     },
-    rpc::utils::{convert_transaction_metadata_from_canonical, verify_pubkey},
     storage::StorageResult,
     surfnet::FINALIZATION_SLOT_THRESHOLD,
     types::{
@@ -225,6 +227,26 @@ impl SurfnetSvmLocker {
         })
     }
 
+    /// Executes a write operation and captures the SVM context from the same lock scope.
+    fn with_contextualized_svm_writer<T, F>(&self, writer: F) -> SvmAccessContext<T>
+    where
+        F: FnOnce(&mut SurfnetSvm) -> T + Send + Sync,
+        T: Send + 'static,
+    {
+        let write_lock = self.0.clone();
+        tokio::task::block_in_place(move || {
+            let mut write_guard = write_lock.blocking_write();
+            let res = writer(&mut write_guard);
+
+            SvmAccessContext::new(
+                write_guard.get_latest_absolute_slot(),
+                write_guard.latest_epoch_info(),
+                write_guard.latest_blockhash(),
+                res,
+            )
+        })
+    }
+
     /// Executes a write operation on the underlying `SurfnetSvm` by acquiring a blocking write lock.
     /// Accepts a closure that receives a mutable reference to `SurfnetSvm` and returns a value.
     ///
@@ -292,8 +314,19 @@ impl SurfnetSvmLocker {
 
     /// Retrieves a local account from the SVM cache, returning a contextualized result.
     pub fn get_account_local(&self, pubkey: &Pubkey) -> SvmAccessContext<GetAccountResult> {
-        self.with_contextualized_svm_reader(|svm_reader| {
-            return svm_reader.inner.get_account_result(pubkey).unwrap();
+        let result = self.with_contextualized_svm_reader(|svm_reader| {
+            svm_reader.inner.get_account_result(pubkey).unwrap()
+        });
+
+        if !result.inner.requires_update() {
+            return result;
+        }
+
+        let pubkey = *pubkey;
+        self.with_contextualized_svm_writer(move |svm_writer| {
+            let update = svm_writer.inner.get_account_result(&pubkey).unwrap();
+            svm_writer.write_account_update(update);
+            svm_writer.inner.get_account_result(&pubkey).unwrap()
         })
     }
 
@@ -314,13 +347,12 @@ impl SurfnetSvmLocker {
             if !is_offline {
                 let offline_owners = self.get_offline_account_owners();
                 let remote_account = client.get_account(pubkey, commitment_config).await?;
-                Ok(
-                    result.with_new_value(Self::filter_downloaded_account_result(
-                        pubkey,
-                        remote_account,
-                        &offline_owners,
-                    )),
-                )
+                let remote_account =
+                    Self::filter_downloaded_account_result(pubkey, remote_account, &offline_owners);
+
+                Ok(self.with_contextualized_svm_writer(move |svm_writer| {
+                    svm_writer.hydrate_account_update(remote_account)
+                }))
             } else {
                 Ok(result)
             }
@@ -356,15 +388,27 @@ impl SurfnetSvmLocker {
         &self,
         pubkeys: &[Pubkey],
     ) -> SvmAccessContext<Vec<GetAccountResult>> {
-        self.with_contextualized_svm_reader(|svm_reader| {
-            let mut accounts = vec![];
+        let results = self.with_contextualized_svm_reader(|svm_reader| {
+            pubkeys
+                .iter()
+                .map(|pubkey| svm_reader.inner.get_account_result(pubkey).unwrap())
+                .collect::<Vec<_>>()
+        });
 
-            for pubkey in pubkeys {
-                let result = svm_reader.inner.get_account_result(pubkey).unwrap();
-                if result.is_none() {};
-                accounts.push(result);
+        if results.inner.iter().all(|result| !result.requires_update()) {
+            return results;
+        }
+
+        let pubkeys = pubkeys.to_vec();
+        self.with_contextualized_svm_writer(move |svm_writer| {
+            for pubkey in &pubkeys {
+                let update = svm_writer.inner.get_account_result(pubkey).unwrap();
+                svm_writer.write_account_update(update);
             }
-            accounts
+            pubkeys
+                .iter()
+                .map(|pubkey| svm_writer.inner.get_account_result(pubkey).unwrap())
+                .collect()
         })
     }
 
@@ -416,9 +460,8 @@ impl SurfnetSvmLocker {
             .get_multiple_accounts(&missing_accounts, commitment_config)
             .await?;
 
-        // Build map of pubkey -> remote result for O(1) lookup
         let offline_owners = self.get_offline_account_owners();
-        let remote_map: HashMap<Pubkey, GetAccountResult> = missing_accounts
+        let remote_results = missing_accounts
             .iter()
             .copied()
             .zip(remote_results.into_iter())
@@ -432,33 +475,30 @@ impl SurfnetSvmLocker {
                     ),
                 )
             })
-            .collect();
+            .collect::<Vec<_>>();
 
-        // Replace None entries with remote results while preserving order
-        // We iterate through original pubkeys array to ensure order is explicit
-        let combined_results: Vec<GetAccountResult> = pubkeys
-            .iter()
-            .zip(local_results.into_iter())
-            .map(|(pubkey, local_result)| {
-                match local_result {
-                    GetAccountResult::None(_) => remote_map
-                        .get(pubkey)
-                        .cloned()
-                        .unwrap_or(GetAccountResult::None(*pubkey)),
-                    found => {
-                        debug!("Keeping local account: {}", pubkey);
-                        found
-                    } // Keep found accounts (no clone, just move)
-                }
-            })
-            .collect();
+        // Remote data is hydration, not an authoritative update. Recheck and insert each
+        // fetched account under the write lock so local writes that happened during the
+        // network request always win. Companion mint/program-data accounts follow the same rule.
+        let requested_pubkeys = pubkeys.to_vec();
+        Ok(self.with_contextualized_svm_writer(move |svm_writer| {
+            let mut hydrated_results = HashMap::new();
+            for (pubkey, update) in remote_results {
+                hydrated_results.insert(pubkey, svm_writer.hydrate_account_update(update));
+            }
 
-        Ok(SvmAccessContext::new(
-            slot,
-            latest_epoch_info,
-            latest_blockhash,
-            combined_results,
-        ))
+            requested_pubkeys
+                .iter()
+                .map(|pubkey| {
+                    let local_result = svm_writer.inner.get_account_result(pubkey).unwrap();
+                    if local_result.is_none() {
+                        hydrated_results.remove(pubkey).unwrap_or(local_result)
+                    } else {
+                        local_result
+                    }
+                })
+                .collect()
+        }))
     }
 
     /// Retrieves multiple accounts, using local or remote context and applying factory defaults if provided.
