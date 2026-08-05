@@ -568,7 +568,6 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
                                     app.successful_transactions += 1;
                                 }
                             }
-                            SimnetEvent::BlockHashExpired => {}
                             SimnetEvent::Aborted(_error) => {
                                 break;
                             }

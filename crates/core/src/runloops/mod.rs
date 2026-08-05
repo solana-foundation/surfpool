@@ -369,9 +369,6 @@ pub async fn start_block_production_runloop(
                             }
                         }
                     }
-                    ClockEvent::ExpireBlockHash => {
-                        do_produce_block = true;
-                    }
                 }
             },
             recv(simnet_commands_rx) -> msg => if let Ok(event) = msg {
@@ -589,13 +586,6 @@ pub fn start_clock_runloop(
             sleep(Duration::from_millis(slot_time));
             if enabled {
                 let _ = clock_event_tx.send(ClockEvent::Tick);
-                // Todo: the block expiration is not completely accurate.
-                if block_hash_timeout.elapsed()
-                    > Duration::from_millis(BLOCKHASH_SLOT_TTL * slot_time)
-                {
-                    let _ = clock_event_tx.send(ClockEvent::ExpireBlockHash);
-                    block_hash_timeout = Instant::now();
-                }
             }
         }
     });

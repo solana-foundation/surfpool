@@ -696,7 +696,6 @@ impl From<SimnetEvent> for SimnetEventValue {
                 value.epoch_info = Some(epoch_info.into());
                 value
             }
-            SimnetEvent::BlockHashExpired => Self::new("blockHashExpired"),
             SimnetEvent::InfoLog(timestamp, message) => {
                 log_event("infoLog", timestamp.to_rfc3339(), message)
             }

@@ -499,7 +499,6 @@ fn log_events(
                             }
                         }
                     }
-                    SimnetEvent::BlockHashExpired => {}
                     SimnetEvent::Aborted(error) => {
                         error!("{}", error);
                         return Err(error);

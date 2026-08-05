@@ -440,7 +440,6 @@ pub enum SimnetEvent {
     SystemClockUpdated(Clock),
     ClockUpdate(ClockCommand),
     EpochInfoUpdate(EpochInfo),
-    BlockHashExpired,
     InfoLog(DateTime<Local>, String),
     ErrorLog(DateTime<Local>, String),
     WarnLog(DateTime<Local>, String),
@@ -595,7 +594,6 @@ pub enum ClockCommand {
 
 pub enum ClockEvent {
     Tick,
-    ExpireBlockHash,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
