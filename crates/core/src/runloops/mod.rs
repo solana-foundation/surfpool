@@ -6,7 +6,7 @@ use std::{
     path::PathBuf,
     sync::{Arc, RwLock},
     thread::{JoinHandle, sleep},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use agave_geyser_plugin_interface::geyser_plugin_interface::{
@@ -44,8 +44,6 @@ use crate::{
     },
     surfnet::{GeyserEvent, PluginCommand, locker::SurfnetSvmLocker, remote::SurfnetRemoteClient},
 };
-
-const BLOCKHASH_SLOT_TTL: u64 = 75;
 
 /// A loaded geyser plugin with all metadata needed for lifecycle management.
 /// Field order matters: `plugin` must be declared before `_library` so it drops first,
@@ -544,7 +542,6 @@ pub fn start_clock_runloop(
 
     let _handle = hiro_system_kit::thread_named("clock").spawn(move || {
         let mut enabled = true;
-        let mut block_hash_timeout = Instant::now();
 
         loop {
             match clock_command_rx.try_recv() {
