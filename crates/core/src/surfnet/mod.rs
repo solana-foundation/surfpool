@@ -48,6 +48,12 @@ pub enum GeyserSlotStatus {
     Rooted,
     /// Slot has been confirmed
     Confirmed,
+    /// First Shred Received
+    FirstShredReceived,
+    /// All shreds for the slot have been received.
+    Completed,
+    /// A new bank fork is created with the slot
+    CreatedBank,
 }
 
 /// Block metadata for geyser plugin notifications.

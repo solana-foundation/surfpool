@@ -334,6 +334,18 @@ pub async fn start_local_surfnet_runloop(
     // Notify geyser plugins that startup is complete
     let _ = svm_locker.with_svm_reader(|svm| svm.geyser_events_tx.send(GeyserEvent::EndOfStartup));
 
+    // Announce the genesis slot so plugins begin tracking it. Block production
+    // announces slot N+1 while closing slot N, so without this the first slot is
+    // never created from a plugin's perspective and its block data gets dropped.
+    let _ = svm_locker.with_svm_reader(|svm| {
+        let slot = svm.get_latest_absolute_slot();
+        svm.geyser_events_tx.send(GeyserEvent::UpdateSlotStatus {
+            slot,
+            parent: slot.checked_sub(1),
+            status: crate::surfnet::GeyserSlotStatus::CreatedBank,
+        })
+    });
+
     start_block_production_runloop(
         clock_event_rx,
         clock_command_tx,
@@ -833,6 +845,9 @@ fn start_geyser_runloop(
                             crate::surfnet::GeyserSlotStatus::Processed => SlotStatus::Processed,
                             crate::surfnet::GeyserSlotStatus::Confirmed => SlotStatus::Confirmed,
                             crate::surfnet::GeyserSlotStatus::Rooted => SlotStatus::Rooted,
+                            crate::surfnet::GeyserSlotStatus::FirstShredReceived => SlotStatus::FirstShredReceived,
+                            crate::surfnet::GeyserSlotStatus::CreatedBank => SlotStatus::CreatedBank,
+                            crate::surfnet::GeyserSlotStatus::Completed => SlotStatus::Completed,
                         };
 
                         for plugin in managed_plugins.iter().map(|p| &*p.plugin) {

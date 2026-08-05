@@ -2461,7 +2461,24 @@ impl SurfnetSvm {
             timestamp: slots_update_ts,
         });
 
+        self.geyser_events_tx
+            .send(GeyserEvent::UpdateSlotStatus {
+                slot: new_slot,
+                parent: Some(parent_slot),
+                status: GeyserSlotStatus::CreatedBank,
+            })
+            .ok();
+
         let geyser_parent_slot = slot.saturating_sub(1);
+
+        // Emit `Processed` for the slot that just executed
+        self.geyser_events_tx
+            .send(GeyserEvent::UpdateSlotStatus {
+                slot,
+                parent: slot.checked_sub(1),
+                status: GeyserSlotStatus::Processed,
+            })
+            .ok();
 
         // Emit confirmation for the same slot used by processed account/transaction updates.
         self.geyser_events_tx
@@ -6828,5 +6845,70 @@ mod tests {
             .expect("get_account should not error")
             .expect("Valid account should be restored");
         assert_eq!(restored_account.lamports, 1_000_000);
+    }
+
+    /// Geyser consumers that reconstruct blocks (yellowstone-grpc, for one) start
+    /// tracking a slot only once a lifecycle status announces it, and discard block
+    /// data that arrives for a slot they are not tracking. So every slot must be
+    /// announced with `CreatedBank` before any of its block data is emitted.
+    ///
+    /// The genesis slot is announced by the runloop rather than here, since block
+    /// production only ever announces the *next* slot — see the `CreatedBank` send
+    /// after `GeyserEvent::EndOfStartup` in `runloops::start_local_surfnet_runloop`.
+    /// That first slot is therefore excluded below.
+    #[test]
+    fn test_slot_is_announced_before_its_block_data_is_emitted() {
+        let (mut svm, _events_rx, geyser_rx) = SurfnetSvm::default();
+        let genesis_slot = svm.get_latest_absolute_slot();
+
+        for _ in 0..5 {
+            svm.confirm_current_block()
+                .expect("block confirmation should succeed");
+        }
+
+        let mut announced = HashSet::new();
+        let mut slots_with_block_data = HashSet::new();
+
+        while let Ok(event) = geyser_rx.try_recv() {
+            match event {
+                GeyserEvent::UpdateSlotStatus {
+                    slot,
+                    status: GeyserSlotStatus::CreatedBank,
+                    ..
+                } => {
+                    assert!(
+                        announced.insert(slot),
+                        "slot {slot} was announced more than once"
+                    );
+                }
+                GeyserEvent::NotifyBlockMetadata(metadata) => {
+                    if metadata.slot != genesis_slot {
+                        assert!(
+                            announced.contains(&metadata.slot),
+                            "block metadata for slot {} was emitted before the slot was announced",
+                            metadata.slot
+                        );
+                    }
+                    slots_with_block_data.insert(metadata.slot);
+                }
+                GeyserEvent::NotifyEntry(entry) => {
+                    if entry.slot != genesis_slot {
+                        assert!(
+                            announced.contains(&entry.slot),
+                            "entry for slot {} was emitted before the slot was announced",
+                            entry.slot
+                        );
+                    }
+                    slots_with_block_data.insert(entry.slot);
+                }
+                _ => {}
+            }
+        }
+
+        assert!(
+            slots_with_block_data.len() > 1,
+            "expected block data for several slots, got {}",
+            slots_with_block_data.len()
+        );
     }
 }
