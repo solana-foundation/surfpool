@@ -57,7 +57,7 @@ pub fn expected_phase(status: &SurfnetStartupStatus) -> SurfnetStartupPhase {
     }) {
         return SurfnetStartupPhase::Initializing;
     }
-    SurfnetStartupPhase::Deploying
+    SurfnetStartupPhase::ExecutingRunbooks
 }
 
 /// Checks the compatibility projection against the startup phase, using
@@ -197,11 +197,11 @@ pub fn plan_state_name(state: PlanState) -> &'static str {
 /// list is what extends the sweep's alphabet and the generated tables.
 pub const TASK_KINDS: [SurfnetStartupTask; 2] = [
     SurfnetStartupTask::RemoteAccounts,
-    SurfnetStartupTask::Deployment,
+    SurfnetStartupTask::RunbookExecutions,
 ];
 
 const _: fn(SurfnetStartupTask) = |task| match task {
-    SurfnetStartupTask::RemoteAccounts | SurfnetStartupTask::Deployment => (),
+    SurfnetStartupTask::RemoteAccounts | SurfnetStartupTask::RunbookExecutions => (),
 };
 
 /// Whether the machine must accept a transition from this state,
@@ -315,7 +315,7 @@ pub fn projection_rows() -> [ProjectionRow; 6] {
                 status
                     .seal_plan(vec![
                         SurfnetStartupTask::RemoteAccounts,
-                        SurfnetStartupTask::Deployment,
+                        SurfnetStartupTask::RunbookExecutions,
                     ])
                     .unwrap();
                 status
@@ -323,13 +323,13 @@ pub fn projection_rows() -> [ProjectionRow; 6] {
             meaning: "Account hydration is still in progress.",
         },
         ProjectionRow {
-            state: "`Sealed`, deployment outstanding",
+            state: "`Sealed`, runbook execution outstanding",
             build: || {
                 let mut status = SurfnetStartupStatus::default();
                 status
                     .seal_plan(vec![
                         SurfnetStartupTask::RemoteAccounts,
-                        SurfnetStartupTask::Deployment,
+                        SurfnetStartupTask::RunbookExecutions,
                     ])
                     .unwrap();
                 status
@@ -340,7 +340,7 @@ pub fn projection_rows() -> [ProjectionRow; 6] {
                     .unwrap();
                 status
             },
-            meaning: "Hydration has completed (or was unnecessary); deployment is the remaining startup work.",
+            meaning: "Hydration has completed (or was unnecessary); runbook execution is the remaining startup work.",
         },
     ]
 }

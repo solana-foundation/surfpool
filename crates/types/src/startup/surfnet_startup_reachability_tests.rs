@@ -80,7 +80,7 @@ fn phase_rank(phase: SurfnetStartupPhase) -> u8 {
     match phase {
         SurfnetStartupPhase::Planning => 0,
         SurfnetStartupPhase::Initializing => 1,
-        SurfnetStartupPhase::Deploying => 2,
+        SurfnetStartupPhase::ExecutingRunbooks => 2,
         SurfnetStartupPhase::Ready => 3,
         SurfnetStartupPhase::Failed => u8::MAX,
     }
@@ -206,7 +206,9 @@ fn phase_target(phase: SurfnetStartupPhase) -> &'static str {
     match phase {
         SurfnetStartupPhase::Planning => link_target!(SurfnetStartupPhase::Planning),
         SurfnetStartupPhase::Initializing => link_target!(SurfnetStartupPhase::Initializing),
-        SurfnetStartupPhase::Deploying => link_target!(SurfnetStartupPhase::Deploying),
+        SurfnetStartupPhase::ExecutingRunbooks => {
+            link_target!(SurfnetStartupPhase::ExecutingRunbooks)
+        }
         SurfnetStartupPhase::Ready => link_target!(SurfnetStartupPhase::Ready),
         SurfnetStartupPhase::Failed => link_target!(SurfnetStartupPhase::Failed),
     }
@@ -546,7 +548,7 @@ fn sweep() -> Observed {
 const PHASE_ORDER: [SurfnetStartupPhase; 5] = [
     SurfnetStartupPhase::Planning,
     SurfnetStartupPhase::Initializing,
-    SurfnetStartupPhase::Deploying,
+    SurfnetStartupPhase::ExecutingRunbooks,
     SurfnetStartupPhase::Ready,
     SurfnetStartupPhase::Failed,
 ];
@@ -556,7 +558,7 @@ fn phase_name(phase: SurfnetStartupPhase) -> &'static str {
     match phase {
         SurfnetStartupPhase::Planning => "Planning",
         SurfnetStartupPhase::Initializing => "Initializing",
-        SurfnetStartupPhase::Deploying => "Deploying",
+        SurfnetStartupPhase::ExecutingRunbooks => "Deploying",
         SurfnetStartupPhase::Ready => "Ready",
         SurfnetStartupPhase::Failed => "Failed",
     }

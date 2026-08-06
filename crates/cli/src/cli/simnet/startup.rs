@@ -313,7 +313,7 @@ async fn plan_startup(
         startup_tasks.push(SurfnetStartupTask::RemoteAccounts);
     }
     if !futures.is_empty() {
-        startup_tasks.push(SurfnetStartupTask::Deployment);
+        startup_tasks.push(SurfnetStartupTask::RunbookExecutions);
     }
 
     Ok(StartupPlan {
@@ -375,7 +375,7 @@ pub(super) async fn plan_and_dispatch_startup(
 
     if !futures.is_empty() {
         let _ = simnet_commands_tx.send(SimnetCommand::StartStartupTask(
-            SurfnetStartupTask::Deployment,
+            SurfnetStartupTask::RunbookExecutions,
         ));
 
         let startup_commands_tx = simnet_commands_tx.clone();
@@ -383,7 +383,7 @@ pub(super) async fn plan_and_dispatch_startup(
             hiro_system_kit::thread_named("Startup Runbook Executions").spawn(move || {
                 // catch_unwind, like the artifact watcher below: a panicking
                 // runbook future must still complete the Deployment task, or
-                // the phase pins at Deploying and readiness never resolves.
+                // the phase pins at ExecutingRunbooks and readiness never resolves.
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     hiro_system_kit::nestable_block_on(join_all(futures))
                 }));
@@ -409,7 +409,7 @@ pub(super) async fn plan_and_dispatch_startup(
                     }
                 };
                 let _ = startup_commands_tx.send(SimnetCommand::CompleteStartupTask(
-                    SurfnetStartupTask::Deployment,
+                    SurfnetStartupTask::RunbookExecutions,
                     result,
                 ));
                 Ok::<(), String>(())
@@ -422,7 +422,7 @@ pub(super) async fn plan_and_dispatch_startup(
             let error = format!("Thread to execute runbooks exited: {error}");
             let _ = simnet_events_tx.send(SimnetEvent::error(error.clone()));
             let _ = simnet_commands_tx.send(SimnetCommand::CompleteStartupTask(
-                SurfnetStartupTask::Deployment,
+                SurfnetStartupTask::RunbookExecutions,
                 Err(error),
             ));
         }

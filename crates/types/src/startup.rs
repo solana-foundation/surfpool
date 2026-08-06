@@ -60,7 +60,7 @@ impl GetSurfnetInfoResponse {
             }
             SurfnetStartupPhase::Planning
             | SurfnetStartupPhase::Initializing
-            | SurfnetStartupPhase::Deploying => runbook_executions.push(compat(None, None)),
+            | SurfnetStartupPhase::ExecutingRunbooks => runbook_executions.push(compat(None, None)),
         }
         Self {
             runbook_executions,
@@ -70,7 +70,7 @@ impl GetSurfnetInfoResponse {
 }
 
 /// Public readiness lifecycle for a surfnet. `Ready` here means the sealed
-/// startup plan completed: clones hydrated, deployment runbooks succeeded.
+/// startup plan completed: clones hydrated, startup runbooks succeeded.
 /// Not to be confused with [`SimnetEvent::Ready`](crate::types::SimnetEvent),
 /// which fires when core startup completes (RPC bound) and can precede this
 /// by the entire clone-and-deploy window.
@@ -83,7 +83,7 @@ pub enum SurfnetStartupPhase {
     #[default]
     Planning,
     Initializing,
-    Deploying,
+    ExecutingRunbooks,
     Ready,
     Failed,
 }
@@ -94,8 +94,8 @@ pub enum SurfnetStartupPhase {
 pub enum SurfnetStartupTask {
     /// Hydrate the accounts declared for cloning from the datasource.
     RemoteAccounts,
-    /// Execute the deployment runbooks.
-    Deployment,
+    /// Execute the startup runbooks.
+    RunbookExecutions,
 }
 
 /// A task's position in its lifecycle. The transitions between these
@@ -454,7 +454,7 @@ impl SealedStartupPlan {
     }
 
     // Phase derivation encodes task ordering: a non-succeeded RemoteAccounts
-    // pins the phase at Initializing, and Deploying is the residual case.
+    // pins the phase at Initializing, and ExecutingRunbooks is the residual case.
     // Adding a task variant requires deciding where it sits in this ordering.
     fn phase(&self) -> SurfnetStartupPhase {
         if self
@@ -475,7 +475,7 @@ impl SealedStartupPlan {
         }) {
             SurfnetStartupPhase::Initializing
         } else {
-            SurfnetStartupPhase::Deploying
+            SurfnetStartupPhase::ExecutingRunbooks
         }
     }
 

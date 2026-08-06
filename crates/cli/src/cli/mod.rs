@@ -315,7 +315,7 @@ pub struct StartProjectOptions {
     /// Skip runbook generation prompts.
     #[clap(long = "yes", short = 'y', action=ArgAction::SetTrue,  default_value = "false")]
     pub skip_runbook_generation_prompts: bool,
-    /// Watch programs in your artifacts folder (default: `target/deploy`), and automatically re-execute the deployment runbook when the `.so` files change. (eg. surfpool start --watch)
+    /// Watch programs in your artifacts folder (default: `target/deploy`), and automatically re-execute the startup runbooks when the `.so` files change. (eg. surfpool start --watch)
     #[clap(long = "watch", action=ArgAction::SetTrue, default_value = "false")]
     pub watch: bool,
     /// Directory containing .so program artifacts.

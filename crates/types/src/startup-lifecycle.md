@@ -25,9 +25,9 @@ stateDiagram-v2
         Hydrating : fetch and install clones
         Hydrating --> [*]
         --
-        [*] --> Deploying
-        Deploying : run deployment runbooks
-        Deploying --> [*]
+        [*] --> ExecutingRunbooks
+        ExecutingRunbooks : run startup runbooks
+        ExecutingRunbooks --> [*]
     }
 
     Initializing --> Ready : every required task succeeded
@@ -82,14 +82,14 @@ Properties:
 `startup.phase` summarizes the current startup state.
 
 <!-- BEGIN GENERATED: projection -->
-| State                            | Phase                                               | Meaning                                                                                 |
-|----------------------------------|-----------------------------------------------------|-----------------------------------------------------------------------------------------|
-| `Planning`                       | [`planning`][SurfnetStartupPhase::Planning]         | The required task set is still being computed.                                          |
-| `PlanningFailed { error }`       | [`failed`][SurfnetStartupPhase::Failed]             | Planning failed before a plan was sealed.                                               |
-| `Sealed`, any task `Failed`      | [`failed`][SurfnetStartupPhase::Failed]             | A required startup task failed.                                                         |
-| `Sealed`, every task `Succeeded` | [`ready`][SurfnetStartupPhase::Ready]               | All required work has completed. An empty sealed plan reaches this state immediately.   |
-| `Sealed`, clones outstanding     | [`initializing`][SurfnetStartupPhase::Initializing] | Account hydration is still in progress.                                                 |
-| `Sealed`, deployment outstanding | [`deploying`][SurfnetStartupPhase::Deploying]       | Hydration has completed (or was unnecessary); deployment is the remaining startup work. |
+| State                                   | Phase                                                         | Meaning                                                                                        |
+|-----------------------------------------|---------------------------------------------------------------|------------------------------------------------------------------------------------------------|
+| `Planning`                              | [`planning`][SurfnetStartupPhase::Planning]                   | The required task set is still being computed.                                                 |
+| `PlanningFailed { error }`              | [`failed`][SurfnetStartupPhase::Failed]                       | Planning failed before a plan was sealed.                                                      |
+| `Sealed`, any task `Failed`             | [`failed`][SurfnetStartupPhase::Failed]                       | A required startup task failed.                                                                |
+| `Sealed`, every task `Succeeded`        | [`ready`][SurfnetStartupPhase::Ready]                         | All required work has completed. An empty sealed plan reaches this state immediately.          |
+| `Sealed`, clones outstanding            | [`initializing`][SurfnetStartupPhase::Initializing]           | Account hydration is still in progress.                                                        |
+| `Sealed`, runbook execution outstanding | [`executingRunbooks`][SurfnetStartupPhase::ExecutingRunbooks] | Hydration has completed (or was unnecessary); runbook execution is the remaining startup work. |
 <!-- END GENERATED: projection -->
 
 Multiple states may project to the same phase. For example, clone tasks that
@@ -110,13 +110,13 @@ The phase graph below is derived by exhaustively exploring every reachable
 state.
 
 <!-- BEGIN GENERATED: observed -->
-| Phase                                             | Accepts                                                                                                                                                       | Can lead to                                                                                                                                                                |
-|---------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| [Planning][SurfnetStartupPhase::Planning]         | [StartupFailed][StartupTransition::FailPlanning], [StartupPlanSealed][StartupTransition::SealPlan]                                                            | [Deploying][SurfnetStartupPhase::Deploying], [Failed][SurfnetStartupPhase::Failed], [Initializing][SurfnetStartupPhase::Initializing], [Ready][SurfnetStartupPhase::Ready] |
-| [Initializing][SurfnetStartupPhase::Initializing] | [StartupTaskFailed][StartupTransition::FailTask], [StartupTaskStarted][StartupTransition::StartTask], [StartupTaskSucceeded][StartupTransition::CompleteTask] | [Deploying][SurfnetStartupPhase::Deploying], [Failed][SurfnetStartupPhase::Failed], [Initializing][SurfnetStartupPhase::Initializing], [Ready][SurfnetStartupPhase::Ready] |
-| [Deploying][SurfnetStartupPhase::Deploying]       | [StartupTaskFailed][StartupTransition::FailTask], [StartupTaskStarted][StartupTransition::StartTask], [StartupTaskSucceeded][StartupTransition::CompleteTask] | [Deploying][SurfnetStartupPhase::Deploying], [Failed][SurfnetStartupPhase::Failed], [Ready][SurfnetStartupPhase::Ready]                                                    |
-| [Ready][SurfnetStartupPhase::Ready]               | nothing                                                                                                                                                       | terminal                                                                                                                                                                   |
-| [Failed][SurfnetStartupPhase::Failed]             | nothing                                                                                                                                                       | terminal                                                                                                                                                                   |
+| Phase                                               | Accepts                                                                                                                                                       | Can lead to                                                                                                                                                                        |
+|-----------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| [Planning][SurfnetStartupPhase::Planning]           | [StartupFailed][StartupTransition::FailPlanning], [StartupPlanSealed][StartupTransition::SealPlan]                                                            | [Deploying][SurfnetStartupPhase::ExecutingRunbooks], [Failed][SurfnetStartupPhase::Failed], [Initializing][SurfnetStartupPhase::Initializing], [Ready][SurfnetStartupPhase::Ready] |
+| [Initializing][SurfnetStartupPhase::Initializing]   | [StartupTaskFailed][StartupTransition::FailTask], [StartupTaskStarted][StartupTransition::StartTask], [StartupTaskSucceeded][StartupTransition::CompleteTask] | [Deploying][SurfnetStartupPhase::ExecutingRunbooks], [Failed][SurfnetStartupPhase::Failed], [Initializing][SurfnetStartupPhase::Initializing], [Ready][SurfnetStartupPhase::Ready] |
+| [Deploying][SurfnetStartupPhase::ExecutingRunbooks] | [StartupTaskFailed][StartupTransition::FailTask], [StartupTaskStarted][StartupTransition::StartTask], [StartupTaskSucceeded][StartupTransition::CompleteTask] | [Deploying][SurfnetStartupPhase::ExecutingRunbooks], [Failed][SurfnetStartupPhase::Failed], [Ready][SurfnetStartupPhase::Ready]                                                    |
+| [Ready][SurfnetStartupPhase::Ready]                 | nothing                                                                                                                                                       | terminal                                                                                                                                                                           |
+| [Failed][SurfnetStartupPhase::Failed]               | nothing                                                                                                                                                       | terminal                                                                                                                                                                           |
 
 41 reachable states, 533 attempted transitions, 63 accepted.
 <!-- END GENERATED: observed -->
@@ -150,7 +150,7 @@ the final clone task succeeds.
 [StartupTransition::FailTask]: StartupTransition::FailTask
 [StartupTransition::SealPlan]: StartupTransition::SealPlan
 [StartupTransition::StartTask]: StartupTransition::StartTask
-[SurfnetStartupPhase::Deploying]: SurfnetStartupPhase::Deploying
+[SurfnetStartupPhase::ExecutingRunbooks]: SurfnetStartupPhase::ExecutingRunbooks
 [SurfnetStartupPhase::Failed]: SurfnetStartupPhase::Failed
 [SurfnetStartupPhase::Initializing]: SurfnetStartupPhase::Initializing
 [SurfnetStartupPhase::Planning]: SurfnetStartupPhase::Planning

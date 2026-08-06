@@ -15,12 +15,12 @@ fn a_sealed_empty_plan_is_ready() {
 }
 
 #[test]
-fn required_tasks_enforce_initialization_then_deployment() {
+fn required_tasks_enforce_initialization_then_runbook_execution() {
     let mut status = SurfnetStartupStatus::default();
     status
         .seal_plan(vec![
             SurfnetStartupTask::RemoteAccounts,
-            SurfnetStartupTask::Deployment,
+            SurfnetStartupTask::RunbookExecutions,
         ])
         .unwrap();
     assert_eq!(status.phase(), SurfnetStartupPhase::Initializing);
@@ -31,11 +31,13 @@ fn required_tasks_enforce_initialization_then_deployment() {
     status
         .complete_task(SurfnetStartupTask::RemoteAccounts)
         .unwrap();
-    assert_eq!(status.phase(), SurfnetStartupPhase::Deploying);
+    assert_eq!(status.phase(), SurfnetStartupPhase::ExecutingRunbooks);
 
-    status.start_task(SurfnetStartupTask::Deployment).unwrap();
     status
-        .complete_task(SurfnetStartupTask::Deployment)
+        .start_task(SurfnetStartupTask::RunbookExecutions)
+        .unwrap();
+    status
+        .complete_task(SurfnetStartupTask::RunbookExecutions)
         .unwrap();
     assert!(status.is_ready());
 }
@@ -96,7 +98,7 @@ fn illegal_transitions_are_rejected() {
     );
     assert_eq!(
         status
-            .seal_plan(vec![SurfnetStartupTask::Deployment])
+            .seal_plan(vec![SurfnetStartupTask::RunbookExecutions])
             .unwrap_err()
             .kind(),
         StartupErrorKind::AlreadySealed {

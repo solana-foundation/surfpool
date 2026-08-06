@@ -4428,7 +4428,7 @@ async fn startup_holds_initializing_when_deployment_finishes_first(test_type: Te
         .send(SimnetCommand::SealStartupPlan(
             vec![
                 SurfnetStartupTask::RemoteAccounts,
-                SurfnetStartupTask::Deployment,
+                SurfnetStartupTask::RunbookExecutions,
             ],
             reply_tx,
         ))
@@ -4439,14 +4439,14 @@ async fn startup_holds_initializing_when_deployment_finishes_first(test_type: Te
         .expect("sealing an unsealed plan should be accepted");
 
     for command in [
-        SimnetCommand::StartStartupTask(SurfnetStartupTask::Deployment),
-        SimnetCommand::CompleteStartupTask(SurfnetStartupTask::Deployment, Ok(())),
+        SimnetCommand::StartStartupTask(SurfnetStartupTask::RunbookExecutions),
+        SimnetCommand::CompleteStartupTask(SurfnetStartupTask::RunbookExecutions, Ok(())),
     ] {
         commands.send(command).unwrap();
     }
     await_startup(&observer, "deployment to succeed", |status| {
         status.tasks().iter().any(|task| {
-            task.task == SurfnetStartupTask::Deployment
+            task.task == SurfnetStartupTask::RunbookExecutions
                 && task.state == SurfnetStartupTaskState::Succeeded
         })
     })
@@ -4497,7 +4497,7 @@ async fn startup_fails_when_the_datasource_cannot_be_reached(test_type: TestType
             // prove nothing does.
             vec![
                 SurfnetStartupTask::RemoteAccounts,
-                SurfnetStartupTask::Deployment,
+                SurfnetStartupTask::RunbookExecutions,
             ],
             reply_tx,
         ))
@@ -4530,7 +4530,7 @@ async fn startup_fails_when_the_datasource_cannot_be_reached(test_type: TestType
     );
     assert!(
         status.tasks().iter().any(|task| {
-            task.task == SurfnetStartupTask::Deployment
+            task.task == SurfnetStartupTask::RunbookExecutions
                 && task.state == SurfnetStartupTaskState::Pending
         }),
         "a failure is terminal; nothing should move the other task: {status:?}"

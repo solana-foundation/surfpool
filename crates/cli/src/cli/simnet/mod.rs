@@ -66,7 +66,7 @@ pub async fn handle_start_local_surfnet_command(
 ) -> Result<(), String> {
     // Local plugin loading is handled directly by `surfpool-core`.
 
-    // We start the simnet as soon as possible, as it needs to be ready for deployments
+    // We start the simnet as soon as possible; startup planning needs it ready
     let (surfnet_svm, simnet_events_rx, geyser_events_rx) =
         SurfnetSvm::new_with_db(cmd.accounts.db.as_deref(), cmd.svm_config())
             .map_err(|e| format!("Failed to initialize Surfnet SVM: {}", e))?;
@@ -250,10 +250,10 @@ pub async fn handle_start_local_surfnet_command(
     }
 
     let simnet_commands_tx_copy = simnet_commands_tx.clone();
-    let mut deploy_progress_rx = vec![];
+    let mut runbook_progress_rx = vec![];
     if !cmd.project.no_deploy {
         match plan_and_dispatch_startup(&cmd, &simnet_events_tx, &simnet_commands_tx_copy).await {
-            Ok(rx) => deploy_progress_rx.push(rx),
+            Ok(rx) => runbook_progress_rx.push(rx),
             // Planning failed before the plan was sealed. Drive the machine
             // to Failed (from Planning-unsealed this always applies) and
             // keep going: whether a failed startup is fatal is the
@@ -261,9 +261,8 @@ pub async fn handle_start_local_surfnet_command(
             // alive and displays it.
             Err(StartupPlanFailure::Planning(e)) => {
                 let _ = simnet_commands_tx_copy.send(SimnetCommand::FailStartupPlanning(e.clone()));
-                let _ = simnet_events_tx.send(SimnetEvent::warn(format!(
-                    "Automatic protocol deployment failed: {e}"
-                )));
+                let _ = simnet_events_tx
+                    .send(SimnetEvent::warn(format!("Startup planning failed: {e}")));
             }
             // The command loop is dead or wedged, so the machine is
             // unreachable and no session can ever become ready. Nothing left
@@ -325,7 +324,7 @@ pub async fn handle_start_local_surfnet_command(
         cmd_cc,
         simnet_events_rx,
         subgraph_events_rx,
-        deploy_progress_rx,
+        runbook_progress_rx,
         simnet_commands_tx,
         breaker,
         sanitized_config,
@@ -366,7 +365,7 @@ async fn start_service(
     cmd: StartSimnet,
     simnet_events_rx: Receiver<SimnetEvent>,
     subgraph_events_rx: Receiver<SubgraphEvent>,
-    deploy_progress_rx: Vec<Receiver<BlockEvent>>,
+    runbook_progress_rx: Vec<Receiver<BlockEvent>>,
     simnet_commands_tx: Sender<SimnetCommand>,
     breaker: Option<Keypair>,
     sanitized_config: SanitizedConfig,
@@ -388,7 +387,7 @@ async fn start_service(
             simnet_events_rx,
             subgraph_events_rx,
             include_debug_logs,
-            deploy_progress_rx,
+            runbook_progress_rx,
             simnet_commands_tx,
             runloop_terminator.unwrap(),
         )?;
@@ -397,7 +396,7 @@ async fn start_service(
             simnet_events_rx,
             simnet_commands_tx,
             include_debug_logs,
-            deploy_progress_rx,
+            runbook_progress_rx,
             displayed_url,
             breaker,
             initial_transactions,
@@ -415,7 +414,7 @@ fn log_events(
     simnet_events_rx: Receiver<SimnetEvent>,
     subgraph_events_rx: Receiver<SubgraphEvent>,
     include_debug_logs: bool,
-    deploy_progress_rx: Vec<Receiver<BlockEvent>>,
+    runbook_progress_rx: Vec<Receiver<BlockEvent>>,
     simnet_commands_tx: Sender<SimnetCommand>,
     runloop_terminator: Arc<AtomicBool>,
 ) -> Result<(), String> {
@@ -448,7 +447,7 @@ fn log_events(
         selector.recv(&subgraph_events_rx);
 
         if !deployment_completed {
-            for rx in deploy_progress_rx.iter() {
+            for rx in runbook_progress_rx.iter() {
                 handles.push(selector.recv(rx));
             }
         }
@@ -562,7 +561,7 @@ fn log_events(
                     break;
                 }
             },
-            i => match oper.recv(&deploy_progress_rx[i - 2]) {
+            i => match oper.recv(&runbook_progress_rx[i - 2]) {
                 Ok(event) => {
                     if let BlockEvent::LogEvent(log) = event {
                         handle_log_event(

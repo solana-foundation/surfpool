@@ -120,17 +120,21 @@ fn scenarios() -> Vec<Scenario> {
             ],
         },
         Scenario {
-            name: "deployment finishing first must not open the window",
+            name: "runbooks finishing first must not open the window",
             provenance: Provenance::DesignRule,
-            context: "Hydration and deployment run concurrently; the fast \
+            context: "Hydration and runbook execution run concurrently; the fast \
                       track completing must not read as startup complete \
                       while the slow track still owns declared accounts.",
             steps: vec![
                 Apply(StartupTransition::SealPlan {
-                    tasks: vec![RemoteAccounts, Deployment],
+                    tasks: vec![RemoteAccounts, RunbookExecutions],
                 }),
-                Apply(StartupTransition::StartTask { task: Deployment }),
-                Apply(StartupTransition::CompleteTask { task: Deployment }),
+                Apply(StartupTransition::StartTask {
+                    task: RunbookExecutions,
+                }),
+                Apply(StartupTransition::CompleteTask {
+                    task: RunbookExecutions,
+                }),
                 Observe {
                     phase: SurfnetStartupPhase::Initializing,
                     anchor_proceeds: false,
@@ -172,7 +176,7 @@ fn scenarios() -> Vec<Scenario> {
                       the compat entry completes with it.",
             steps: vec![
                 Apply(StartupTransition::SealPlan {
-                    tasks: vec![RemoteAccounts, Deployment],
+                    tasks: vec![RemoteAccounts, RunbookExecutions],
                 }),
                 Apply(StartupTransition::StartTask {
                     task: RemoteAccounts,

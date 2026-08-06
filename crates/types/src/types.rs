@@ -453,7 +453,7 @@ pub enum SimnetEvent {
     /// have been replayed (the payload is their count). This is *not* public
     /// readiness: with an external startup planner (the CLI), it fires while
     /// the startup phase is still `Planning`, before clones are hydrated or
-    /// deployment runbooks run. Public readiness is
+    /// startup runbooks run. Public readiness is
     /// [`SurfnetStartupPhase::Ready`], observable via
     /// `surfnet_getSurfnetInfo` or the startup watch channel. With no
     /// external planner the two coincide: the runloop seals the empty plan
