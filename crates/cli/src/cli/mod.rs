@@ -13,6 +13,8 @@ use clap::{ArgAction, Args, CommandFactory, Parser, Subcommand};
 use clap_complete::{Generator, Shell};
 use fern::colors::{Color, ColoredLevelConfig};
 use hiro_system_kit::{self, Logger};
+// The only caller is the daemon fork, which exists on Linux alone.
+#[cfg(target_os = "linux")]
 use log::info;
 use solana_keypair::Keypair;
 use solana_pubkey::Pubkey;
