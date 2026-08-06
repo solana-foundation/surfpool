@@ -588,12 +588,10 @@ pub async fn start_block_production_runloop(
                                     svm_locker
                                         .write_multiple_account_updates(&account_updates.inner);
 
-                                    // A declared account the datasource does not have is not a
+                                    // A cloned account the datasource does not have is not a
                                     // failure: hydration did complete, and some workflows clone
-                                    // addresses that do not exist yet. It is worth saying out
-                                    // loud, though, because the surfnet reaches Ready with the
-                                    // account absent, which looks exactly like the readiness race
-                                    // this plan exists to prevent.
+                                    // addresses that do not exist yet. Warn, though, because the
+                                    // surfnet reaches Ready with the account absent.
                                     let absent =
                                         absent_after_hydration(&svm_locker, &account_updates.inner);
                                     if !absent.is_empty() {

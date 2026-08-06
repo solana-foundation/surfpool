@@ -725,9 +725,10 @@ impl StartSimnet {
             subgraph: self.subgraph_config(),
             studio: self.studio_config(),
             plugin_config_path,
-            // The CLI inspects the project (clones, deployment runbooks)
-            // after the runloop starts and seals the plan itself; the
-            // runloop must not seal an empty one out from under it.
+            // `External` makes the runloop wait for someone else to seal the
+            // startup plan instead of sealing an empty one at boot. Here that
+            // someone is the CLI: it inspects the project (clones, startup
+            // runbooks) after the runloop starts and seals the plan itself.
             startup_planner: StartupPlanner::External,
         }
     }

@@ -487,8 +487,9 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
                 match oper.index() {
                     0 => match oper.recv(&app.simnet_events_rx) {
                         Ok(event) => match &event {
-                            // The startup panel reads the watch channel; the
-                            // sequence matters to tests, not to the display.
+                            // The startup sequence matters to other listeners
+                            // (the headless watchdog, the SDK's event stream),
+                            // not to the TUI.
                             SimnetEvent::StartupStatusChanged(_) => {}
                             SimnetEvent::AnsweredClient { .. } => {}
                             SimnetEvent::AccountUpdate(dt, _account) => {

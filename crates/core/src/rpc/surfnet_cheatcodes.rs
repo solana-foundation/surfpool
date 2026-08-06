@@ -2227,15 +2227,10 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
         let value =
             GetSurfnetInfoResponse::with_startup(runbook_executions, startup_status, started_at);
 
-        // The predicate is the client's own conclusion from this response, not
-        // the surfnet's internal phase: Anchor reads readiness as "every
-        // execution reports complete", and an empty list satisfies it. Deriving
-        // it from what was answered keeps the event meaningful for any build,
-        // including one whose readiness rule differs.
-        // try_send: this runs on every poll, and the bounded events channel
-        // may belong to an embedder that never drains it. A full channel
-        // costs one ordering-evidence event; a blocking send would park an
-        // RPC worker for as long as the channel stays full.
+        // Record the readiness verdict the client would read from this
+        // response (Anchor: every execution complete; an empty list
+        // qualifies). try_send: an embedder may never drain the bounded
+        // events channel, and a full one must not park an RPC worker.
         let _ = svm_locker
             .simnet_events_tx()
             .try_send(SimnetEvent::AnsweredClient {
