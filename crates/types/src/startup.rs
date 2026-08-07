@@ -322,7 +322,7 @@ impl std::fmt::Display for StartupErrorKind {
 ///
 /// The lifecycle in full, from the spec beside this file. The reachability
 /// tests hold the machine to it, and the include anchors the document, so
-/// renaming it breaks the build rather than leaving a dead reference:
+/// renaming the file breaks the build rather than leaving a dead reference:
 ///
 /// ---
 ///

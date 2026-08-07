@@ -431,19 +431,17 @@ pub mod pubkey_option_account_map {
     }
 }
 
-/// What the surfnet told a client, reduced to the predicate a property names
-/// rather than the payload it answered with.
+/// What the surfnet told a client, reduced to a yes or no.
 ///
 /// A served response is output: it is asserted on or read in a report, never
-/// fed back into a surfnet. Reduced to a predicate so the event stream does
-/// not carry a second copy of the wire format.
+/// fed back into a surfnet, so the event carries the conclusion a client
+/// would draw instead of a second copy of the wire format.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClientAnswer {
     /// A readiness question, and whether the answer conveyed readiness.
     ///
     /// Monotone: readiness does not regress, so the first answer carrying
-    /// `ready: true` is the moment a client could have been misled, and an
-    /// ordering assertion about it is well posed.
+    /// `ready: true` is the moment a client could have been misled.
     Readiness { ready: bool },
 }
 

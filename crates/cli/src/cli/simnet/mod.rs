@@ -66,7 +66,8 @@ pub async fn handle_start_local_surfnet_command(
 ) -> Result<(), String> {
     // Local plugin loading is handled directly by `surfpool-core`.
 
-    // We start the simnet as soon as possible; startup planning needs it ready
+    // We start the simnet as soon as possible; startup planning waits for
+    // its `Ready` event before sealing.
     let (surfnet_svm, simnet_events_rx, geyser_events_rx) =
         SurfnetSvm::new_with_db(cmd.accounts.db.as_deref(), cmd.svm_config())
             .map_err(|e| format!("Failed to initialize Surfnet SVM: {}", e))?;
@@ -467,7 +468,8 @@ fn log_events(
                     // A headless run reports readiness through the watchdog,
                     // which reads the status directly.
                     SimnetEvent::StartupStatusChanged(_) => {}
-                    // Ordering evidence for tests; nothing for an operator to read.
+                    // The answer record matters to other listeners (tests,
+                    // the SDK); nothing for an operator to read.
                     SimnetEvent::AnsweredClient { .. } => {}
                     SimnetEvent::PluginLoaded(_) => {
                         info!("{}", event.plugin_loaded_msg());

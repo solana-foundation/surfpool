@@ -3893,12 +3893,12 @@ impl SurfnetSvm {
         self.startup_status_watch_tx.subscribe()
     }
 
-    // send_replace rather than send: the status must publish even while no
-    // subscriber exists yet, so a late subscriber's first borrow() is current.
     /// Publishes an accepted transition on both channels: the watch channel
     /// for readers that want the current status, and the event channel for
     /// readers that want the sequence.
     fn publish_startup_status(&self) {
+        // send_replace rather than send: the status must publish even while no
+        // subscriber exists yet, so a late subscriber's first borrow() is current.
         self.startup_status_watch_tx
             .send_replace(self.startup_status.clone());
         // try_send: callers hold the SVM write guard, and the bounded events
