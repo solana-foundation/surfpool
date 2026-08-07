@@ -61,6 +61,24 @@ test("embedded surfpool() boots a Surfnet and wires the full kit client", async 
   assert.equal(funded.value, 1_000_000_000n);
 });
 
+test("embedded surfpool() airdrops configured addresses at startup", async (t) => {
+  const recipient = Surfnet.newKeypair().publicKey;
+  const signerLike = { address: Surfnet.newKeypair().publicKey };
+  const client = await createClient().use(
+    surfpool({
+      airdropAddresses: [recipient, signerLike],
+      airdropAmount: 3_000_000_000n,
+      surfnet: { offline: true },
+    }),
+  );
+  t.after(() => client.surfnet.stop());
+
+  const funded = await client.rpc.getBalance(recipient).send();
+  assert.equal(funded.value, 3_000_000_000n);
+  const fundedSigner = await client.rpc.getBalance(signerLike.address).send();
+  assert.equal(fundedSigner.value, 3_000_000_000n);
+});
+
 test("disposing the embedded client stops the Surfnet", async () => {
   const client = await createClient().use(surfpool({ surfnet: { offline: true } }));
   await client.rpc.getSlot().send();

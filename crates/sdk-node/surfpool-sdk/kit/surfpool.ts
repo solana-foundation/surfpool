@@ -1,8 +1,21 @@
-import { type ClientWithPayer, createKeyPairSignerFromBytes, extendClient, pipe, withCleanup } from '@solana/kit';
+import {
+    type Address,
+    type ClientWithPayer,
+    createKeyPairSignerFromBytes,
+    extendClient,
+    pipe,
+    withCleanup,
+} from '@solana/kit';
 import { solanaLocalRpc, type SolanaRpcConfig } from '@solana/kit-plugin-rpc';
 import type { SurfnetConfig } from '@solana/surfpool';
 
 import { createSurfnetCheatcodesRpc } from './cheatcodes.js';
+
+/** Lamports each `airdropAddresses` entry is topped up to when no amount is given. */
+const DEFAULT_AIRDROP_LAMPORTS = 10_000_000_000n;
+
+/** An address to fund, or anything carrying one (a signer, a PDA, an account). */
+export type AirdropTarget = Address | { readonly address: Address };
 
 /**
  * Transaction planner/executor and RPC options forwarded to the standard
@@ -11,35 +24,91 @@ import { createSurfnetCheatcodesRpc } from './cheatcodes.js';
  */
 export type SurfpoolRpcOptions = Omit<SolanaRpcConfig<string>, 'rpcSubscriptionsUrl' | 'rpcUrl'>;
 
-/** Configuration for {@link surfpool} in embedded mode (boots an in-process Surfnet). */
-export type SurfpoolEmbeddedConfig = SurfpoolRpcOptions & {
-    rpcSubscriptionsUrl?: never;
-    rpcUrl?: never;
-    /** Startup options forwarded verbatim to `Surfnet.startWithConfig()`. */
-    surfnet?: SurfnetConfig;
+/** Startup funding applied to both modes. */
+type SurfpoolAirdropOptions = {
+    /**
+     * Addresses (or signers) topped up to {@link SurfpoolAirdropOptions.airdropAmount}
+     * lamports while the client is being composed. Addresses already holding at
+     * least that much are left alone.
+     */
+    airdropAddresses?: readonly AirdropTarget[];
+    /** Lamports to fund each entry of `airdropAddresses` with. Defaults to 10 SOL. */
+    airdropAmount?: bigint | number;
 };
 
+/** Configuration for {@link surfpool} in embedded mode (boots an in-process Surfnet). */
+export type SurfpoolEmbeddedConfig = SurfpoolAirdropOptions &
+    SurfpoolRpcOptions & {
+        rpcSubscriptionsUrl?: never;
+        rpcUrl?: never;
+        /** Startup options forwarded verbatim to `Surfnet.startWithConfig()`. */
+        surfnet?: SurfnetConfig;
+    };
+
 /** Configuration for {@link surfpool} in attach mode (connects to a running Surfpool). */
-export type SurfpoolAttachConfig = SurfpoolRpcOptions & {
-    /**
-     * The WebSocket URL of the running Surfpool instance. When omitted and
-     * the `rpcUrl` has an explicit port, defaults to Surfpool's default
-     * WebSocket port (8900, `--ws-port`) on the same host — Surfpool's
-     * WebSocket port is independent of its HTTP port. For a `rpcUrl` without
-     * a port (e.g. behind a proxy), only the protocol is swapped to
-     * `ws`/`wss`. Set this explicitly when your setup differs.
-     */
-    rpcSubscriptionsUrl?: string;
-    /** The HTTP RPC URL of a running Surfpool instance to attach to. */
-    rpcUrl: string;
-    surfnet?: never;
+export type SurfpoolAttachConfig = SurfpoolAirdropOptions &
+    SurfpoolRpcOptions & {
+        /**
+         * The WebSocket URL of the running Surfpool instance. When omitted and
+         * the `rpcUrl` has an explicit port, defaults to Surfpool's default
+         * WebSocket port (8900, `--ws-port`) on the same host — Surfpool's
+         * WebSocket port is independent of its HTTP port. For a `rpcUrl` without
+         * a port (e.g. behind a proxy), only the protocol is swapped to
+         * `ws`/`wss`. Set this explicitly when your setup differs.
+         */
+        rpcSubscriptionsUrl?: string;
+        /** The HTTP RPC URL of a running Surfpool instance to attach to. */
+        rpcUrl: string;
+        surfnet?: never;
+    };
+
+/** Attach-mode configuration that funds addresses, making the plugin asynchronous. */
+export type SurfpoolAttachConfigWithAirdrop = SurfpoolAttachConfig & {
+    airdropAddresses: readonly AirdropTarget[];
 };
 
 export type SurfpoolConfig = SurfpoolAttachConfig | SurfpoolEmbeddedConfig;
 
+/**
+ * Tops each target up to `amount` lamports through the `setAccount` cheatcode,
+ * leaving any account that already holds at least that much untouched. Only
+ * the lamport balance is written, so an existing account keeps its data and
+ * owner.
+ */
+async function fundAirdropAddresses(
+    client: {
+        cheatcodes: ReturnType<typeof createSurfnetCheatcodesRpc>;
+        rpc: { getBalance: (address: Address) => { send: () => Promise<{ value: bigint }> } };
+    },
+    targets: readonly AirdropTarget[],
+    amount: bigint,
+): Promise<void> {
+    await Promise.all(
+        targets.map(async target => {
+            const address = typeof target === 'string' ? target : target.address;
+            try {
+                const { value: balance } = await client.rpc.getBalance(address).send();
+                if (balance >= amount) {
+                    return;
+                }
+                await client.cheatcodes.setAccount(address, { lamports: amount }).send();
+            } catch (error) {
+                throw new Error(`Failed to airdrop ${amount} lamports to ${address}`, { cause: error });
+            }
+        }),
+    );
+}
+
 function surfpoolEmbedded(config: SurfpoolEmbeddedConfig = {}) {
     return async <T extends object>(client: T) => {
-        const { rpcSubscriptionsUrl: _unusedWs, rpcUrl: _unusedRpc, surfnet: surfnetConfig, ...rpcOptions } = config;
+        const {
+            airdropAddresses,
+            airdropAmount,
+            rpcSubscriptionsUrl: _unusedWs,
+            rpcUrl: _unusedRpc,
+            surfnet: surfnetConfig,
+            ...rpcOptions
+        } = config;
         // Lazy imports keep the optional peers optional: the native module is
         // only needed in embedded mode, and the signer package is only needed
         // for the payer this mode installs.
@@ -65,6 +134,14 @@ function surfpoolEmbedded(config: SurfpoolEmbeddedConfig = {}) {
                     rpcUrl: surfnet.rpcUrl,
                 }),
             );
+
+            if (airdropAddresses?.length) {
+                await fundAirdropAddresses(
+                    configuredClient,
+                    airdropAddresses,
+                    BigInt(airdropAmount ?? DEFAULT_AIRDROP_LAMPORTS),
+                );
+            }
 
             // Disposing the client stops the in-process Surfnet so its servers
             // and ports are freed; recreating the client boots a fresh one.
@@ -103,7 +180,14 @@ function surfpoolEmbedded(config: SurfpoolEmbeddedConfig = {}) {
 
 function surfpoolAttach(config: SurfpoolAttachConfig) {
     return <T extends ClientWithPayer>(client: T) => {
-        const { rpcSubscriptionsUrl, rpcUrl, surfnet: _unusedSurfnet, ...rpcOptions } = config;
+        const {
+            airdropAddresses: _unusedAirdropAddresses,
+            airdropAmount: _unusedAirdropAmount,
+            rpcSubscriptionsUrl,
+            rpcUrl,
+            surfnet: _unusedSurfnet,
+            ...rpcOptions
+        } = config;
         const wsUrl = rpcSubscriptionsUrl ?? deriveSubscriptionsUrl(rpcUrl);
 
         return pipe(
@@ -118,6 +202,19 @@ function surfpoolAttach(config: SurfpoolAttachConfig) {
                 rpcUrl,
             }),
         );
+    };
+}
+
+function surfpoolAttachFunded(config: SurfpoolAttachConfigWithAirdrop) {
+    const attach = surfpoolAttach(config);
+    return async <T extends ClientWithPayer>(client: T) => {
+        const configuredClient = attach(client);
+        await fundAirdropAddresses(
+            configuredClient,
+            config.airdropAddresses,
+            BigInt(config.airdropAmount ?? DEFAULT_AIRDROP_LAMPORTS),
+        );
+        return configuredClient;
     };
 }
 
@@ -138,7 +235,10 @@ function surfpoolAttach(config: SurfpoolAttachConfig) {
  * **Attach mode** (when `rpcUrl` is set): connects to an already-running
  * Surfpool instance (e.g. `surfpool start`) instead of booting one. No native
  * module is loaded, no `payer` is installed (the client must already have
- * one), and there is no `client.surfnet` handle.
+ * one), and there is no `client.surfnet` handle. Because that payer is usually
+ * unfunded on the running Surfnet, `airdropAddresses` tops it (and anything
+ * else listed) up to `airdropAmount` lamports as the client is composed; the
+ * plugin then returns a promise, so `.use()` must be awaited.
  *
  * @example Embedded
  * ```ts
@@ -154,17 +254,27 @@ function surfpoolAttach(config: SurfpoolAttachConfig) {
  * ```ts
  * const client = await createClient()
  *     .use(payer(myPayer))
- *     .use(surfpool({ rpcUrl: 'http://127.0.0.1:8899' }));
+ *     .use(surfpool({ airdropAddresses: [myPayer], rpcUrl: 'http://127.0.0.1:8899' }));
  * ```
  */
 export function surfpool(config?: SurfpoolEmbeddedConfig): ReturnType<typeof surfpoolEmbedded>;
-export function surfpool(config: SurfpoolAttachConfig): ReturnType<typeof surfpoolAttach>;
+export function surfpool(config: SurfpoolAttachConfigWithAirdrop): ReturnType<typeof surfpoolAttachFunded>;
+export function surfpool(
+    config: SurfpoolAttachConfig & { airdropAddresses?: never },
+): ReturnType<typeof surfpoolAttach>;
 export function surfpool(config: SurfpoolConfig = {}) {
-    return isAttachConfig(config) ? surfpoolAttach(config) : surfpoolEmbedded(config);
+    if (!isAttachConfig(config)) {
+        return surfpoolEmbedded(config);
+    }
+    return hasAirdropAddresses(config) ? surfpoolAttachFunded(config) : surfpoolAttach(config);
 }
 
 function isAttachConfig(config: SurfpoolConfig): config is SurfpoolAttachConfig {
     return typeof config.rpcUrl === 'string';
+}
+
+function hasAirdropAddresses(config: SurfpoolAttachConfig): config is SurfpoolAttachConfigWithAirdrop {
+    return config.airdropAddresses !== undefined;
 }
 
 function deriveSubscriptionsUrl(rpcUrl: string): string {
