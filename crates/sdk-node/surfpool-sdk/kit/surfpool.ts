@@ -74,14 +74,20 @@ export type SurfpoolConfig = SurfpoolAttachConfig | SurfpoolEmbeddedConfig;
 
 /**
  * A `number` above `Number.MAX_SAFE_INTEGER` has already lost precision by the
- * time it is read, and a fractional one is not a lamport amount at all; both
- * are rejected rather than silently funding a different balance.
+ * time it is read, and a fractional one is not a lamport amount at all. A
+ * negative amount is below every balance, so it would skip funding entirely
+ * rather than do what it says. All three are rejected instead of silently
+ * funding something other than what was asked for.
  */
 function toLamports(amount: bigint | number = DEFAULT_AIRDROP_LAMPORTS): bigint {
     if (typeof amount === 'number' && !Number.isSafeInteger(amount)) {
         throw new Error(`airdropAmount must be a safe integer or a bigint; received ${amount}`);
     }
-    return BigInt(amount);
+    const lamports = BigInt(amount);
+    if (lamports < 0n) {
+        throw new Error(`airdropAmount must not be negative; received ${amount}`);
+    }
+    return lamports;
 }
 
 /**

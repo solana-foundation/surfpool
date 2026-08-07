@@ -302,7 +302,7 @@ test("attach mode honors airdropAmount and skips addresses already holding enoug
   }
 });
 
-test("attach mode rejects airdropAmount numbers that cannot represent lamports exactly", async () => {
+test("attach mode rejects airdropAmount values that cannot represent a lamport top-up", async () => {
   const restore = mockFetch(() => {
     throw new Error("no request should be made for an invalid amount");
   });
@@ -314,6 +314,16 @@ test("attach mode rejects airdropAmount numbers that cannot represent lamports e
           surfpool({ airdropAddresses: [payer], airdropAmount, rpcUrl: ENDPOINT }),
         ),
         /airdropAmount must be a safe integer or a bigint/,
+      );
+    }
+    // A negative amount is below every balance, so it would silently fund nothing.
+    for (const airdropAmount of [-1, -1n]) {
+      const payer = fakePayer();
+      await assert.rejects(
+        createClient({ payer }).use(
+          surfpool({ airdropAddresses: [payer], airdropAmount, rpcUrl: ENDPOINT }),
+        ),
+        /airdropAmount must not be negative/,
       );
     }
   } finally {
