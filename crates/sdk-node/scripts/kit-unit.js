@@ -302,6 +302,25 @@ test("attach mode honors airdropAmount and skips addresses already holding enoug
   }
 });
 
+test("attach mode rejects airdropAmount numbers that cannot represent lamports exactly", async () => {
+  const restore = mockFetch(() => {
+    throw new Error("no request should be made for an invalid amount");
+  });
+  try {
+    for (const airdropAmount of [Number.MAX_SAFE_INTEGER + 2, 1.5]) {
+      const payer = fakePayer();
+      await assert.rejects(
+        createClient({ payer }).use(
+          surfpool({ airdropAddresses: [payer], airdropAmount, rpcUrl: ENDPOINT }),
+        ),
+        /airdropAmount must be a safe integer or a bigint/,
+      );
+    }
+  } finally {
+    restore();
+  }
+});
+
 test("attach mode airdrop failures reject with the offending address", async () => {
   const restore = mockFetch((request) =>
     request.method === "getBalance"

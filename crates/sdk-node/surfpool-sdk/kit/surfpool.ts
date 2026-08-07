@@ -32,7 +32,10 @@ type SurfpoolAirdropOptions = {
      * least that much are left alone.
      */
     airdropAddresses?: readonly AirdropTarget[];
-    /** Lamports to fund each entry of `airdropAddresses` with. Defaults to 10 SOL. */
+    /**
+     * Lamports to fund each entry of `airdropAddresses` with. Defaults to 10 SOL.
+     * A `number` must be a safe integer; pass a `bigint` for amounts above 2^53.
+     */
     airdropAmount?: bigint | number;
 };
 
@@ -68,6 +71,18 @@ export type SurfpoolAttachConfigWithAirdrop = SurfpoolAttachConfig & {
 };
 
 export type SurfpoolConfig = SurfpoolAttachConfig | SurfpoolEmbeddedConfig;
+
+/**
+ * A `number` above `Number.MAX_SAFE_INTEGER` has already lost precision by the
+ * time it is read, and a fractional one is not a lamport amount at all; both
+ * are rejected rather than silently funding a different balance.
+ */
+function toLamports(amount: bigint | number = DEFAULT_AIRDROP_LAMPORTS): bigint {
+    if (typeof amount === 'number' && !Number.isSafeInteger(amount)) {
+        throw new Error(`airdropAmount must be a safe integer or a bigint; received ${amount}`);
+    }
+    return BigInt(amount);
+}
 
 /**
  * Tops each target up to `amount` lamports through the `setAccount` cheatcode,
@@ -136,11 +151,7 @@ function surfpoolEmbedded(config: SurfpoolEmbeddedConfig = {}) {
             );
 
             if (airdropAddresses?.length) {
-                await fundAirdropAddresses(
-                    configuredClient,
-                    airdropAddresses,
-                    BigInt(airdropAmount ?? DEFAULT_AIRDROP_LAMPORTS),
-                );
+                await fundAirdropAddresses(configuredClient, airdropAddresses, toLamports(airdropAmount));
             }
 
             // Disposing the client stops the in-process Surfnet so its servers
@@ -209,11 +220,7 @@ function surfpoolAttachFunded(config: SurfpoolAttachConfigWithAirdrop) {
     const attach = surfpoolAttach(config);
     return async <T extends ClientWithPayer>(client: T) => {
         const configuredClient = attach(client);
-        await fundAirdropAddresses(
-            configuredClient,
-            config.airdropAddresses,
-            BigInt(config.airdropAmount ?? DEFAULT_AIRDROP_LAMPORTS),
-        );
+        await fundAirdropAddresses(configuredClient, config.airdropAddresses, toLamports(config.airdropAmount));
         return configuredClient;
     };
 }
