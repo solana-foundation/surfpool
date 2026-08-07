@@ -4144,7 +4144,7 @@ mod tests {
         assert!(startup.has_changed().unwrap());
         assert_eq!(
             startup.borrow_and_update().phase(),
-            SurfnetStartupPhase::Initializing
+            SurfnetStartupPhase::CloningRemoteAccounts
         );
 
         svm.start_startup_task(SurfnetStartupTask::RemoteAccounts)

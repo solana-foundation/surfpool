@@ -1,6 +1,5 @@
 //! Startup planning for a local surfnet: inspect the project, seal the
-//! startup plan, dispatch the work, and watch the lifecycle to a terminal
-//! phase.
+//! startup plan, dispatch the work, and watch the lifecycle to completion.
 
 use std::{path::Path, sync::mpsc, time::Duration};
 
@@ -82,13 +81,13 @@ impl RunbookExecutionMode {
     }
 }
 
-/// Spawns the startup watchdog when running headless (`--no-tui` or daemon).
-/// Legacy Anchor's readiness loop can only perceive `completed_at` and
-/// process death (it has no timeout and never reads `errors`), so a headless
-/// surfnet whose startup failed must abort rather than serve forever. The
-/// TUI instead stays alive and displays the failure; killing an interactive
-/// session would be wrong, so in TUI mode this spawns nothing and drops the
-/// receiver.
+/// Spawns the startup watchdog when running headless (`--no-tui` or
+/// `daemon`). The watchdog sends [`SimnetCommand::Terminate`] if startup
+/// fails, killing the surfnet: a headless surfnet whose startup failed would
+/// otherwise serve forever to readiness pollers that have no timeout
+/// (Anchor's readiness loop reads only `completed_at` and process death).
+/// If not headless, no watchdog is spawned; the TUI stays alive and
+/// displays the failure.
 pub(super) fn spawn_startup_watchdog(
     headless: bool,
     startup_status_rx: tokio::sync::watch::Receiver<surfpool_types::SurfnetStartupStatus>,
@@ -100,19 +99,19 @@ pub(super) fn spawn_startup_watchdog(
     }
     hiro_system_kit::thread_named("Startup Watchdog")
         .spawn(move || {
-            watch_startup_until_terminal(startup_status_rx, events_tx, commands_tx);
+            watch_startup_until_completion(startup_status_rx, events_tx, commands_tx);
             Ok::<(), String>(())
         })
         .map(|_| ())
         .map_err(|e| format!("Thread to watch startup status exited: {e}"))
 }
 
-/// Blocks until the startup lifecycle reaches a terminal phase. On `Failed`,
+/// Blocks until the startup lifecycle completes, in either direction. On `Failed`,
 /// sends `Aborted` first (so the event loop exits with the error before the
 /// shutdown reaches it) and then `Terminate` (so the runloop shuts down
 /// gracefully, WAL checkpoint included). `Ready`, or a dropped sender because
 /// the surfnet is already shutting down, requires nothing.
-pub(super) fn watch_startup_until_terminal(
+pub(super) fn watch_startup_until_completion(
     mut startup_status_rx: tokio::sync::watch::Receiver<surfpool_types::SurfnetStartupStatus>,
     events_tx: Sender<SimnetEvent>,
     commands_tx: Sender<SimnetCommand>,
@@ -141,15 +140,16 @@ pub(super) fn watch_startup_until_terminal(
 /// runloop emits `SimnetEvent::Ready` immediately before entering the
 /// command loop on the same task, and the CLI waits for Ready before
 /// planning, so the loop is provably alive at every call site. A timeout
-/// here means the loop died or wedged, not that it is merely slow.
+/// here means the loop is dead or wedged, not merely slow.
 const SEAL_STARTUP_PLAN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How startup planning failed, split at the seal boundary because the two
 /// halves demand different responses from the caller.
 pub(super) enum StartupPlanFailure {
-    /// Planning failed before the plan was sealed. The startup machine is
-    /// reachable and still in Planning-unsealed, so the caller can (and
-    /// must) drive it to Failed; the watchdog policy then decides fatality.
+    /// Planning failed before the plan was sealed. The startup state
+    /// machine (`SurfnetStartupStatus`) is reachable and still in
+    /// Planning-unsealed, so the caller can (and must) drive it to Failed;
+    /// the watchdog policy then decides fatality.
     Planning(String),
     /// The seal did not take. Which half failed decides what is knowable
     /// afterwards, so the two arrive separately.
@@ -158,11 +158,13 @@ pub(super) enum StartupPlanFailure {
 
 /// The two ways sealing fails, which differ in what they leave known.
 pub(super) enum SealFailure {
-    /// The round trip did not complete: the command loop is dead or wedged,
-    /// so the machine's state is unknowable and no session can become ready.
+    /// The round trip did not complete: the command loop is dead or wedged
+    /// (alive, but unable to make progress because something it needs is
+    /// blocked), so the startup state machine's state is unknowable and no
+    /// session can become ready.
     Unreachable(String),
-    /// The machine answered, and refused. Its state is known, and the reason
-    /// says which rule declined.
+    /// The startup state machine answered, and refused. Its state is known,
+    /// and the reason says which rule declined.
     Refused(StartupError),
 }
 
@@ -590,4 +592,198 @@ fn assemble_runbook_execution_futures(
         }
     }
     futures
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RunbookExecutionMode;
+
+    /// A project that already has a `txtx.yml` executes it as written. Framework
+    /// detection contributes clone addresses on that path, but nothing the
+    /// runbook needs, so a project whose `Anchor.toml` or `Cargo.toml` cannot be
+    /// read still starts. Treating that read as fatal would strand a working
+    /// project on a file it does not depend on.
+    #[test]
+    fn an_existing_runbook_does_not_depend_on_framework_detection() {
+        assert!(
+            !RunbookExecutionMode::ExistingOnDisk.requires_framework_detection(),
+            "an on-disk runbook is authoritative; detection only adds clones"
+        );
+    }
+
+    /// One malformed address should not cost a project the rest of its clones,
+    /// nor its startup. No runbook is built from the clone list, so a typo in
+    /// `test.validator.clone` is reported and the valid addresses still load.
+    #[test]
+    fn a_malformed_clone_address_does_not_discard_the_valid_ones() {
+        let (parsed, rejected) = super::parse_clone_addresses(&[
+            "AqH29mZfQFgRpfwaPoTMWSKJ5kqauoc1FwVBRksZyQrt".to_string(),
+            "not-a-pubkey".to_string(),
+            "SysvarC1ock11111111111111111111111111111111".to_string(),
+        ]);
+
+        assert_eq!(parsed.len(), 2, "both valid addresses should survive");
+        assert_eq!(rejected.len(), 1, "the malformed one should be reported");
+        assert!(
+            rejected[0].contains("not-a-pubkey"),
+            "the report should name the address a user has to fix: {}",
+            rejected[0]
+        );
+    }
+
+    /// The other two modes build the runbook out of what detection finds, so a
+    /// failure there leaves nothing to execute and must surface.
+    #[test]
+    fn scaffolded_and_in_memory_runbooks_require_framework_detection() {
+        for mode in [
+            RunbookExecutionMode::ScaffoldOnDisk,
+            RunbookExecutionMode::InMemory,
+        ] {
+            assert!(
+                mode.requires_framework_detection(),
+                "{mode:?} has no runbook without detection"
+            );
+        }
+    }
+
+    mod startup_watchdog {
+        use std::time::{Duration, Instant};
+
+        use crossbeam::channel::{Receiver, unbounded};
+        use surfpool_types::{
+            SimnetCommand, SimnetEvent, SurfnetStartupStatus, SurfnetStartupTask,
+        };
+        use tokio::sync::watch;
+
+        use super::super::{spawn_startup_watchdog, watch_startup_until_completion};
+
+        const TIMEOUT: Duration = Duration::from_secs(5);
+
+        fn failed_status(error: &str) -> SurfnetStartupStatus {
+            let mut status = SurfnetStartupStatus::default();
+            status
+                .seal_plan(vec![SurfnetStartupTask::RemoteAccounts])
+                .unwrap();
+            status
+                .start_task(SurfnetStartupTask::RemoteAccounts)
+                .unwrap();
+            status
+                .fail_task(SurfnetStartupTask::RemoteAccounts, error)
+                .unwrap();
+            status
+        }
+
+        fn ready_status() -> SurfnetStartupStatus {
+            let mut status = SurfnetStartupStatus::default();
+            status.seal_plan(vec![]).unwrap();
+            status
+        }
+
+        fn assert_channels_stay_empty(
+            events_rx: &Receiver<SimnetEvent>,
+            commands_rx: &Receiver<SimnetCommand>,
+        ) {
+            assert!(events_rx.try_recv().is_err(), "unexpected simnet event");
+            assert!(commands_rx.try_recv().is_err(), "unexpected simnet command");
+        }
+
+        #[test]
+        fn headless_watchdog_aborts_and_terminates_on_failed_startup() {
+            let (status_tx, status_rx) = watch::channel(SurfnetStartupStatus::default());
+            let (events_tx, events_rx) = unbounded();
+            let (commands_tx, commands_rx) = unbounded();
+
+            let watchdog = std::thread::spawn(move || {
+                watch_startup_until_completion(status_rx, events_tx, commands_tx)
+            });
+            status_tx.send_replace(failed_status("datasource unavailable"));
+
+            match events_rx.recv_timeout(TIMEOUT) {
+                Ok(SimnetEvent::Aborted(error)) => {
+                    assert!(
+                        error.contains("datasource unavailable"),
+                        "abort lost the failure reason: {error}"
+                    );
+                }
+                other => panic!("expected Aborted, got {other:?}"),
+            }
+            assert!(matches!(
+                commands_rx.recv_timeout(TIMEOUT),
+                Ok(SimnetCommand::Terminate(_))
+            ));
+            watchdog.join().unwrap();
+        }
+
+        #[test]
+        fn headless_watchdog_stays_quiet_when_startup_reaches_ready() {
+            let (status_tx, status_rx) = watch::channel(SurfnetStartupStatus::default());
+            let (events_tx, events_rx) = unbounded();
+            let (commands_tx, commands_rx) = unbounded();
+
+            let watchdog = std::thread::spawn(move || {
+                watch_startup_until_completion(status_rx, events_tx, commands_tx)
+            });
+            status_tx.send_replace(ready_status());
+
+            // The join proves the watchdog saw the terminal phase, so an
+            // empty channel afterwards is not a timing artifact.
+            watchdog.join().unwrap();
+            assert_channels_stay_empty(&events_rx, &commands_rx);
+        }
+
+        #[test]
+        fn headless_watchdog_stays_quiet_when_the_surfnet_shuts_down_first() {
+            let (status_tx, status_rx) = watch::channel(SurfnetStartupStatus::default());
+            let (events_tx, events_rx) = unbounded();
+            let (commands_tx, commands_rx) = unbounded();
+
+            let watchdog = std::thread::spawn(move || {
+                watch_startup_until_completion(status_rx, events_tx, commands_tx)
+            });
+            // The watchdog sees shutdown as a dropped sender, and must not
+            // report it as a failure.
+            drop(status_tx);
+
+            watchdog.join().unwrap();
+            assert_channels_stay_empty(&events_rx, &commands_rx);
+        }
+
+        #[test]
+        fn tui_mode_spawns_no_watchdog() {
+            let (status_tx, status_rx) = watch::channel(SurfnetStartupStatus::default());
+            let (events_tx, events_rx) = unbounded();
+            let (commands_tx, commands_rx) = unbounded();
+
+            spawn_startup_watchdog(false, status_rx, events_tx, commands_tx).unwrap();
+
+            // The receiver was dropped rather than parked in a thread, so
+            // nobody is watching: a later failure cannot trigger an abort.
+            // No sleep needed; with zero receivers there is no race to lose.
+            assert_eq!(status_tx.receiver_count(), 0);
+            status_tx.send_replace(failed_status("boom"));
+            assert_channels_stay_empty(&events_rx, &commands_rx);
+        }
+
+        #[test]
+        fn headless_mode_spawns_a_watchdog_that_exits_after_ready() {
+            let (status_tx, status_rx) = watch::channel(SurfnetStartupStatus::default());
+            let (events_tx, events_rx) = unbounded();
+            let (commands_tx, commands_rx) = unbounded();
+
+            spawn_startup_watchdog(true, status_rx, events_tx, commands_tx).unwrap();
+
+            // The spawned thread holds the receiver, distinguishing headless
+            // from TUI mode above.
+            assert_eq!(status_tx.receiver_count(), 1);
+
+            // Ready releases the watchdog; the receiver drops with it.
+            status_tx.send_replace(ready_status());
+            let deadline = Instant::now() + TIMEOUT;
+            while status_tx.receiver_count() != 0 {
+                assert!(Instant::now() < deadline, "watchdog did not exit on Ready");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_channels_stay_empty(&events_rx, &commands_rx);
+        }
+    }
 }

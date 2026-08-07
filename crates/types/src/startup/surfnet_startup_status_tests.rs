@@ -23,7 +23,7 @@ fn required_tasks_enforce_initialization_then_runbook_execution() {
             SurfnetStartupTask::RunbookExecutions,
         ])
         .unwrap();
-    assert_eq!(status.phase(), SurfnetStartupPhase::Initializing);
+    assert_eq!(status.phase(), SurfnetStartupPhase::CloningRemoteAccounts);
 
     status
         .start_task(SurfnetStartupTask::RemoteAccounts)
@@ -102,7 +102,7 @@ fn illegal_transitions_are_rejected() {
             .unwrap_err()
             .kind(),
         StartupErrorKind::AlreadySealed {
-            phase: SurfnetStartupPhase::Initializing
+            phase: SurfnetStartupPhase::CloningRemoteAccounts
         }
     );
 }
@@ -318,7 +318,7 @@ fn serializes_to_the_flat_wire_shape() {
     assert_eq!(
         json,
         serde_json::json!({
-            "phase": "initializing",
+            "phase": "cloningRemoteAccounts",
             "planSealed": true,
             "tasks": [
                 { "task": "remoteAccounts", "state": "pending", "error": null }

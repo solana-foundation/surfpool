@@ -8,22 +8,25 @@ use crate::types::{GetSurfnetInfoResponse, RunbookExecutionStatusReport};
 impl GetSurfnetInfoResponse {
     /// Runbook ID of the synthetic startup entry in `runbook_executions`.
     ///
-    /// The value is part of the legacy Anchor wire contract and must not
-    /// change; the constant's name carries no such constraint.
+    /// Anchor's readiness loop requires the `runbookId` field to exist as a
+    /// string (a missing field fails its deserialization) but never reads
+    /// the value, so the string itself is free to change; keeping it stable
+    /// is a kindness to log readers, not a contract.
     pub const STARTUP_COMPAT_RUNBOOK_ID: &'static str = "surfpool-startup";
 
-    /// Builds a response with startup state projected into the legacy
-    /// `runbook_executions` representation.
+    /// Builds a response with startup state projected into the
+    /// `runbook_executions` representation that pre-startup-machine clients
+    /// (Anchor's readiness loop among them) already consume.
     ///
     /// While startup is in progress, the projection contains one incomplete
     /// synthetic runbook execution. A failed startup is represented as a
     /// completed execution carrying the failure messages. Once startup is
     /// ready, the synthetic entry is omitted.
     ///
-    /// `started_at` is the surfnet startup time in Unix seconds. It must
-    /// remain stable across calls: legacy clients diff `runbook_executions`
-    /// between polls, and a churning timestamp reads as a new execution on
-    /// every poll.
+    /// `started_at` is the surfnet startup time in Unix seconds. Keep it
+    /// stable across calls: Anchor's readiness loop only reads
+    /// `completed_at`, but a churning timestamp would make every poll look
+    /// like a new execution to any client that compares responses.
     pub fn with_startup(
         mut runbook_executions: Vec<RunbookExecutionStatusReport>,
         startup: SurfnetStartupStatus,
@@ -40,7 +43,7 @@ impl GetSurfnetInfoResponse {
         // - ready: omitted.
         //
         // A failed entry must be complete. Leaving it incomplete would park
-        // legacy clients in that loop forever; completing it lets them
+        // clients in that loop forever; completing it lets them
         // proceed and encounter the recorded failure.
         //
         // The machine does not retain the failure instant, so the failed
@@ -59,7 +62,7 @@ impl GetSurfnetInfoResponse {
                 runbook_executions.push(compat(Some(started_at), Some(startup.failure_messages())))
             }
             SurfnetStartupPhase::Planning
-            | SurfnetStartupPhase::Initializing
+            | SurfnetStartupPhase::CloningRemoteAccounts
             | SurfnetStartupPhase::ExecutingRunbooks => runbook_executions.push(compat(None, None)),
         }
         Self {
@@ -82,7 +85,7 @@ impl GetSurfnetInfoResponse {
 pub enum SurfnetStartupPhase {
     #[default]
     Planning,
-    Initializing,
+    CloningRemoteAccounts,
     ExecutingRunbooks,
     Ready,
     Failed,
@@ -454,7 +457,7 @@ impl SealedStartupPlan {
     }
 
     // Phase derivation encodes task ordering: a non-succeeded RemoteAccounts
-    // pins the phase at Initializing, and ExecutingRunbooks is the residual case.
+    // pins the phase at CloningRemoteAccounts, and ExecutingRunbooks is the residual case.
     // Adding a task variant requires deciding where it sits in this ordering.
     fn phase(&self) -> SurfnetStartupPhase {
         if self
@@ -473,7 +476,7 @@ impl SealedStartupPlan {
             status.task == SurfnetStartupTask::RemoteAccounts
                 && status.state != SurfnetStartupTaskState::Succeeded
         }) {
-            SurfnetStartupPhase::Initializing
+            SurfnetStartupPhase::CloningRemoteAccounts
         } else {
             SurfnetStartupPhase::ExecutingRunbooks
         }
@@ -505,6 +508,10 @@ impl SealedStartupPlan {
     // The task moves return whether they were accepted and mutate only on
     // acceptance. They classify nothing: a refusal's reason is derived by
     // `StartupError::kind` from the (transition, state) pair.
+
+    /// Moves `task` from `Pending` to `Running`. Returns false when the
+    /// plan is terminal, the task is not in the plan, or the task is not
+    /// `Pending`.
     fn start_task(&mut self, task: SurfnetStartupTask) -> bool {
         if !self.active() {
             return false;
@@ -519,6 +526,9 @@ impl SealedStartupPlan {
         true
     }
 
+    /// Moves `task` from `Running` to `Succeeded`. Returns false when the
+    /// plan is terminal, the task is not in the plan, or the task is not
+    /// `Running`.
     fn complete_task(&mut self, task: SurfnetStartupTask) -> bool {
         if !self.active() {
             return false;
@@ -533,6 +543,10 @@ impl SealedStartupPlan {
         true
     }
 
+    /// Moves `task` to `Failed` from `Pending` or `Running`, recording the
+    /// error. Returns false when the plan is terminal, the task is not in
+    /// the plan, or the task is already terminal. Failing from `Pending` is
+    /// deliberate: work can fail before it begins.
     fn fail_task(&mut self, task: SurfnetStartupTask, error: String) -> bool {
         if !self.active() {
             return false;

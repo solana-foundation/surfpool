@@ -100,14 +100,14 @@ fn scenarios() -> Vec<Scenario> {
                 }),
                 // The original race window: sealed, clone outstanding.
                 Observe {
-                    phase: SurfnetStartupPhase::Initializing,
+                    phase: SurfnetStartupPhase::CloningRemoteAccounts,
                     anchor_proceeds: false,
                 },
                 Apply(StartupTransition::StartTask {
                     task: RemoteAccounts,
                 }),
                 Observe {
-                    phase: SurfnetStartupPhase::Initializing,
+                    phase: SurfnetStartupPhase::CloningRemoteAccounts,
                     anchor_proceeds: false,
                 },
                 Apply(StartupTransition::CompleteTask {
@@ -136,7 +136,7 @@ fn scenarios() -> Vec<Scenario> {
                     task: RunbookExecutions,
                 }),
                 Observe {
-                    phase: SurfnetStartupPhase::Initializing,
+                    phase: SurfnetStartupPhase::CloningRemoteAccounts,
                     anchor_proceeds: false,
                 },
                 Apply(StartupTransition::StartTask {

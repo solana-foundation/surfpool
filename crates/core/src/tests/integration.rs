@@ -4221,7 +4221,7 @@ async fn test_get_local_signatures_with_limit(test_type: TestType) {
 /// the window under test never opens.
 ///
 /// The window comes from the plan rather than from a fetch. A sealed plan whose
-/// `RemoteAccounts` task has not succeeded is `Initializing` regardless of what
+/// `RemoteAccounts` task has not succeeded is `CloningRemoteAccounts` regardless of what
 /// any datasource is doing, so sealing and then asking reaches the state under
 /// test. The surfnet runs offline because nothing needs to be held open and no
 /// clock is involved.
@@ -4403,7 +4403,7 @@ async fn startup_refuses_tasks_dispatched_before_the_seal(test_type: TestType) {
 
     // Had the early command been registered, the task would be Running here.
     let status = observer.startup_status();
-    assert_eq!(status.phase(), SurfnetStartupPhase::Initializing);
+    assert_eq!(status.phase(), SurfnetStartupPhase::CloningRemoteAccounts);
     assert!(
         status
             .tasks()
@@ -4414,7 +4414,7 @@ async fn startup_refuses_tasks_dispatched_before_the_seal(test_type: TestType) {
 }
 
 /// Deployment can finish while hydration is still in flight, because the
-/// planner dispatches them concurrently. The phase must hold at Initializing
+/// planner dispatches them concurrently. The phase must hold at CloningRemoteAccounts
 /// until the clones land.
 // Multi-threaded flavor: the locker reads through a blocking guard, which
 // panics on a current-thread runtime.
@@ -4456,7 +4456,7 @@ async fn startup_holds_initializing_when_deployment_finishes_first(test_type: Te
     // the phase must not have moved.
     assert_eq!(
         observer.startup_status().phase(),
-        SurfnetStartupPhase::Initializing,
+        SurfnetStartupPhase::CloningRemoteAccounts,
         "deployment finishing first must not move the phase"
     );
 

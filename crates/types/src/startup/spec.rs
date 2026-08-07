@@ -55,7 +55,7 @@ pub fn expected_phase(status: &SurfnetStartupStatus) -> SurfnetStartupPhase {
         task.task == SurfnetStartupTask::RemoteAccounts
             && task.state != SurfnetStartupTaskState::Succeeded
     }) {
-        return SurfnetStartupPhase::Initializing;
+        return SurfnetStartupPhase::CloningRemoteAccounts;
     }
     SurfnetStartupPhase::ExecutingRunbooks
 }

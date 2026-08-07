@@ -79,7 +79,7 @@ fn event_name(transition: &StartupTransition) -> &'static str {
 fn phase_rank(phase: SurfnetStartupPhase) -> u8 {
     match phase {
         SurfnetStartupPhase::Planning => 0,
-        SurfnetStartupPhase::Initializing => 1,
+        SurfnetStartupPhase::CloningRemoteAccounts => 1,
         SurfnetStartupPhase::ExecutingRunbooks => 2,
         SurfnetStartupPhase::Ready => 3,
         SurfnetStartupPhase::Failed => u8::MAX,
@@ -205,7 +205,9 @@ fn reference(display: &str, target: &'static str) -> String {
 fn phase_target(phase: SurfnetStartupPhase) -> &'static str {
     match phase {
         SurfnetStartupPhase::Planning => link_target!(SurfnetStartupPhase::Planning),
-        SurfnetStartupPhase::Initializing => link_target!(SurfnetStartupPhase::Initializing),
+        SurfnetStartupPhase::CloningRemoteAccounts => {
+            link_target!(SurfnetStartupPhase::CloningRemoteAccounts)
+        }
         SurfnetStartupPhase::ExecutingRunbooks => {
             link_target!(SurfnetStartupPhase::ExecutingRunbooks)
         }
@@ -547,7 +549,7 @@ fn sweep() -> Observed {
 /// The order the spec's tables list phases in.
 const PHASE_ORDER: [SurfnetStartupPhase; 5] = [
     SurfnetStartupPhase::Planning,
-    SurfnetStartupPhase::Initializing,
+    SurfnetStartupPhase::CloningRemoteAccounts,
     SurfnetStartupPhase::ExecutingRunbooks,
     SurfnetStartupPhase::Ready,
     SurfnetStartupPhase::Failed,
@@ -557,8 +559,8 @@ const PHASE_ORDER: [SurfnetStartupPhase; 5] = [
 fn phase_name(phase: SurfnetStartupPhase) -> &'static str {
     match phase {
         SurfnetStartupPhase::Planning => "Planning",
-        SurfnetStartupPhase::Initializing => "Initializing",
-        SurfnetStartupPhase::ExecutingRunbooks => "Deploying",
+        SurfnetStartupPhase::CloningRemoteAccounts => "CloningRemoteAccounts",
+        SurfnetStartupPhase::ExecutingRunbooks => "ExecutingRunbooks",
         SurfnetStartupPhase::Ready => "Ready",
         SurfnetStartupPhase::Failed => "Failed",
     }
@@ -828,7 +830,10 @@ fn the_forbidden_pairing_is_one_we_can_build() {
     outstanding
         .seal_plan(vec![SurfnetStartupTask::RemoteAccounts])
         .expect("an unsealed plan should accept a seal");
-    assert_eq!(outstanding.phase(), SurfnetStartupPhase::Initializing);
+    assert_eq!(
+        outstanding.phase(),
+        SurfnetStartupPhase::CloningRemoteAccounts
+    );
 
     // The response a client received during the clone window before the
     // fix: a sealed plan with the clone outstanding, and an empty list.

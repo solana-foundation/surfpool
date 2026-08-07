@@ -623,12 +623,14 @@ pub enum SimnetCommand {
         Option<bool>,
     ),
     Terminate(Option<(Hash, String)>),
-    /// Fixes the startup task list; `Ready` is unreachable until a plan is
-    /// sealed. The only startup command with a reply channel: the planner
-    /// must not dispatch tasks against an unsealed plan, so it blocks on the
-    /// outcome. The startup commands below are fire-and-forget
-    /// because no caller decision hangs on them; their failures are machine
-    /// rejections, which the runloop reports as error events.
+    /// Seals the startup plan. Once sealed, `Ready` is unreachable until
+    /// every declared task completes successfully; an unsealed plan can
+    /// never reach `Ready`.
+    ///
+    /// Carries a reply channel because the planner must not dispatch tasks
+    /// until the seal has been accepted. The remaining startup commands are
+    /// fire-and-forget because no caller decision depends on their outcome;
+    /// state-machine rejections are reported asynchronously as error events.
     SealStartupPlan(Vec<SurfnetStartupTask>, Sender<Result<(), StartupError>>),
     /// Reports a failure discovered while the plan was still unsealed
     /// (project inspection failed); drives the phase to `Failed`.
