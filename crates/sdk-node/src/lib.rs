@@ -665,7 +665,6 @@ impl From<SimnetEvent> for SimnetEventValue {
             }
             SimnetEvent::Shutdown => Self::new("shutdown"),
             SimnetEvent::StartupStatusChanged(_) => Self::new("startupStatusChanged"),
-            SimnetEvent::AnsweredClient { .. } => Self::new("answeredClient"),
             SimnetEvent::SystemClockUpdated(clock) => {
                 let mut value = Self::new("systemClockUpdated");
                 value.clock = Some(ClockValue {

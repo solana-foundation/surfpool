@@ -491,7 +491,6 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
                             // (the headless watchdog, the SDK's event stream),
                             // not to the TUI.
                             SimnetEvent::StartupStatusChanged(_) => {}
-                            SimnetEvent::AnsweredClient { .. } => {}
                             SimnetEvent::AccountUpdate(dt, _account) => {
                                 new_events.push((
                                     EventType::Success,

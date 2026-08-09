@@ -470,9 +470,6 @@ fn log_events(
                     // A headless run reports readiness through the watchdog,
                     // which reads the status directly.
                     SimnetEvent::StartupStatusChanged(_) => {}
-                    // The answer record matters to other listeners (tests,
-                    // the SDK); nothing for an operator to read.
-                    SimnetEvent::AnsweredClient { .. } => {}
                     SimnetEvent::PluginLoaded(_) => {
                         info!("{}", event.plugin_loaded_msg());
                     }

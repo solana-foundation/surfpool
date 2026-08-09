@@ -848,7 +848,7 @@ fn the_forbidden_pairing_is_one_we_can_build() {
             .runbook_executions
             .iter()
             .all(|execution| execution.completed_at.is_some()),
-        "a legacy client reads this response as startup finished"
+        "a polling client reads this response as startup finished"
     );
     assert!(
         !forbidden.startup.is_ready(),

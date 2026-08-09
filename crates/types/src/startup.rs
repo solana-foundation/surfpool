@@ -32,10 +32,9 @@ impl GetSurfnetInfoResponse {
         startup: SurfnetStartupStatus,
         started_at: u32,
     ) -> Self {
-        // Legacy Anchor clients (versions that predate the explicit startup
-        // field) infer readiness by waiting until every `runbook_executions`
-        // entry is complete. They do not inspect `errors`, and their polling
-        // loop has no timeout.
+        // Anchor's readiness loop (current master included) infers readiness
+        // by waiting until every `runbook_executions` entry is complete. It
+        // does not inspect `errors`, and it has no timeout.
         //
         // Project startup into that protocol as one synthetic execution:
         // - in progress: incomplete;

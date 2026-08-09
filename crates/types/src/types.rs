@@ -431,20 +431,6 @@ pub mod pubkey_option_account_map {
     }
 }
 
-/// What the surfnet told a client, reduced to a yes or no.
-///
-/// A served response is output: it is asserted on or read in a report, never
-/// fed back into a surfnet, so the event carries the conclusion a client
-/// would draw instead of a second copy of the wire format.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ClientAnswer {
-    /// A readiness question, and whether the answer conveyed readiness.
-    ///
-    /// Monotone: readiness does not regress, so the first answer carrying
-    /// `ready: true` is the moment a client could have been misled.
-    Readiness { ready: bool },
-}
-
 #[derive(Debug)]
 pub enum SimnetEvent {
     /// RPC servers are bound and stored transactions have been replayed
@@ -456,15 +442,6 @@ pub enum SimnetEvent {
     /// two; [`StartupPlanner::Runloop`] seals the empty plan immediately
     /// before this event, so they coincide.
     CoreStarted(u64),
-    /// The surfnet answered a client, carrying what the answer conveyed.
-    ///
-    /// Reports what a client was told, so a test can assert on the answer a
-    /// client received rather than infer it from internal state. Issue 715 is
-    /// defined by client observation, which is why the answer is recorded.
-    AnsweredClient {
-        method: &'static str,
-        answer: ClientAnswer,
-    },
     /// The startup machine accepted a transition, carrying the status it
     /// produced. One event per accepted transition, in the order they were
     /// applied, so readiness can be observed as a position in a sequence.

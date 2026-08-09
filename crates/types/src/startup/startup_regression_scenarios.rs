@@ -30,7 +30,7 @@ enum Step {
     ///
     /// - `phase` is what a current client reads from the `startup`
     ///   field.
-    /// - `anchor_proceeds` is what a legacy client (predating that
+    /// - `anchor_proceeds` is what a polling client (one that ignores the
     ///   field) concludes from the projected `runbook_executions`; it
     ///   proceeds when every entry is complete.
     Observe {
@@ -152,7 +152,7 @@ fn scenarios() -> Vec<Scenario> {
             ],
         },
         Scenario {
-            name: "a planning failure must release legacy pollers",
+            name: "a planning failure must release pollers",
             provenance: Provenance::DesignRule,
             context: "Legacy Anchor's readiness loop has no timeout; a \
                       failure that left the compat entry pending would \
@@ -169,7 +169,7 @@ fn scenarios() -> Vec<Scenario> {
             ],
         },
         Scenario {
-            name: "a hydration failure must release legacy pollers",
+            name: "a hydration failure must release pollers",
             provenance: Provenance::DesignRule,
             context: "Same rule as a planning failure, reached through a \
                       sealed plan: the failed task carries the reason and \

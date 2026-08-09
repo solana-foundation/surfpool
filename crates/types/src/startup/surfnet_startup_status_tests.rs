@@ -374,7 +374,7 @@ fn deserialization_never_manufactures_readiness_from_an_unsealed_status() {
 const STARTED_AT: u32 = 1_753_000_000;
 
 #[test]
-fn legacy_anchor_sees_startup_as_pending_until_ready() {
+fn anchor_sees_startup_as_pending_until_ready() {
     let planning =
         GetSurfnetInfoResponse::with_startup(vec![], SurfnetStartupStatus::default(), STARTED_AT);
     assert_eq!(planning.runbook_executions.len(), 1);
@@ -406,11 +406,11 @@ fn compat_entry_is_stable_across_polls() {
     }
 }
 
-// A pending compat entry on Failed would starve legacy Anchor's readiness
+// A pending compat entry on Failed would starve Anchor's readiness
 // loop, which has no timeout; the entry must complete, with the reason
 // recorded in `errors`.
 #[test]
-fn legacy_anchor_sees_startup_failure_as_completed_with_errors() {
+fn anchor_sees_startup_failure_as_completed_with_errors() {
     let mut failed = SurfnetStartupStatus::default();
     failed
         .seal_plan(vec![SurfnetStartupTask::RemoteAccounts])
@@ -439,7 +439,7 @@ fn legacy_anchor_sees_startup_failure_as_completed_with_errors() {
 // fail_planning has no task to carry the error, so the machine-level
 // error must reach the compat entry on its own.
 #[test]
-fn legacy_anchor_sees_planning_failure_as_completed_with_errors() {
+fn anchor_sees_planning_failure_as_completed_with_errors() {
     let mut failed = SurfnetStartupStatus::default();
     failed.fail_planning("could not detect framework").unwrap();
 
