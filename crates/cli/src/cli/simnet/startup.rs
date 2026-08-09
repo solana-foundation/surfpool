@@ -137,7 +137,7 @@ pub(super) fn watch_startup_until_completion(
 }
 
 /// Bounded wait for the seal round-trip. Generous rather than tight: the
-/// runloop emits `SimnetEvent::Ready` immediately before entering the
+/// runloop emits `SimnetEvent::CoreStarted` immediately before entering the
 /// command loop on the same task, and the CLI waits for Ready before
 /// planning, so the loop is provably alive at every call site. A timeout
 /// here means the loop is dead or wedged, not merely slow.
@@ -357,8 +357,8 @@ pub(super) async fn plan_and_dispatch_startup(
         .await
         .map_err(StartupPlanFailure::Planning)?;
 
-    // Sealing happens before any task is submitted. From this point forward,
-    // readiness is derived solely from the registered task transitions.
+    // Seal before dispatching anything: from here on, only the registered
+    // tasks' transitions can move readiness.
     seal_startup_plan(simnet_commands_tx, startup_tasks).map_err(StartupPlanFailure::Sealing)?;
 
     // One choreography for all startup tasks: the submitter sends

@@ -83,7 +83,7 @@ pub fn run_headless(surfnet_id: u16, rpc_port: u16, ws_port: u16) -> StartSurfne
 
     let simnet_events_tx = surfnet_svm.simnet_events_tx.clone();
 
-    // The default StartupPlanner::None makes the runloop seal an empty
+    // The default StartupPlanner::Runloop makes the runloop seal an empty
     // startup plan before announcing Ready, so this embedded surfnet reads
     // as publicly ready without any sealing choreography here.
     let mut config = SurfpoolConfig::default();
@@ -141,7 +141,7 @@ pub fn run_headless(surfnet_id: u16, rpc_port: u16, ws_port: u16) -> StartSurfne
                     SimnetEvent::Aborted(error) => {
                         return StartSurfnetResponse::error(error);
                     }
-                    SimnetEvent::Ready(_) => {
+                    SimnetEvent::CoreStarted(_) => {
                         let surfnet_url = format!("http://127.0.0.1:{}", rpc_port);
                         break StartSurfnetResponse::success(StartSurfnetSuccess {
                             kind: StartSurfnetKind::Headless,

@@ -72,11 +72,10 @@ impl GetSurfnetInfoResponse {
     }
 }
 
-/// Public readiness lifecycle for a surfnet. `Ready` here means the sealed
+/// Public readiness lifecycle for a surfnet. `Ready` means the sealed
 /// startup plan completed: clones hydrated, startup runbooks succeeded.
-/// Not to be confused with [`SimnetEvent::Ready`](crate::types::SimnetEvent),
-/// which fires when core startup completes (RPC bound) and can precede this
-/// by the entire clone-and-deploy window.
+/// [`SimnetEvent::CoreStarted`](crate::types::SimnetEvent) can precede it
+/// by the entire clone-and-run window.
 ///
 /// Each variant's meaning is defined by the phase projection table in
 /// [`SurfnetStartupStatus`]'s documentation.
@@ -337,8 +336,8 @@ pub enum SurfnetStartupStatus {
     Planning,
     /// Planning failed before a plan was sealed. Terminal.
     PlanningFailed { error: String },
-    /// The task set is closed; the phase derives from the task states. An
-    /// empty sealed plan derives `Ready` immediately.
+    /// The task set is closed; the phase follows from the task states.
+    /// Sealing an empty set reaches `Ready` immediately.
     Sealed(SealedStartupPlan),
 }
 
@@ -417,7 +416,7 @@ impl<'de> Deserialize<'de> for SurfnetStartupStatus {
     }
 }
 
-/// A startup plan whose task set is fixed.
+/// A startup plan after sealing: the task set can no longer change.
 ///
 /// The task operations live here rather than on [`SurfnetStartupStatus`], so
 /// holding one of these is proof the plan was sealed. Every mutation routes

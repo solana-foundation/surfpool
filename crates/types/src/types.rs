@@ -447,16 +447,15 @@ pub enum ClientAnswer {
 
 #[derive(Debug)]
 pub enum SimnetEvent {
-    /// Core startup completed: RPC servers are bound and stored transactions
-    /// have been replayed (the payload is their count). This is *not* public
-    /// readiness: with an external startup planner (the CLI), it fires while
-    /// the startup phase is still `Planning`, before clones are hydrated or
-    /// startup runbooks run. Public readiness is
-    /// [`SurfnetStartupPhase::Ready`], observable via
-    /// `surfnet_getSurfnetInfo` or the startup watch channel. With no
-    /// external planner the two coincide: the runloop seals the empty plan
-    /// immediately before emitting this event.
-    Ready(u64),
+    /// RPC servers are bound and stored transactions have been replayed
+    /// (the payload is their count).
+    ///
+    /// Public readiness is [`SurfnetStartupPhase::Ready`], observable via
+    /// `surfnet_getSurfnetInfo` or the startup watch channel. An external
+    /// planner (the CLI) leaves a whole clone-and-run window between the
+    /// two; [`StartupPlanner::Runloop`] seals the empty plan immediately
+    /// before this event, so they coincide.
+    CoreStarted(u64),
     /// The surfnet answered a client, carrying what the answer conveyed.
     ///
     /// Reports what a client was told, so a test can assert on the answer a
@@ -692,11 +691,11 @@ pub struct SurfpoolConfig {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum StartupPlanner {
-    /// No external planner exists: the runloop seals an empty plan itself,
-    /// right before announcing readiness, so the surfnet becomes publicly
-    /// ready as soon as core startup completes.
+    /// The runloop is the planner: it seals an empty plan itself, right
+    /// before announcing core start, so the surfnet becomes publicly ready
+    /// as soon as core startup completes.
     #[default]
-    None,
+    Runloop,
     /// An external planner (the CLI) inspects the project and seals the plan
     /// via [`SimnetCommand::SealStartupPlan`]; the runloop must not seal. If
     /// the planner dies before sealing, the surfnet stays un-ready forever,
@@ -2172,6 +2171,6 @@ mod tests {
             .remove("startup_planner");
 
         let config: SurfpoolConfig = serde_json::from_value(config_json).unwrap();
-        assert_eq!(config.startup_planner, StartupPlanner::None);
+        assert_eq!(config.startup_planner, StartupPlanner::Runloop);
     }
 }

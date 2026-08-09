@@ -322,19 +322,18 @@ pub async fn start_local_surfnet_runloop(
 
         count
     });
-    // With no external planner, the empty startup plan is known by
-    // construction; seal it here, before the Ready event, so an embedder
-    // that waits for Ready observes a publicly ready surfnet. With an
-    // external planner (the CLI), Ready only means "RPC bound": the planner
-    // inspects the project after this and seals the plan itself.
-    if startup_planner == StartupPlanner::None {
+    // `Runloop` means nobody declares startup work, so the plan is empty.
+    // Seal it before CoreStarted, and an embedder waiting on that event
+    // observes a publicly ready surfnet. An external planner instead
+    // inspects the project after this point and seals its own plan.
+    if startup_planner == StartupPlanner::Runloop {
         if let Err(error) = svm_locker.seal_startup_plan(vec![]) {
             let _ = simnet_events_tx_cc.try_send(SimnetEvent::error(format!(
                 "Failed to seal startup plan: {error}"
             )));
         }
     }
-    let _ = simnet_events_tx_cc.send(SimnetEvent::Ready(initial_transaction_count));
+    let _ = simnet_events_tx_cc.send(SimnetEvent::CoreStarted(initial_transaction_count));
 
     // Notify geyser plugins that startup is complete
     let _ = svm_locker.with_svm_reader(|svm| svm.geyser_events_tx.send(GeyserEvent::EndOfStartup));

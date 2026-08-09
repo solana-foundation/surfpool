@@ -236,7 +236,7 @@ pub async fn handle_start_local_surfnet_command(
                 return Err(error);
             }
             Ok(SimnetEvent::Shutdown) => return Ok(()),
-            Ok(SimnetEvent::Ready(initial_transactions)) => break initial_transactions,
+            Ok(SimnetEvent::CoreStarted(initial_transactions)) => break initial_transactions,
             Ok(other) => early_events.push(other),
             Err(_) => continue,
         }
@@ -510,7 +510,7 @@ fn log_events(
                         error!("{}", error);
                         return Err(error);
                     }
-                    SimnetEvent::Ready(_) => {}
+                    SimnetEvent::CoreStarted(_) => {}
                     SimnetEvent::Connected(_rpc_url) => {}
                     SimnetEvent::Shutdown => {
                         break;

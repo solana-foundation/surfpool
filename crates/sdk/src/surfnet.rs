@@ -160,7 +160,7 @@ impl SurfnetBuilder {
         startup_airdrop_addresses.extend(airdrop_addresses);
         let startup_airdrop_addresses_for_rpc = startup_airdrop_addresses.clone();
 
-        // The default StartupPlanner::None makes the runloop seal an empty
+        // The default StartupPlanner::Runloop makes the runloop seal an empty
         // startup plan before announcing Ready, so wait_for_ready below
         // implies a publicly ready surfnet (getSurfnetInfo reports phase
         // ready with no pending compat entry).
@@ -383,7 +383,7 @@ fn get_free_port() -> SurfnetResult<u16> {
 fn wait_for_ready(events_rx: &Receiver<SimnetEvent>) -> SurfnetResult<()> {
     loop {
         match events_rx.recv() {
-            Ok(SimnetEvent::Ready(_)) => return Ok(()),
+            Ok(SimnetEvent::CoreStarted(_)) => return Ok(()),
             Ok(SimnetEvent::Aborted(err)) => return Err(SurfnetError::Aborted(err)),
             Ok(SimnetEvent::Shutdown) => {
                 return Err(SurfnetError::Aborted(

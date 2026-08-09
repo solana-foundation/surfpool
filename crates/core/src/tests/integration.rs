@@ -288,7 +288,7 @@ fn wait_for_startup(
     while !(ready && connected) {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         match simnet_events_rx.recv_timeout(remaining) {
-            Ok(SimnetEvent::Ready(_)) => ready = true,
+            Ok(SimnetEvent::CoreStarted(_)) => ready = true,
             Ok(SimnetEvent::Connected(_)) => connected = true,
             Ok(_) => (),
             Err(RecvTimeoutError::Timeout) => {
@@ -336,8 +336,11 @@ async fn test_simnet_ready(test_type: TestType) {
     // event rather than an error. Waiting for a particular one needs the
     // accumulating shape `wait_for_ready_and_connected` uses.
     match simnet_events_rx.recv() {
-        Ok(SimnetEvent::Ready(_) | SimnetEvent::Connected(_) | SimnetEvent::EpochInfoUpdate(_)) => {
-        }
+        Ok(
+            SimnetEvent::CoreStarted(_)
+            | SimnetEvent::Connected(_)
+            | SimnetEvent::EpochInfoUpdate(_),
+        ) => {}
         event => panic!("Expected startup event: {event:?}"),
     }
 }
@@ -1087,7 +1090,7 @@ async fn test_load_snapshot_program_is_invokable() {
 
     loop {
         match simnet_events_rx.recv_timeout(Duration::from_secs(5)) {
-            Ok(SimnetEvent::Ready(_)) => break,
+            Ok(SimnetEvent::CoreStarted(_)) => break,
             Ok(_) => {}
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                 panic!("timed out waiting for surfnet runloop to become ready");

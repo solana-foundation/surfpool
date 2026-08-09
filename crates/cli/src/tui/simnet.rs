@@ -576,7 +576,7 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
                             SimnetEvent::Aborted(_error) => {
                                 break;
                             }
-                            SimnetEvent::Ready(_) => {}
+                            SimnetEvent::CoreStarted(_) => {}
                             SimnetEvent::Connected(_) => {}
                             SimnetEvent::Shutdown => {
                                 return Ok(());
