@@ -1,16 +1,32 @@
 //! Exhaustive model check of the startup state machine. The reachable state
 //! space is finite and small (two task kinds, four task states, five phases),
-//! so a breadth-first search from the default state can verify the startup
+//! so a depth-first search from the default state can verify the startup
 //! invariants at every reachable state and along every accepted transition,
 //! with no sampling involved.
 //!
-//! The race in issue 715 was a history property: no sequence of transitions
-//! may let a client observe readiness while declared work is outstanding.
-//! This sweep checks state invariants instead, which suffices because the
-//! projection a client reads is a pure function of the current state and
-//! every reachable state is visited. If readiness ever acquires memory of
-//! its own (a cache, a debounce, an asynchronous publish), that reduction
-//! stops holding, and forbidden histories need checking directly.
+//! Why visiting every reachable state is enough to trust the live code:
+//! the sweep starts from the same `default()` state production starts
+//! from, and drives the same `apply` function production calls (the named
+//! methods such as `start_task` are thin wrappers over it). Every state
+//! the sweep visits is checked, and every accepted transition out of a
+//! checked state leads to a state that gets checked in turn. Production
+//! has no other way to reach a state, so any state the live process can
+//! occupy is one this sweep already checked.
+//!
+//! Some mistakes need no check at all, because the type cannot represent
+//! them: the phase is computed from the state on every read rather than
+//! stored, and only a sealed plan carries a task table to compute `Ready`
+//! from. So an unsealed status cannot claim readiness, and a stored phase
+//! cannot fall out of sync with the state it summarizes, because there is
+//! no stored phase.
+//!
+//! One requirement is about sequences of events rather than single
+//! states: a client must never observe readiness while declared work is
+//! outstanding. Checking each state is still enough, because what a
+//! client reads is computed from the current state alone and every
+//! reachable state gets checked. If readiness is ever computed from
+//! anything else (a cache, a debounce, an asynchronous publish), that
+//! argument stops working, and event sequences need checking directly.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
@@ -63,7 +79,12 @@ fn seal_payloads() -> Vec<Vec<SurfnetStartupTask>> {
     plans
 }
 
-/// The spec's event name for a transition.
+/// The spec's name for the event a transition represents. The machine and
+/// the spec name the same set of moves differently: `StartupTransition`
+/// variants on the machine side, `PlanEvent` and `TaskEvent` on the spec
+/// side. This function is the bridge between the two, so the observed
+/// table records events under the spec's names, and `event_target` can
+/// look a name back up in the spec's event lists to build its link.
 fn event_name(transition: &StartupTransition) -> &'static str {
     match transition {
         StartupTransition::SealPlan { .. } => spec::PlanEvent::Sealed.name(),
@@ -74,8 +95,12 @@ fn event_name(transition: &StartupTransition) -> &'static str {
     }
 }
 
-/// Progress order for the monotonicity check. `Failed` is handled
-/// separately: it is reachable from any non-terminal phase.
+/// Startup only moves forward: planning, then cloning, then runbooks,
+/// then ready. The sweep asserts that every accepted transition keeps or
+/// raises this rank, so no transition can move startup backward. `Failed`
+/// sits outside the ordering: any non-terminal phase may fail (the sweep
+/// exempts transitions into it), and nothing leaves it (terminal states
+/// accept no transitions), so its rank is never actually compared.
 fn phase_rank(phase: SurfnetStartupPhase) -> u8 {
     match phase {
         SurfnetStartupPhase::Planning => 0,
@@ -87,16 +112,16 @@ fn phase_rank(phase: SurfnetStartupPhase) -> u8 {
 }
 
 fn assert_state_invariants(status: &SurfnetStartupStatus) {
-    // The oracle equation is total: every state has exactly one expected
-    // phase, so no state slips through unchecked. This subsumes the
-    // headline issue-715 invariant (Ready requires a sealed plan with
-    // every required task succeeded).
+    // The spec gives every state exactly one expected phase, so no state
+    // the sweep visits can slip through unchecked. This one equality also
+    // covers the headline invariant: the spec only answers `Ready` for a
+    // sealed plan whose every required task has succeeded.
     //
     // Two former assertions have no runtime check anymore because the
-    // sum-type representation makes their violations unrepresentable:
-    // the machine-level error is now derived (so it cannot disagree
-    // with the Failed phase), and an unsealed status has no task table
-    // (so tasks cannot be registered before sealing).
+    // enum cannot represent their violations: the machine-level error is
+    // derived (so it cannot disagree with the Failed phase), and an
+    // unsealed status has no task table (so tasks cannot be registered
+    // before sealing).
     assert_eq!(
         status.phase(),
         spec::expected_phase(status),
@@ -114,8 +139,10 @@ fn assert_state_invariants(status: &SurfnetStartupStatus) {
          would read readiness from {status:?}"
     );
 
-    // Task-level error bookkeeping is still two stored fields, so the
-    // biconditional remains a real check.
+    // Task-level error bookkeeping is still two stored fields, so this
+    // stays a real check: a task must carry an error exactly when it is
+    // `Failed`. An error on a task that has not failed, and a failed task
+    // with no reason recorded, are both bugs.
     for task in status.tasks() {
         assert_eq!(
             task.error.is_some(),
@@ -341,9 +368,9 @@ fn plan_target_cell(state: spec::PlanState) -> String {
     }
 }
 
-/// One row per event: the states it moves, and where to. The spec's
-/// transition function is total over the small vocabulary, so the rows
-/// enumerate rather than restate it.
+/// One row per event: the states it moves, and where to.
+/// `spec::task_transition` answers for every (state, event) pair, so the
+/// rows are read straight off it rather than written by hand.
 fn render_task_lifecycle() -> String {
     let rows: Vec<[String; 3]> = spec::TaskEvent::ALL
         .iter()
@@ -509,9 +536,10 @@ fn sweep() -> Observed {
         }
     }
 
-    // Adequacy: an alphabet whose representatives never reach a guard
-    // would pass every assertion above while exercising nothing, so
-    // every event kind must be both accepted and rejected somewhere.
+    // Every event kind must be both accepted and rejected somewhere in
+    // the walk. A command list that never reached a refusal (or never
+    // landed) would pass every check above while proving nothing,
+    // because those checks only fire when a transition is attempted.
     for name in spec::PlanEvent::ALL
         .map(spec::PlanEvent::name)
         .into_iter()

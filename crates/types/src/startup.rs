@@ -314,10 +314,10 @@ impl std::fmt::Display for StartupErrorKind {
 /// untouched, so a caller can publish the status after every attempt
 /// without checking which attempts landed.
 ///
-/// The representation carries the issue-715 invariant structurally: the
-/// phase is a projection of the variant, and only a sealed plan has a task
-/// table to derive `Ready` from, so an unsealed status cannot represent
-/// readiness at all. The wire shape is unchanged: a manual `Serialize`
+/// The core guarantee (never ready while declared work is outstanding)
+/// is built into the type itself: the phase is a projection of the
+/// variant, and only a sealed plan has a task table to derive `Ready`
+/// from, so an unsealed status cannot represent readiness at all. The wire shape is unchanged: a manual `Serialize`
 /// impl projects the same flat `{ phase, planSealed, tasks, error }`
 /// object the struct form produced.
 ///

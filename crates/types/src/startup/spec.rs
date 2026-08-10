@@ -69,7 +69,7 @@ pub fn expected_phase(status: &SurfnetStartupStatus) -> SurfnetStartupPhase {
 /// a readiness loop that has no timeout, so the entry completes and the
 /// reason is reported in `errors`.
 ///
-/// Stated in terms of Anchor's predicate rather than an empty list,
+/// Stated in terms of Anchor's rule rather than an empty list,
 /// because an empty list is only one way to satisfy it. An entry marked
 /// complete regardless of phase satisfies it too, and a check written
 /// against emptiness does not detect that.
