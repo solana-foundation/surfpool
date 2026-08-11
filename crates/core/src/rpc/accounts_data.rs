@@ -3,7 +3,7 @@ use jsonrpc_derive::rpc;
 use solana_account_decoder::{
     UiAccount,
     parse_account_data::SplTokenAdditionalDataV2,
-    parse_token::{TokenAccountType, UiTokenAmount, parse_token_v3},
+    parse_token::{TokenAccountType, UiTokenAmount, parse_token_v3, real_number_string_trimmed},
 };
 use solana_client::{
     rpc_config::RpcAccountInfoConfig,
@@ -675,7 +675,10 @@ impl AccountsData for SurfpoolAccountsDataRpc {
                                 amount: mint.supply.clone(),
                                 decimals: mint.decimals,
                                 ui_amount,
-                                ui_amount_string: mint.supply,
+                                ui_amount_string: real_number_string_trimmed(
+                                    supply_u64,
+                                    mint.decimals,
+                                ),
                             })
                         }
                         _ => None,
@@ -936,7 +939,7 @@ mod tests {
 
         assert_eq!(res.value.amount, "1000000000000");
         assert_eq!(res.value.decimals, 6);
-        assert_eq!(res.value.ui_amount_string, "1000000000000");
+        assert_eq!(res.value.ui_amount_string, "1000000");
     }
 
     #[tokio::test(flavor = "multi_thread")]
