@@ -2222,7 +2222,7 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|elapsed| elapsed.as_secs() as u32)
                 .unwrap_or_default();
-            (svm_reader.startup_status.clone(), started_at)
+            (svm_reader.startup_status().clone(), started_at)
         });
         let value =
             GetSurfnetInfoResponse::with_startup(runbook_executions, startup_status, started_at);

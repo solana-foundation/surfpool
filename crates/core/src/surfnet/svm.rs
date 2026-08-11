@@ -312,7 +312,10 @@ pub struct SurfnetSvm {
     pub max_profiles: usize,
     pub skip_blockhash_check: bool,
     pub runbook_executions: Vec<RunbookExecutionStatusReport>,
-    pub startup_status: SurfnetStartupStatus,
+    /// The startup state machine. Kept private so that every mutation goes
+    /// through [`Self::seal_startup_plan`] and its sibling wrappers, which
+    /// publish each accepted transition; read via [`Self::startup_status`].
+    startup_status: SurfnetStartupStatus,
     /// Publishes accepted startup transitions to watch subscribers. Kept
     /// private so that all writes go through the state machine; subscribe via
     /// [`Self::subscribe_startup_status`].
@@ -3883,6 +3886,13 @@ impl SurfnetSvm {
         }
         self.publish_startup_status();
         Ok(())
+    }
+
+    /// The current startup status. Read-only: mutations go through
+    /// [`Self::seal_startup_plan`] and its sibling wrappers so that every
+    /// accepted transition is published.
+    pub fn startup_status(&self) -> &SurfnetStartupStatus {
+        &self.startup_status
     }
 
     /// Subscribes to startup lifecycle changes. Returns a watch receiver whose

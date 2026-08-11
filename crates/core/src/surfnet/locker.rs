@@ -3990,7 +3990,7 @@ impl SurfnetSvmLocker {
     }
 
     pub fn startup_status(&self) -> SurfnetStartupStatus {
-        self.with_svm_reader(|svm_reader| svm_reader.startup_status.clone())
+        self.with_svm_reader(|svm_reader| svm_reader.startup_status().clone())
     }
 
     /// Subscribes to startup lifecycle changes. Returns a watch receiver whose
