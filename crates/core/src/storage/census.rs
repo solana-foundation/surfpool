@@ -144,6 +144,30 @@ impl surfpool_db::diesel::r2d2::ManageConnection for CountingSqliteManager {
 mod tests {
     use super::*;
 
+    /// Dropping the backend (and its stores) must close every connection it
+    /// opened.
+    #[test]
+    #[ignore = "process-global counters; run alone with --ignored --nocapture"]
+    fn dropping_backend_closes_connections() {
+        let temp_file = tempfile::NamedTempFile::new().unwrap();
+        let db_path = temp_file.path().to_str().unwrap();
+
+        let before = snapshot();
+        let backend = crate::storage::sqlite::SqliteBackend::open(db_path, "census").unwrap();
+        let store: crate::storage::SqliteStorage<String, String> =
+            backend.open_store("census_table").unwrap();
+        let opened = snapshot().since(&before);
+        assert!(opened.connections_opened > 0, "pool should open connections");
+
+        drop(store);
+        drop(backend);
+        let after = snapshot().since(&before);
+        assert_eq!(
+            after.connections_closed, after.connections_opened,
+            "every connection opened by the backend should close at drop"
+        );
+    }
+
     /// Builds and drops N surfnets against on-disk and in-memory SQLite,
     /// printing the exact resource movement per phase.
     #[test]

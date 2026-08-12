@@ -8,7 +8,7 @@ use surfpool_db::diesel::{
 
 use crate::storage::{
     Storage, StorageError, StorageResult,
-    census::{CountedConnection, CountingSqliteManager},
+    census::{self, CountedConnection, CountingSqliteManager},
     diesel_common::{
         CountRecord, KeyRecord, KvRecord, ValueRecord, deserialize_value, serialize_key,
         serialize_value,
@@ -82,6 +82,7 @@ impl SqliteBackend {
             .connection_customizer(Box::new(SqlitePragmaCustomizer { is_file_based }))
             .build(manager)
             .map_err(|e| StorageError::PooledConnectionError(NAME.into(), e))?;
+        census::pool_created();
 
         // journal_mode=WAL persists to file; wal_autocheckpoint is per-connection
         if is_file_based {
