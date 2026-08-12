@@ -157,7 +157,10 @@ mod tests {
         let store: crate::storage::SqliteStorage<String, String> =
             backend.open_store("census_table").unwrap();
         let opened = snapshot().since(&before);
-        assert!(opened.connections_opened > 0, "pool should open connections");
+        assert!(
+            opened.connections_opened > 0,
+            "pool should open connections"
+        );
 
         drop(store);
         drop(backend);
