@@ -18,7 +18,7 @@ use solana_transaction::versioned::VersionedTransaction;
 
 use crate::{
     error::{SurfpoolError, SurfpoolResult},
-    storage::{OverlayStorage, Storage, new_kv_store},
+    storage::{OverlayStorage, Storage, StorageBackend},
     surfnet::{GetAccountResult, locker::is_supported_token_program},
 };
 
@@ -31,11 +31,7 @@ pub struct SurfnetLiteSvm {
 }
 
 impl SurfnetLiteSvm {
-    pub fn new(
-        database_url: Option<&str>,
-        surfnet_id: &str,
-        feature_set: FeatureSet,
-    ) -> SurfpoolResult<Self> {
+    pub fn new(storage_backend: &StorageBackend, feature_set: FeatureSet) -> SurfpoolResult<Self> {
         let mut lite_svm = Self {
             svm: Self::litesvm_settings(feature_set),
             db: None,
@@ -43,9 +39,9 @@ impl SurfnetLiteSvm {
 
         create_native_mint(&mut lite_svm);
 
-        if let Some(db_url) = database_url {
+        if storage_backend.is_persistent() {
             let db: Box<dyn Storage<String, AccountSharedData>> =
-                new_kv_store(&Some(db_url), "accounts", surfnet_id)?;
+                storage_backend.open_store("accounts")?;
             lite_svm.db = Some(db);
         }
 
@@ -83,13 +79,6 @@ impl SurfnetLiteSvm {
             .with_precompiles()
             .with_blockhash_check(false)
             .with_sigverify(false)
-    }
-
-    /// Explicitly shutdown the storage, performing cleanup like WAL checkpoint for SQLite.
-    pub fn shutdown(&self) {
-        if let Some(db) = &self.db {
-            db.shutdown();
-        }
     }
 
     pub fn reset(&mut self, feature_set: FeatureSet) -> SurfpoolResult<()> {

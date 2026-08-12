@@ -14,7 +14,7 @@ use surfpool_db::diesel::{
 };
 
 use crate::storage::{
-    Storage, StorageConstructor, StorageError, StorageResult,
+    Storage, StorageError, StorageResult,
     diesel_common::{
         CountRecord, KeyRecord, KvRecord, ValueRecord, deserialize_value, serialize_key,
         serialize_value,
@@ -55,6 +55,49 @@ fn get_or_create_shared_pool(
 
     pools_guard.insert(database_url.to_string(), pool.clone());
     Ok(pool)
+}
+
+/// The PostgreSQL side of a [`super::StorageBackend`]. Holds a lease on the
+/// process-level pool for its database URL: unlike SQLite, the pool stays
+/// shared across surfnets, since pooling exists to amortize the network
+/// connection and the server caps total sessions.
+#[derive(Clone)]
+pub struct PostgresBackend {
+    pool: Pool<ConnectionManager<diesel::PgConnection>>,
+    surfnet_id: String,
+}
+
+impl PostgresBackend {
+    pub fn open(database_url: &str, surfnet_id: &str) -> StorageResult<Self> {
+        debug!(
+            "Opening PostgreSQL backend for database: {} with surfnet_id: {}",
+            database_url, surfnet_id
+        );
+        let pool = get_or_create_shared_pool(database_url)?;
+        Ok(PostgresBackend {
+            pool,
+            surfnet_id: surfnet_id.to_string(),
+        })
+    }
+
+    pub fn open_store<K, V>(&self, table_name: &str) -> StorageResult<PostgresStorage<K, V>>
+    where
+        K: Serialize + for<'de> Deserialize<'de> + Clone + Send + Sync + 'static,
+        V: Serialize + for<'de> Deserialize<'de> + Clone + Send + Sync + 'static,
+    {
+        let storage = PostgresStorage {
+            pool: self.pool.clone(),
+            _phantom: std::marker::PhantomData,
+            table_name: table_name.to_string(),
+            surfnet_id: self.surfnet_id.clone(),
+        };
+        storage.ensure_table_exists()?;
+        debug!(
+            "PostgreSQL storage connected successfully for table: {}",
+            table_name
+        );
+        Ok(storage)
+    }
 }
 
 #[derive(Clone)]
@@ -312,36 +355,5 @@ where
             self.table_name
         );
         Ok(Box::new(iter))
-    }
-}
-
-impl<K, V> StorageConstructor<K, V> for PostgresStorage<K, V>
-where
-    K: Serialize + for<'de> Deserialize<'de> + Clone + Send + Sync + 'static,
-    V: Serialize + for<'de> Deserialize<'de> + Clone + Send + Sync + 'static,
-{
-    fn connect(database_url: &str, table_name: &str, surfnet_id: &str) -> StorageResult<Self> {
-        debug!(
-            "Connecting to PostgreSQL database: {} with table: {} and surfnet_id: {}",
-            database_url, table_name, surfnet_id
-        );
-
-        // Use shared connection pool to avoid exhausting connections when many
-        // instances connect to the same database (e.g., parallel tests)
-        let pool = get_or_create_shared_pool(database_url)?;
-
-        let storage = PostgresStorage {
-            pool,
-            _phantom: std::marker::PhantomData,
-            table_name: table_name.to_string(),
-            surfnet_id: surfnet_id.to_string(),
-        };
-
-        storage.ensure_table_exists()?;
-        debug!(
-            "PostgreSQL storage connected successfully for table: {}",
-            table_name
-        );
-        Ok(storage)
     }
 }

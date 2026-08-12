@@ -1,10 +1,4 @@
-use std::{
-    collections::{HashMap, HashSet},
-    sync::{
-        Mutex, OnceLock,
-        atomic::{AtomicU64, Ordering},
-    },
-};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use log::debug;
 use serde::{Deserialize, Serialize};
@@ -13,8 +7,8 @@ use surfpool_db::diesel::{
 };
 
 use crate::storage::{
-    Storage, StorageConstructor, StorageError, StorageResult,
-    census::{self, CountedConnection, CountingSqliteManager},
+    Storage, StorageError, StorageResult,
+    census::{CountedConnection, CountingSqliteManager},
     diesel_common::{
         CountRecord, KeyRecord, KvRecord, ValueRecord, deserialize_value, serialize_key,
         serialize_value,
@@ -43,88 +37,90 @@ impl diesel::r2d2::CustomizeConnection<CountedConnection, diesel::r2d2::Error>
     }
 }
 
-/// Track which database files have already been checkpointed during shutdown.
-/// This prevents multiple SqliteStorage instances sharing the same file from
-/// conflicting when each tries to checkpoint and delete WAL files.
-fn checkpointed_databases() -> &'static Mutex<HashSet<String>> {
-    static CHECKPOINTED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-    CHECKPOINTED.get_or_init(|| Mutex::new(HashSet::new()))
-}
-
-/// Shared pools keyed by connection string (file-based DBs only).
-static SHARED_POOLS: OnceLock<Mutex<HashMap<String, SqlitePool>>> = OnceLock::new();
-
-/// Counter for unique in-memory database names.
+/// Counter for unique in-memory database names, so that separate backends
+/// (separate surfnets) get separate in-memory databases.
 static MEMORY_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-fn get_or_create_shared_pool(
-    connection_string: &str,
+/// The SQLite side of a [`super::StorageBackend`]: one connection pool per
+/// surfnet, shared by every store opened on it. The pool lives exactly as
+/// long as the backend (and the stores holding clones of it), so dropping
+/// the surfnet releases the connections and their descriptors.
+#[derive(Clone)]
+pub struct SqliteBackend {
+    pool: SqlitePool,
+    connection_string: String,
     is_file_based: bool,
-) -> StorageResult<SqlitePool> {
-    // In-memory DBs get isolated pools
-    if !is_file_based {
-        let manager = CountingSqliteManager::new(connection_string);
+    surfnet_id: String,
+}
+
+impl SqliteBackend {
+    pub fn open(database_url: &str, surfnet_id: &str) -> StorageResult<Self> {
+        debug!(
+            "Opening SQLite backend for database: {} with surfnet_id: {}",
+            database_url, surfnet_id
+        );
+
+        let connection_string = if database_url == ":memory:" {
+            // Unique name per backend; cache=shared so the pool's connections
+            // (and therefore all of this surfnet's stores) share one database.
+            let id = MEMORY_DB_COUNTER.fetch_add(1, Ordering::Relaxed);
+            format!("file:memdb{}?mode=memory&cache=shared", id)
+        } else if database_url.starts_with("file:") {
+            if database_url.contains('?') {
+                format!("{}&mode=rwc", database_url)
+            } else {
+                format!("{}?mode=rwc", database_url)
+            }
+        } else {
+            format!("file:{}?mode=rwc", database_url)
+        };
+
+        let is_file_based = database_url != ":memory:";
+        let manager = CountingSqliteManager::new(&connection_string);
         let pool = Pool::builder()
             .max_size(10)
             .connection_customizer(Box::new(SqlitePragmaCustomizer { is_file_based }))
             .build(manager)
             .map_err(|e| StorageError::PooledConnectionError(NAME.into(), e))?;
-        census::pool_created();
-        return Ok(pool);
+
+        // journal_mode=WAL persists to file; wal_autocheckpoint is per-connection
+        if is_file_based {
+            let mut conn = pool.get().map_err(|_| StorageError::LockError)?;
+            conn.batch_execute("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=1000;")
+                .map_err(|e| StorageError::create_table("pragma_init", NAME, e))?;
+        }
+
+        Ok(SqliteBackend {
+            pool,
+            connection_string,
+            is_file_based,
+            surfnet_id: surfnet_id.to_string(),
+        })
     }
 
-    let pools = SHARED_POOLS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut guard = pools.lock().map_err(|_| StorageError::LockError)?;
-
-    if let Some(pool) = guard.get(connection_string) {
-        debug!("Reusing shared SQLite pool for {}", connection_string);
-        census::pool_reused();
-        return Ok(pool.clone());
-    }
-
-    debug!("Creating shared SQLite pool for {}", connection_string);
-    let manager = CountingSqliteManager::new(connection_string);
-    let pool = Pool::builder()
-        .max_size(10)
-        .connection_customizer(Box::new(SqlitePragmaCustomizer { is_file_based }))
-        .build(manager)
-        .map_err(|e| StorageError::PooledConnectionError(NAME.into(), e))?;
-    census::pool_created();
-
-    // journal_mode=WAL persists to file; wal_autocheckpoint is per-connection
+    pub fn open_store<K, V>(&self, table_name: &str) -> StorageResult<SqliteStorage<K, V>>
+    where
+        K: Serialize + for<'de> Deserialize<'de> + Clone + Send + Sync + 'static,
+        V: Serialize + for<'de> Deserialize<'de> + Clone + Send + Sync + 'static,
     {
-        let mut conn = pool.get().map_err(|_| StorageError::LockError)?;
-        conn.batch_execute("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=1000;")
-            .map_err(|e| StorageError::create_table("pragma_init", NAME, e))?;
+        let storage = SqliteStorage {
+            pool: self.pool.clone(),
+            _phantom: std::marker::PhantomData,
+            table_name: table_name.to_string(),
+            surfnet_id: self.surfnet_id.clone(),
+        };
+        storage.ensure_table_exists()?;
+        debug!(
+            "SQLite storage connected successfully for table: {}",
+            table_name
+        );
+        Ok(storage)
     }
 
-    guard.insert(connection_string.to_string(), pool.clone());
-    Ok(pool)
-}
-
-#[derive(Clone)]
-pub struct SqliteStorage<K, V> {
-    pool: SqlitePool,
-    _phantom: std::marker::PhantomData<(K, V)>,
-    table_name: String,
-    surfnet_id: String,
-    /// Whether this is a file-based database (not :memory:)
-    /// Used to determine if WAL checkpoint should be performed on drop
-    is_file_based: bool,
-    /// The connection string for creating direct connections during cleanup
-    connection_string: String,
-}
-
-const NAME: &str = "SQLite";
-
-// Checkpoint implementation that doesn't require K, V bounds
-impl<K, V> SqliteStorage<K, V> {
-    /// Checkpoint the WAL and truncate it to consolidate into the main database file,
-    /// then remove the -wal and -shm files.
-    /// Only runs for file-based databases (not :memory:).
-    /// Uses a static set to track which databases have been checkpointed to avoid
-    /// conflicts when multiple SqliteStorage instances share the same database file.
-    fn checkpoint(&self) {
+    /// Checkpoint the WAL and truncate it to consolidate into the main
+    /// database file, then remove the -wal and -shm files. Only runs for
+    /// file-based databases (not :memory:). Safe to call more than once.
+    pub(super) fn checkpoint(&self) {
         if !self.is_file_based {
             return;
         }
@@ -138,23 +134,7 @@ impl<K, V> SqliteStorage<K, V> {
             .unwrap_or(&self.connection_string)
             .to_string();
 
-        // Check if this database has already been checkpointed by another storage instance
-        {
-            let mut checkpointed = checkpointed_databases().lock().unwrap();
-            if checkpointed.contains(&db_path) {
-                debug!(
-                    "Database {} already checkpointed, skipping for table '{}'",
-                    db_path, self.table_name
-                );
-                return;
-            }
-            checkpointed.insert(db_path.clone());
-        }
-
-        debug!(
-            "Checkpointing WAL for database '{}' (table '{}')",
-            db_path, self.table_name
-        );
+        debug!("Checkpointing WAL for database '{}'", db_path);
 
         // Use pool connection to checkpoint - this flushes WAL to main database
         if let Ok(mut conn) = self.pool.get() {
@@ -185,6 +165,16 @@ impl<K, V> SqliteStorage<K, V> {
         }
     }
 }
+
+#[derive(Clone)]
+pub struct SqliteStorage<K, V> {
+    pool: SqlitePool,
+    _phantom: std::marker::PhantomData<(K, V)>,
+    table_name: String,
+    surfnet_id: String,
+}
+
+const NAME: &str = "SQLite";
 
 impl<K, V> SqliteStorage<K, V>
 where
@@ -367,10 +357,6 @@ where
         Box::new(self.clone())
     }
 
-    fn shutdown(&self) {
-        self.checkpoint();
-    }
-
     fn count(&self) -> StorageResult<u64> {
         debug!("Counting entries in table '{}'", self.table_name);
         let query = sql_query(format!(
@@ -435,52 +421,6 @@ where
     }
 }
 
-impl<K, V> StorageConstructor<K, V> for SqliteStorage<K, V>
-where
-    K: Serialize + for<'de> Deserialize<'de> + Clone + Send + Sync + 'static,
-    V: Serialize + for<'de> Deserialize<'de> + Clone + Send + Sync + 'static,
-{
-    fn connect(database_url: &str, table_name: &str, surfnet_id: &str) -> StorageResult<Self> {
-        debug!(
-            "Connecting to SQLite database: {} with table: {} and surfnet_id: {}",
-            database_url, table_name, surfnet_id
-        );
-
-        let connection_string = if database_url == ":memory:" {
-            // Unique name per storage instance; cache=shared so pool connections share it
-            let id = MEMORY_DB_COUNTER.fetch_add(1, Ordering::Relaxed);
-            format!("file:memdb{}?mode=memory&cache=shared", id)
-        } else if database_url.starts_with("file:") {
-            if database_url.contains('?') {
-                format!("{}&mode=rwc", database_url)
-            } else {
-                format!("{}?mode=rwc", database_url)
-            }
-        } else {
-            format!("file:{}?mode=rwc", database_url)
-        };
-
-        let is_file_based = database_url != ":memory:";
-        let pool = get_or_create_shared_pool(&connection_string, is_file_based)?;
-
-        let storage = SqliteStorage {
-            pool,
-            _phantom: std::marker::PhantomData,
-            table_name: table_name.to_string(),
-            surfnet_id: surfnet_id.to_string(),
-            is_file_based,
-            connection_string,
-        };
-
-        storage.ensure_table_exists()?;
-        debug!(
-            "SQLite storage connected successfully for table: {}",
-            table_name
-        );
-        Ok(storage)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -491,18 +431,16 @@ mod tests {
         value: i64,
     }
 
-    /// SqliteStorage instances pointing to the same file share one connection pool.
+    /// Stores opened on one backend share its connection pool.
     #[test]
-    fn test_shared_pool_across_multiple_storages() {
+    fn test_stores_share_the_backend_pool() {
         let temp_file = tempfile::NamedTempFile::new().unwrap();
         let db_path = temp_file.path().to_str().unwrap();
 
-        let storage1: SqliteStorage<String, String> =
-            SqliteStorage::connect(db_path, "table1", "surfnet1").unwrap();
-        let storage2: SqliteStorage<String, String> =
-            SqliteStorage::connect(db_path, "table2", "surfnet1").unwrap();
-        let storage3: SqliteStorage<String, String> =
-            SqliteStorage::connect(db_path, "table3", "surfnet1").unwrap();
+        let backend = SqliteBackend::open(db_path, "surfnet1").unwrap();
+        let storage1: SqliteStorage<String, String> = backend.open_store("table1").unwrap();
+        let storage2: SqliteStorage<String, String> = backend.open_store("table2").unwrap();
+        let storage3: SqliteStorage<String, String> = backend.open_store("table3").unwrap();
 
         let _conn1 = storage1.pool.get().unwrap();
 
@@ -530,8 +468,8 @@ mod tests {
         let temp_file = tempfile::NamedTempFile::new().unwrap();
         let db_path = temp_file.path().to_str().unwrap();
 
-        let storage: SqliteStorage<String, String> =
-            SqliteStorage::connect(db_path, "pragma_test", "surfnet1").unwrap();
+        let backend = SqliteBackend::open(db_path, "surfnet1").unwrap();
+        let storage: SqliteStorage<String, String> = backend.open_store("pragma_test").unwrap();
 
         let _conn1 = storage.pool.get().unwrap();
         let mut conn2 = storage.pool.get().unwrap();
@@ -555,8 +493,8 @@ mod tests {
         let temp_file = tempfile::NamedTempFile::new().unwrap();
         let db_path = temp_file.path().to_str().unwrap();
 
-        let storage: SqliteStorage<String, String> =
-            SqliteStorage::connect(db_path, "pragma_test", "surfnet1").unwrap();
+        let backend = SqliteBackend::open(db_path, "surfnet1").unwrap();
+        let storage: SqliteStorage<String, String> = backend.open_store("pragma_test").unwrap();
 
         let _conn1 = storage.pool.get().unwrap();
         let mut conn2 = storage.pool.get().unwrap();
@@ -574,19 +512,42 @@ mod tests {
         assert_eq!(temp_result[0].value, 2, "temp_store should be MEMORY (2)");
     }
 
-    /// In-memory databases are isolated between SqliteStorage instances.
+    /// In-memory databases are isolated between backends (surfnets).
     #[test]
-    fn test_in_memory_databases_are_isolated() {
+    fn test_in_memory_backends_are_isolated() {
+        let backend1 = SqliteBackend::open(":memory:", "surfnet1").unwrap();
+        let backend2 = SqliteBackend::open(":memory:", "surfnet1").unwrap();
+
         let mut storage1: SqliteStorage<String, String> =
-            SqliteStorage::connect(":memory:", "test_table", "surfnet1").unwrap();
-        let storage2: SqliteStorage<String, String> =
-            SqliteStorage::connect(":memory:", "test_table", "surfnet1").unwrap();
+            backend1.open_store("test_table").unwrap();
+        let storage2: SqliteStorage<String, String> = backend2.open_store("test_table").unwrap();
 
         storage1
             .store("key1".to_string(), "value1".to_string())
             .unwrap();
 
         let result = storage2.get(&"key1".to_string()).unwrap();
-        assert!(result.is_none(), "in-memory databases should be isolated");
+        assert!(result.is_none(), "in-memory backends should be isolated");
+    }
+
+    /// Within one backend, in-memory stores share the database, matching the
+    /// on-disk behavior (distinct tables in one database file).
+    #[test]
+    fn test_in_memory_stores_share_one_database() {
+        let backend = SqliteBackend::open(":memory:", "surfnet1").unwrap();
+
+        let mut storage1: SqliteStorage<String, String> = backend.open_store("table_a").unwrap();
+        let storage2: SqliteStorage<String, String> = backend.open_store("table_a").unwrap();
+
+        storage1
+            .store("key1".to_string(), "value1".to_string())
+            .unwrap();
+
+        let result = storage2.get(&"key1".to_string()).unwrap();
+        assert_eq!(
+            result,
+            Some("value1".to_string()),
+            "stores on one backend should see each other's writes"
+        );
     }
 }

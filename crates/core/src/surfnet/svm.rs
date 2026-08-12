@@ -85,7 +85,7 @@ use crate::{
     error::{AirdropError, SurfpoolError, SurfpoolResult},
     rpc::utils::convert_transaction_metadata_from_canonical,
     scenarios::TemplateRegistry,
-    storage::{OverlayStorage, Storage, new_kv_store, new_kv_store_with_default},
+    storage::{OverlayStorage, Storage, StorageBackend},
     surfnet::{
         LogsSubscriptionData, locker::is_supported_token_program, surfnet_lite_svm::SurfnetLiteSvm,
     },
@@ -340,6 +340,10 @@ pub struct SurfnetSvm {
     pub slot_checkpoint: Box<dyn Storage<String, u64>>,
     /// Tracks the slot at which we last persisted the checkpoint.
     pub last_checkpoint_slot: u64,
+    /// The storage backend every kv store above was opened on. Owns the
+    /// surfnet's database connections; kept so shutdown has one place to
+    /// flush and so the connections live exactly as long as the surfnet.
+    storage_backend: StorageBackend,
 }
 
 /// Add `pubkey_str` to the pubkey-list at `key`, creating the entry when absent
@@ -482,25 +486,7 @@ impl SurfnetSvm {
     /// Explicitly shutdown the SVM, performing cleanup like WAL checkpoint for SQLite.
     /// This should be called before the application exits to ensure data is persisted.
     pub fn shutdown(&self) {
-        self.inner.shutdown();
-        self.blocks.shutdown();
-        self.transactions.shutdown();
-        self.jito_bundles.shutdown();
-        self.token_accounts.shutdown();
-        self.token_mints.shutdown();
-        self.accounts_by_owner.shutdown();
-        self.token_accounts_by_owner.shutdown();
-        self.token_accounts_by_delegate.shutdown();
-        self.token_accounts_by_mint.shutdown();
-        self.streamed_accounts.shutdown();
-        self.scheduled_overrides.shutdown();
-        self.registered_idls.shutdown();
-        self.profile_tag_map.shutdown();
-        self.simulated_transaction_profiles.shutdown();
-        self.executed_transaction_profiles.shutdown();
-        self.account_associated_data.shutdown();
-        self.offline_accounts.shutdown();
-        self.slot_checkpoint.shutdown();
+        self.storage_backend.shutdown();
     }
 
     /// Creates a clone of the SVM with overlay storage wrappers for all database-backed fields.
@@ -604,6 +590,7 @@ impl SurfnetSvm {
             genesis_updated_at: self.genesis_updated_at,
             slot_checkpoint: OverlayStorage::wrap(self.slot_checkpoint.clone_box()),
             last_checkpoint_slot: self.last_checkpoint_slot,
+            storage_backend: self.storage_backend.clone(),
         }
     }
 
@@ -844,7 +831,8 @@ impl SurfnetSvm {
         // constructed exactly once, with the correct features and feature
         // accounts loaded. See `compose_feature_set` for the composition rules.
         let feature_set = compose_feature_set(&config.feature_config);
-        let inner = SurfnetLiteSvm::new(database_url, &surfnet_id, feature_set.clone())?;
+        let storage_backend = StorageBackend::open(&database_url, &surfnet_id)?;
+        let inner = SurfnetLiteSvm::new(&storage_backend, feature_set.clone())?;
 
         let native_mint_account = inner
             .get_account(&spl_token_interface::native_mint::ID)?
@@ -876,20 +864,20 @@ impl SurfnetSvm {
 
         // Load native mint into owned account and token mint indexes
         let mut accounts_by_owner_db: Box<dyn Storage<String, Vec<String>>> =
-            new_kv_store(&database_url, "accounts_by_owner", &surfnet_id)?;
+            storage_backend.open_store("accounts_by_owner")?;
         accounts_by_owner_db.store(
             native_mint_account.owner.to_string(),
             vec![spl_token_interface::native_mint::ID.to_string()],
         )?;
-        let blocks_db = new_kv_store(&database_url, "blocks", &surfnet_id)?;
-        let transactions_db = new_kv_store(&database_url, "transactions", &surfnet_id)?;
-        let jito_bundles_db = new_kv_store(&database_url, "jito_bundles", &surfnet_id)?;
-        let token_accounts_db = new_kv_store(&database_url, "token_accounts", &surfnet_id)?;
+        let blocks_db = storage_backend.open_store("blocks")?;
+        let transactions_db = storage_backend.open_store("transactions")?;
+        let jito_bundles_db = storage_backend.open_store("jito_bundles")?;
+        let token_accounts_db = storage_backend.open_store("token_accounts")?;
         let mut token_mints_db: Box<dyn Storage<String, MintAccount>> =
-            new_kv_store(&database_url, "token_mints", &surfnet_id)?;
+            storage_backend.open_store("token_mints")?;
         let mut account_associated_data_db: Box<
             dyn Storage<String, SerializableAccountAdditionalData>,
-        > = new_kv_store(&database_url, "account_associated_data", &surfnet_id)?;
+        > = storage_backend.open_store("account_associated_data")?;
         // Store initial account associated data (native mint)
         account_associated_data_db.store(
             spl_token_interface::native_mint::ID.to_string(),
@@ -900,30 +888,28 @@ impl SurfnetSvm {
             parsed_mint_account,
         )?;
         let token_accounts_by_owner_db: Box<dyn Storage<String, Vec<String>>> =
-            new_kv_store(&database_url, "token_accounts_by_owner", &surfnet_id)?;
+            storage_backend.open_store("token_accounts_by_owner")?;
         let token_accounts_by_delegate_db: Box<dyn Storage<String, Vec<String>>> =
-            new_kv_store(&database_url, "token_accounts_by_delegate", &surfnet_id)?;
+            storage_backend.open_store("token_accounts_by_delegate")?;
         let token_accounts_by_mint_db: Box<dyn Storage<String, Vec<String>>> =
-            new_kv_store(&database_url, "token_accounts_by_mint", &surfnet_id)?;
+            storage_backend.open_store("token_accounts_by_mint")?;
         let streamed_accounts_db: Box<dyn Storage<String, bool>> =
-            new_kv_store(&database_url, "streamed_accounts", &surfnet_id)?;
+            storage_backend.open_store("streamed_accounts")?;
         let scheduled_overrides_db: Box<dyn Storage<u64, Vec<OverrideInstance>>> =
-            new_kv_store(&database_url, "scheduled_overrides", &surfnet_id)?;
+            storage_backend.open_store("scheduled_overrides")?;
         let offline_accounts_db: Box<dyn Storage<String, OfflineAccountConfig>> =
-            new_kv_store(&database_url, "offline_accounts", &surfnet_id)?;
+            storage_backend.open_store("offline_accounts")?;
         let registered_idls_db: Box<dyn Storage<String, Vec<VersionedIdl>>> =
-            new_kv_store(&database_url, "registered_idls", &surfnet_id)?;
+            storage_backend.open_store("registered_idls")?;
         let profile_tag_map_db: Box<dyn Storage<String, Vec<UuidOrSignature>>> =
-            new_kv_store(&database_url, "profile_tag_map", &surfnet_id)?;
+            storage_backend.open_store("profile_tag_map")?;
         let simulated_transaction_profiles_db: Box<dyn Storage<String, KeyedProfileResult>> =
-            new_kv_store(&database_url, "simulated_transaction_profiles", &surfnet_id)?;
+            storage_backend.open_store("simulated_transaction_profiles")?;
         let executed_transaction_profiles_db: Box<dyn Storage<String, KeyedProfileResult>> = {
             // Ensure max_profiles is at least 1 to avoid creating a zero-capacity FifoMap
             let max_profiles = max(1, config.max_profiles);
-            new_kv_store_with_default(
-                &database_url,
+            storage_backend.open_store_with_default(
                 "executed_transaction_profiles",
-                &surfnet_id,
                 // Use FifoMap for executed_transaction_profiles to maintain FIFO eviction behavior
                 // (when no on-disk DB is provided)
                 move || Box::new(FifoMap::<String, KeyedProfileResult>::new(max_profiles)),
@@ -933,7 +919,7 @@ impl SurfnetSvm {
         let mut epoch_info = Self::default_epoch_info(&epoch_schedule);
         let default_genesis_slot = epoch_info.absolute_slot;
         let slot_checkpoint_db: Box<dyn Storage<String, u64>> =
-            new_kv_store(&database_url, "slot_checkpoint", &surfnet_id)?;
+            storage_backend.open_store("slot_checkpoint")?;
 
         // Recover chain state: prefer slot checkpoint, fall back to max block in DB.
         let checkpoint_slot = slot_checkpoint_db.get(&"latest_slot".to_string())?;
@@ -1061,6 +1047,7 @@ impl SurfnetSvm {
             genesis_updated_at: updated_at,
             slot_checkpoint: slot_checkpoint_db,
             last_checkpoint_slot,
+            storage_backend,
         };
 
         svm.inner.set_log_bytes_limit(config.log_bytes_limit);

@@ -1,3 +1,4 @@
+mod backend;
 pub mod census;
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
 mod diesel_common;
@@ -8,6 +9,7 @@ mod overlay;
 mod postgres;
 #[cfg(feature = "sqlite")]
 mod sqlite;
+pub use backend::StorageBackend;
 pub use hash_map::HashMap as StorageHashMap;
 pub use overlay::OverlayStorage;
 #[cfg(feature = "postgres")]
@@ -17,89 +19,6 @@ pub use sqlite::SqliteStorage;
 pub use surfpool_types::FifoMap as StorageFifoMap;
 
 use crate::error::SurfpoolError;
-
-pub fn new_kv_store<K, V>(
-    database_url: &Option<&str>,
-    table_name: &str,
-    surfnet_id: &str,
-) -> StorageResult<Box<dyn Storage<K, V>>>
-where
-    K: serde::Serialize
-        + serde::de::DeserializeOwned
-        + Send
-        + Sync
-        + 'static
-        + Clone
-        + Eq
-        + std::hash::Hash,
-    V: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static + Clone,
-{
-    new_kv_store_with_default(database_url, table_name, surfnet_id, || {
-        Box::new(StorageHashMap::new())
-    })
-}
-
-pub fn new_kv_store_with_default<K, V, F>(
-    database_url: &Option<&str>,
-    table_name: &str,
-    surfnet_id: &str,
-    default_storage_constructor: F,
-) -> StorageResult<Box<dyn Storage<K, V>>>
-where
-    K: serde::Serialize
-        + serde::de::DeserializeOwned
-        + Send
-        + Sync
-        + 'static
-        + Clone
-        + Eq
-        + std::hash::Hash,
-    V: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static + Clone,
-    F: FnOnce() -> Box<dyn Storage<K, V>>,
-{
-    match database_url {
-        Some(url) => {
-            #[cfg(feature = "postgres")]
-            if url.starts_with("postgres://") || url.starts_with("postgresql://") {
-                let storage = PostgresStorage::connect(url, table_name, surfnet_id)?;
-                Ok(Box::new(storage))
-            } else {
-                #[cfg(feature = "sqlite")]
-                {
-                    let storage = SqliteStorage::connect(url, table_name, surfnet_id)?;
-                    Ok(Box::new(storage))
-                }
-                #[cfg(not(feature = "sqlite"))]
-                {
-                    Err(StorageError::InvalidPostgresUrl(url.to_string()))
-                }
-            }
-
-            #[cfg(not(feature = "postgres"))]
-            if url.starts_with("postgres://") || url.starts_with("postgresql://") {
-                Err(StorageError::PostgresNotEnabled)
-            } else {
-                #[cfg(feature = "sqlite")]
-                {
-                    let storage = SqliteStorage::connect(
-                        database_url.unwrap_or(":memory:"),
-                        table_name,
-                        surfnet_id,
-                    )?;
-                    Ok(Box::new(storage))
-                }
-                #[cfg(not(feature = "sqlite"))]
-                {
-                    Err(StorageError::SqliteNotEnabled)
-                }
-            }
-        }
-        _ => {
-            let storage = default_storage_constructor();
-            Ok(storage)
-        }
-    }
-}
 
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
@@ -281,13 +200,6 @@ impl<K, V> Clone for Box<dyn Storage<K, V>> {
     fn clone(&self) -> Self {
         self.clone_box()
     }
-}
-
-// Separate trait for construction - this doesn't need to be dyn-compatible
-pub trait StorageConstructor<K, V>: Storage<K, V> + Clone {
-    fn connect(database_url: &str, table_name: &str, surfnet_id: &str) -> StorageResult<Self>
-    where
-        Self: Sized;
 }
 
 #[cfg(test)]
