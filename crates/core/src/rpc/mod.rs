@@ -291,19 +291,14 @@ impl SurfpoolWebsocketMeta {
     }
 
     pub fn log_debug(&self, msg: &str) {
-        let _ = self
-            .runloop_context
+        self.runloop_context
             .svm_locker
             .simnet_events_tx()
-            .send(SimnetEvent::debug(msg));
+            .debug(msg);
     }
 
     pub fn log_warn(&self, msg: &str) {
-        let _ = self
-            .runloop_context
-            .svm_locker
-            .simnet_events_tx()
-            .send(SimnetEvent::warn(msg));
+        self.runloop_context.svm_locker.simnet_events_tx().warn(msg);
     }
 }
 

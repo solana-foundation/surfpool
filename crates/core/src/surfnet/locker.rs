@@ -55,9 +55,9 @@ use solana_transaction_status::{
 use surfpool_types::{
     AccountSnapshot, ComputeUnitsEstimationResult, ExecutionCapture, ExportSnapshotConfig, Idl,
     KeyedProfileResult, ProfileResult, RpcProfileResultConfig, RunbookExecutionStatusReport,
-    SimnetCommand, SimnetEvent, StartupError, SurfnetStartupStatus, SurfnetStartupTask,
-    TransactionConfirmationStatus, TransactionStatusEvent, UiKeyedProfileResult, UuidOrSignature,
-    VersionedIdl,
+    SimnetCommand, SimnetEvent, SimnetEventsTx, StartupError, SurfnetStartupStatus,
+    SurfnetStartupTask, TransactionConfirmationStatus, TransactionStatusEvent,
+    UiKeyedProfileResult, UuidOrSignature, VersionedIdl,
 };
 use tokio::sync::RwLock;
 use txtx_addon_kit::indexmap::IndexSet;
@@ -530,7 +530,7 @@ impl SurfnetSvmLocker {
                 Ok(pk) => pk,
                 Err(e) => {
                     self.with_svm_reader(|svm| {
-                        let _ = svm.simnet_events_tx.send(SimnetEvent::warn(format!(
+                        svm.simnet_events_tx.warn(format!(
                             "Skipping invalid pubkey '{}' in snapshot: {}",
                             pubkey_str, e
                         )));
@@ -546,7 +546,7 @@ impl SurfnetSvmLocker {
                         Ok(d) => d,
                         Err(e) => {
                             self.with_svm_reader(|svm| {
-                                let _ = svm.simnet_events_tx.send(SimnetEvent::warn(format!(
+                                svm.simnet_events_tx.warn(format!(
                                     "Skipping account '{}': failed to decode base64 data: {}",
                                     pubkey_str, e
                                 )));
@@ -560,7 +560,7 @@ impl SurfnetSvmLocker {
                         Ok(pk) => pk,
                         Err(e) => {
                             self.with_svm_reader(|svm| {
-                                let _ = svm.simnet_events_tx.send(SimnetEvent::warn(format!(
+                                svm.simnet_events_tx.warn(format!(
                                     "Skipping account '{}': invalid owner pubkey: {}",
                                     pubkey_str, e
                                 )));
@@ -593,7 +593,7 @@ impl SurfnetSvmLocker {
         if let Some(client) = remote_client {
             if !pubkeys_to_fetch.is_empty() {
                 self.with_svm_reader(|svm| {
-                    let _ = svm.simnet_events_tx.send(SimnetEvent::info(format!(
+                    svm.simnet_events_tx.info(format!(
                         "Fetching {} accounts from remote RPC for snapshot",
                         pubkeys_to_fetch.len()
                     )));
@@ -635,10 +635,8 @@ impl SurfnetSvmLocker {
                     }
                     Err(e) => {
                         self.with_svm_reader(|svm| {
-                            let _ = svm.simnet_events_tx.send(SimnetEvent::warn(format!(
-                                "Failed to fetch some accounts from remote: {}",
-                                e
-                            )));
+                            svm.simnet_events_tx
+                                .warn(format!("Failed to fetch some accounts from remote: {}", e));
                         });
                     }
                 }
@@ -653,10 +651,8 @@ impl SurfnetSvmLocker {
 
             for (pubkey, account) in accounts_to_load {
                 if let Err(e) = svm.set_account(&pubkey, account.clone()) {
-                    let _ = svm.simnet_events_tx.send(SimnetEvent::warn(format!(
-                        "Failed to set account '{}': {}",
-                        pubkey, e
-                    )));
+                    svm.simnet_events_tx
+                        .warn(format!("Failed to set account '{}': {}", pubkey, e));
                     continue;
                 }
 
@@ -761,7 +757,7 @@ impl SurfnetSvmLocker {
                     }
                     RemoteRpcResult::MethodNotSupported => {
                         let tx = self.simnet_events_tx();
-                        let _ = tx.send(SimnetEvent::warn("The `getLargestAccounts` method was sent to the remote RPC, but this method isn't supported by your RPC provider. Only local accounts will be returned."));
+                        tx.warn("The `getLargestAccounts` method was sent to the remote RPC, but this method isn't supported by your RPC provider. Only local accounts will be returned.");
                         (vec![], vec![])
                     }
                 };
@@ -1815,10 +1811,8 @@ impl SurfnetSvmLocker {
             {
                 Ok(profiles) => profiles,
                 Err(e) => {
-                    let _ = self.simnet_events_tx().try_send(SimnetEvent::error(format!(
-                        "Failed to generate instruction profiles: {}",
-                        e
-                    )));
+                    self.simnet_events_tx()
+                        .error(format!("Failed to generate instruction profiles: {}", e));
                     None
                 }
             }
@@ -1918,7 +1912,7 @@ impl SurfnetSvmLocker {
             }
             let mut svm_clone = self.with_svm_reader(|svm_reader| svm_reader.clone_for_profiling());
 
-            let (dummy_simnet_tx, _) = crossbeam_channel::bounded(1);
+            let (dummy_simnet_tx, _) = SimnetEventsTx::channel(1);
             let (dummy_geyser_tx, _) = crossbeam_channel::bounded(1);
             svm_clone.simnet_events_tx = dummy_simnet_tx;
             svm_clone.geyser_events_tx = dummy_geyser_tx;
@@ -1980,10 +1974,7 @@ impl SurfnetSvmLocker {
         if do_propagate {
             let meta = convert_transaction_metadata_from_canonical(&meta);
             let simnet_events_tx = self.simnet_events_tx();
-            let _ = simnet_events_tx.try_send(SimnetEvent::error(format!(
-                "Transaction simulation failed: {}",
-                err
-            )));
+            simnet_events_tx.error(format!("Transaction simulation failed: {}", err));
 
             self.with_svm_writer(|svm_writer| {
                 svm_writer.notify_signature_subscribers(
@@ -2074,10 +2065,7 @@ impl SurfnetSvmLocker {
         if do_propagate {
             let meta_canonical = convert_transaction_metadata_from_canonical(&meta);
             let simnet_events_tx = self.simnet_events_tx();
-            let _ = simnet_events_tx.try_send(SimnetEvent::error(format!(
-                "Transaction execution failed: {}",
-                err
-            )));
+            simnet_events_tx.error(format!("Transaction execution failed: {}", err));
             let _ = status_tx.try_send(TransactionStatusEvent::ExecutionFailure((
                 err.clone(),
                 meta_canonical.clone(),
@@ -2131,9 +2119,9 @@ impl SurfnetSvmLocker {
                     log_messages.clone(),
                     CommitmentLevel::Processed,
                 );
-                let _ = svm_writer
+                svm_writer
                     .simnet_events_tx
-                    .try_send(SimnetEvent::transaction_processed(
+                    .log(SimnetEvent::transaction_processed(
                         meta_canonical,
                         Some(err),
                     ));
@@ -2299,9 +2287,9 @@ impl SurfnetSvmLocker {
                     ),
                 )?;
 
-                let _ = svm_writer
+                svm_writer
                     .simnet_events_tx
-                    .try_send(SimnetEvent::transaction_processed(transaction_meta, None));
+                    .log(SimnetEvent::transaction_processed(transaction_meta, None));
 
                 let _ = svm_writer
                     .geyser_events_tx
@@ -2477,10 +2465,7 @@ impl SurfnetSvmLocker {
         include_owned_accounts: bool,
     ) -> SurfpoolResult<()> {
         let simnet_events_tx = self.simnet_events_tx();
-        let _ = simnet_events_tx.send(SimnetEvent::info(format!(
-            "Account {} will be reset",
-            pubkey
-        )));
+        simnet_events_tx.info(format!("Account {} will be reset", pubkey));
         // Set the account online so it can be fetched from mainnet again.
         self.remove_offline_account(pubkey, include_owned_accounts)?;
 
@@ -2498,7 +2483,7 @@ impl SurfnetSvmLocker {
         remote_ctx: &Option<SurfnetRemoteClient>,
     ) -> SurfpoolResult<()> {
         let simnet_events_tx = self.simnet_events_tx();
-        let _ = simnet_events_tx.send(SimnetEvent::info("Resetting network..."));
+        simnet_events_tx.info("Resetting network...");
 
         // Fetch epoch info from remote if available (similar to initialize)
         let (mut epoch_info, epoch_schedule) = if let Some(remote_client) = remote_ctx {
@@ -2531,7 +2516,7 @@ impl SurfnetSvmLocker {
         include_owned_accounts: bool,
     ) -> SurfpoolResult<()> {
         let simnet_events_tx = self.simnet_events_tx();
-        let _ = simnet_events_tx.send(SimnetEvent::info(format!(
+        simnet_events_tx.info(format!(
             "Account {} will be marked offline (excluded from remote downloads)",
             pubkey
         )));
@@ -2557,10 +2542,7 @@ impl SurfnetSvmLocker {
         include_owned_accounts: bool,
     ) -> SurfpoolResult<()> {
         let simnet_events_tx = self.simnet_events_tx();
-        let _ = simnet_events_tx.send(SimnetEvent::info(format!(
-            "Account {} changes will be streamed",
-            pubkey
-        )));
+        simnet_events_tx.info(format!("Account {} changes will be streamed", pubkey));
         self.with_svm_writer(|svm_writer| {
             svm_writer
                 .streamed_accounts
@@ -3492,42 +3474,26 @@ impl SurfnetSvmLocker {
         match (original_authority, new_authority) {
             (Some(original), Some(new)) => {
                 if original != new {
-                    let _ = simnet_events_tx.send(SimnetEvent::info(format!(
-                        "Setting new authority for program {}",
-                        program_id
-                    )));
-                    let _ = simnet_events_tx
-                        .send(SimnetEvent::info(format!("Old Authority: {}", original)));
-                    let _ =
-                        simnet_events_tx.send(SimnetEvent::info(format!("New Authority: {}", new)));
+                    simnet_events_tx
+                        .info(format!("Setting new authority for program {}", program_id));
+                    simnet_events_tx.info(format!("Old Authority: {}", original));
+                    let _ = simnet_events_tx.info(format!("New Authority: {}", new));
                 } else {
-                    let _ = simnet_events_tx.send(SimnetEvent::info(format!(
-                        "No authority change for program {}",
-                        program_id
-                    )));
+                    simnet_events_tx
+                        .info(format!("No authority change for program {}", program_id));
                 }
             }
             (Some(original), None) => {
-                let _ = simnet_events_tx.send(SimnetEvent::info(format!(
-                    "Removing authority for program {}",
-                    program_id
-                )));
-                let _ = simnet_events_tx
-                    .send(SimnetEvent::info(format!("Old Authority: {}", original)));
+                simnet_events_tx.info(format!("Removing authority for program {}", program_id));
+                simnet_events_tx.info(format!("Old Authority: {}", original));
             }
             (None, Some(new)) => {
-                let _ = simnet_events_tx.send(SimnetEvent::info(format!(
-                    "Setting new authority for program {}",
-                    program_id
-                )));
-                let _ = simnet_events_tx.send(SimnetEvent::info("Old Authority: None".to_string()));
-                let _ = simnet_events_tx.send(SimnetEvent::info(format!("New Authority: {}", new)));
+                simnet_events_tx.info(format!("Setting new authority for program {}", program_id));
+                simnet_events_tx.info("Old Authority: None".to_string());
+                simnet_events_tx.info(format!("New Authority: {}", new));
             }
             (None, None) => {
-                let _ = simnet_events_tx.send(SimnetEvent::info(format!(
-                    "No authority change for program {}",
-                    program_id
-                )));
+                simnet_events_tx.info(format!("No authority change for program {}", program_id));
             }
         };
 
@@ -3628,7 +3594,7 @@ impl SurfnetSvmLocker {
 
         let remote_accounts = remote_accounts_result.handle_method_not_supported(|| {
             let tx = self.simnet_events_tx();
-            let _ = tx.send(SimnetEvent::warn("The `getProgramAccounts` method was sent to the remote RPC, but this method isn't supported by your RPC provider. If you need this method, please use a different RPC provider."));
+            tx.warn("The `getProgramAccounts` method was sent to the remote RPC, but this method isn't supported by your RPC provider. If you need this method, please use a different RPC provider.");
             vec![]
         });
 
@@ -3738,7 +3704,7 @@ impl SurfnetSvmLocker {
 /// Pass through functions for accessing the underlying SurfnetSvm instance
 impl SurfnetSvmLocker {
     /// Returns a sender for simulation events from the underlying SVM.
-    pub fn simnet_events_tx(&self) -> Sender<SimnetEvent> {
+    pub fn simnet_events_tx(&self) -> SimnetEventsTx {
         self.with_svm_reader(|svm_reader| svm_reader.simnet_events_tx.clone())
     }
 
@@ -3787,7 +3753,7 @@ impl SurfnetSvmLocker {
                 SurfpoolError::internal(format!("Failed to confirm clock update: {}", e))
             })?;
 
-        let _ = self.simnet_events_tx().send(SimnetEvent::info(format!(
+        self.simnet_events_tx().info(format!(
             "Time travel to {} successful (epoch {} / slot {})",
             formated_time, updated_epoch_info.epoch, updated_epoch_info.absolute_slot
         )));
@@ -4094,7 +4060,7 @@ impl SurfnetSvmLocker {
             svm_writer.set_account(&program_id, program_account.clone())
         });
         if let Err(e) = set_result {
-            let _ = self.simnet_events_tx().send(SimnetEvent::info(format!(
+            self.simnet_events_tx().info(format!(
                 "Program cache update deferred for {}: {}",
                 program_id, e
             )));
@@ -4131,12 +4097,10 @@ impl SurfnetSvmLocker {
                             .minimum_balance_for_rent_exemption(program_data.len())
                     });
 
-                    let _ = svm_locker
-                        .simnet_events_tx()
-                        .send(SimnetEvent::info(format!(
-                            "Creating program account {} with program data address {}",
-                            program_id, program_data_address
-                        )));
+                    svm_locker.simnet_events_tx().info(format!(
+                        "Creating program account {} with program data address {}",
+                        program_id, program_data_address
+                    ));
 
                     GetAccountResult::FoundAccount(
                         program_id,
@@ -4229,12 +4193,10 @@ impl SurfnetSvmLocker {
                             .minimum_balance_for_rent_exemption(programdata_data.len())
                     });
 
-                    let _ = svm_locker
-                        .simnet_events_tx()
-                        .send(SimnetEvent::info(format!(
-                            "Creating program data account {} for program {}",
-                            program_data_address, program_id
-                        )));
+                    svm_locker.simnet_events_tx().info(format!(
+                        "Creating program data account {} for program {}",
+                        program_data_address, program_id
+                    ));
 
                     GetAccountResult::FoundAccount(
                         program_data_address,
@@ -4283,7 +4245,7 @@ impl SurfnetSvmLocker {
         };
 
         let new_metadata = if upgrade_authority_address.ne(&authority) {
-            let _ = self.simnet_events_tx().send(SimnetEvent::info(format!(
+            self.simnet_events_tx().info(format!(
                 "Updating program authority of program {} to {}",
                 program_id,
                 authority.unwrap_or(solana_system_interface::program::id())
@@ -4331,7 +4293,7 @@ impl SurfnetSvmLocker {
             });
             program_data_account.lamports = new_lamports;
 
-            let _ = self.simnet_events_tx().send(SimnetEvent::info(format!(
+            self.simnet_events_tx().info(format!(
                 "Expanding program data account to {} bytes",
                 new_size
             )));
@@ -4348,7 +4310,7 @@ impl SurfnetSvmLocker {
             Ok::<(), SurfpoolError>(())
         })?;
 
-        let _ = self.simnet_events_tx().send(SimnetEvent::info(format!(
+        self.simnet_events_tx().info(format!(
             "Wrote {} bytes to program {} at offset {}",
             data.len(),
             program_id,

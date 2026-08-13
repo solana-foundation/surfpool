@@ -112,10 +112,7 @@ pub fn run_headless(surfnet_id: u16, rpc_port: u16, ws_port: u16) -> StartSurfne
         match result {
             Ok(Ok(_)) => {}
             Ok(Err(e)) => {
-                let _ = simnet_events_tx.send(SimnetEvent::error(format!(
-                    "Surfnet operational error: {}",
-                    e
-                )));
+                simnet_events_tx.error(format!("Surfnet operational error: {}", e));
             }
             Err(panic_payload) => {
                 let panic_msg = match panic_payload.downcast_ref::<&'static str>() {
@@ -125,10 +122,7 @@ pub fn run_headless(surfnet_id: u16, rpc_port: u16, ws_port: u16) -> StartSurfne
                         None => "Surfnet thread panicked with an unknown payload",
                     },
                 };
-                let _ = simnet_events_tx.send(SimnetEvent::error(format!(
-                    "Surfnet thread panic: {}",
-                    panic_msg
-                )));
+                simnet_events_tx.error(format!("Surfnet thread panic: {}", panic_msg));
             }
         }
         Ok::<(), String>(())

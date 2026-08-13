@@ -1,11 +1,12 @@
-//! Pins the delivery behavior of the simnet events channel.
+//! Pins the delivery contract of the simnet events channel.
 //!
-//! The channel is `crossbeam_channel::bounded(1024)` (`surfnet/svm.rs`), and
-//! core sends on it with `let _ = tx.try_send(...)` at dozens of sites. On a
-//! bounded channel `try_send` fails when the buffer is full, so under
-//! backpressure those sites drop events silently, with no distinction
-//! between a log line and an `Aborted`. These tests demonstrate the drop and
-//! measure it, so a later change to the sending policy has a pinned before.
+//! The channel is bounded(1024) and the sender is a [`SimnetEventsTx`],
+//! which owns the two delivery policies: `log` is lossy by contract
+//! (telemetry may drop under backpressure), `emit` is lossless (lifecycle
+//! events block until the reader drains). The first commit on this branch
+//! pinned the old behavior, where every core send was a silent `try_send`
+//! and a full buffer dropped an `Aborted` exactly like a log line; these
+//! tests assert the split that replaced it.
 
 use surfpool_types::SimnetEvent;
 
@@ -21,56 +22,61 @@ fn empty_events_channel() -> (SurfnetSvm, crossbeam_channel::Receiver<SimnetEven
 }
 
 #[test]
-fn the_events_channel_refuses_the_1025th_event() {
-    let (svm, _rx) = empty_events_channel();
-
-    let mut accepted = 0u32;
-    while svm
-        .simnet_events_tx
-        .try_send(SimnetEvent::info(format!("filler {accepted}")))
-        .is_ok()
-    {
-        accepted += 1;
-    }
-
-    assert_eq!(accepted, 1024, "the buffer holds exactly its bound");
-}
-
-#[test]
-fn a_full_buffer_drops_an_abort_silently() {
+fn log_keeps_at_most_the_buffer_capacity() {
     let (svm, simnet_events_rx) = empty_events_channel();
 
-    for i in 0..1024 {
-        svm.simnet_events_tx
-            .try_send(SimnetEvent::info(format!("noise {i}")))
-            .expect("the first 1024 sends are accepted");
+    for i in 0..1025 {
+        svm.simnet_events_tx.info(format!("filler {i}"));
     }
 
-    // The idiom used at the core call sites, verbatim: the Result vanishes,
-    // and with it the abort.
-    let _ = svm
-        .simnet_events_tx
-        .try_send(SimnetEvent::Aborted("out of lamports".to_string()));
-
     let received: Vec<SimnetEvent> = simnet_events_rx.try_iter().collect();
-    assert_eq!(received.len(), 1024);
-    assert!(
-        !received
-            .iter()
-            .any(|e| matches!(e, SimnetEvent::Aborted(_))),
-        "the abort was dropped; 1024 log lines were kept instead"
+    assert_eq!(
+        received.len(),
+        1024,
+        "the 1,025th log line is dropped, and dropping it returns immediately"
     );
 }
 
 #[test]
-fn a_burst_beyond_capacity_loses_the_newest_events() {
+fn emit_delivers_the_abort_through_a_full_buffer() {
+    let (svm, simnet_events_rx) = empty_events_channel();
+
+    for i in 0..1024 {
+        svm.simnet_events_tx.info(format!("noise {i}"));
+    }
+
+    // Before the sender newtype, this event went through the same silent
+    // try_send as the noise and vanished. emit blocks until the reader
+    // makes room, so it arrives.
+    let tx = svm.simnet_events_tx.clone();
+    let emitter = std::thread::spawn(move || {
+        tx.emit(SimnetEvent::Aborted("out of lamports".to_string()));
+    });
+
+    let mut received = Vec::new();
+    // 1024 noise lines plus the abort.
+    for _ in 0..1025 {
+        received.push(
+            simnet_events_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("every event arrives once the reader drains"),
+        );
+    }
+    emitter.join().unwrap();
+
+    assert!(
+        matches!(&received[1024], SimnetEvent::Aborted(msg) if msg == "out of lamports"),
+        "the abort queued behind the noise instead of dropping"
+    );
+}
+
+#[test]
+fn a_log_burst_beyond_capacity_sheds_the_newest_lines() {
     let (svm, simnet_events_rx) = empty_events_channel();
 
     const BURST: usize = 4096;
     for i in 0..BURST {
-        let _ = svm
-            .simnet_events_tx
-            .try_send(SimnetEvent::info(format!("{i}")));
+        svm.simnet_events_tx.info(format!("{i}"));
     }
 
     let received: Vec<usize> = simnet_events_rx
@@ -81,12 +87,16 @@ fn a_burst_beyond_capacity_loses_the_newest_events() {
         })
         .collect();
 
-    assert_eq!(received.len(), 1024, "3072 of 4096 events were dropped");
+    assert_eq!(
+        received.len(),
+        1024,
+        "3072 of 4096 log lines were shed, the lossy contract log declares"
+    );
     assert_eq!(
         received,
         (0..1024).collect::<Vec<_>>(),
-        "the survivors are the oldest events; everything after the buffer \
-         filled was lost, so under backpressure the freshest information is \
-         what disappears"
+        "the survivors are the oldest lines; a reader that falls behind \
+         loses recent telemetry, never lifecycle events, which go through \
+         emit"
     );
 }

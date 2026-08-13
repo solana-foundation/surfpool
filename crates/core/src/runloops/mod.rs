@@ -30,7 +30,8 @@ use solana_transaction::sanitized::{MessageHash, SanitizedTransaction};
 use solana_transaction_status::RewardsAndNumPartitions;
 use surfpool_types::{
     BlockProductionMode, ClockCommand, ClockEvent, DEFAULT_MAINNET_RPC_URL, DataIndexingCommand,
-    SimnetCommand, SimnetConfig, SimnetEvent, StartupPlanner, SurfnetStartupTask, SurfpoolConfig,
+    SimnetCommand, SimnetConfig, SimnetEvent, SimnetEventsTx, StartupPlanner, SurfnetStartupTask,
+    SurfpoolConfig,
 };
 type PluginConstructor = unsafe fn() -> *mut dyn GeyserPlugin;
 use txtx_addon_kit::helpers::fs::FileLocation;
@@ -196,13 +197,13 @@ pub async fn start_local_surfnet_runloop(
     svm_locker.initialize(&remote_rpc_client).await?;
 
     if let Some(remote_client) = &remote_rpc_client {
-        let _ = svm_locker
+        svm_locker
             .simnet_events_tx()
-            .send(SimnetEvent::Connected(remote_client.client.url()));
+            .emit(SimnetEvent::Connected(remote_client.client.url()));
     }
-    let _ = svm_locker
+    svm_locker
         .simnet_events_tx()
-        .send(SimnetEvent::EpochInfoUpdate(svm_locker.get_epoch_info()));
+        .emit(SimnetEvent::EpochInfoUpdate(svm_locker.get_epoch_info()));
 
     svm_locker.airdrop_pubkeys(simnet.airdrop_token_amount, &simnet.airdrop_addresses);
 
@@ -218,7 +219,7 @@ pub async fn start_local_surfnet_runloop(
         {
             Ok(loaded_count) => {
                 let _ = svm_locker.with_svm_reader(|svm| {
-                    svm.simnet_events_tx.send(SimnetEvent::info(format!(
+                    svm.simnet_events_tx.info(format!(
                         "Preloaded {} accounts from snapshot(s) into SVM",
                         loaded_count
                     )))
@@ -226,10 +227,8 @@ pub async fn start_local_surfnet_runloop(
             }
             Err(e) => {
                 let _ = svm_locker.with_svm_reader(|svm| {
-                    svm.simnet_events_tx.send(SimnetEvent::warn(format!(
-                        "Error loading snapshot accounts: {}",
-                        e
-                    )))
+                    svm.simnet_events_tx
+                        .warn(format!("Error loading snapshot accounts: {}", e))
                 });
             }
         }
@@ -258,8 +257,7 @@ pub async fn start_local_surfnet_runloop(
     ) {
         Ok(_) => {}
         Err(e) => {
-            let _ =
-                simnet_events_tx_cc.send(SimnetEvent::error(format!("Geyser plugin failed: {e}")));
+            let _ = simnet_events_tx_cc.error(format!("Geyser plugin failed: {e}"));
         }
     };
 
@@ -316,7 +314,7 @@ pub async fn start_local_surfnet_runloop(
                 .into_iter()
                 .sorted_by(|(a_slot, _), (b_slot, _)| a_slot.cmp(b_slot))
             {
-                let _ = svm.simnet_events_tx.send(event);
+                svm.simnet_events_tx.log(event);
             }
         }
 
@@ -328,12 +326,10 @@ pub async fn start_local_surfnet_runloop(
     // inspects the project after this point and seals its own plan.
     if startup_planner == StartupPlanner::Runloop {
         if let Err(error) = svm_locker.seal_startup_plan(vec![]) {
-            let _ = simnet_events_tx_cc.try_send(SimnetEvent::error(format!(
-                "Failed to seal startup plan: {error}"
-            )));
+            simnet_events_tx_cc.error(format!("Failed to seal startup plan: {error}"));
         }
     }
-    let _ = simnet_events_tx_cc.send(SimnetEvent::CoreStarted(initial_transaction_count));
+    simnet_events_tx_cc.emit(SimnetEvent::CoreStarted(initial_transaction_count));
 
     // Notify geyser plugins that startup is complete
     let _ = svm_locker.with_svm_reader(|svm| svm.geyser_events_tx.send(GeyserEvent::EndOfStartup));
@@ -464,7 +460,7 @@ pub async fn start_block_production_runloop(
                     SimnetCommand::UpdateInternalClock(_, clock) => {
                         // Confirm the current block to materialize any scheduled overrides for this slot
                         if let Err(e) = svm_locker.confirm_current_block(&remote_client_with_commitment).await {
-                            let _ = svm_locker.simnet_events_tx().send(SimnetEvent::error(format!(
+                            svm_locker.simnet_events_tx().error(format!(
                                 "Failed to confirm block after time travel: {}", e
                             )));
                         }
@@ -477,13 +473,13 @@ pub async fn start_block_production_runloop(
                             svm_writer.latest_epoch_info.slot_index = clock.slot;
                             svm_writer.latest_epoch_info.epoch = clock.epoch;
                             svm_writer.latest_epoch_info.absolute_slot = clock.slot + clock.epoch * svm_writer.latest_epoch_info.slots_in_epoch;
-                            let _ = svm_writer.simnet_events_tx.send(SimnetEvent::SystemClockUpdated(clock));
+                            svm_writer.simnet_events_tx.log(SimnetEvent::SystemClockUpdated(clock));
                         });
                     }
                     SimnetCommand::UpdateInternalClockWithConfirmation(_, clock, response_tx) => {
                         // Confirm the current block to materialize any scheduled overrides for this slot
                         if let Err(e) = svm_locker.confirm_current_block(&remote_client_with_commitment).await {
-                            let _ = svm_locker.simnet_events_tx().send(SimnetEvent::error(format!(
+                            svm_locker.simnet_events_tx().error(format!(
                                 "Failed to confirm block after time travel: {}", e
                             )));
                         }
@@ -496,7 +492,7 @@ pub async fn start_block_production_runloop(
                             svm_writer.latest_epoch_info.slot_index = clock.slot;
                             svm_writer.latest_epoch_info.epoch = clock.epoch;
                             svm_writer.latest_epoch_info.absolute_slot = clock.slot + clock.epoch * svm_writer.latest_epoch_info.slots_in_epoch;
-                            let _ = svm_writer.simnet_events_tx.send(SimnetEvent::SystemClockUpdated(clock));
+                            svm_writer.simnet_events_tx.log(SimnetEvent::SystemClockUpdated(clock));
                             svm_writer.latest_epoch_info.clone()
                         });
 
@@ -511,7 +507,7 @@ pub async fn start_block_production_runloop(
                        let skip_sig_verify = skip_sig_verify_override.unwrap_or(global_skip_sig_verify);
                        let sigverify = !skip_sig_verify;
                        if let Err(e) = svm_locker.process_transaction(&remote_client_with_commitment, transaction, status_tx, skip_preflight, sigverify).await {
-                            let _ = svm_locker.simnet_events_tx().send(SimnetEvent::error(format!("Failed to process transaction: {}", e)));
+                            svm_locker.simnet_events_tx().error(format!("Failed to process transaction: {}", e));
                        }
                        if block_production_mode.eq(&BlockProductionMode::Transaction) {
                            do_produce_block = true;
@@ -530,7 +526,7 @@ pub async fn start_block_production_runloop(
                     SimnetCommand::SealStartupPlan(tasks, response_tx) => {
                         let result = svm_locker.seal_startup_plan(tasks);
                         if let Err(error) = &result {
-                            let _ = svm_locker.simnet_events_tx().try_send(SimnetEvent::error(
+                            svm_locker.simnet_events_tx().error(
                                 format!("Failed to seal startup plan: {error}"),
                             ));
                         }
@@ -540,24 +536,23 @@ pub async fn start_block_production_runloop(
                         if let Err(transition_error) =
                             svm_locker.fail_startup_planning(error.clone())
                         {
-                            let _ = svm_locker.simnet_events_tx().try_send(SimnetEvent::error(
+                            svm_locker.simnet_events_tx().error(
                                 format!("Failed to transition startup to Failed: {transition_error}"),
                             ));
                         }
-                        let _ = svm_locker
-                            .simnet_events_tx()
-                            .try_send(SimnetEvent::error(format!("Surfpool startup failed: {error}")));
+                        svm_locker
+                            .simnet_events_tx().error(format!("Surfpool startup failed: {error}"));
                     }
                     SimnetCommand::StartStartupTask(task) => {
                         if let Err(error) = svm_locker.start_startup_task(task) {
-                            let _ = svm_locker.simnet_events_tx().try_send(SimnetEvent::error(
+                            svm_locker.simnet_events_tx().error(
                                 format!("Failed to start startup task {task:?}: {error}"),
                             ));
                         }
                     }
                     SimnetCommand::CompleteStartupTask(task, result) => {
                         if let Err(error) = svm_locker.complete_startup_task(task, result) {
-                            let _ = svm_locker.simnet_events_tx().try_send(SimnetEvent::error(
+                            svm_locker.simnet_events_tx().error(
                                 format!("Failed to complete startup task {task:?}: {error}"),
                             ));
                         }
@@ -594,13 +589,11 @@ pub async fn start_block_production_runloop(
                                     let absent =
                                         absent_after_hydration(&svm_locker, &account_updates.inner);
                                     if !absent.is_empty() {
-                                        let _ = svm_locker.simnet_events_tx().try_send(
-                                            SimnetEvent::warn(format!(
-                                                "Cloned accounts not found on the datasource, and \
-                                                 absent locally: {}",
-                                                absent.iter().map(|key| key.to_string()).join(", ")
-                                            )),
-                                        );
+                                        svm_locker.simnet_events_tx().warn(format!(
+                                            "Cloned accounts not found on the datasource, and \
+                                             absent locally: {}",
+                                            absent.iter().map(|key| key.to_string()).join(", ")
+                                        ));
                                     }
                                     Ok(())
                                 }
@@ -612,15 +605,14 @@ pub async fn start_block_production_runloop(
                         };
 
                         if let Err(error) = &fetch_result {
-                            let _ = svm_locker
-                                .simnet_events_tx()
-                                .try_send(SimnetEvent::error(error.clone()));
+                            svm_locker
+                                .simnet_events_tx().error(error.clone());
                         }
                         if let Err(error) = svm_locker.complete_startup_task(
                             SurfnetStartupTask::RemoteAccounts,
                             fetch_result,
                         ) {
-                            let _ = svm_locker.simnet_events_tx().try_send(SimnetEvent::error(
+                            svm_locker.simnet_events_tx().error(
                                 format!("Failed to finish remote account hydration: {error}"),
                             ));
                         }
@@ -647,7 +639,7 @@ pub async fn start_block_production_runloop(
 
 pub fn start_clock_runloop(
     mut slot_time: u64,
-    simnet_events_tx: Option<Sender<SimnetEvent>>,
+    simnet_events_tx: Option<SimnetEventsTx>,
 ) -> (Receiver<ClockEvent>, Sender<ClockCommand>) {
     let (clock_event_tx, clock_event_rx) = unbounded::<ClockEvent>();
     let (clock_command_tx, clock_command_rx) = unbounded::<ClockCommand>();
@@ -661,21 +653,21 @@ pub fn start_clock_runloop(
                     enabled = false;
                     if let Some(ref simnet_events_tx) = simnet_events_tx {
                         let _ =
-                            simnet_events_tx.send(SimnetEvent::ClockUpdate(ClockCommand::Pause));
+                            simnet_events_tx.emit(SimnetEvent::ClockUpdate(ClockCommand::Pause));
                     }
                 }
                 Ok(ClockCommand::Resume) => {
                     enabled = true;
                     if let Some(ref simnet_events_tx) = simnet_events_tx {
                         let _ =
-                            simnet_events_tx.send(SimnetEvent::ClockUpdate(ClockCommand::Resume));
+                            simnet_events_tx.emit(SimnetEvent::ClockUpdate(ClockCommand::Resume));
                     }
                 }
                 Ok(ClockCommand::Toggle) => {
                     enabled = !enabled;
                     if let Some(ref simnet_events_tx) = simnet_events_tx {
                         let _ =
-                            simnet_events_tx.send(SimnetEvent::ClockUpdate(ClockCommand::Toggle));
+                            simnet_events_tx.emit(SimnetEvent::ClockUpdate(ClockCommand::Toggle));
                     }
                 }
                 Ok(ClockCommand::UpdateSlotInterval(updated_slot_time)) => {
@@ -687,7 +679,7 @@ pub fn start_clock_runloop(
                     enabled = false;
                     if let Some(ref simnet_events_tx) = simnet_events_tx {
                         let _ =
-                            simnet_events_tx.send(SimnetEvent::ClockUpdate(ClockCommand::Pause));
+                            simnet_events_tx.emit(SimnetEvent::ClockUpdate(ClockCommand::Pause));
                     }
                 }
                 Err(_e) => {}
@@ -704,7 +696,7 @@ pub fn start_clock_runloop(
 
 fn start_geyser_runloop(
     plugin_config_paths: Vec<PathBuf>,
-    simnet_events_tx: Sender<SimnetEvent>,
+    simnet_events_tx: SimnetEventsTx,
     geyser_events_rx: Receiver<GeyserEvent>,
     plugin_commands_rx: Receiver<PluginCommand>,
 ) -> Result<JoinHandle<Result<(), String>>, String> {
@@ -715,15 +707,15 @@ fn start_geyser_runloop(
 
         // helper to log errors that can't be propagated
         let log_error = |msg:String|{
-            let _ = simnet_events_tx.send(SimnetEvent::error(msg));
+            simnet_events_tx.error(msg);
         };
 
         let log_warn = |msg:String|{
-            let _ = simnet_events_tx.send(SimnetEvent::warn(msg));
+            simnet_events_tx.warn(msg);
         };
 
         let log_info = |msg:String|{
-            let _ = simnet_events_tx.send(SimnetEvent::info(msg));
+            simnet_events_tx.info(msg);
         };
 
         // Load plugins from config paths at startup
@@ -836,7 +828,7 @@ fn start_geyser_runloop(
                     Ok(GeyserEvent::EndOfStartup) => {
                         for plugin in managed_plugins.iter().map(|p| &*p.plugin) {
                             if let Err(e) = plugin.notify_end_of_startup() {
-                                let _ = simnet_events_tx.send(SimnetEvent::error(format!("Failed to notify end of startup to Geyser plugin: {:?}", e)));
+                                simnet_events_tx.error(format!("Failed to notify end of startup to Geyser plugin: {:?}", e));
                             }
                         }
                     }
@@ -849,7 +841,7 @@ fn start_geyser_runloop(
 
                         for plugin in managed_plugins.iter().map(|p| &*p.plugin) {
                             if let Err(e) = plugin.update_slot_status(slot, parent, &slot_status) {
-                                let _ = simnet_events_tx.send(SimnetEvent::error(format!("Failed to update slot status in Geyser plugin: {:?}", e)));
+                                simnet_events_tx.error(format!("Failed to update slot status in Geyser plugin: {:?}", e));
                             }
                         }
                     }
@@ -873,7 +865,7 @@ fn start_geyser_runloop(
 
                         for plugin in managed_plugins.iter().map(|p| &*p.plugin) {
                             if let Err(e) = plugin.notify_block_metadata(ReplicaBlockInfoVersions::V0_0_4(&block_info)) {
-                                let _ = simnet_events_tx.send(SimnetEvent::error(format!("Failed to notify block metadata to Geyser plugin: {:?}", e)));
+                                simnet_events_tx.error(format!("Failed to notify block metadata to Geyser plugin: {:?}", e));
                             }
                         }
                     }
@@ -889,7 +881,7 @@ fn start_geyser_runloop(
 
                         for plugin in managed_plugins.iter().map(|p| &*p.plugin) {
                             if let Err(e) = plugin.notify_entry(ReplicaEntryInfoVersions::V0_0_2(&entry_replica)) {
-                                let _ = simnet_events_tx.send(SimnetEvent::error(format!("Failed to notify entry to Geyser plugin: {:?}", e)));
+                                simnet_events_tx.error(format!("Failed to notify entry to Geyser plugin: {:?}", e));
                             }
                         }
                     }
@@ -999,7 +991,7 @@ async fn start_rpc_servers_runloop(
 async fn start_http_rpc_server_runloop(
     config: &SurfpoolConfig,
     middleware: SurfpoolMiddleware,
-    simnet_events_tx: Sender<SimnetEvent>,
+    simnet_events_tx: SimnetEventsTx,
 ) -> Result<(JoinHandle<()>, jsonrpc_http_server::CloseHandle), String> {
     let server_bind: SocketAddr = config
         .rpc
@@ -1048,14 +1040,14 @@ async fn start_http_rpc_server_runloop(
                 Err(e) => {
                     let error = format!("Failed to start RPC server: {:?}", e);
                     let _ = close_handle_tx.send(Err(error.clone()));
-                    let _ = simnet_events_tx.send(SimnetEvent::Aborted(error));
+                    simnet_events_tx.emit(SimnetEvent::Aborted(error));
                     return;
                 }
             };
 
             let _ = close_handle_tx.send(Ok(server.close_handle()));
             server.wait();
-            let _ = simnet_events_tx.send(SimnetEvent::Shutdown);
+            simnet_events_tx.emit(SimnetEvent::Shutdown);
         })
         .map_err(|e| format!("Failed to spawn RPC Handler thread: {:?}", e))?;
 
@@ -1068,7 +1060,7 @@ async fn start_http_rpc_server_runloop(
 async fn start_ws_rpc_server_runloop(
     config: &SurfpoolConfig,
     middleware: SurfpoolMiddleware,
-    simnet_events_tx: Sender<SimnetEvent>,
+    simnet_events_tx: SimnetEventsTx,
 ) -> Result<(JoinHandle<()>, jsonrpc_ws_server::CloseHandle), String> {
     let ws_server_bind: SocketAddr = config
         .rpc
@@ -1131,7 +1123,7 @@ async fn start_ws_rpc_server_runloop(
                     Err(e) => {
                         let error = format!("Failed to start WebSocket RPC server: {:?}", e);
                         let _ = close_handle_tx.send(Err(error.clone()));
-                        let _ = simnet_events_tx.send(SimnetEvent::Aborted(error));
+                        simnet_events_tx.emit(SimnetEvent::Aborted(error));
                         return;
                     }
                 };
@@ -1143,7 +1135,7 @@ async fn start_ws_rpc_server_runloop(
                 .await
                 .ok();
 
-                let _ = simnet_events_tx.send(SimnetEvent::Shutdown);
+                simnet_events_tx.emit(SimnetEvent::Shutdown);
             });
         })
         .map_err(|e| format!("Failed to spawn WebSocket RPC Handler thread: {:?}", e))?;

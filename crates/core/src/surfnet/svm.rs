@@ -57,7 +57,7 @@ use surfpool_types::{
     AccountChange, AccountProfileState, AccountSnapshot, DEFAULT_PROFILING_MAP_CAPACITY,
     DEFAULT_SLOT_TIME_MS, ExportSnapshotConfig, ExportSnapshotScope, FifoMap, Idl,
     OverrideInstance, ProfileResult, RpcProfileDepth, RpcProfileResultConfig,
-    RunbookExecutionStatusReport, SimnetEvent, StartupError, SurfnetStartupStatus,
+    RunbookExecutionStatusReport, SimnetEvent, SimnetEventsTx, StartupError, SurfnetStartupStatus,
     SurfnetStartupTask, SvmFeatureConfig, TransactionConfirmationStatus, TransactionStatusEvent,
     UiAccountChange, UiAccountProfileState, UiProfileResult, VersionedIdl,
     types::{
@@ -271,7 +271,7 @@ pub struct SurfnetSvm {
     pub perf_samples: VecDeque<RpcPerfSample>,
     pub transactions_processed: u64,
     pub latest_epoch_info: EpochInfo,
-    pub simnet_events_tx: Sender<SimnetEvent>,
+    pub simnet_events_tx: SimnetEventsTx,
     pub geyser_events_tx: Sender<GeyserEvent>,
     pub signature_subscriptions: HashMap<Signature, Vec<SignatureSubscriptionData>>,
     pub account_subscriptions: AccountSubscriptionData,
@@ -520,7 +520,7 @@ impl SurfnetSvm {
     /// and `sandbox_geyser_events_rx`. Bundle commit code can drain these to replay the events
     /// on the original VM's channels.
     pub fn clone_for_profiling(&self) -> Self {
-        let (dummy_simnet_tx, _) = crossbeam_channel::bounded(1);
+        let (dummy_simnet_tx, _) = SimnetEventsTx::channel(1);
         let (dummy_geyser_tx, _) = crossbeam_channel::bounded(1);
 
         Self {
@@ -643,7 +643,7 @@ impl SurfnetSvm {
     pub fn clone_for_bundle_sandbox(&self) -> BundleSandbox {
         let mut svm = self.clone_for_profiling();
         let (geyser_tx, geyser_rx) = crossbeam_channel::unbounded();
-        let (simnet_tx, simnet_rx) = crossbeam_channel::unbounded();
+        let (simnet_tx, simnet_rx) = SimnetEventsTx::unbounded();
         svm.geyser_events_tx = geyser_tx;
         svm.simnet_events_tx = simnet_tx;
         BundleSandbox {
@@ -797,7 +797,7 @@ impl SurfnetSvm {
 
         // 6. Drain buffered simnet events; replay onto self's real channel.
         while let Ok(event) = simnet_rx.try_recv() {
-            let _ = self.simnet_events_tx.try_send(event);
+            self.simnet_events_tx.log(event);
         }
 
         // 7. Fire signature/logs subscribers and Success acks for each committed tx.
@@ -835,7 +835,7 @@ impl SurfnetSvm {
         database_url: Option<&str>,
         config: SurfnetSvmConfig,
     ) -> SurfpoolResult<(Self, Receiver<SimnetEvent>, Receiver<GeyserEvent>)> {
-        let (simnet_events_tx, simnet_events_rx) = crossbeam_channel::bounded(1024);
+        let (simnet_events_tx, simnet_events_rx) = SimnetEventsTx::channel(1024);
         let (geyser_events_tx, geyser_events_rx) = crossbeam_channel::bounded(1024);
         let surfnet_id = config.surfnet_id;
 
@@ -1240,28 +1240,24 @@ impl SurfnetSvm {
         for recipient in addresses {
             match self.airdrop(recipient, lamports) {
                 Ok(_) => {
-                    let _ = self.simnet_events_tx.send(SimnetEvent::info(format!(
+                    self.simnet_events_tx.info(format!(
                         "Genesis airdrop successful {}: {}",
                         recipient, lamports
                     )));
                 }
                 Err(AirdropError::ZeroAmount) => {
-                    let _ = self
-                        .simnet_events_tx
-                        .send(SimnetEvent::info("Skipping 0 lamport airdrop"));
+                    let _ = self.simnet_events_tx.info("Skipping 0 lamport airdrop");
                     return;
                 }
                 Err(AirdropError::BelowRentExemption { lamports, min_rent }) => {
-                    let _ = self.simnet_events_tx.send(SimnetEvent::error(format!(
+                    self.simnet_events_tx.error(format!(
                         "Skipping invalid airdrop: amount {lamports} is below the rent-exempt minimum of {min_rent} lamports"
                     )));
                     return;
                 }
                 Err(AirdropError::Other(e)) => {
-                    let _ = self.simnet_events_tx.send(SimnetEvent::error(format!(
-                        "Genesis airdrop failed {}: {}",
-                        recipient, e
-                    )));
+                    self.simnet_events_tx
+                        .error(format!("Genesis airdrop failed {}: {}", recipient, e));
                 }
             };
         }
@@ -1625,7 +1621,7 @@ impl SurfnetSvm {
 
         let _ = self
             .simnet_events_tx
-            .send(SimnetEvent::account_update(*pubkey));
+            .log(SimnetEvent::account_update(*pubkey));
         Ok(())
     }
 
@@ -2000,14 +1996,14 @@ impl SurfnetSvm {
 
         // Log any errors that occurred
         if !errors.is_empty() {
-            let _ = self.simnet_events_tx.send(SimnetEvent::warn(format!(
+            self.simnet_events_tx.warn(format!(
                 "Snapshot restore completed with {} errors: {}",
                 errors.len(),
                 errors.join("; ")
             )));
         }
 
-        let _ = self.simnet_events_tx.send(SimnetEvent::info(format!(
+        self.simnet_events_tx.info(format!(
             "Restored {} accounts from snapshot",
             restored_count
         )));
@@ -2041,7 +2037,7 @@ impl SurfnetSvm {
 
         if cu_analysis_enabled {
             let estimation_result = self.estimate_compute_units(&tx);
-            let _ = self.simnet_events_tx.try_send(SimnetEvent::info(format!(
+            self.simnet_events_tx.info(format!(
                 "CU Estimation for tx: {} | Consumed: {} | Success: {} | Logs: {:?} | Error: {:?}",
                 tx.signatures
                     .first()
@@ -2060,9 +2056,8 @@ impl SurfnetSvm {
 
             let transaction_meta = convert_transaction_metadata_from_canonical(&meta);
 
-            let _ = self
-                .simnet_events_tx
-                .try_send(SimnetEvent::transaction_processed(
+            self.simnet_events_tx
+                .log(SimnetEvent::transaction_processed(
                     transaction_meta,
                     Some(err.clone()),
                 ));
@@ -2075,9 +2070,8 @@ impl SurfnetSvm {
                 let transaction_meta =
                     convert_transaction_metadata_from_canonical(&tx_failure.meta);
 
-                let _ = self
-                    .simnet_events_tx
-                    .try_send(SimnetEvent::transaction_processed(
+                self.simnet_events_tx
+                    .log(SimnetEvent::transaction_processed(
                         transaction_meta,
                         Some(tx_failure.err.clone()),
                     ));
@@ -2314,23 +2308,17 @@ impl SurfnetSvm {
                                 if let Err(e) =
                                     self.set_account(&programdata_address, programdata_account)
                                 {
-                                    let _ = self
-                                        .simnet_events_tx
-                                        .send(SimnetEvent::error(e.to_string()));
+                                    let _ = self.simnet_events_tx.error(e.to_string());
                                 }
                             }
                             Ok(Some(_)) => {}
                             Err(e) => {
-                                let _ = self
-                                    .simnet_events_tx
-                                    .send(SimnetEvent::error(e.to_string()));
+                                let _ = self.simnet_events_tx.error(e.to_string());
                             }
                         }
                     }
                     if let Err(e) = self.set_account(&pubkey, account.clone()) {
-                        let _ = self
-                            .simnet_events_tx
-                            .send(SimnetEvent::error(e.to_string()));
+                        let _ = self.simnet_events_tx.error(e.to_string());
                     }
                 }
             }
@@ -2343,30 +2331,22 @@ impl SurfnetSvm {
                             if let Err(e) =
                                 self.set_account(&programdata_address, programdata_account)
                             {
-                                let _ = self
-                                    .simnet_events_tx
-                                    .send(SimnetEvent::error(e.to_string()));
+                                let _ = self.simnet_events_tx.error(e.to_string());
                             }
                         }
                         Ok(Some(_)) => {}
                         Err(e) => {
-                            let _ = self
-                                .simnet_events_tx
-                                .send(SimnetEvent::error(e.to_string()));
+                            let _ = self.simnet_events_tx.error(e.to_string());
                         }
                     }
                 }
                 if let Err(e) = self.set_account(&pubkey, account.clone()) {
-                    let _ = self
-                        .simnet_events_tx
-                        .send(SimnetEvent::error(e.to_string()));
+                    let _ = self.simnet_events_tx.error(e.to_string());
                 }
             }
             GetAccountResult::FoundTokenAccount((pubkey, account), (_, None)) => {
                 if let Err(e) = self.set_account(&pubkey, account.clone()) {
-                    let _ = self
-                        .simnet_events_tx
-                        .send(SimnetEvent::error(e.to_string()));
+                    let _ = self.simnet_events_tx.error(e.to_string());
                 }
             }
             GetAccountResult::FoundProgramAccount(
@@ -2379,14 +2359,10 @@ impl SurfnetSvm {
             ) => {
                 // The data account _must_ be set first, as the program account depends on it.
                 if let Err(e) = self.set_account(&coupled_pubkey, coupled_account.clone()) {
-                    let _ = self
-                        .simnet_events_tx
-                        .send(SimnetEvent::error(e.to_string()));
+                    let _ = self.simnet_events_tx.error(e.to_string());
                 }
                 if let Err(e) = self.set_account(&pubkey, account.clone()) {
-                    let _ = self
-                        .simnet_events_tx
-                        .send(SimnetEvent::error(e.to_string()));
+                    let _ = self.simnet_events_tx.error(e.to_string());
                 }
             }
             GetAccountResult::None(_) => {}
@@ -2551,7 +2527,7 @@ impl SurfnetSvm {
 
         let _ = self
             .simnet_events_tx
-            .send(SimnetEvent::SystemClockUpdated(clock.clone()));
+            .log(SimnetEvent::SystemClockUpdated(clock.clone()));
         self.inner.set_sysvar(&clock);
 
         self.finalize_transactions()?;
@@ -3911,15 +3887,13 @@ impl SurfnetSvm {
         // subscriber exists yet, so a late subscriber's first borrow() is current.
         self.startup_status_watch_tx
             .send_replace(self.startup_status.clone());
-        // try_send: callers hold the SVM write guard, and the bounded events
-        // channel may belong to an embedder that never drains it. The watch
-        // channel above is the reliable path; the event stream is a best
-        // effort sequence, and dropping an entry must not wedge the SVM.
-        let _ = self
-            .simnet_events_tx
-            .try_send(SimnetEvent::StartupStatusChanged(
-                self.startup_status.clone(),
-            ));
+        // log, not emit: callers hold the SVM write guard, and the bounded
+        // events channel may belong to an embedder that never drains it. The
+        // watch channel above is the reliable path; the event stream is a
+        // best effort sequence, and dropping an entry must not wedge the SVM.
+        self.simnet_events_tx.log(SimnetEvent::StartupStatusChanged(
+            self.startup_status.clone(),
+        ));
     }
 
     pub fn complete_runbook_execution(&mut self, runbook_id: &str, error: Option<Vec<String>>) {
