@@ -16,7 +16,7 @@ use solana_keypair::Keypair;
 use solana_pubkey::Pubkey;
 use solana_signer::Signer;
 use surfpool_core::{start_local_surfnet, surfnet::svm::SurfnetSvm};
-use surfpool_types::{SanitizedConfig, SimnetCommand, SimnetEvent, SubgraphEvent};
+use surfpool_types::{SanitizedConfig, SimnetCommand, SimnetEvent, SimnetEventsTx, SubgraphEvent};
 use txtx_core::kit::{channel::Receiver, helpers::fs::FileLocation, types::frontend::BlockEvent};
 use txtx_gql::kit::{indexmap::IndexMap, types::frontend::LogLevel, uuid::Uuid};
 
@@ -243,13 +243,7 @@ pub async fn handle_start_local_surfnet_command(
     };
 
     // Re-send early events (like snapshot loading messages) so the TUI receives them
-    for event in early_events {
-        simnet_events_tx.emit(event);
-    }
-
-    for event in airdrop_events {
-        simnet_events_tx.emit(event);
-    }
+    replay_early_events(&simnet_events_tx, early_events, airdrop_events);
 
     let simnet_commands_tx_copy = simnet_commands_tx.clone();
     let mut runbook_progress_rx = vec![];
@@ -625,5 +619,60 @@ mod tests {
             public_service_url(None, None, "http", "0.0.0.0", 8899),
             "http://127.0.0.1:8899"
         );
+    }
+}
+
+/// Re-send events buffered before `CoreStarted` (and the airdrop
+/// announcements) so the frontend consumer receives them.
+pub(crate) fn replay_early_events(
+    simnet_events_tx: &SimnetEventsTx,
+    early_events: Vec<SimnetEvent>,
+    airdrop_events: Vec<SimnetEvent>,
+) {
+    for event in early_events.into_iter().chain(airdrop_events) {
+        simnet_events_tx.emit(event);
+    }
+}
+
+#[cfg(test)]
+mod replay_tests {
+    use std::{thread, time::Duration};
+
+    use surfpool_types::SimnetEventsTx;
+
+    use super::*;
+
+    /// Startup calls the replay on the thread that owns the only receiver,
+    /// and concurrent producers may already have refilled the buffer, so
+    /// the call must return without waiting on a drain; the events follow
+    /// once the consumer starts. Small capacity for speed; the mechanism is
+    /// capacity-independent.
+    #[test]
+    fn replay_returns_before_the_consumer_drains() {
+        let (tx, rx) = SimnetEventsTx::channel(4);
+        for i in 0..4 {
+            tx.info(format!("producer {i}"));
+        }
+
+        let replay_tx = tx.clone();
+        let replayer = thread::spawn(move || {
+            replay_early_events(&replay_tx, vec![SimnetEvent::info("replayed")], vec![]);
+        });
+
+        thread::sleep(Duration::from_millis(300));
+        assert!(
+            replayer.is_finished(),
+            "replay must not block the receiver-owning thread on a full buffer"
+        );
+
+        // The consumer drains, as log_events/start_app do; every event
+        // arrives, the replayed one behind the producers.
+        let received: Vec<SimnetEvent> = (0..5)
+            .map(|_| {
+                rx.recv_timeout(Duration::from_secs(5))
+                    .expect("every event arrives once the consumer drains")
+            })
+            .collect();
+        assert!(matches!(&received[4], SimnetEvent::InfoLog(_, msg) if msg == "replayed"));
     }
 }
