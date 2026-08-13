@@ -10,7 +10,8 @@ use notify::{
 };
 use solana_pubkey::Pubkey;
 use surfpool_types::{
-    SimnetCommand, SimnetEvent, StartupError, SurfnetStartupPhase, SurfnetStartupTask,
+    SimnetCommand, SimnetEvent, SimnetEventsTx, StartupError, SurfnetStartupPhase,
+    SurfnetStartupTask,
 };
 use txtx_core::{
     kit::{
@@ -91,7 +92,7 @@ impl RunbookExecutionMode {
 pub(super) fn spawn_startup_watchdog(
     headless: bool,
     startup_status_rx: tokio::sync::watch::Receiver<surfpool_types::SurfnetStartupStatus>,
-    events_tx: Sender<SimnetEvent>,
+    events_tx: SimnetEventsTx,
     commands_tx: Sender<SimnetCommand>,
 ) -> Result<(), String> {
     if !headless {
@@ -113,7 +114,7 @@ pub(super) fn spawn_startup_watchdog(
 /// the surfnet is already shutting down, requires nothing.
 pub(super) fn watch_startup_until_completion(
     mut startup_status_rx: tokio::sync::watch::Receiver<surfpool_types::SurfnetStartupStatus>,
-    events_tx: Sender<SimnetEvent>,
+    events_tx: SimnetEventsTx,
     commands_tx: Sender<SimnetCommand>,
 ) {
     let terminal = hiro_system_kit::nestable_block_on(startup_status_rx.wait_for(|status| {
@@ -129,7 +130,7 @@ pub(super) fn watch_startup_until_completion(
         _ => None,
     };
     if let Some(error) = failure {
-        let _ = events_tx.send(SimnetEvent::Aborted(format!(
+        events_tx.emit(SimnetEvent::Aborted(format!(
             "Surfpool startup failed: {error}"
         )));
         let _ = commands_tx.send(SimnetCommand::Terminate(None));
@@ -211,7 +212,7 @@ struct StartupPlan {
 /// failure leaves it in Planning-unsealed for the caller to fail explicitly.
 async fn plan_startup(
     cmd: &StartSimnet,
-    simnet_events_tx: &Sender<SimnetEvent>,
+    simnet_events_tx: &SimnetEventsTx,
 ) -> Result<StartupPlan, String> {
     let (progress_tx, progress_rx) = crossbeam::channel::unbounded();
 
@@ -252,10 +253,10 @@ async fn plan_startup(
             return Err(format!("Failed to detect project framework: {e}"));
         }
         Err(e) => {
-            let _ = simnet_events_tx.send(SimnetEvent::warn(format!(
+            simnet_events_tx.warn(format!(
                 "Could not detect the project framework, continuing with the runbook on disk. \
                  Declared clones, if any, were not loaded: {e}"
-            )));
+            ));
             None
         }
     };
@@ -272,12 +273,12 @@ async fn plan_startup(
         let (parsed, rejected) = parse_clone_addresses(&clones.unwrap_or_default());
         clone_pubkeys = parsed;
         if !rejected.is_empty() {
-            let _ = simnet_events_tx.send(SimnetEvent::warn(format!(
+            simnet_events_tx.warn(format!(
                 "Ignoring {} declared clone address(es) that could not be parsed; \
                  the rest were loaded. {}",
                 rejected.len(),
                 rejected.join("; ")
-            )));
+            ));
         }
 
         match mode {
@@ -340,7 +341,7 @@ async fn plan_startup(
 /// choreography around them.
 pub(super) async fn plan_and_dispatch_startup(
     cmd: &StartSimnet,
-    simnet_events_tx: &Sender<SimnetEvent>,
+    simnet_events_tx: &SimnetEventsTx,
     simnet_commands_tx: &Sender<SimnetCommand>,
 ) -> Result<Receiver<BlockEvent>, StartupPlanFailure> {
     let StartupPlan {
@@ -424,7 +425,7 @@ pub(super) async fn plan_and_dispatch_startup(
             // fatality. The error event covers the TUI, which has no other
             // channel announcing the failed phase.
             let error = format!("Thread to execute runbooks exited: {error}");
-            let _ = simnet_events_tx.send(SimnetEvent::error(error.clone()));
+            simnet_events_tx.error(error.clone());
             let _ = simnet_commands_tx.send(SimnetCommand::CompleteStartupTask(
                 SurfnetStartupTask::RunbookExecutions,
                 Err(error),
@@ -445,9 +446,9 @@ pub(super) async fn plan_and_dispatch_startup(
             in_memory_runbook_data,
             runbook_input,
         ) {
-            let _ = simnet_events_tx.send(SimnetEvent::warn(format!(
+            simnet_events_tx.warn(format!(
                 "Failed to watch deploy artifacts for changes: {error}"
-            )));
+            ));
         }
     }
 
@@ -460,7 +461,7 @@ fn spawn_artifact_watcher(
     base_location: FileLocation,
     artifacts_path: Option<String>,
     progress_tx: Sender<BlockEvent>,
-    simnet_events_tx: Sender<SimnetEvent>,
+    simnet_events_tx: SimnetEventsTx,
     on_disk_runbook_data: Option<(FileLocation, Vec<String>)>,
     in_memory_runbook_data: Option<(String, RunbookSources, WorkspaceManifest)>,
     runbook_input: Vec<String>,
@@ -548,7 +549,7 @@ type RunbookExecutionFutures =
 
 fn assemble_runbook_execution_futures(
     progress_tx: &Sender<BlockEvent>,
-    simnet_events_tx: &Sender<SimnetEvent>,
+    simnet_events_tx: &SimnetEventsTx,
     on_disk_runbook_data: &Option<(FileLocation, Vec<String>)>,
     in_memory_runbook_data: &Option<(String, RunbookSources, WorkspaceManifest)>,
     runbook_input: &[String],
@@ -651,7 +652,7 @@ mod tests {
 
         use crossbeam::channel::{Receiver, unbounded};
         use surfpool_types::{
-            SimnetCommand, SimnetEvent, SurfnetStartupStatus, SurfnetStartupTask,
+            SimnetCommand, SimnetEvent, SimnetEventsTx, SurfnetStartupStatus, SurfnetStartupTask,
         };
         use tokio::sync::watch;
 
@@ -690,7 +691,7 @@ mod tests {
         #[test]
         fn headless_watchdog_aborts_and_terminates_on_failed_startup() {
             let (status_tx, status_rx) = watch::channel(SurfnetStartupStatus::default());
-            let (events_tx, events_rx) = unbounded();
+            let (events_tx, events_rx) = SimnetEventsTx::unbounded();
             let (commands_tx, commands_rx) = unbounded();
 
             let watchdog = std::thread::spawn(move || {
@@ -717,7 +718,7 @@ mod tests {
         #[test]
         fn headless_watchdog_stays_quiet_when_startup_reaches_ready() {
             let (status_tx, status_rx) = watch::channel(SurfnetStartupStatus::default());
-            let (events_tx, events_rx) = unbounded();
+            let (events_tx, events_rx) = SimnetEventsTx::unbounded();
             let (commands_tx, commands_rx) = unbounded();
 
             let watchdog = std::thread::spawn(move || {
@@ -734,7 +735,7 @@ mod tests {
         #[test]
         fn headless_watchdog_stays_quiet_when_the_surfnet_shuts_down_first() {
             let (status_tx, status_rx) = watch::channel(SurfnetStartupStatus::default());
-            let (events_tx, events_rx) = unbounded();
+            let (events_tx, events_rx) = SimnetEventsTx::unbounded();
             let (commands_tx, commands_rx) = unbounded();
 
             let watchdog = std::thread::spawn(move || {
@@ -751,7 +752,7 @@ mod tests {
         #[test]
         fn tui_mode_spawns_no_watchdog() {
             let (status_tx, status_rx) = watch::channel(SurfnetStartupStatus::default());
-            let (events_tx, events_rx) = unbounded();
+            let (events_tx, events_rx) = SimnetEventsTx::unbounded();
             let (commands_tx, commands_rx) = unbounded();
 
             spawn_startup_watchdog(false, status_rx, events_tx, commands_tx).unwrap();
@@ -767,7 +768,7 @@ mod tests {
         #[test]
         fn headless_mode_spawns_a_watchdog_that_exits_after_ready() {
             let (status_tx, status_rx) = watch::channel(SurfnetStartupStatus::default());
-            let (events_tx, events_rx) = unbounded();
+            let (events_tx, events_rx) = SimnetEventsTx::unbounded();
             let (commands_tx, commands_rx) = unbounded();
 
             spawn_startup_watchdog(true, status_rx, events_tx, commands_tx).unwrap();

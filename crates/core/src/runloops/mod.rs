@@ -222,7 +222,7 @@ pub async fn start_local_surfnet_runloop(
                     svm.simnet_events_tx.info(format!(
                         "Preloaded {} accounts from snapshot(s) into SVM",
                         loaded_count
-                    )))
+                    ))
                 });
             }
             Err(e) => {
@@ -462,7 +462,7 @@ pub async fn start_block_production_runloop(
                         if let Err(e) = svm_locker.confirm_current_block(&remote_client_with_commitment).await {
                             svm_locker.simnet_events_tx().error(format!(
                                 "Failed to confirm block after time travel: {}", e
-                            )));
+                            ));
                         }
 
                         svm_locker.with_svm_writer(|svm_writer| {
@@ -481,7 +481,7 @@ pub async fn start_block_production_runloop(
                         if let Err(e) = svm_locker.confirm_current_block(&remote_client_with_commitment).await {
                             svm_locker.simnet_events_tx().error(format!(
                                 "Failed to confirm block after time travel: {}", e
-                            )));
+                            ));
                         }
 
                         let epoch_info = svm_locker.with_svm_writer(|svm_writer| {
@@ -528,7 +528,7 @@ pub async fn start_block_production_runloop(
                         if let Err(error) = &result {
                             svm_locker.simnet_events_tx().error(
                                 format!("Failed to seal startup plan: {error}"),
-                            ));
+                            );
                         }
                         let _ = response_tx.send(result);
                     }
@@ -538,7 +538,7 @@ pub async fn start_block_production_runloop(
                         {
                             svm_locker.simnet_events_tx().error(
                                 format!("Failed to transition startup to Failed: {transition_error}"),
-                            ));
+                            );
                         }
                         svm_locker
                             .simnet_events_tx().error(format!("Surfpool startup failed: {error}"));
@@ -547,14 +547,14 @@ pub async fn start_block_production_runloop(
                         if let Err(error) = svm_locker.start_startup_task(task) {
                             svm_locker.simnet_events_tx().error(
                                 format!("Failed to start startup task {task:?}: {error}"),
-                            ));
+                            );
                         }
                     }
                     SimnetCommand::CompleteStartupTask(task, result) => {
                         if let Err(error) = svm_locker.complete_startup_task(task, result) {
                             svm_locker.simnet_events_tx().error(
                                 format!("Failed to complete startup task {task:?}: {error}"),
-                            ));
+                            );
                         }
                     }
                     SimnetCommand::StartRunbookExecution(runbook_id) => {
@@ -614,7 +614,7 @@ pub async fn start_block_production_runloop(
                         ) {
                             svm_locker.simnet_events_tx().error(
                                 format!("Failed to finish remote account hydration: {error}"),
-                            ));
+                            );
                         }
                     }
                     SimnetCommand::AirdropProcessed => {

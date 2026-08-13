@@ -1435,7 +1435,7 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
                             // if the account does not exist locally or in the remote, create a new account with default values
                             svm_locker.simnet_events_tx().info(format!(
                                 "Account {pubkey} not found, creating a new account from default values"
-                            )));
+                            ));
                             GetAccountResult::FoundAccount(
                                 pubkey,
                                 solana_account::Account {

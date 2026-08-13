@@ -1243,7 +1243,7 @@ impl SurfnetSvm {
                     self.simnet_events_tx.info(format!(
                         "Genesis airdrop successful {}: {}",
                         recipient, lamports
-                    )));
+                    ));
                 }
                 Err(AirdropError::ZeroAmount) => {
                     let _ = self.simnet_events_tx.info("Skipping 0 lamport airdrop");
@@ -1252,7 +1252,7 @@ impl SurfnetSvm {
                 Err(AirdropError::BelowRentExemption { lamports, min_rent }) => {
                     self.simnet_events_tx.error(format!(
                         "Skipping invalid airdrop: amount {lamports} is below the rent-exempt minimum of {min_rent} lamports"
-                    )));
+                    ));
                     return;
                 }
                 Err(AirdropError::Other(e)) => {
@@ -2000,13 +2000,13 @@ impl SurfnetSvm {
                 "Snapshot restore completed with {} errors: {}",
                 errors.len(),
                 errors.join("; ")
-            )));
+            ));
         }
 
         self.simnet_events_tx.info(format!(
             "Restored {} accounts from snapshot",
             restored_count
-        )));
+        ));
 
         Ok(restored_count)
     }
@@ -2046,7 +2046,7 @@ impl SurfnetSvm {
                 estimation_result.success,
                 estimation_result.log_messages,
                 estimation_result.error_message
-            )));
+            ));
         }
         self.transactions_processed += 1;
 

@@ -80,15 +80,15 @@ pub async fn handle_start_local_surfnet_command(
                 &cmd.observability.metrics_addr,
             ) {
                 Err(e) => {
-                    let _ = surfnet_svm
+                    surfnet_svm
                         .simnet_events_tx
-                        .send(SimnetEvent::warn(format!("Metrics init failed: {}", e)));
+                        .warn(format!("Metrics init failed: {}", e));
                 }
                 Ok(_) => {
-                    let _ = surfnet_svm.simnet_events_tx.send(SimnetEvent::info(format!(
+                    surfnet_svm.simnet_events_tx.info(format!(
                         "Metrics available at http://{}/metrics",
                         cmd.observability.metrics_addr
-                    )));
+                    ));
                 }
             }
         }
@@ -129,11 +129,11 @@ pub async fn handle_start_local_surfnet_command(
                 Option<surfpool_types::AccountSnapshot>,
             > = serde_json::from_str(&content)
                 .map_err(|e| format!("Failed to parse snapshot JSON '{}': {}", snapshot_path, e))?;
-            let _ = simnet_events_tx.send(SimnetEvent::info(format!(
+            simnet_events_tx.info(format!(
                 "Loaded {} accounts from snapshot file: {}",
                 snapshot_data.len(),
                 snapshot_path
-            )));
+            ));
 
             // Merge into the combined snapshot (later files override earlier ones)
             merged_snapshot.extend(snapshot_data);
@@ -197,11 +197,11 @@ pub async fn handle_start_local_surfnet_command(
         Ok(explorer_handle) => Some(explorer_handle),
         Err(e) => {
             error!("Failed to start subgraph and explorer server: {}", e);
-            let _ = simnet_events_tx.send(SimnetEvent::warn(format!(
+            simnet_events_tx.warn(format!(
                 "Failed to start subgraph and explorer server: {}",
                 e
-            )));
-            let _ = simnet_events_tx.send(SimnetEvent::info("Continuing with simnet startup..."));
+            ));
+            simnet_events_tx.info("Continuing with simnet startup...");
             None
         }
     };
@@ -221,7 +221,7 @@ pub async fn handle_start_local_surfnet_command(
             );
             if let Err(e) = hiro_system_kit::nestable_block_on(future) {
                 // Send the error through the event channel so the main thread can handle it
-                let _ = simnet_events_tx_for_thread.send(SimnetEvent::Aborted(e.to_string()));
+                simnet_events_tx_for_thread.emit(SimnetEvent::Aborted(e.to_string()));
             }
             Ok::<(), String>(())
         })
@@ -244,11 +244,11 @@ pub async fn handle_start_local_surfnet_command(
 
     // Re-send early events (like snapshot loading messages) so the TUI receives them
     for event in early_events {
-        let _ = simnet_events_tx.send(event);
+        simnet_events_tx.emit(event);
     }
 
     for event in airdrop_events {
-        let _ = simnet_events_tx.send(event);
+        simnet_events_tx.emit(event);
     }
 
     let simnet_commands_tx_copy = simnet_commands_tx.clone();
@@ -262,8 +262,7 @@ pub async fn handle_start_local_surfnet_command(
             // the watchdog's decision.
             Err(StartupPlanFailure::Planning(e)) => {
                 let _ = simnet_commands_tx_copy.send(SimnetCommand::FailStartupPlanning(e.clone()));
-                let _ = simnet_events_tx
-                    .send(SimnetEvent::warn(format!("Startup planning failed: {e}")));
+                simnet_events_tx.warn(format!("Startup planning failed: {e}"));
             }
             // The command loop is dead or wedged, so the startup state machine
             // is unreachable and no session can ever become ready.
@@ -309,8 +308,7 @@ pub async fn handle_start_local_surfnet_command(
         if let Ok(response) = response {
             if let Ok(body) = response.json::<CheckVersionResponse>().await {
                 if let Some(deprecation_notice) = body.deprecation_notice {
-                    let _ =
-                        simnet_events_tx.send(SimnetEvent::warn(deprecation_notice.to_string()));
+                    let _ = simnet_events_tx.warn(deprecation_notice.to_string());
                 }
             }
         }

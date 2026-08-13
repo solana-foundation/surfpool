@@ -533,7 +533,7 @@ impl SurfnetSvmLocker {
                         svm.simnet_events_tx.warn(format!(
                             "Skipping invalid pubkey '{}' in snapshot: {}",
                             pubkey_str, e
-                        )));
+                        ));
                     });
                     continue;
                 }
@@ -549,7 +549,7 @@ impl SurfnetSvmLocker {
                                 svm.simnet_events_tx.warn(format!(
                                     "Skipping account '{}': failed to decode base64 data: {}",
                                     pubkey_str, e
-                                )));
+                                ));
                             });
                             continue;
                         }
@@ -563,7 +563,7 @@ impl SurfnetSvmLocker {
                                 svm.simnet_events_tx.warn(format!(
                                     "Skipping account '{}': invalid owner pubkey: {}",
                                     pubkey_str, e
-                                )));
+                                ));
                             });
                             continue;
                         }
@@ -596,7 +596,7 @@ impl SurfnetSvmLocker {
                     svm.simnet_events_tx.info(format!(
                         "Fetching {} accounts from remote RPC for snapshot",
                         pubkeys_to_fetch.len()
-                    )));
+                    ));
                 });
 
                 match client
@@ -2519,7 +2519,7 @@ impl SurfnetSvmLocker {
         simnet_events_tx.info(format!(
             "Account {} will be marked offline (excluded from remote downloads)",
             pubkey
-        )));
+        ));
 
         self.with_svm_writer(move |svm_writer| {
             if let Err(e) = svm_writer.offline_accounts.store(
@@ -3756,7 +3756,7 @@ impl SurfnetSvmLocker {
         self.simnet_events_tx().info(format!(
             "Time travel to {} successful (epoch {} / slot {})",
             formated_time, updated_epoch_info.epoch, updated_epoch_info.absolute_slot
-        )));
+        ));
 
         Ok(updated_epoch_info)
     }
@@ -4063,7 +4063,7 @@ impl SurfnetSvmLocker {
             self.simnet_events_tx().info(format!(
                 "Program cache update deferred for {}: {}",
                 program_id, e
-            )));
+            ));
         }
 
         Ok(())
@@ -4249,7 +4249,7 @@ impl SurfnetSvmLocker {
                 "Updating program authority of program {} to {}",
                 program_id,
                 authority.unwrap_or(solana_system_interface::program::id())
-            )));
+            ));
             solana_loader_v3_interface::state::UpgradeableLoaderState::ProgramData {
                 slot,
                 upgrade_authority_address: authority
@@ -4296,7 +4296,7 @@ impl SurfnetSvmLocker {
             self.simnet_events_tx().info(format!(
                 "Expanding program data account to {} bytes",
                 new_size
-            )));
+            ));
         }
 
         // Write the metadata
@@ -4315,7 +4315,7 @@ impl SurfnetSvmLocker {
             data.len(),
             program_id,
             offset
-        )));
+        ));
 
         Ok(program_data_account)
     }

@@ -4,7 +4,7 @@ use crossbeam::channel;
 use dialoguer::{Confirm, console::Style, theme::ColorfulTheme};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use log::{debug, error, info, trace, warn};
-use surfpool_types::SimnetEvent;
+use surfpool_types::{SimnetEvent, SimnetEventsTx};
 use tokio::{sync::RwLock, task::JoinHandle};
 use txtx_addon_network_svm::SvmNetworkAddon;
 use txtx_core::{
@@ -72,7 +72,7 @@ pub fn load_workspace_manifest_from_manifest_path(
 }
 
 pub async fn handle_execute_runbook_command(cmd: ExecuteRunbook) -> Result<(), String> {
-    let (simnet_events_tx, simnet_events_rx) = channel::unbounded();
+    let (simnet_events_tx, simnet_events_rx) = SimnetEventsTx::unbounded();
     let (progress_tx, progress_rx) = channel::unbounded();
 
     let _ = hiro_system_kit::thread_named("Runbook Execution Event Loop").spawn(move || {
@@ -131,7 +131,7 @@ pub async fn load_runbook_from_file_path(
 
 pub async fn execute_in_memory_runbook(
     progress_tx: Sender<BlockEvent>,
-    simnet_events_tx: crossbeam::channel::Sender<SimnetEvent>,
+    simnet_events_tx: SimnetEventsTx,
     cmd: ExecuteRunbook,
     do_setup_logger: bool,
     runbook_id: String,
@@ -155,7 +155,7 @@ pub async fn execute_in_memory_runbook(
 
 pub async fn execute_on_disk_runbook(
     progress_tx: Sender<BlockEvent>,
-    simnet_events_tx: crossbeam::channel::Sender<SimnetEvent>,
+    simnet_events_tx: SimnetEventsTx,
     cmd: ExecuteRunbook,
     do_setup_logger: bool,
 ) -> Result<(), String> {
@@ -190,7 +190,7 @@ pub async fn execute_on_disk_runbook(
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_runbook(
     progress_tx: Sender<BlockEvent>,
-    simnet_events_tx: crossbeam::channel::Sender<SimnetEvent>,
+    simnet_events_tx: SimnetEventsTx,
     cmd: ExecuteRunbook,
     do_setup_logger: bool,
     runbook_id: String,
@@ -243,7 +243,7 @@ pub async fn execute_runbook(
         ) {
             Ok(snapshot) => Some(snapshot),
             Err(e) => {
-                let _ = simnet_events_tx.send(SimnetEvent::warn(format!("{:?}", e)));
+                simnet_events_tx.warn(format!("{:?}", e));
                 None
             }
         }
@@ -259,19 +259,18 @@ pub async fn execute_runbook(
 
         for flow_context in runbook.flow_contexts.iter() {
             if old.flows.get(&flow_context.name).is_none() {
-                let _ = simnet_events_tx.send(SimnetEvent::info(format!(
+                simnet_events_tx.info(format!(
                     "Previous snapshot not found for flow {}",
                     flow_context.name
-                )));
+                ));
             };
         }
 
         let consolidated_changes = match ctx.diff(old, new) {
             Ok(changes) => changes,
             Err(e) => {
-                let _ =
-                    simnet_events_tx.send(SimnetEvent::warn("Failed to process runbook snapshot"));
-                let _ = simnet_events_tx.send(SimnetEvent::warn(e));
+                let _ = simnet_events_tx.warn("Failed to process runbook snapshot");
+                simnet_events_tx.warn(e);
                 return Ok(());
             }
         };
@@ -320,7 +319,7 @@ pub async fn execute_runbook(
     }
 
     if cmd.unsupervised {
-        let _ = simnet_events_tx.send(SimnetEvent::RunbookStarted(runbook_id.clone()));
+        simnet_events_tx.emit(SimnetEvent::RunbookStarted(runbook_id.clone()));
         let res = start_unsupervised_runbook_runloop(&mut runbook, &progress_tx).await;
         let diags = res
             .as_ref()
@@ -333,7 +332,7 @@ pub async fn execute_runbook(
             &simnet_events_tx,
             cmd.output_json,
         );
-        let _ = simnet_events_tx.send(SimnetEvent::RunbookCompleted(runbook_id, diags));
+        simnet_events_tx.emit(SimnetEvent::RunbookCompleted(runbook_id, diags));
         if !success {
             return Err("Runbook execution failed".to_string());
         }
@@ -357,7 +356,7 @@ pub async fn configure_supervised_execution(
     mut runbook: Runbook,
     runbook_state_location: Option<RunbookStateLocation>,
     cmd: &ExecuteRunbook,
-    simnet_events_tx: crossbeam::channel::Sender<SimnetEvent>,
+    simnet_events_tx: SimnetEventsTx,
 ) -> Result<(Sender<bool>, JoinHandle<()>), String> {
     #[cfg(feature = "supervisor_ui")]
     let runbook_name = runbook.runbook_id.name.clone();
@@ -452,11 +451,9 @@ pub async fn configure_supervised_execution(
             while let Ok(msg) = supervisor_events_rx.recv() {
                 match msg {
                     txtx_supervisor_ui::SupervisorEvents::Started(network_binding) => {
-                        let _ = moved_simnet_events_tx.send(SimnetEvent::info(
-                            "Starting the supervisor web console".to_string(),
-                        ));
                         let _ = moved_simnet_events_tx
-                            .send(SimnetEvent::info(format!("http://{}", network_binding)));
+                            .info("Starting the supervisor web console".to_string());
+                        let _ = moved_simnet_events_tx.info(format!("http://{}", network_binding));
                     }
                 }
             }
@@ -506,7 +503,7 @@ pub async fn configure_supervised_execution(
                         block_store.insert(len, new_block.clone());
                     }
                     BlockEvent::RunbookCompleted(_) => {
-                        let _ = simnet_events_tx.send(SimnetEvent::info("Runbook completed"));
+                        simnet_events_tx.info("Runbook completed");
                     }
                     BlockEvent::Error(new_block) => {
                         let len = block_store.len();
@@ -646,11 +643,11 @@ pub fn display_snapshot_diffing(
     Some(consolidated_changes)
 }
 
-fn log_diagnostic_lines(diags: Vec<Diagnostic>, simnet_events_tx: &Sender<SimnetEvent>) {
+fn log_diagnostic_lines(diags: Vec<Diagnostic>, simnet_events_tx: &SimnetEventsTx) {
     for diag in diags.iter() {
         let diag_str = diag.to_string();
         for line in diag_str.lines() {
-            let _ = simnet_events_tx.send(SimnetEvent::warn(line));
+            simnet_events_tx.warn(line);
         }
     }
 }
@@ -658,23 +655,23 @@ fn log_diagnostic_lines(diags: Vec<Diagnostic>, simnet_events_tx: &Sender<Simnet
 fn log_actions_to_execute(
     actions_to_execute: &IndexMap<String, Vec<(String, Option<String>)>>,
     is_first_time: bool,
-    simnet_events_tx: &Sender<SimnetEvent>,
+    simnet_events_tx: &SimnetEventsTx,
 ) {
     let msg = if is_first_time {
         "The following actions have been added and will be executed for the first time:"
     } else {
         "The following actions will be re-executed:"
     };
-    let _ = simnet_events_tx.send(SimnetEvent::info(msg));
+    simnet_events_tx.info(msg);
     let documentation_missing = black!("<description field empty>");
     for (context, actions) in actions_to_execute.iter() {
-        let _ = simnet_events_tx.send(SimnetEvent::info(context.to_string()));
+        simnet_events_tx.info(context.to_string());
         for (action_name, documentation) in actions.iter() {
-            let _ = simnet_events_tx.send(SimnetEvent::info(format!(
+            simnet_events_tx.info(format!(
                 "- {}: {}",
                 action_name,
                 documentation.as_ref().unwrap_or(&documentation_missing)
-            )));
+            ));
         }
     }
 }
@@ -682,21 +679,15 @@ fn log_actions_to_execute(
 fn write_runbook_transient_state(
     runbook: &mut Runbook,
     runbook_state_location: Option<RunbookStateLocation>,
-    simnet_events_tx: &Sender<SimnetEvent>,
+    simnet_events_tx: &SimnetEventsTx,
 ) {
     match runbook.mark_failed_and_write_transient_state(runbook_state_location) {
         Ok(Some(location)) => {
-            let _ = simnet_events_tx.send(SimnetEvent::warn(format!(
-                "! Saving transient state to {}",
-                location
-            )));
+            simnet_events_tx.warn(format!("! Saving transient state to {}", location));
         }
         Ok(None) => {}
         Err(e) => {
-            let _ = simnet_events_tx.send(SimnetEvent::warn(format!(
-                "x Failed to write transient runbook state: {}",
-                e
-            )));
+            simnet_events_tx.warn(format!("x Failed to write transient runbook state: {}", e));
         }
     };
 }
@@ -704,21 +695,15 @@ fn write_runbook_transient_state(
 fn write_runbook_state(
     runbook: &mut Runbook,
     runbook_state_location: Option<RunbookStateLocation>,
-    simnet_events_tx: &Sender<SimnetEvent>,
+    simnet_events_tx: &SimnetEventsTx,
 ) {
     match runbook.write_runbook_state(runbook_state_location) {
         Ok(Some(location)) => {
-            let _ = simnet_events_tx.send(SimnetEvent::info(format!(
-                "Saved execution state to {}",
-                location
-            )));
+            simnet_events_tx.info(format!("Saved execution state to {}", location));
         }
         Ok(None) => {}
         Err(e) => {
-            let _ = simnet_events_tx.send(SimnetEvent::warn(format!(
-                "Failed to write runbook state: {}",
-                e
-            )));
+            simnet_events_tx.warn(format!("Failed to write runbook state: {}", e));
         }
     };
 }
@@ -727,11 +712,11 @@ fn process_runbook_execution_output(
     execution_result: Result<(), Vec<Diagnostic>>,
     runbook: &mut Runbook,
     runbook_state_location: Option<RunbookStateLocation>,
-    simnet_events_tx: &Sender<SimnetEvent>,
+    simnet_events_tx: &SimnetEventsTx,
     output_json: Option<Option<String>>,
 ) -> bool {
     if let Err(diags) = execution_result {
-        let _ = simnet_events_tx.send(SimnetEvent::warn("Runbook execution aborted"));
+        simnet_events_tx.warn("Runbook execution aborted");
         log_diagnostic_lines(diags, simnet_events_tx);
         write_runbook_transient_state(runbook, runbook_state_location, simnet_events_tx);
         return false;
@@ -752,31 +737,27 @@ fn process_runbook_execution_output(
                         &get_json_converters(),
                     ) {
                         Ok(output_location) => {
-                            let _ = simnet_events_tx.send(SimnetEvent::info(format!(
-                                "Outputs written to {}",
-                                output_location
-                            )));
+                            simnet_events_tx
+                                .info(format!("Outputs written to {}", output_location));
                         }
                         Err(e) => {
-                            let _ = simnet_events_tx.send(SimnetEvent::warn(format!(
-                                "Failed to write runbook outputs: {}",
-                                e
-                            )));
+                            simnet_events_tx
+                                .warn(format!("Failed to write runbook outputs: {}", e));
                         }
                     }
                 } else {
-                    let _ = simnet_events_tx.send(SimnetEvent::info(
+                    simnet_events_tx.info(
                         serde_json::to_string_pretty(
                             &runbook_outputs.to_json(&get_json_converters()),
                         )
                         .unwrap(),
-                    ));
+                    );
                 }
             } else {
-                let _ = simnet_events_tx.send(SimnetEvent::debug(
+                simnet_events_tx.debug(
                     serde_json::to_string_pretty(&runbook_outputs.to_json(&get_json_converters()))
                         .unwrap(),
-                ));
+                );
             }
         }
         write_runbook_state(runbook, runbook_state_location, simnet_events_tx);
