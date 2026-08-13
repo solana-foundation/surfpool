@@ -311,9 +311,10 @@ impl SurfnetRemoteClient {
 
         let remote_accounts = self
             .client
-            .get_multiple_accounts(pubkeys)
+            .get_multiple_accounts_with_commitment(pubkeys, commitment_config)
             .await
-            .map_err(SurfpoolError::get_multiple_accounts)?;
+            .map_err(SurfpoolError::get_multiple_accounts)?
+            .value;
         debug!("Fetched {:?} accounts from remote", pubkeys);
         debug!(
             "Found accounts for pubkeys: {:#?}",
@@ -854,6 +855,62 @@ mod tests {
                 }
             }
         }
+    }
+
+    struct RecordsRequests {
+        requests: Arc<Mutex<Vec<(RpcRequest, serde_json::Value)>>>,
+    }
+
+    #[async_trait]
+    impl RpcSender for RecordsRequests {
+        async fn send(
+            &self,
+            request: RpcRequest,
+            params: serde_json::Value,
+        ) -> ClientResult<serde_json::Value> {
+            self.requests
+                .lock()
+                .expect("request recorder mutex should not be poisoned")
+                .push((request, params));
+            Ok(json!({
+                "context": { "slot": 1 },
+                "value": [null],
+            }))
+        }
+
+        fn get_transport_stats(&self) -> RpcTransportStats {
+            RpcTransportStats::default()
+        }
+
+        fn url(&self) -> String {
+            "http://records.example".to_string()
+        }
+    }
+
+    #[tokio::test]
+    async fn multiple_account_fetch_uses_the_requested_commitment() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let client = SurfnetRemoteClient {
+            client: RpcClient::new_sender(
+                RecordsRequests {
+                    requests: Arc::clone(&requests),
+                },
+                RpcClientConfig::default(),
+            ),
+        };
+
+        let pubkey = Pubkey::new_unique();
+        client
+            .get_multiple_accounts(&[pubkey], CommitmentConfig::confirmed())
+            .await
+            .expect("remote account fetch should succeed");
+
+        let requests = requests
+            .lock()
+            .expect("request recorder mutex should not be poisoned");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].0, RpcRequest::GetMultipleAccounts);
+        assert_eq!(requests[0].1[1]["commitment"], "confirmed");
     }
 
     /// A call that never completes, whether because the endpoint went quiet
