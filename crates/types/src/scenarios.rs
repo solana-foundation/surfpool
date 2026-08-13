@@ -1355,7 +1355,9 @@ mod tests {
                     source: Box::new(SeedError::InvalidPubkey("garbage".to_string())),
                 }
                 .to_string(),
-                format!("seed 1 of derived PDA for program {program}: 'garbage' is not a valid pubkey"),
+                format!(
+                    "seed 1 of derived PDA for program {program}: 'garbage' is not a valid pubkey"
+                ),
             ),
             (
                 ScenarioError::InvalidAddress(SeedError::InvalidPubkey("garbage".to_string()))
