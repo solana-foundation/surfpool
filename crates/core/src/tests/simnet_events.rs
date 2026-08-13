@@ -3,10 +3,7 @@
 //! The channel is bounded(1024) and the sender is a [`SimnetEventsTx`],
 //! which owns the two delivery policies: `log` is lossy by contract
 //! (telemetry may drop under backpressure), `emit` is lossless (lifecycle
-//! events block until the reader drains). The first commit on this branch
-//! pinned the old behavior, where every core send was a silent `try_send`
-//! and a full buffer dropped an `Aborted` exactly like a log line; these
-//! tests assert the split that replaced it.
+//! events block until the reader drains).
 
 use surfpool_types::SimnetEvent;
 

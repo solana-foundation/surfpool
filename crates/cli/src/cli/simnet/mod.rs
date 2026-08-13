@@ -221,7 +221,7 @@ pub async fn handle_start_local_surfnet_command(
             );
             if let Err(e) = hiro_system_kit::nestable_block_on(future) {
                 // Send the error through the event channel so the main thread can handle it
-                simnet_events_tx_for_thread.emit(SimnetEvent::Aborted(e.to_string()));
+                simnet_events_tx_for_thread.aborted(e.to_string());
             }
             Ok::<(), String>(())
         })
@@ -638,7 +638,7 @@ pub(crate) fn replay_early_events(
     let tx = simnet_events_tx.clone();
     let _ = hiro_system_kit::thread_named("early-event-replay").spawn(move || {
         for event in early_events.into_iter().chain(airdrop_events) {
-            tx.emit(event);
+            tx.forward(event);
         }
         Ok::<(), String>(())
     });
@@ -654,9 +654,10 @@ mod replay_tests {
 
     /// Startup calls the replay on the thread that owns the only receiver,
     /// and concurrent producers may already have refilled the buffer, so
-    /// the call must return without waiting on a drain; the events follow
-    /// once the consumer starts. Small capacity for speed; the mechanism is
-    /// capacity-independent.
+    /// the call must return without waiting on a drain. Buffered events
+    /// route by class: lifecycle events arrive once the consumer drains;
+    /// telemetry may drop, telemetry's standing contract. Small capacity
+    /// for speed; the mechanism is capacity-independent.
     #[test]
     fn replay_returns_before_the_consumer_drains() {
         let (tx, rx) = SimnetEventsTx::channel(4);
@@ -666,7 +667,14 @@ mod replay_tests {
 
         let replay_tx = tx.clone();
         let replayer = thread::spawn(move || {
-            replay_early_events(&replay_tx, vec![SimnetEvent::info("replayed")], vec![]);
+            replay_early_events(
+                &replay_tx,
+                vec![
+                    SimnetEvent::info("telemetry, droppable"),
+                    SimnetEvent::RunbookStarted("lifecycle, must arrive".to_string()),
+                ],
+                vec![],
+            );
         });
 
         thread::sleep(Duration::from_millis(300));
@@ -675,14 +683,18 @@ mod replay_tests {
             "replay must not block the receiver-owning thread on a full buffer"
         );
 
-        // The consumer drains, as log_events/start_app do; every event
-        // arrives, the replayed one behind the producers.
+        // The consumer drains, as log_events/start_app do. The four producer
+        // events and the lifecycle event arrive; the telemetry line found
+        // the buffer full and dropped.
         let received: Vec<SimnetEvent> = (0..5)
             .map(|_| {
                 rx.recv_timeout(Duration::from_secs(5))
-                    .expect("every event arrives once the consumer drains")
+                    .expect("every surviving event arrives once the consumer drains")
             })
             .collect();
-        assert!(matches!(&received[4], SimnetEvent::InfoLog(_, msg) if msg == "replayed"));
+        assert!(
+            matches!(&received[4], SimnetEvent::RunbookStarted(msg) if msg == "lifecycle, must arrive")
+        );
+        assert!(rx.try_recv().is_err(), "nothing else was queued");
     }
 }

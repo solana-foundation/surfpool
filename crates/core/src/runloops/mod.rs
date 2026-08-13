@@ -199,11 +199,11 @@ pub async fn start_local_surfnet_runloop(
     if let Some(remote_client) = &remote_rpc_client {
         svm_locker
             .simnet_events_tx()
-            .emit(SimnetEvent::Connected(remote_client.client.url()));
+            .connected(remote_client.client.url());
     }
     svm_locker
         .simnet_events_tx()
-        .emit(SimnetEvent::EpochInfoUpdate(svm_locker.get_epoch_info()));
+        .epoch_info_update(svm_locker.get_epoch_info());
 
     svm_locker.airdrop_pubkeys(simnet.airdrop_token_amount, &simnet.airdrop_addresses);
 
@@ -329,7 +329,7 @@ pub async fn start_local_surfnet_runloop(
             simnet_events_tx_cc.error(format!("Failed to seal startup plan: {error}"));
         }
     }
-    simnet_events_tx_cc.emit(SimnetEvent::CoreStarted(initial_transaction_count));
+    simnet_events_tx_cc.core_started(initial_transaction_count);
 
     // Notify geyser plugins that startup is complete
     let _ = svm_locker.with_svm_reader(|svm| svm.geyser_events_tx.send(GeyserEvent::EndOfStartup));
@@ -473,7 +473,7 @@ pub async fn start_block_production_runloop(
                             svm_writer.latest_epoch_info.slot_index = clock.slot;
                             svm_writer.latest_epoch_info.epoch = clock.epoch;
                             svm_writer.latest_epoch_info.absolute_slot = clock.slot + clock.epoch * svm_writer.latest_epoch_info.slots_in_epoch;
-                            svm_writer.simnet_events_tx.log(SimnetEvent::SystemClockUpdated(clock));
+                            svm_writer.simnet_events_tx.system_clock_updated(clock);
                         });
                     }
                     SimnetCommand::UpdateInternalClockWithConfirmation(_, clock, response_tx) => {
@@ -492,7 +492,7 @@ pub async fn start_block_production_runloop(
                             svm_writer.latest_epoch_info.slot_index = clock.slot;
                             svm_writer.latest_epoch_info.epoch = clock.epoch;
                             svm_writer.latest_epoch_info.absolute_slot = clock.slot + clock.epoch * svm_writer.latest_epoch_info.slots_in_epoch;
-                            svm_writer.simnet_events_tx.log(SimnetEvent::SystemClockUpdated(clock));
+                            svm_writer.simnet_events_tx.system_clock_updated(clock);
                             svm_writer.latest_epoch_info.clone()
                         });
 
@@ -652,22 +652,19 @@ pub fn start_clock_runloop(
                 Ok(ClockCommand::Pause) => {
                     enabled = false;
                     if let Some(ref simnet_events_tx) = simnet_events_tx {
-                        let _ =
-                            simnet_events_tx.emit(SimnetEvent::ClockUpdate(ClockCommand::Pause));
+                        let _ = simnet_events_tx.clock_update(ClockCommand::Pause);
                     }
                 }
                 Ok(ClockCommand::Resume) => {
                     enabled = true;
                     if let Some(ref simnet_events_tx) = simnet_events_tx {
-                        let _ =
-                            simnet_events_tx.emit(SimnetEvent::ClockUpdate(ClockCommand::Resume));
+                        let _ = simnet_events_tx.clock_update(ClockCommand::Resume);
                     }
                 }
                 Ok(ClockCommand::Toggle) => {
                     enabled = !enabled;
                     if let Some(ref simnet_events_tx) = simnet_events_tx {
-                        let _ =
-                            simnet_events_tx.emit(SimnetEvent::ClockUpdate(ClockCommand::Toggle));
+                        let _ = simnet_events_tx.clock_update(ClockCommand::Toggle);
                     }
                 }
                 Ok(ClockCommand::UpdateSlotInterval(updated_slot_time)) => {
@@ -678,8 +675,7 @@ pub fn start_clock_runloop(
                     // If it reaches here, just treat it as a regular Pause
                     enabled = false;
                     if let Some(ref simnet_events_tx) = simnet_events_tx {
-                        let _ =
-                            simnet_events_tx.emit(SimnetEvent::ClockUpdate(ClockCommand::Pause));
+                        let _ = simnet_events_tx.clock_update(ClockCommand::Pause);
                     }
                 }
                 Err(_e) => {}
@@ -1040,14 +1036,14 @@ async fn start_http_rpc_server_runloop(
                 Err(e) => {
                     let error = format!("Failed to start RPC server: {:?}", e);
                     let _ = close_handle_tx.send(Err(error.clone()));
-                    simnet_events_tx.emit(SimnetEvent::Aborted(error));
+                    simnet_events_tx.aborted(error);
                     return;
                 }
             };
 
             let _ = close_handle_tx.send(Ok(server.close_handle()));
             server.wait();
-            simnet_events_tx.emit(SimnetEvent::Shutdown);
+            simnet_events_tx.shutdown();
         })
         .map_err(|e| format!("Failed to spawn RPC Handler thread: {:?}", e))?;
 
@@ -1123,7 +1119,7 @@ async fn start_ws_rpc_server_runloop(
                     Err(e) => {
                         let error = format!("Failed to start WebSocket RPC server: {:?}", e);
                         let _ = close_handle_tx.send(Err(error.clone()));
-                        simnet_events_tx.emit(SimnetEvent::Aborted(error));
+                        simnet_events_tx.aborted(error);
                         return;
                     }
                 };
@@ -1135,7 +1131,7 @@ async fn start_ws_rpc_server_runloop(
                 .await
                 .ok();
 
-                simnet_events_tx.emit(SimnetEvent::Shutdown);
+                simnet_events_tx.shutdown();
             });
         })
         .map_err(|e| format!("Failed to spawn WebSocket RPC Handler thread: {:?}", e))?;

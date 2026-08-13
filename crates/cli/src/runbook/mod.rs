@@ -319,7 +319,7 @@ pub async fn execute_runbook(
     }
 
     if cmd.unsupervised {
-        simnet_events_tx.emit(SimnetEvent::RunbookStarted(runbook_id.clone()));
+        simnet_events_tx.runbook_started(runbook_id.clone());
         let res = start_unsupervised_runbook_runloop(&mut runbook, &progress_tx).await;
         let diags = res
             .as_ref()
@@ -332,7 +332,7 @@ pub async fn execute_runbook(
             &simnet_events_tx,
             cmd.output_json,
         );
-        simnet_events_tx.emit(SimnetEvent::RunbookCompleted(runbook_id, diags));
+        simnet_events_tx.runbook_completed(runbook_id, diags);
         if !success {
             return Err("Runbook execution failed".to_string());
         }

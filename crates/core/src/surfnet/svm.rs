@@ -1619,9 +1619,7 @@ impl SurfnetSvm {
         // Notify program subscribers
         self.notify_program_subscribers(pubkey, &account);
 
-        let _ = self
-            .simnet_events_tx
-            .log(SimnetEvent::account_update(*pubkey));
+        let _ = self.simnet_events_tx.account_update(*pubkey);
         Ok(())
     }
 
@@ -2057,10 +2055,7 @@ impl SurfnetSvm {
             let transaction_meta = convert_transaction_metadata_from_canonical(&meta);
 
             self.simnet_events_tx
-                .log(SimnetEvent::transaction_processed(
-                    transaction_meta,
-                    Some(err.clone()),
-                ));
+                .transaction_processed(transaction_meta, Some(err.clone()));
             return Err(FailedTransactionMetadata { err, meta });
         }
 
@@ -2071,10 +2066,7 @@ impl SurfnetSvm {
                     convert_transaction_metadata_from_canonical(&tx_failure.meta);
 
                 self.simnet_events_tx
-                    .log(SimnetEvent::transaction_processed(
-                        transaction_meta,
-                        Some(tx_failure.err.clone()),
-                    ));
+                    .transaction_processed(transaction_meta, Some(tx_failure.err.clone()));
                 Err(tx_failure)
             }
         }
@@ -2525,9 +2517,7 @@ impl SurfnetSvm {
             leader_schedule_epoch: 0, // todo
         };
 
-        let _ = self
-            .simnet_events_tx
-            .log(SimnetEvent::SystemClockUpdated(clock.clone()));
+        let _ = self.simnet_events_tx.system_clock_updated(clock.clone());
         self.inner.set_sysvar(&clock);
 
         self.finalize_transactions()?;
@@ -3887,13 +3877,8 @@ impl SurfnetSvm {
         // subscriber exists yet, so a late subscriber's first borrow() is current.
         self.startup_status_watch_tx
             .send_replace(self.startup_status.clone());
-        // log, not emit: callers hold the SVM write guard, and the bounded
-        // events channel may belong to an embedder that never drains it. The
-        // watch channel above is the reliable path; the event stream is a
-        // best effort sequence, and dropping an entry must not wedge the SVM.
-        self.simnet_events_tx.log(SimnetEvent::StartupStatusChanged(
-            self.startup_status.clone(),
-        ));
+        self.simnet_events_tx
+            .startup_status_changed(self.startup_status.clone());
     }
 
     pub fn complete_runbook_execution(&mut self, runbook_id: &str, error: Option<Vec<String>>) {

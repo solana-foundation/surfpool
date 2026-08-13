@@ -55,9 +55,9 @@ use solana_transaction_status::{
 use surfpool_types::{
     AccountSnapshot, ComputeUnitsEstimationResult, ExecutionCapture, ExportSnapshotConfig, Idl,
     KeyedProfileResult, ProfileResult, RpcProfileResultConfig, RunbookExecutionStatusReport,
-    SimnetCommand, SimnetEvent, SimnetEventsTx, StartupError, SurfnetStartupStatus,
-    SurfnetStartupTask, TransactionConfirmationStatus, TransactionStatusEvent,
-    UiKeyedProfileResult, UuidOrSignature, VersionedIdl,
+    SimnetCommand, SimnetEventsTx, StartupError, SurfnetStartupStatus, SurfnetStartupTask,
+    TransactionConfirmationStatus, TransactionStatusEvent, UiKeyedProfileResult, UuidOrSignature,
+    VersionedIdl,
 };
 use tokio::sync::RwLock;
 use txtx_addon_kit::indexmap::IndexSet;
@@ -2121,10 +2121,7 @@ impl SurfnetSvmLocker {
                 );
                 svm_writer
                     .simnet_events_tx
-                    .log(SimnetEvent::transaction_processed(
-                        meta_canonical,
-                        Some(err),
-                    ));
+                    .transaction_processed(meta_canonical, Some(err));
                 Ok::<(), SurfpoolError>(())
             })?;
         }
@@ -2289,7 +2286,7 @@ impl SurfnetSvmLocker {
 
                 svm_writer
                     .simnet_events_tx
-                    .log(SimnetEvent::transaction_processed(transaction_meta, None));
+                    .transaction_processed(transaction_meta, None);
 
                 let _ = svm_writer
                     .geyser_events_tx

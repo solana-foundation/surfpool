@@ -10,8 +10,7 @@ use notify::{
 };
 use solana_pubkey::Pubkey;
 use surfpool_types::{
-    SimnetCommand, SimnetEvent, SimnetEventsTx, StartupError, SurfnetStartupPhase,
-    SurfnetStartupTask,
+    SimnetCommand, SimnetEventsTx, StartupError, SurfnetStartupPhase, SurfnetStartupTask,
 };
 use txtx_core::{
     kit::{
@@ -130,9 +129,7 @@ pub(super) fn watch_startup_until_completion(
         _ => None,
     };
     if let Some(error) = failure {
-        events_tx.emit(SimnetEvent::Aborted(format!(
-            "Surfpool startup failed: {error}"
-        )));
+        events_tx.aborted(format!("Surfpool startup failed: {error}"));
         let _ = commands_tx.send(SimnetCommand::Terminate(None));
     }
 }
