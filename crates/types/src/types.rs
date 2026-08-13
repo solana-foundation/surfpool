@@ -569,6 +569,67 @@ impl SimnetEvent {
     }
 }
 
+/// Sending half of the simnet events channel.
+///
+/// Owns the delivery policy so call sites state intent only: `log` may drop
+/// under backpressure; `emit` may not, and blocks until the reader drains.
+/// The channel is bounded, so without this split every sender re-decides the
+/// policy inline, and a dropped lifecycle event silently breaks any frontend
+/// holding a model of the surfnet.
+#[derive(Clone, Debug)]
+pub struct SimnetEventsTx(Sender<SimnetEvent>);
+
+impl SimnetEventsTx {
+    pub fn channel(capacity: usize) -> (Self, crossbeam_channel::Receiver<SimnetEvent>) {
+        let (tx, rx) = crossbeam_channel::bounded(capacity);
+        (Self(tx), rx)
+    }
+
+    /// An unbounded sender for buffering contexts (the bundle sandbox), where
+    /// the reader is the code that created the channel and drains it fully.
+    /// `log` and `emit` are equivalent on an unbounded channel.
+    pub fn unbounded() -> (Self, crossbeam_channel::Receiver<SimnetEvent>) {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        (Self(tx), rx)
+    }
+
+    /// Telemetry, lossy by contract: dropping a log line under load is the
+    /// chosen behavior, stated here once instead of at every call site.
+    pub fn info(&self, msg: impl Into<String>) {
+        self.log(SimnetEvent::info(msg));
+    }
+
+    pub fn warn(&self, msg: impl Into<String>) {
+        self.log(SimnetEvent::warn(msg));
+    }
+
+    pub fn error(&self, msg: impl Into<String>) {
+        self.log(SimnetEvent::error(msg));
+    }
+
+    pub fn debug(&self, msg: impl Into<String>) {
+        self.log(SimnetEvent::debug(msg));
+    }
+
+    /// Lossy delivery for log-class events: under backpressure the event is
+    /// dropped rather than stalling the sender.
+    pub fn log(&self, event: SimnetEvent) {
+        let _ = self.0.try_send(event);
+    }
+
+    /// Lossless delivery for lifecycle events: blocks on a full buffer. A
+    /// disconnected receiver means shutdown, and the event no longer has an
+    /// audience.
+    ///
+    /// Never call this while holding the SVM lock: the reader may need that
+    /// lock to drain, so a blocked emit under the guard wedges every thread
+    /// behind it. Guard-context code sends with `log` and the receiver
+    /// recovers state it missed by reading the SVM, not the event stream.
+    pub fn emit(&self, event: SimnetEvent) {
+        let _ = self.0.send(event);
+    }
+}
+
 #[derive(Debug)]
 pub enum TransactionStatusEvent {
     Success(TransactionConfirmationStatus),
@@ -2149,5 +2210,56 @@ mod tests {
 
         let config: SurfpoolConfig = serde_json::from_value(config_json).unwrap();
         assert_eq!(config.startup_planner, StartupPlanner::Runloop);
+    }
+}
+
+#[cfg(test)]
+mod simnet_events_tx_tests {
+    use super::*;
+
+    /// `log` returns immediately on a full buffer and the event is gone.
+    #[test]
+    fn log_drops_on_a_full_buffer() {
+        let (tx, rx) = SimnetEventsTx::channel(1);
+        tx.info("first");
+        tx.info("second");
+
+        let received: Vec<SimnetEvent> = rx.try_iter().collect();
+        assert_eq!(received.len(), 1);
+        assert!(
+            matches!(&received[0], SimnetEvent::InfoLog(_, msg) if msg == "first"),
+            "the buffer kept the first event and dropped the second"
+        );
+    }
+
+    /// `emit` blocks on a full buffer and delivers once the reader drains.
+    #[test]
+    fn emit_blocks_until_the_reader_drains() {
+        let (tx, rx) = SimnetEventsTx::channel(1);
+        tx.info("filler");
+
+        let sender = std::thread::spawn(move || {
+            tx.emit(SimnetEvent::Aborted("must arrive".to_string()));
+        });
+
+        // The abort cannot be in the buffer until the filler is drained.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            matches!(rx.recv().unwrap(), SimnetEvent::InfoLog(_, _)),
+            "the filler is still first in line"
+        );
+        let next = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the blocked emit completes once there is room");
+        assert!(matches!(next, SimnetEvent::Aborted(msg) if msg == "must arrive"));
+        sender.join().unwrap();
+    }
+
+    /// `emit` returns rather than panicking when the receiver is gone.
+    #[test]
+    fn emit_shrugs_at_a_disconnected_receiver() {
+        let (tx, rx) = SimnetEventsTx::channel(1);
+        drop(rx);
+        tx.emit(SimnetEvent::Aborted("no audience".to_string()));
     }
 }
