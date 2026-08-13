@@ -1607,13 +1607,29 @@ mod tests {
         assert_eq!(seed.to_bytes(Some(&values)), Ok(vec![2, 1]));
     }
 
+    /// Every non-u16 string reports `WrongType`, including "65536": the
+    /// string path rejects at the parse, so an overflowing decimal string
+    /// reports the type, not the range. Only JSON numbers get
+    /// `U16OutOfRange`.
     #[test]
     fn u16_be_ref_rejects_strings_that_are_not_a_u16() {
         let seed = PdaSeed::U16BeRef("index".to_string());
 
         for value in [json!("65536"), json!("abc"), json!("-1"), json!("")] {
             let values = HashMap::from([("index".to_string(), value.clone())]);
-            assert!(seed.to_bytes(Some(&values)).is_err(), "value {value}");
+            let err = seed
+                .to_bytes(Some(&values))
+                .expect_err(&format!("value {value}"));
+            assert_eq!(
+                err,
+                SeedError::WrongType {
+                    name: "index".to_string(),
+                    expected: "u16",
+                    found: "string",
+                },
+                "value {value}"
+            );
+            assert_eq!(err.to_string(), "property 'index' is string, expected u16");
         }
     }
 
