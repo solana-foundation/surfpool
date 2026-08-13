@@ -8,6 +8,7 @@ use serde_json::json;
 use solana_client::{client_error::ClientError, rpc_request::TokenAccountsFilter};
 use solana_clock::Slot;
 use solana_pubkey::Pubkey;
+use solana_signature::Signature;
 use solana_transaction::TransactionError;
 use solana_transaction_status::EncodeError;
 
@@ -137,6 +138,18 @@ impl SurfpoolError {
         error.data = Some(json!(format!(
             "Failed to fetch account {} from remote: {}",
             pubkey,
+            e.to_string()
+        )));
+        Self(error)
+    }
+
+    pub fn get_transaction<T>(signature: Signature, e: T) -> Self
+    where
+        T: ToString,
+    {
+        let mut error = Error::internal_error();
+        error.data = Some(json!(format!(
+            "Failed to fetch transaction {signature} from remote: {}",
             e.to_string()
         )));
         Self(error)

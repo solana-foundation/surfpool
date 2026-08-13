@@ -1517,9 +1517,9 @@ impl SurfnetSvmLocker {
         let local_result = self.get_transaction_local(signature, &config)?;
         let latest_absolute_slot = self.get_latest_absolute_slot();
         if local_result.is_none() {
-            Ok(client
-                .get_transaction(*signature, config, latest_absolute_slot)
-                .await)
+            client
+                .try_get_transaction(*signature, config, latest_absolute_slot)
+                .await
         } else {
             Ok(local_result)
         }
