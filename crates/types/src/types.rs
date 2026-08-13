@@ -593,20 +593,22 @@ impl SimnetEventsTx {
         (Self(tx), rx)
     }
 
-    /// Telemetry, lossy by contract: dropping a log line under load is the
-    /// chosen behavior, stated here once instead of at every call site.
+    /// Lossy ([`Self::log`]): may drop under backpressure.
     pub fn info(&self, msg: impl Into<String>) {
         self.log(SimnetEvent::info(msg));
     }
 
+    /// Lossy ([`Self::log`]): may drop under backpressure.
     pub fn warn(&self, msg: impl Into<String>) {
         self.log(SimnetEvent::warn(msg));
     }
 
+    /// Lossy ([`Self::log`]): may drop under backpressure.
     pub fn error(&self, msg: impl Into<String>) {
         self.log(SimnetEvent::error(msg));
     }
 
+    /// Lossy ([`Self::log`]): may drop under backpressure.
     pub fn debug(&self, msg: impl Into<String>) {
         self.log(SimnetEvent::debug(msg));
     }
@@ -626,6 +628,105 @@ impl SimnetEventsTx {
     /// behind it.
     pub fn emit(&self, event: SimnetEvent) {
         let _ = self.0.send(event);
+    }
+
+    /// Routes a pre-built event by its class: telemetry and guard-context
+    /// state events go through `log`, lifecycle events through `emit`. For
+    /// forwarding buffered events (the startup replay); a new call site
+    /// names its event instead.
+    pub fn forward(&self, event: SimnetEvent) {
+        match &event {
+            SimnetEvent::InfoLog(..)
+            | SimnetEvent::WarnLog(..)
+            | SimnetEvent::ErrorLog(..)
+            | SimnetEvent::DebugLog(..)
+            | SimnetEvent::SystemClockUpdated(..)
+            | SimnetEvent::StartupStatusChanged(..)
+            | SimnetEvent::AccountUpdate(..) => self.log(event),
+            _ => self.emit(event),
+        }
+    }
+
+    /// Lossless ([`Self::emit`]): blocks on a full buffer; never call
+    /// while holding the SVM lock.
+    pub fn core_started(&self, replayed_transaction_count: u64) {
+        self.emit(SimnetEvent::CoreStarted(replayed_transaction_count));
+    }
+
+    /// Lossless ([`Self::emit`]): blocks on a full buffer; never call
+    /// while holding the SVM lock.
+    pub fn connected(&self, url: impl Into<String>) {
+        self.emit(SimnetEvent::Connected(url.into()));
+    }
+
+    /// Lossless ([`Self::emit`]): blocks on a full buffer; never call
+    /// while holding the SVM lock.
+    pub fn aborted(&self, reason: impl Into<String>) {
+        self.emit(SimnetEvent::Aborted(reason.into()));
+    }
+
+    /// Lossless ([`Self::emit`]): blocks on a full buffer; never call
+    /// while holding the SVM lock.
+    pub fn shutdown(&self) {
+        self.emit(SimnetEvent::Shutdown);
+    }
+
+    /// Lossless ([`Self::emit`]): blocks on a full buffer; never call
+    /// while holding the SVM lock.
+    pub fn clock_update(&self, command: ClockCommand) {
+        self.emit(SimnetEvent::ClockUpdate(command));
+    }
+
+    /// Lossless ([`Self::emit`]): blocks on a full buffer; never call
+    /// while holding the SVM lock.
+    pub fn epoch_info_update(&self, epoch_info: EpochInfo) {
+        self.emit(SimnetEvent::EpochInfoUpdate(epoch_info));
+    }
+
+    /// Lossless ([`Self::emit`]): blocks on a full buffer; never call
+    /// while holding the SVM lock.
+    pub fn runbook_started(&self, runbook_id: impl Into<String>) {
+        self.emit(SimnetEvent::RunbookStarted(runbook_id.into()));
+    }
+
+    /// Lossless ([`Self::emit`]): blocks on a full buffer; never call
+    /// while holding the SVM lock.
+    pub fn runbook_completed(
+        &self,
+        runbook_id: impl Into<String>,
+        diagnostics: Option<Vec<String>>,
+    ) {
+        self.emit(SimnetEvent::RunbookCompleted(
+            runbook_id.into(),
+            diagnostics,
+        ));
+    }
+
+    /// Senders hold the SVM lock when startup transitions publish, so this
+    /// logs: a blocked send under the guard wedges every thread behind it,
+    /// and the startup watch channel is the reliable readiness signal.
+    pub fn startup_status_changed(&self, status: SurfnetStartupStatus) {
+        self.log(SimnetEvent::StartupStatusChanged(status));
+    }
+
+    /// Senders hold the SVM lock; logs for the same reason as
+    /// [`Self::startup_status_changed`]. Readers recover the clock from the
+    /// SVM.
+    pub fn system_clock_updated(&self, clock: Clock) {
+        self.log(SimnetEvent::SystemClockUpdated(clock));
+    }
+
+    /// Senders hold the SVM lock; logs for the same reason as
+    /// [`Self::startup_status_changed`]. The transaction is in storage and
+    /// queryable regardless.
+    pub fn transaction_processed(&self, meta: TransactionMetadata, err: Option<TransactionError>) {
+        self.log(SimnetEvent::transaction_processed(meta, err));
+    }
+
+    /// Senders hold the SVM lock; logs for the same reason as
+    /// [`Self::startup_status_changed`]. The account state is in the SVM.
+    pub fn account_update(&self, pubkey: Pubkey) {
+        self.log(SimnetEvent::account_update(pubkey));
     }
 }
 
