@@ -629,9 +629,19 @@ pub(crate) fn replay_early_events(
     early_events: Vec<SimnetEvent>,
     airdrop_events: Vec<SimnetEvent>,
 ) {
-    for event in early_events.into_iter().chain(airdrop_events) {
-        simnet_events_tx.emit(event);
-    }
+    // On a separate thread: the caller owns the only receiver and does not
+    // drain again until the frontend consumer starts, so a blocking emit on
+    // the caller's thread wedges startup once the buffer fills (a warm
+    // start can buffer a full channel of replayed transactions before
+    // CoreStarted). The replay thread blocks until the consumer drains,
+    // intentionally.
+    let tx = simnet_events_tx.clone();
+    let _ = hiro_system_kit::thread_named("early-event-replay").spawn(move || {
+        for event in early_events.into_iter().chain(airdrop_events) {
+            tx.emit(event);
+        }
+        Ok::<(), String>(())
+    });
 }
 
 #[cfg(test)]
