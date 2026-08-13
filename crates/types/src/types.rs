@@ -623,8 +623,7 @@ impl SimnetEventsTx {
     ///
     /// Never call this while holding the SVM lock: the reader may need that
     /// lock to drain, so a blocked emit under the guard wedges every thread
-    /// behind it. Guard-context code sends with `log` and the receiver
-    /// recovers state it missed by reading the SVM, not the event stream.
+    /// behind it.
     pub fn emit(&self, event: SimnetEvent) {
         let _ = self.0.send(event);
     }
