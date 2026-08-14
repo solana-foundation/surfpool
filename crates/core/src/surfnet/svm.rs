@@ -2305,12 +2305,16 @@ impl SurfnetSvm {
 
         // A database result includes its own associated programdata or mint
         // account. Prefer that complete local representation to a stale
-        // fetched result, while still allowing each component to preserve a
-        // newer LiteSVM value below.
+        // fetched result. Conversely, a live primary makes the entire fetched
+        // result stale: do not install its coupled mint or programdata before
+        // skipping the primary, or the live account could observe mismatched
+        // dependency state.
         if local.requires_update() {
             Ok(local)
-        } else {
+        } else if local.is_none() {
             Ok(account_update)
+        } else {
+            Ok(GetAccountResult::None(pubkey))
         }
     }
 
@@ -4500,6 +4504,61 @@ mod tests {
             program_data_address,
             program_data_account,
         )
+    }
+
+    #[test]
+    fn hydrate_if_absent_skips_coupled_dependencies_when_primary_is_live() {
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let local_primary = Account {
+            lamports: 1,
+            data: vec![1],
+            owner: Pubkey::new_unique(),
+            executable: false,
+            rent_epoch: 0,
+        };
+        let fetched_primary = Account {
+            lamports: 2,
+            data: vec![2],
+            owner: Pubkey::new_unique(),
+            executable: false,
+            rent_epoch: 0,
+        };
+
+        let token_primary = Pubkey::new_unique();
+        let token_mint = Pubkey::new_unique();
+        svm.set_account(&token_primary, local_primary.clone())
+            .unwrap();
+        svm.apply_account_update(
+            GetAccountResult::FoundTokenAccount(
+                (token_primary, fetched_primary.clone()),
+                (token_mint, Some(fetched_primary.clone())),
+            ),
+            AccountUpdatePolicy::HydrateIfAbsent,
+        )
+        .unwrap();
+        assert_eq!(
+            svm.get_account(&token_primary).unwrap(),
+            Some(local_primary.clone())
+        );
+        assert!(svm.inner.get_account_no_db(&token_mint).is_none());
+
+        let program_primary = Pubkey::new_unique();
+        let programdata = Pubkey::new_unique();
+        svm.set_account(&program_primary, local_primary.clone())
+            .unwrap();
+        svm.apply_account_update(
+            GetAccountResult::FoundProgramAccount(
+                (program_primary, fetched_primary.clone()),
+                (programdata, Some(fetched_primary)),
+            ),
+            AccountUpdatePolicy::HydrateIfAbsent,
+        )
+        .unwrap();
+        assert_eq!(
+            svm.get_account(&program_primary).unwrap(),
+            Some(local_primary)
+        );
+        assert!(svm.inner.get_account_no_db(&programdata).is_none());
     }
 
     #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
