@@ -117,6 +117,17 @@ lazy_static::lazy_static! {
     };
 }
 
+/// Determines whether an account result is an authoritative state change or
+/// a best-effort cache hydration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AccountUpdatePolicy {
+    /// Replace local state with the supplied account update.
+    Authoritative,
+    /// Keep any live LiteSVM state and rehydrate database-only state instead
+    /// of replacing it with a fetched result.
+    HydrateIfAbsent,
+}
+
 /// Helper function to apply an override to a decoded account value using dot notation
 pub fn apply_override_to_decoded_account(
     decoded_value: &mut Value,
@@ -2235,98 +2246,28 @@ impl SurfnetSvm {
         Ok(())
     }
 
-    /// Writes account updates to the SVM state based on the provided account update result.
-    ///
-    /// # Arguments
-    /// * `account_update` - The account update result to process.
-    pub fn write_account_update(&mut self, account_update: GetAccountResult) {
-        let init_programdata_account = |program_account: &Account| {
-            if !program_account.executable {
-                return None;
-            }
-            if !program_account
-                .owner
-                .eq(&solana_sdk_ids::bpf_loader_upgradeable::id())
-            {
-                return None;
-            }
-            let Ok(UpgradeableLoaderState::Program {
-                programdata_address,
-            }) = bincode::deserialize::<UpgradeableLoaderState>(&program_account.data)
-            else {
-                return None;
-            };
+    /// Materializes an account lookup result into the SVM according to its
+    /// source policy. This is the sole insertion path for `GetAccountResult`;
+    /// callers must state whether the result is authoritative or cache-only.
+    pub(crate) fn apply_account_update(
+        &mut self,
+        account_update: GetAccountResult,
+        policy: AccountUpdatePolicy,
+    ) -> SurfpoolResult<()> {
+        let account_update = self.account_update_for_policy(account_update, policy)?;
 
-            let programdata_state = UpgradeableLoaderState::ProgramData {
-                upgrade_authority_address: Some(system_program::id()),
-                slot: self.get_latest_absolute_slot(),
-            };
-            let mut data = bincode::serialize(&programdata_state).unwrap();
-
-            data.extend_from_slice(crate::surfnet::noop_program::NOOP_PROGRAM_ELF);
-            let lamports = self.inner.minimum_balance_for_rent_exemption(data.len());
-            Some((
-                programdata_address,
-                Account {
-                    lamports,
-                    data,
-                    owner: solana_sdk_ids::bpf_loader_upgradeable::id(),
-                    executable: false,
-                    rent_epoch: 0,
-                },
-            ))
-        };
         match account_update {
-            GetAccountResult::FoundAccount(pubkey, account, do_update_account) => {
-                if do_update_account {
-                    if let Some((programdata_address, programdata_account)) =
-                        init_programdata_account(&account)
-                    {
-                        match self.get_account(&programdata_address) {
-                            Ok(None) => {
-                                if let Err(e) =
-                                    self.set_account(&programdata_address, programdata_account)
-                                {
-                                    let _ = self.simnet_events_tx.error(e.to_string());
-                                }
-                            }
-                            Ok(Some(_)) => {}
-                            Err(e) => {
-                                let _ = self.simnet_events_tx.error(e.to_string());
-                            }
-                        }
-                    }
-                    if let Err(e) = self.set_account(&pubkey, account.clone()) {
-                        let _ = self.simnet_events_tx.error(e.to_string());
-                    }
-                }
+            GetAccountResult::FoundAccount(pubkey, account, true) => {
+                self.apply_synthetic_programdata(&account)?;
+                self.apply_account_component(pubkey, account, policy)?;
             }
+            GetAccountResult::FoundAccount(_, _, false) | GetAccountResult::None(_) => {}
             GetAccountResult::FoundProgramAccount((pubkey, account), (_, None)) => {
-                if let Some((programdata_address, programdata_account)) =
-                    init_programdata_account(&account)
-                {
-                    match self.get_account(&programdata_address) {
-                        Ok(None) => {
-                            if let Err(e) =
-                                self.set_account(&programdata_address, programdata_account)
-                            {
-                                let _ = self.simnet_events_tx.error(e.to_string());
-                            }
-                        }
-                        Ok(Some(_)) => {}
-                        Err(e) => {
-                            let _ = self.simnet_events_tx.error(e.to_string());
-                        }
-                    }
-                }
-                if let Err(e) = self.set_account(&pubkey, account.clone()) {
-                    let _ = self.simnet_events_tx.error(e.to_string());
-                }
+                self.apply_synthetic_programdata(&account)?;
+                self.apply_account_component(pubkey, account, policy)?;
             }
             GetAccountResult::FoundTokenAccount((pubkey, account), (_, None)) => {
-                if let Err(e) = self.set_account(&pubkey, account.clone()) {
-                    let _ = self.simnet_events_tx.error(e.to_string());
-                }
+                self.apply_account_component(pubkey, account, policy)?;
             }
             GetAccountResult::FoundProgramAccount(
                 (pubkey, account),
@@ -2336,16 +2277,103 @@ impl SurfnetSvm {
                 (pubkey, account),
                 (coupled_pubkey, Some(coupled_account)),
             ) => {
-                // The data account _must_ be set first, as the program account depends on it.
-                if let Err(e) = self.set_account(&coupled_pubkey, coupled_account.clone()) {
-                    let _ = self.simnet_events_tx.error(e.to_string());
-                }
-                if let Err(e) = self.set_account(&pubkey, account.clone()) {
-                    let _ = self.simnet_events_tx.error(e.to_string());
-                }
+                // Programdata and mint accounts must be available before their
+                // dependent program or token accounts.
+                self.apply_account_component(coupled_pubkey, coupled_account, policy)?;
+                self.apply_account_component(pubkey, account, policy)?;
             }
-            GetAccountResult::None(_) => {}
         }
+
+        Ok(())
+    }
+
+    fn account_update_for_policy(
+        &self,
+        account_update: GetAccountResult,
+        policy: AccountUpdatePolicy,
+    ) -> SurfpoolResult<GetAccountResult> {
+        if policy != AccountUpdatePolicy::HydrateIfAbsent {
+            return Ok(account_update);
+        }
+
+        let pubkey = match &account_update {
+            GetAccountResult::None(pubkey) | GetAccountResult::FoundAccount(pubkey, ..) => *pubkey,
+            GetAccountResult::FoundProgramAccount((pubkey, _), _)
+            | GetAccountResult::FoundTokenAccount((pubkey, _), _) => *pubkey,
+        };
+        let local = self.inner.get_account_result(&pubkey)?;
+
+        // A database result includes its own associated programdata or mint
+        // account. Prefer that complete local representation to a stale
+        // fetched result, while still allowing each component to preserve a
+        // newer LiteSVM value below.
+        if local.requires_update() {
+            Ok(local)
+        } else {
+            Ok(account_update)
+        }
+    }
+
+    fn apply_account_component(
+        &mut self,
+        pubkey: Pubkey,
+        account: Account,
+        policy: AccountUpdatePolicy,
+    ) -> SurfpoolResult<()> {
+        let account = if policy == AccountUpdatePolicy::HydrateIfAbsent {
+            match self.inner.get_account_result(&pubkey)? {
+                GetAccountResult::None(_) => account,
+                local if local.requires_update() => local.map_account()?,
+                _ => return Ok(()),
+            }
+        } else {
+            account
+        };
+
+        // Preserve the established behavior for fetched data: an account that
+        // LiteSVM rejects (such as an incomplete program upload) is still
+        // returned to the caller, with the insertion failure emitted as an
+        // event for observability.
+        if let Err(error) = self.set_account(&pubkey, account) {
+            let _ = self.simnet_events_tx.error(error.to_string());
+        }
+        Ok(())
+    }
+
+    fn apply_synthetic_programdata(&mut self, program_account: &Account) -> SurfpoolResult<()> {
+        if !program_account.executable
+            || program_account.owner != solana_sdk_ids::bpf_loader_upgradeable::id()
+        {
+            return Ok(());
+        }
+        let Ok(UpgradeableLoaderState::Program {
+            programdata_address,
+        }) = bincode::deserialize::<UpgradeableLoaderState>(&program_account.data)
+        else {
+            return Ok(());
+        };
+
+        let programdata_state = UpgradeableLoaderState::ProgramData {
+            upgrade_authority_address: Some(system_program::id()),
+            slot: self.get_latest_absolute_slot(),
+        };
+        let mut data = bincode::serialize(&programdata_state).unwrap();
+        data.extend_from_slice(crate::surfnet::noop_program::NOOP_PROGRAM_ELF);
+        let lamports = self.inner.minimum_balance_for_rent_exemption(data.len());
+
+        // A synthesized fallback is never authoritative: retain any real
+        // programdata already held in memory or in the configured database.
+        self.apply_account_component(
+            programdata_address,
+            Account {
+                lamports,
+                data,
+                owner: solana_sdk_ids::bpf_loader_upgradeable::id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+            AccountUpdatePolicy::HydrateIfAbsent,
+        )
     }
 
     pub fn confirm_current_block(&mut self) -> SurfpoolResult<()> {
@@ -4490,11 +4518,12 @@ mod tests {
             rent_epoch: 0,
         };
 
-        // GetAccountResult::None should be a noop when writing account updates
+        // GetAccountResult::None should be a noop when materializing account updates.
         {
             let index_before = svm.get_all_accounts().unwrap();
             let empty_update = GetAccountResult::None(pubkey);
-            svm.write_account_update(empty_update);
+            svm.apply_account_update(empty_update, AccountUpdatePolicy::Authoritative)
+                .unwrap();
             assert_eq!(svm.get_all_accounts().unwrap(), index_before);
         }
 
@@ -4502,7 +4531,8 @@ mod tests {
         {
             let index_before = svm.get_all_accounts().unwrap();
             let found_update = GetAccountResult::FoundAccount(pubkey, account.clone(), false);
-            svm.write_account_update(found_update);
+            svm.apply_account_update(found_update, AccountUpdatePolicy::Authoritative)
+                .unwrap();
             assert_eq!(svm.get_all_accounts().unwrap(), index_before);
         }
 
@@ -4510,7 +4540,8 @@ mod tests {
         {
             let index_before = svm.get_all_accounts().unwrap();
             let found_update = GetAccountResult::FoundAccount(pubkey, account.clone(), true);
-            svm.write_account_update(found_update);
+            svm.apply_account_update(found_update, AccountUpdatePolicy::Authoritative)
+                .unwrap();
             assert_eq!(
                 svm.get_all_accounts().unwrap().len(),
                 index_before.len() + 1
@@ -4520,6 +4551,50 @@ mod tests {
                     "Expected account update event not received after GetAccountResult::FoundAccount update"
                 );
             }
+        }
+
+        // Hydration preserves live LiteSVM state, while an authoritative
+        // update explicitly replaces it.
+        {
+            let policy_pubkey = Pubkey::new_unique();
+            let local_account = Account {
+                lamports: 1,
+                data: vec![1],
+                owner: Pubkey::new_unique(),
+                executable: false,
+                rent_epoch: 0,
+            };
+            let fetched_account = Account {
+                lamports: 2,
+                data: vec![2],
+                owner: Pubkey::new_unique(),
+                executable: false,
+                rent_epoch: 0,
+            };
+            svm.set_account(&policy_pubkey, local_account.clone())
+                .unwrap();
+
+            svm.apply_account_update(
+                GetAccountResult::FoundAccount(policy_pubkey, fetched_account.clone(), true),
+                AccountUpdatePolicy::HydrateIfAbsent,
+            )
+            .unwrap();
+            assert_eq!(
+                svm.get_account(&policy_pubkey).unwrap(),
+                Some(local_account)
+            );
+
+            svm.apply_account_update(
+                GetAccountResult::FoundAccount(policy_pubkey, fetched_account.clone(), true),
+                AccountUpdatePolicy::Authoritative,
+            )
+            .unwrap();
+            assert_eq!(
+                svm.get_account(&policy_pubkey).unwrap(),
+                Some(fetched_account)
+            );
+
+            while events_rx.try_recv().is_ok() {}
         }
 
         // GetAccountResult::FoundProgramAccount with no program account inserts a default programdata account
@@ -4551,7 +4626,11 @@ mod tests {
                 (program_address, program_account.clone()),
                 (program_data_address, None),
             );
-            svm.write_account_update(found_program_account_update);
+            svm.apply_account_update(
+                found_program_account_update,
+                AccountUpdatePolicy::Authoritative,
+            )
+            .unwrap();
 
             if !expect_account_update_event(
                 &events_rx,
@@ -4585,7 +4664,11 @@ mod tests {
                 (program_address, program_account.clone()),
                 (program_data_address, Some(program_data_account.clone())),
             );
-            svm.write_account_update(found_program_account_update);
+            svm.apply_account_update(
+                found_program_account_update,
+                AccountUpdatePolicy::Authoritative,
+            )
+            .unwrap();
             assert_eq!(
                 svm.get_all_accounts().unwrap().len(),
                 index_before.len() + 2
@@ -4620,7 +4703,8 @@ mod tests {
                 program_data_account.clone(),
                 true,
             );
-            svm.write_account_update(found_update);
+            svm.apply_account_update(found_update, AccountUpdatePolicy::Authoritative)
+                .unwrap();
             assert_eq!(
                 svm.get_all_accounts().unwrap().len(),
                 index_before.len() + 1
@@ -4641,7 +4725,11 @@ mod tests {
                 (program_address, program_account.clone()),
                 (program_data_address, None),
             );
-            svm.write_account_update(program_account_found_update);
+            svm.apply_account_update(
+                program_account_found_update,
+                AccountUpdatePolicy::Authoritative,
+            )
+            .unwrap();
             assert_eq!(
                 svm.get_all_accounts().unwrap().len(),
                 index_before.len() + 1

@@ -30,7 +30,7 @@ use crate::{
         State,
         utils::{decode_and_deserialize, verify_pubkey, verify_pubkeys},
     },
-    surfnet::{GetAccountResult, locker::SvmAccessContext},
+    surfnet::{GetAccountResult, locker::SvmAccessContext, svm::AccountUpdatePolicy},
     types::{
         TimeTravelConfig, TokenAccount, build_confidential_token_account_data,
         mint_has_transfer_fee_config,
@@ -1453,7 +1453,7 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
                 (account_result_to_update, slot)
             };
 
-            svm_locker.write_account_update(account_to_set);
+            svm_locker.apply_account_update(account_to_set, AccountUpdatePolicy::Authoritative)?;
 
             Ok(RpcResponse {
                 context: RpcResponseContext::new(latest_absolute_slot),
@@ -1642,8 +1642,6 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
             let mint_has_transfer_fee = confidential.is_some()
                 && !get_mint_result.is_none()
                 && mint_has_transfer_fee_config(get_mint_result.expected_data());
-            svm_locker.write_account_update(get_mint_result);
-
             let minimum_rent = svm_locker.with_svm_reader(|svm_reader| {
                 svm_reader.inner.minimum_balance_for_rent_exemption(
                     TokenAccount::get_packed_len_for_token_program_id(&token_program_id),
@@ -1722,7 +1720,7 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
                 account.data = final_account_bytes.clone();
                 Ok(())
             })?;
-            svm_locker.write_account_update(token_account);
+            svm_locker.apply_account_update(token_account, AccountUpdatePolicy::Authoritative)?;
 
             Ok(RpcResponse {
                 context: RpcResponseContext::new(slot),

@@ -1937,8 +1937,6 @@ impl Full for SurfpoolFullRpc {
                 track_accounts_data_size(res);
             }
 
-            svm_locker.write_multiple_account_updates(&account_updates);
-
             // Convert TransactionLoadedAddresses to LoadedAddresses before it gets consumed
             let loaded_addresses_data = loaded_addresses.as_ref().map(|la| la.loaded_addresses());
 
@@ -1950,7 +1948,6 @@ impl Full for SurfpoolFullRpc {
                 for res in alt_updates.iter() {
                     track_accounts_data_size(res);
                 }
-                svm_locker.write_multiple_account_updates(&alt_updates);
             }
 
             let replacement_blockhash = if config.replace_recent_blockhash {

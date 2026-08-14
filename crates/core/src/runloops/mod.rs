@@ -577,11 +577,6 @@ pub async fn start_block_production_runloop(
                                 .await
                             {
                                 Ok(account_updates) => {
-                                    // The locker holds one write guard while applying the complete
-                                    // batch, so Ready cannot expose a partially installed clone set.
-                                    svm_locker
-                                        .write_multiple_account_updates(&account_updates.inner);
-
                                     // A cloned account the datasource does not have is not a
                                     // failure: hydration did complete, and some workflows clone
                                     // addresses that do not exist yet. Warn, though, because the

@@ -383,8 +383,6 @@ impl AccountsData for SurfpoolAccountsDataRpc {
             if let Some(m) = crate::telemetry::metrics() {
                 m.record_rpc_request("getAccountInfo", rpc_start.elapsed().as_millis() as u64);
             }
-            svm_locker.write_account_update(account_update.clone());
-
             let ui_account = if let Some(((pubkey, account), token_data)) =
                 account_update.map_account_with_token_data()
             {
@@ -452,8 +450,6 @@ impl AccountsData for SurfpoolAccountsDataRpc {
                     rpc_start.elapsed().as_millis() as u64,
                 );
             }
-
-            svm_locker.write_multiple_account_updates(&account_updates);
 
             // Convert account updates to UI accounts, order is already preserved by get_multiple_accounts
             let mut ui_accounts = vec![];
@@ -544,8 +540,6 @@ impl AccountsData for SurfpoolAccountsDataRpc {
                 .await?
                 .inner;
 
-            svm_locker.write_account_update(token_account_result.clone());
-
             let token_account = token_account_result.map_account()?;
 
             let (mint_pubkey, _amount) = if is_supported_token_program(&token_account.owner) {
@@ -570,8 +564,6 @@ impl AccountsData for SurfpoolAccountsDataRpc {
             } = svm_locker
                 .get_account(&remote_ctx, &mint_pubkey, None)
                 .await?;
-
-            svm_locker.write_account_update(mint_account_result.clone());
 
             let mint_account = mint_account_result.map_account()?;
 
@@ -634,8 +626,6 @@ impl AccountsData for SurfpoolAccountsDataRpc {
             } = svm_locker
                 .get_account(&remote_ctx, &mint_pubkey, None)
                 .await?;
-
-            svm_locker.write_account_update(mint_account_result.clone());
 
             let mint_account = mint_account_result.map_account()?;
 
@@ -715,7 +705,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        surfnet::{GetAccountResult, remote::SurfnetRemoteClient},
+        surfnet::{GetAccountResult, remote::SurfnetRemoteClient, svm::AccountUpdatePolicy},
         tests::helpers::TestSetup,
         types::SyntheticBlockhash,
     };
@@ -754,7 +744,11 @@ mod tests {
         setup
             .context
             .svm_locker
-            .write_account_update(GetAccountResult::FoundAccount(mint_pk, mint_account, true));
+            .apply_account_update(
+                GetAccountResult::FoundAccount(mint_pk, mint_account, true),
+                AccountUpdatePolicy::Authoritative,
+            )
+            .unwrap();
 
         let token_account_pk = Pubkey::new_unique();
 
@@ -786,11 +780,11 @@ mod tests {
         setup
             .context
             .svm_locker
-            .write_account_update(GetAccountResult::FoundAccount(
-                token_account_pk,
-                token_account,
-                true,
-            ));
+            .apply_account_update(
+                GetAccountResult::FoundAccount(token_account_pk, token_account, true),
+                AccountUpdatePolicy::Authoritative,
+            )
+            .unwrap();
 
         let res = setup
             .rpc
@@ -1567,11 +1561,19 @@ mod tests {
         setup
             .context
             .svm_locker
-            .write_account_update(GetAccountResult::FoundAccount(pk1, account1, true));
+            .apply_account_update(
+                GetAccountResult::FoundAccount(pk1, account1, true),
+                AccountUpdatePolicy::Authoritative,
+            )
+            .unwrap();
         setup
             .context
             .svm_locker
-            .write_account_update(GetAccountResult::FoundAccount(pk3, account3, true));
+            .apply_account_update(
+                GetAccountResult::FoundAccount(pk3, account3, true),
+                AccountUpdatePolicy::Authoritative,
+            )
+            .unwrap();
 
         // Request accounts in order: [pk1, pk2, pk3]
         // pk1 and pk3 are local, pk2 is missing (will try remote fetch and fail)
