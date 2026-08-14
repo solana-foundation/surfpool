@@ -48,7 +48,7 @@ use crate::{
     error::{SurfpoolError, SurfpoolResult},
     rpc::utils::{adjust_default_transaction_config, get_default_transaction_config},
     surfnet::{
-        FINALIZATION_SLOT_THRESHOLD, GetAccountResult, GetTransactionResult,
+        CoupledAccount, FINALIZATION_SLOT_THRESHOLD, GetAccountResult, GetTransactionResult,
         locker::SvmAccessContext, svm::MAX_RECENT_BLOCKHASHES_STANDARD,
     },
     types::{SurfnetTransactionStatus, surfpool_tx_metadata_to_litesvm_tx_metadata},
@@ -1901,9 +1901,10 @@ impl Full for SurfpoolFullRpc {
                         }
                     }
                     // According to SIMD 0186, program data is tracked as well as program accounts
-                    GetAccountResult::FoundProgramAccount(
+                    GetAccountResult::FoundCoupledAccount(
                         (pubkey, account),
-                        (pd_pubkey, pd_account),
+                        CoupledAccount::ProgramData(pd_pubkey, pd_account),
+                        _,
                     ) => {
                         if seen_accounts.insert(*pubkey) {
                             loaded_accounts_data_size += account.data.len() as u64;
@@ -1914,9 +1915,10 @@ impl Full for SurfpoolFullRpc {
                             }
                         }
                     }
-                    GetAccountResult::FoundTokenAccount(
+                    GetAccountResult::FoundCoupledAccount(
                         (pubkey, account),
-                        (td_pubkey, td_account),
+                        CoupledAccount::Mint(td_pubkey, td_account),
+                        _,
                     ) => {
                         if seen_accounts.insert(*pubkey) {
                             loaded_accounts_data_size += account.data.len() as u64;

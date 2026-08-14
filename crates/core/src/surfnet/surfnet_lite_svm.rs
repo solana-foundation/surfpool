@@ -19,7 +19,9 @@ use solana_transaction::versioned::VersionedTransaction;
 use crate::{
     error::{SurfpoolError, SurfpoolResult},
     storage::{OverlayStorage, Storage, StorageBackend},
-    surfnet::{GetAccountResult, locker::is_supported_token_program},
+    surfnet::{
+        AccountSource, CoupledAccount, GetAccountResult, locker::is_supported_token_program,
+    },
 };
 
 pub const LAMPORTS_PER_SOL: u64 = 1_000_000_000;
@@ -191,9 +193,9 @@ impl SurfnetLiteSvm {
     pub fn get_account_result(&self, pubkey: &Pubkey) -> SurfpoolResult<GetAccountResult> {
         if let Some(account) = self.svm.get_account(pubkey) {
             return Ok(GetAccountResult::FoundAccount(
-                *pubkey, account,
-                // mark as not an account that should be updated in the SVM, since this is a local read and it already exists
-                false,
+                *pubkey,
+                account,
+                AccountSource::Svm,
             ));
         } else if let Some(db) = &self.db {
             let mut result = None;
@@ -202,9 +204,10 @@ impl SurfnetLiteSvm {
                     if let Ok(token_account) = crate::types::TokenAccount::unpack(&account.data) {
                         let mint = db.get(&token_account.mint().to_string())?.map(Into::into);
 
-                        result = Some(GetAccountResult::FoundTokenAccount(
+                        result = Some(GetAccountResult::FoundCoupledAccount(
                             (*pubkey, account.clone()),
-                            (token_account.mint(), mint),
+                            CoupledAccount::Mint(token_account.mint(), mint),
+                            AccountSource::Database,
                         ));
                     };
                 } else if account.executable {
@@ -212,16 +215,17 @@ impl SurfnetLiteSvm {
 
                     let program_data = db.get(&program_data_address.to_string())?.map(Into::into);
 
-                    result = Some(GetAccountResult::FoundProgramAccount(
+                    result = Some(GetAccountResult::FoundCoupledAccount(
                         (*pubkey, account.clone()),
-                        (program_data_address, program_data),
+                        CoupledAccount::ProgramData(program_data_address, program_data),
+                        AccountSource::Database,
                     ));
                 }
 
                 return Ok(result.unwrap_or(GetAccountResult::FoundAccount(
-                    *pubkey, account,
-                    // Mark this account as needing to be updated in the SVM, since we pulled it from the db
-                    true,
+                    *pubkey,
+                    account,
+                    AccountSource::Database,
                 )));
             }
         }

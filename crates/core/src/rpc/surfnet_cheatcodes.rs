@@ -30,7 +30,9 @@ use crate::{
         State,
         utils::{decode_and_deserialize, verify_pubkey, verify_pubkeys},
     },
-    surfnet::{GetAccountResult, locker::SvmAccessContext, svm::AccountUpdatePolicy},
+    surfnet::{
+        AccountSource, GetAccountResult, locker::SvmAccessContext, svm::AccountUpdatePolicy,
+    },
     types::{
         TimeTravelConfig, TokenAccount, build_confidential_token_account_data,
         mint_has_transfer_fee_config,
@@ -1422,7 +1424,7 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
         Box::pin(async move {
             let (account_to_set, latest_absolute_slot) = if let Some(account) = account_update_opt {
                 (
-                    GetAccountResult::FoundAccount(pubkey, account, true),
+                    GetAccountResult::FoundAccount(pubkey, account, AccountSource::Generated),
                     svm_locker.get_latest_absolute_slot(),
                 )
             } else {
@@ -1445,7 +1447,7 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
                                     rent_epoch: 0,
                                     data: vec![],
                                 },
-                                true, // indicate that the account should be updated in the SVM, since it's new
+                                AccountSource::Generated,
                             )
                 }))).await?;
 
@@ -1676,7 +1678,7 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
                                 rent_epoch: 0,
                                 data,
                             },
-                            true, // indicate that the account should be updated in the SVM, since it's new
+                            AccountSource::Generated,
                         )
                     })),
                 )

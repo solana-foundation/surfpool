@@ -705,7 +705,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        surfnet::{GetAccountResult, remote::SurfnetRemoteClient, svm::AccountUpdatePolicy},
+        surfnet::{
+            AccountSource, GetAccountResult, remote::SurfnetRemoteClient, svm::AccountUpdatePolicy,
+        },
         tests::helpers::TestSetup,
         types::SyntheticBlockhash,
     };
@@ -745,7 +747,7 @@ mod tests {
             .context
             .svm_locker
             .apply_account_update(
-                GetAccountResult::FoundAccount(mint_pk, mint_account, true),
+                GetAccountResult::FoundAccount(mint_pk, mint_account, AccountSource::Generated),
                 AccountUpdatePolicy::Authoritative,
             )
             .unwrap();
@@ -781,7 +783,11 @@ mod tests {
             .context
             .svm_locker
             .apply_account_update(
-                GetAccountResult::FoundAccount(token_account_pk, token_account, true),
+                GetAccountResult::FoundAccount(
+                    token_account_pk,
+                    token_account,
+                    AccountSource::Generated,
+                ),
                 AccountUpdatePolicy::Authoritative,
             )
             .unwrap();
@@ -1562,7 +1568,7 @@ mod tests {
             .context
             .svm_locker
             .apply_account_update(
-                GetAccountResult::FoundAccount(pk1, account1, true),
+                GetAccountResult::FoundAccount(pk1, account1, AccountSource::Generated),
                 AccountUpdatePolicy::Authoritative,
             )
             .unwrap();
@@ -1570,7 +1576,7 @@ mod tests {
             .context
             .svm_locker
             .apply_account_update(
-                GetAccountResult::FoundAccount(pk3, account3, true),
+                GetAccountResult::FoundAccount(pk3, account3, AccountSource::Generated),
                 AccountUpdatePolicy::Authoritative,
             )
             .unwrap();

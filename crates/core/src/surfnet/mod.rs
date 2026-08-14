@@ -220,30 +220,51 @@ impl Display for SignatureSubscriptionType {
     }
 }
 
-type DoUpdateSvm = bool;
+/// Identifies where an account result was read from.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AccountSource {
+    /// The account is already present in the live LiteSVM state.
+    Svm,
+    /// The account was read from the configured database and is not yet in LiteSVM.
+    Database,
+    /// The account was fetched from the remote RPC.
+    Remote,
+    /// The account was created locally by a default factory or mutation path.
+    Generated,
+}
+
+/// The kind of secondary account returned with a coupled account result.
+#[derive(Clone, Debug)]
+pub enum CoupledAccount {
+    /// Upgradeable programs may be returned with their program-data account.
+    ProgramData(Pubkey, Option<Account>),
+    /// Token accounts may be returned with their mint account.
+    Mint(Pubkey, Option<Account>),
+}
 
 #[derive(Clone, Debug)]
-/// Represents the result of a get_account operation.
+/// Represents the result of a `get_account` operation.
+///
+/// The result records provenance, while the caller chooses how that result may
+/// affect the SVM through [svm::AccountUpdatePolicy]. In particular,
+/// provenance does not imply authoritative replacement. See the policy
+/// documentation for the complete result-by-policy decision table.
 pub enum GetAccountResult {
     /// Represents that the account was not found.
     None(Pubkey),
-    /// Represents that the account was found.
-    /// The `DoUpdateSvm` flag indicates whether the SVM should be updated after this account is found.
-    /// This is useful for cases where the account was fetched from a remote source and needs to be
-    /// updated in the SVM to reflect the latest state. However, when the account is found locally,
-    /// it likely does not need to be updated in the SVM.
-    FoundAccount(Pubkey, Account, DoUpdateSvm),
-    FoundProgramAccount((Pubkey, Account), (Pubkey, Option<Account>)),
-    FoundTokenAccount((Pubkey, Account), (Pubkey, Option<Account>)),
+    /// Represents an account found in one of the account stores.
+    FoundAccount(Pubkey, Account, AccountSource),
+    /// Represents an account coupled to a program-data or mint account.
+    FoundCoupledAccount((Pubkey, Account), CoupledAccount, AccountSource),
 }
 
 impl GetAccountResult {
     pub fn expected_data(&self) -> &Vec<u8> {
         match &self {
             Self::None(_) => unreachable!(),
-            Self::FoundAccount(_, account, _)
-            | Self::FoundProgramAccount((_, account), _)
-            | Self::FoundTokenAccount((_, account), _) => &account.data,
+            Self::FoundAccount(_, account, _) | Self::FoundCoupledAccount((_, account), _, _) => {
+                &account.data
+            }
         }
     }
 
@@ -253,15 +274,15 @@ impl GetAccountResult {
     {
         match self {
             Self::None(_) => unreachable!(),
-            Self::FoundAccount(_, account, do_update_account) => {
+            Self::FoundAccount(_, account, source) => {
                 update(account)?;
-                *do_update_account = true;
+                // Applying an override turns a read result into an explicit
+                // local mutation, regardless of where the original account came from.
+                *source = AccountSource::Generated;
             }
-            Self::FoundProgramAccount((_, account), _) => {
+            Self::FoundCoupledAccount((_, account), _, source) => {
                 update(account)?;
-            }
-            Self::FoundTokenAccount((_, account), _) => {
-                update(account)?;
+                *source = AccountSource::Generated;
             }
         }
         Ok(())
@@ -270,9 +291,9 @@ impl GetAccountResult {
     pub fn map_account(self) -> SurfpoolResult<Account> {
         match self {
             Self::None(pubkey) => Err(SurfpoolError::account_not_found(pubkey)),
-            Self::FoundAccount(_, account, _)
-            | Self::FoundProgramAccount((_, account), _)
-            | Self::FoundTokenAccount((_, account), _) => Ok(account),
+            Self::FoundAccount(_, account, _) | Self::FoundCoupledAccount((_, account), _, _) => {
+                Ok(account)
+            }
         }
     }
 
@@ -283,10 +304,12 @@ impl GetAccountResult {
         match self {
             Self::None(_) => None,
             Self::FoundAccount(pubkey, account, _) => Some(((pubkey, account), None)),
-            Self::FoundProgramAccount((pubkey, account), _) => Some(((pubkey, account), None)),
-            Self::FoundTokenAccount((pubkey, account), token_data) => {
-                Some(((pubkey, account), Some(token_data)))
-            }
+            Self::FoundCoupledAccount((pubkey, account), coupled, _) => match coupled {
+                CoupledAccount::ProgramData(_, _) => Some(((pubkey, account), None)),
+                CoupledAccount::Mint(coupled_pubkey, coupled_account) => {
+                    Some(((pubkey, account), Some((coupled_pubkey, coupled_account))))
+                }
+            },
         }
     }
 
@@ -294,12 +317,12 @@ impl GetAccountResult {
         matches!(self, Self::None(_))
     }
 
-    pub const fn requires_update(&self) -> bool {
+    pub const fn source(&self) -> Option<AccountSource> {
         match self {
-            Self::None(_) => false,
-            Self::FoundAccount(_, _, do_update) => *do_update,
-            Self::FoundProgramAccount(_, _) => true,
-            Self::FoundTokenAccount(_, _) => true,
+            Self::None(_) => None,
+            Self::FoundAccount(_, _, source) | Self::FoundCoupledAccount(_, _, source) => {
+                Some(*source)
+            }
         }
     }
 }

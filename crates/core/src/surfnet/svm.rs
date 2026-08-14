@@ -76,10 +76,10 @@ use txtx_addon_network_svm_types::idl::{
 use uuid::Uuid;
 
 use super::{
-    AccountSubscriptionData, BlockHeader, BlockIdentifier, FINALIZATION_SLOT_THRESHOLD,
-    GetAccountResult, GeyserBlockMetadata, GeyserEntryInfo, GeyserEvent, GeyserSlotStatus,
-    ProgramSubscriptionData, SignatureSubscriptionData, SignatureSubscriptionType,
-    SlotsUpdatesSubscriptionData, remote::SurfnetRemoteClient,
+    AccountSource, AccountSubscriptionData, BlockHeader, BlockIdentifier, CoupledAccount,
+    FINALIZATION_SLOT_THRESHOLD, GetAccountResult, GeyserBlockMetadata, GeyserEntryInfo,
+    GeyserEvent, GeyserSlotStatus, ProgramSubscriptionData, SignatureSubscriptionData,
+    SignatureSubscriptionType, SlotsUpdatesSubscriptionData, remote::SurfnetRemoteClient,
 };
 use crate::{
     error::{AirdropError, SurfpoolError, SurfpoolResult},
@@ -117,8 +117,19 @@ lazy_static::lazy_static! {
     };
 }
 
-/// Determines whether an account result is an authoritative state change or
-/// a best-effort cache hydration.
+/// Determines how an account result may change the SVM.
+///
+/// The result's [`AccountSource`] describes where the data came from; this
+/// policy describes what the current operation is allowed to do with it.
+///
+/// | Result | Source | `Authoritative` | `HydrateIfAbsent` |
+/// | --- | --- | --- | --- |
+/// | `None` | Any | No-op | No-op |
+/// | `FoundAccount` | `Svm` | No-op; it is already live | No-op |
+/// | `FoundAccount` | `Database` or `Remote` | Replace when explicitly applied | Insert only when absent; preserve live state |
+/// | `FoundAccount` | `Generated` | Replace when explicitly applied | No-op; generated state is already an explicit mutation |
+/// | `FoundCoupledAccount::ProgramData` | `Database` or `Remote` | Apply program-data before program | Hydrate each missing component, preserving live state |
+/// | `FoundCoupledAccount::Mint` | `Database` or `Remote` | Apply mint before token account when present | Hydrate each missing component, preserving live state |
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AccountUpdatePolicy {
     /// Replace local state with the supplied account update.
@@ -126,6 +137,17 @@ pub(crate) enum AccountUpdatePolicy {
     /// Keep any live LiteSVM state and rehydrate database-only state instead
     /// of replacing it with a fetched result.
     HydrateIfAbsent,
+}
+
+impl AccountUpdatePolicy {
+    /// Converts account provenance into the non-authoritative policy used when
+    /// a result needs to be materialized in LiteSVM.
+    pub(crate) const fn for_source(source: AccountSource) -> Option<Self> {
+        match source {
+            AccountSource::Database | AccountSource::Remote => Some(Self::HydrateIfAbsent),
+            AccountSource::Svm | AccountSource::Generated => None,
+        }
+    }
 }
 
 /// Helper function to apply an override to a decoded account value using dot notation
@@ -2257,29 +2279,42 @@ impl SurfnetSvm {
         let account_update = self.account_update_for_policy(account_update, policy)?;
 
         match account_update {
-            GetAccountResult::FoundAccount(pubkey, account, true) => {
-                self.apply_synthetic_programdata(&account)?;
-                self.apply_account_component(pubkey, account, policy)?;
+            GetAccountResult::None(_) => {}
+            GetAccountResult::FoundAccount(pubkey, account, source) => {
+                if source != AccountSource::Svm {
+                    self.apply_synthetic_programdata(&account)?;
+                    self.apply_account_component(pubkey, account, policy)?;
+                }
             }
-            GetAccountResult::FoundAccount(_, _, false) | GetAccountResult::None(_) => {}
-            GetAccountResult::FoundProgramAccount((pubkey, account), (_, None)) => {
-                self.apply_synthetic_programdata(&account)?;
-                self.apply_account_component(pubkey, account, policy)?;
-            }
-            GetAccountResult::FoundTokenAccount((pubkey, account), (_, None)) => {
-                self.apply_account_component(pubkey, account, policy)?;
-            }
-            GetAccountResult::FoundProgramAccount(
+            GetAccountResult::FoundCoupledAccount(
                 (pubkey, account),
-                (coupled_pubkey, Some(coupled_account)),
-            )
-            | GetAccountResult::FoundTokenAccount(
-                (pubkey, account),
-                (coupled_pubkey, Some(coupled_account)),
+                CoupledAccount::ProgramData(_, None),
+                _,
             ) => {
-                // Programdata and mint accounts must be available before their
-                // dependent program or token accounts.
+                self.apply_synthetic_programdata(&account)?;
+                self.apply_account_component(pubkey, account, policy)?;
+            }
+            GetAccountResult::FoundCoupledAccount(
+                (pubkey, account),
+                CoupledAccount::ProgramData(coupled_pubkey, Some(coupled_account)),
+                _,
+            ) => {
                 self.apply_account_component(coupled_pubkey, coupled_account, policy)?;
+                self.apply_account_component(pubkey, account, policy)?;
+            }
+            GetAccountResult::FoundCoupledAccount(
+                (pubkey, account),
+                CoupledAccount::Mint(coupled_pubkey, Some(coupled_account)),
+                _,
+            ) => {
+                self.apply_account_component(coupled_pubkey, coupled_account, policy)?;
+                self.apply_account_component(pubkey, account, policy)?;
+            }
+            GetAccountResult::FoundCoupledAccount(
+                (pubkey, account),
+                CoupledAccount::Mint(_, None),
+                _,
+            ) => {
                 self.apply_account_component(pubkey, account, policy)?;
             }
         }
@@ -2298,8 +2333,7 @@ impl SurfnetSvm {
 
         let pubkey = match &account_update {
             GetAccountResult::None(pubkey) | GetAccountResult::FoundAccount(pubkey, ..) => *pubkey,
-            GetAccountResult::FoundProgramAccount((pubkey, _), _)
-            | GetAccountResult::FoundTokenAccount((pubkey, _), _) => *pubkey,
+            GetAccountResult::FoundCoupledAccount((pubkey, _), _, _) => *pubkey,
         };
         let local = self.inner.get_account_result(&pubkey)?;
 
@@ -2309,7 +2343,11 @@ impl SurfnetSvm {
         // result stale: do not install its coupled mint or programdata before
         // skipping the primary, or the live account could observe mismatched
         // dependency state.
-        if local.requires_update() {
+        if local
+            .source()
+            .and_then(AccountUpdatePolicy::for_source)
+            .is_some()
+        {
             Ok(local)
         } else if local.is_none() {
             Ok(account_update)
@@ -2327,7 +2365,14 @@ impl SurfnetSvm {
         let account = if policy == AccountUpdatePolicy::HydrateIfAbsent {
             match self.inner.get_account_result(&pubkey)? {
                 GetAccountResult::None(_) => account,
-                local if local.requires_update() => local.map_account()?,
+                local
+                    if local
+                        .source()
+                        .and_then(AccountUpdatePolicy::for_source)
+                        .is_some() =>
+                {
+                    local.map_account()?
+                }
                 _ => return Ok(()),
             }
         } else {
@@ -4529,9 +4574,10 @@ mod tests {
         svm.set_account(&token_primary, local_primary.clone())
             .unwrap();
         svm.apply_account_update(
-            GetAccountResult::FoundTokenAccount(
+            GetAccountResult::FoundCoupledAccount(
                 (token_primary, fetched_primary.clone()),
-                (token_mint, Some(fetched_primary.clone())),
+                CoupledAccount::Mint(token_mint, Some(fetched_primary.clone())),
+                AccountSource::Remote,
             ),
             AccountUpdatePolicy::HydrateIfAbsent,
         )
@@ -4547,9 +4593,10 @@ mod tests {
         svm.set_account(&program_primary, local_primary.clone())
             .unwrap();
         svm.apply_account_update(
-            GetAccountResult::FoundProgramAccount(
+            GetAccountResult::FoundCoupledAccount(
                 (program_primary, fetched_primary.clone()),
-                (programdata, Some(fetched_primary)),
+                CoupledAccount::ProgramData(programdata, Some(fetched_primary)),
+                AccountSource::Remote,
             ),
             AccountUpdatePolicy::HydrateIfAbsent,
         )
@@ -4586,19 +4633,21 @@ mod tests {
             assert_eq!(svm.get_all_accounts().unwrap(), index_before);
         }
 
-        // GetAccountResult::FoundAccount with `DoUpdateSvm` flag to false should be a noop
+        // An account already present in LiteSVM is not materialized again.
         {
             let index_before = svm.get_all_accounts().unwrap();
-            let found_update = GetAccountResult::FoundAccount(pubkey, account.clone(), false);
+            let found_update =
+                GetAccountResult::FoundAccount(pubkey, account.clone(), AccountSource::Svm);
             svm.apply_account_update(found_update, AccountUpdatePolicy::Authoritative)
                 .unwrap();
             assert_eq!(svm.get_all_accounts().unwrap(), index_before);
         }
 
-        // GetAccountResult::FoundAccount with `DoUpdateSvm` flag to true should update the account
+        // A generated account is explicitly materialized by the caller.
         {
             let index_before = svm.get_all_accounts().unwrap();
-            let found_update = GetAccountResult::FoundAccount(pubkey, account.clone(), true);
+            let found_update =
+                GetAccountResult::FoundAccount(pubkey, account.clone(), AccountSource::Generated);
             svm.apply_account_update(found_update, AccountUpdatePolicy::Authoritative)
                 .unwrap();
             assert_eq!(
@@ -4634,7 +4683,11 @@ mod tests {
                 .unwrap();
 
             svm.apply_account_update(
-                GetAccountResult::FoundAccount(policy_pubkey, fetched_account.clone(), true),
+                GetAccountResult::FoundAccount(
+                    policy_pubkey,
+                    fetched_account.clone(),
+                    AccountSource::Remote,
+                ),
                 AccountUpdatePolicy::HydrateIfAbsent,
             )
             .unwrap();
@@ -4644,7 +4697,11 @@ mod tests {
             );
 
             svm.apply_account_update(
-                GetAccountResult::FoundAccount(policy_pubkey, fetched_account.clone(), true),
+                GetAccountResult::FoundAccount(
+                    policy_pubkey,
+                    fetched_account.clone(),
+                    AccountSource::Remote,
+                ),
                 AccountUpdatePolicy::Authoritative,
             )
             .unwrap();
@@ -4656,7 +4713,7 @@ mod tests {
             while events_rx.try_recv().is_ok() {}
         }
 
-        // GetAccountResult::FoundProgramAccount with no program account inserts a default programdata account
+        // A coupled program result with no program-data account inserts a default programdata account.
         {
             let (program_address, program_account, program_data_address, _) =
                 create_program_accounts();
@@ -4681,9 +4738,10 @@ mod tests {
             };
 
             let index_before = svm.get_all_accounts().unwrap();
-            let found_program_account_update = GetAccountResult::FoundProgramAccount(
+            let found_program_account_update = GetAccountResult::FoundCoupledAccount(
                 (program_address, program_account.clone()),
-                (program_data_address, None),
+                CoupledAccount::ProgramData(program_data_address, None),
+                AccountSource::Remote,
             );
             svm.apply_account_update(
                 found_program_account_update,
@@ -4704,7 +4762,7 @@ mod tests {
 
             if !expect_account_update_event(&events_rx, &svm, &program_address, &program_account) {
                 panic!(
-                    "Expected account update event not received after GetAccountResult::FoundProgramAccount update for program pubkey"
+                    "Expected account update event not received after coupled program update for program pubkey"
                 );
             }
             assert_eq!(
@@ -4713,15 +4771,19 @@ mod tests {
             );
         }
 
-        // GetAccountResult::FoundProgramAccount with program account + program data account inserts two accounts
+        // A coupled program result with program data inserts both accounts.
         {
             let (program_address, program_account, program_data_address, program_data_account) =
                 create_program_accounts();
 
             let index_before = svm.get_all_accounts().unwrap();
-            let found_program_account_update = GetAccountResult::FoundProgramAccount(
+            let found_program_account_update = GetAccountResult::FoundCoupledAccount(
                 (program_address, program_account.clone()),
-                (program_data_address, Some(program_data_account.clone())),
+                CoupledAccount::ProgramData(
+                    program_data_address,
+                    Some(program_data_account.clone()),
+                ),
+                AccountSource::Remote,
             );
             svm.apply_account_update(
                 found_program_account_update,
@@ -4739,18 +4801,18 @@ mod tests {
                 &program_data_account,
             ) {
                 panic!(
-                    "Expected account update event not received after GetAccountResult::FoundProgramAccount update for program data pubkey"
+                    "Expected account update event not received after coupled program update for program data pubkey"
                 );
             }
 
             if !expect_account_update_event(&events_rx, &svm, &program_address, &program_account) {
                 panic!(
-                    "Expected account update event not received after GetAccountResult::FoundProgramAccount update for program pubkey"
+                    "Expected account update event not received after coupled program update for program pubkey"
                 );
             }
         }
 
-        // If we insert the program data account ahead of time, then have a GetAccountResult::FoundProgramAccount with just the program data account,
+        // If we insert the program data account ahead of time, then apply a coupled program result,
         // we should get one insert
         {
             let (program_address, program_account, program_data_address, program_data_account) =
@@ -4760,7 +4822,7 @@ mod tests {
             let found_update = GetAccountResult::FoundAccount(
                 program_data_address,
                 program_data_account.clone(),
-                true,
+                AccountSource::Remote,
             );
             svm.apply_account_update(found_update, AccountUpdatePolicy::Authoritative)
                 .unwrap();
@@ -4780,9 +4842,10 @@ mod tests {
             }
 
             let index_before = svm.get_all_accounts().unwrap();
-            let program_account_found_update = GetAccountResult::FoundProgramAccount(
+            let program_account_found_update = GetAccountResult::FoundCoupledAccount(
                 (program_address, program_account.clone()),
-                (program_data_address, None),
+                CoupledAccount::ProgramData(program_data_address, None),
+                AccountSource::Remote,
             );
             svm.apply_account_update(
                 program_account_found_update,

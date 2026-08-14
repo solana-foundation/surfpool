@@ -45,7 +45,7 @@ use crate::{
         surfnet_cheatcodes::SurfnetCheatcodes, ws::Rpc,
     },
     surfnet::{
-        GetAccountResult, GeyserEvent, PluginCommand, locker::SurfnetSvmLocker,
+        AccountSource, GetAccountResult, GeyserEvent, PluginCommand, locker::SurfnetSvmLocker,
         remote::SurfnetRemoteClient,
     },
 };
@@ -1166,7 +1166,7 @@ mod absent_after_hydration_tests {
         let results = vec![
             GetAccountResult::None(missing),
             GetAccountResult::None(offline),
-            GetAccountResult::FoundAccount(found, Account::default(), true),
+            GetAccountResult::FoundAccount(found, Account::default(), AccountSource::Generated),
         ];
 
         assert_eq!(

@@ -1047,8 +1047,7 @@ async fn snapshot_accounts(
                 }
             }
             crate::surfnet::GetAccountResult::FoundAccount(_, account, _)
-            | crate::surfnet::GetAccountResult::FoundProgramAccount((_, account), _)
-            | crate::surfnet::GetAccountResult::FoundTokenAccount((_, account), _) => {
+            | crate::surfnet::GetAccountResult::FoundCoupledAccount((_, account), _, _) => {
                 account.clone()
             }
         };

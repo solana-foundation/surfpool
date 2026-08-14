@@ -38,7 +38,9 @@ use super::GetTransactionResult;
 use crate::{
     error::{SurfpoolError, SurfpoolResult},
     rpc::utils::is_method_not_supported_error,
-    surfnet::{GetAccountResult, locker::is_supported_token_program},
+    surfnet::{
+        AccountSource, CoupledAccount, GetAccountResult, locker::is_supported_token_program,
+    },
     types::{RemoteRpcResult, TokenAccount},
 };
 
@@ -216,9 +218,10 @@ impl SurfnetRemoteClient {
                             .await
                             .map_err(|e| SurfpoolError::get_account(*pubkey, e))?;
 
-                        result = Some(GetAccountResult::FoundTokenAccount(
+                        result = Some(GetAccountResult::FoundCoupledAccount(
                             (*pubkey, account.clone()),
-                            (token_account.mint(), mint.value),
+                            CoupledAccount::Mint(token_account.mint(), mint.value),
+                            AccountSource::Remote,
                         ));
                     };
                 } else if account.executable {
@@ -230,16 +233,17 @@ impl SurfnetRemoteClient {
                         .await
                         .map_err(|e| SurfpoolError::get_account(*pubkey, e))?;
 
-                    result = Some(GetAccountResult::FoundProgramAccount(
+                    result = Some(GetAccountResult::FoundCoupledAccount(
                         (*pubkey, account.clone()),
-                        (program_data_address, program_data.value),
+                        CoupledAccount::ProgramData(program_data_address, program_data.value),
+                        AccountSource::Remote,
                     ));
                 }
 
                 result.unwrap_or(GetAccountResult::FoundAccount(
-                    *pubkey, account,
-                    // Mark this account as needing to be updated in the SVM, since we fetched it
-                    true,
+                    *pubkey,
+                    account,
+                    AccountSource::Remote,
                 ))
             }
             None => GetAccountResult::None(*pubkey),
@@ -291,8 +295,7 @@ impl SurfnetRemoteClient {
                             GetAccountResult::FoundAccount(
                                 *pubkey,
                                 remote_account,
-                                // Mark this account as needing to be updated in the SVM, since we fetched it
-                                true,
+                                AccountSource::Remote,
                             ),
                         );
                     }
@@ -305,8 +308,7 @@ impl SurfnetRemoteClient {
                         GetAccountResult::FoundAccount(
                             *pubkey,
                             remote_account,
-                            // Mark this account as needing to be updated in the SVM, since we fetched it
-                            true,
+                            AccountSource::Remote,
                         ),
                     );
                 }
@@ -357,17 +359,22 @@ impl SurfnetRemoteClient {
                     // mint accounts to be inserted
                     results_map.insert(
                         account_buffer[index].0,
-                        GetAccountResult::FoundTokenAccount(
+                        GetAccountResult::FoundCoupledAccount(
                             (account_buffer[index].0, account_buffer[index].1.clone()),
-                            (account_buffer[index].2, remote_account.clone()),
+                            CoupledAccount::Mint(account_buffer[index].2, remote_account.clone()),
+                            AccountSource::Remote,
                         ),
                     );
                 } else {
                     results_map.insert(
                         account_buffer[index].0,
-                        GetAccountResult::FoundProgramAccount(
+                        GetAccountResult::FoundCoupledAccount(
                             (account_buffer[index].0, account_buffer[index].1.clone()),
-                            (account_buffer[index].2, remote_account.clone()),
+                            CoupledAccount::ProgramData(
+                                account_buffer[index].2,
+                                remote_account.clone(),
+                            ),
+                            AccountSource::Remote,
                         ),
                     );
                 }

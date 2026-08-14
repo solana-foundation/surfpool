@@ -64,8 +64,9 @@ use txtx_addon_kit::indexmap::IndexSet;
 use uuid::Uuid;
 
 use super::{
-    AccountFactory, GetAccountResult, GetTransactionResult, GeyserEvent, SignatureSubscriptionType,
-    SurfnetSvm, remote::SurfnetRemoteClient, svm::AccountUpdatePolicy,
+    AccountFactory, AccountSource, CoupledAccount, GetAccountResult, GetTransactionResult,
+    GeyserEvent, SignatureSubscriptionType, SurfnetSvm, remote::SurfnetRemoteClient,
+    svm::AccountUpdatePolicy,
 };
 use crate::{
     error::{AirdropError, SurfpoolError, SurfpoolResult},
@@ -283,8 +284,7 @@ impl SurfnetSvmLocker {
     ) -> GetAccountResult {
         match result {
             GetAccountResult::FoundAccount(_, account, _)
-            | GetAccountResult::FoundProgramAccount((_, account), _)
-            | GetAccountResult::FoundTokenAccount((_, account), _)
+            | GetAccountResult::FoundCoupledAccount((_, account), _, _)
                 if offline_owners.contains(&account.owner) =>
             {
                 GetAccountResult::None(*requested_pubkey)
@@ -344,7 +344,11 @@ impl SurfnetSvmLocker {
     ) -> SurfpoolResult<GetAccountResult> {
         let local_account = svm_writer.inner.get_account_result(&pubkey)?;
         if !local_account.is_none() {
-            if local_account.requires_update() {
+            if local_account
+                .source()
+                .and_then(AccountUpdatePolicy::for_source)
+                .is_some()
+            {
                 svm_writer.apply_account_update(
                     local_account.clone(),
                     AccountUpdatePolicy::HydrateIfAbsent,
@@ -424,7 +428,12 @@ impl SurfnetSvmLocker {
             } else {
                 Ok(result)
             }
-        } else if result.inner.requires_update() {
+        } else if result
+            .inner
+            .source()
+            .and_then(AccountUpdatePolicy::for_source)
+            .is_some()
+        {
             // An account read from the configured database must be restored to
             // LiteSVM. Re-check under the write lock so a concurrent local
             // write wins over the stale database value.
@@ -446,7 +455,12 @@ impl SurfnetSvmLocker {
                 .await?
         } else {
             let result = self.get_account_local(pubkey);
-            if result.inner.requires_update() {
+            if result
+                .inner
+                .source()
+                .and_then(AccountUpdatePolicy::for_source)
+                .is_some()
+            {
                 self.resolve_account_after_fetch(*pubkey, None)?
             } else {
                 result
@@ -509,7 +523,12 @@ impl SurfnetSvmLocker {
         }
 
         if missing_accounts.is_empty() {
-            if local_results.iter().any(GetAccountResult::requires_update) {
+            if local_results.iter().any(|result| {
+                result
+                    .source()
+                    .and_then(AccountUpdatePolicy::for_source)
+                    .is_some()
+            }) {
                 return self.resolve_accounts_after_fetch(pubkeys, HashMap::new());
             }
 
@@ -558,7 +577,12 @@ impl SurfnetSvmLocker {
             .await?
         } else {
             let results = self.get_multiple_accounts_local(pubkeys);
-            if results.inner.iter().any(GetAccountResult::requires_update) {
+            if results.inner.iter().any(|result| {
+                result
+                    .source()
+                    .and_then(AccountUpdatePolicy::for_source)
+                    .is_some()
+            }) {
                 self.resolve_accounts_after_fetch(pubkeys, HashMap::new())?
             } else {
                 results
@@ -695,18 +719,20 @@ impl SurfnetSvmLocker {
                                 GetAccountResult::FoundAccount(_, account, _) => {
                                     accounts_to_load.push((*pubkey, account, true));
                                 }
-                                GetAccountResult::FoundProgramAccount(
+                                GetAccountResult::FoundCoupledAccount(
                                     (program_pubkey, program_account),
-                                    (data_pubkey, data_account_opt),
+                                    CoupledAccount::ProgramData(data_pubkey, data_account_opt),
+                                    _,
                                 ) => {
                                     accounts_to_load.push((program_pubkey, program_account, true));
                                     if let Some(data_account) = data_account_opt {
                                         accounts_to_load.push((data_pubkey, data_account, true));
                                     }
                                 }
-                                GetAccountResult::FoundTokenAccount(
+                                GetAccountResult::FoundCoupledAccount(
                                     (token_pubkey, token_account),
-                                    (mint_pubkey, mint_account_opt),
+                                    CoupledAccount::Mint(mint_pubkey, mint_account_opt),
+                                    _,
                                 ) => {
                                     accounts_to_load.push((token_pubkey, token_account, true));
                                     if let Some(mint_account) = mint_account_opt {
@@ -738,7 +764,11 @@ impl SurfnetSvmLocker {
             for (pubkey, account, fetched_from_remote) in accounts_to_load {
                 let load_result = if fetched_from_remote {
                     svm.apply_account_update(
-                        GetAccountResult::FoundAccount(pubkey, account.clone(), true),
+                        GetAccountResult::FoundAccount(
+                            pubkey,
+                            account.clone(),
+                            AccountSource::Remote,
+                        ),
                         AccountUpdatePolicy::HydrateIfAbsent,
                     )
                 } else {
@@ -1838,8 +1868,7 @@ impl SurfnetSvmLocker {
                         capture.insert(pubkey, None);
                     }
                     GetAccountResult::FoundAccount(pubkey, account, _)
-                    | GetAccountResult::FoundProgramAccount((pubkey, account), _)
-                    | GetAccountResult::FoundTokenAccount((pubkey, account), _) => {
+                    | GetAccountResult::FoundCoupledAccount((pubkey, account), _, _) => {
                         capture.insert(pubkey, Some(account));
                     }
                 }
@@ -3494,15 +3523,18 @@ impl SurfnetSvmLocker {
                             new_authority,
                         )?;
 
-                        get_account_result = GetAccountResult::FoundProgramAccount(
+                        get_account_result = GetAccountResult::FoundCoupledAccount(
                             (*pubkey, program_account.clone()),
-                            (programdata_address, Some(programdata_account.clone())),
+                            CoupledAccount::ProgramData(
+                                programdata_address,
+                                Some(programdata_account.clone()),
+                            ),
+                            AccountSource::Generated,
                         );
 
                         original_authority
                     }
-                    GetAccountResult::FoundProgramAccount(_, _)
-                    | GetAccountResult::FoundTokenAccount(_, _) => {
+                    GetAccountResult::FoundCoupledAccount(_, _, _) => {
                         return Err(SurfpoolError::invalid_program_account(
                             pubkey,
                             "Not a program account",
@@ -3510,16 +3542,18 @@ impl SurfnetSvmLocker {
                     }
                 }
             }
-            GetAccountResult::FoundProgramAccount(_, (_, None)) => {
+            GetAccountResult::FoundCoupledAccount(_, CoupledAccount::ProgramData(_, None), _) => {
                 return Err(SurfpoolError::invalid_program_account(
                     program_id,
                     "Program data account does not exist",
                 ));
             }
-            GetAccountResult::FoundProgramAccount(_, (_, Some(programdata_account))) => {
-                update_programdata_account(&program_id, programdata_account, new_authority)?
-            }
-            GetAccountResult::FoundTokenAccount(_, _) => {
+            GetAccountResult::FoundCoupledAccount(
+                _,
+                CoupledAccount::ProgramData(_, Some(programdata_account)),
+                _,
+            ) => update_programdata_account(&program_id, programdata_account, new_authority)?,
+            GetAccountResult::FoundCoupledAccount(_, CoupledAccount::Mint(_, _), _) => {
                 return Err(SurfpoolError::invalid_program_account(
                     program_id,
                     "Not a program account",
@@ -4168,7 +4202,7 @@ impl SurfnetSvmLocker {
                             executable: true,
                             rent_epoch: 0,
                         },
-                        true,
+                        AccountSource::Generated,
                     )
                 })),
             )
@@ -4177,7 +4211,7 @@ impl SurfnetSvmLocker {
         // Check if account was created before consuming it
         let was_program_created = matches!(
             program_account_result,
-            GetAccountResult::FoundAccount(_, _, true)
+            GetAccountResult::FoundAccount(_, _, AccountSource::Generated)
         );
 
         // Ensure we have a valid program account
@@ -4202,7 +4236,11 @@ impl SurfnetSvmLocker {
         // Persist the program account if it was newly created
         if was_program_created {
             self.apply_account_update(
-                GetAccountResult::FoundAccount(program_id, program_account.clone(), true),
+                GetAccountResult::FoundAccount(
+                    program_id,
+                    program_account.clone(),
+                    AccountSource::Generated,
+                ),
                 AccountUpdatePolicy::Authoritative,
             )?;
         }
@@ -4263,7 +4301,7 @@ impl SurfnetSvmLocker {
                             executable: false,
                             rent_epoch: 0,
                         },
-                        true,
+                        AccountSource::Generated,
                     )
                 })),
             )
@@ -4541,7 +4579,7 @@ mod tests {
                 executable: false,
                 rent_epoch: 0,
             },
-            true,
+            AccountSource::Remote,
         );
 
         // This represents a request that observed the account as absent and
@@ -4645,9 +4683,10 @@ mod tests {
         locker
             .resolve_account_after_fetch(
                 primary,
-                Some(GetAccountResult::FoundTokenAccount(
+                Some(GetAccountResult::FoundCoupledAccount(
                     (primary, remote_primary),
-                    (dependency, Some(remote_dependency)),
+                    CoupledAccount::Mint(dependency, Some(remote_dependency)),
+                    AccountSource::Remote,
                 )),
             )
             .unwrap();
@@ -4698,7 +4737,7 @@ mod tests {
                         executable: false,
                         rent_epoch: 0,
                     },
-                    true,
+                    AccountSource::Remote,
                 ),
             ),
             (
@@ -4712,7 +4751,7 @@ mod tests {
                         executable: false,
                         rent_epoch: 0,
                     },
-                    true,
+                    AccountSource::Remote,
                 ),
             ),
         ]);
