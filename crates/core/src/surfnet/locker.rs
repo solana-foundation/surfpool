@@ -379,7 +379,47 @@ impl SurfnetSvmLocker {
             )?;
         }
 
-        Ok(fetched_account)
+        Self::refresh_coupled_account(svm_writer, fetched_account)
+    }
+
+    /// Rebuilds the returned coupled result from the state that is now live in
+    /// LiteSVM. Hydration may intentionally keep a newer local dependency,
+    /// so returning the original fetched composite would expose stale data to
+    /// callers even though the SVM itself is correct.
+    fn refresh_coupled_account(
+        svm_writer: &SurfnetSvm,
+        account_result: GetAccountResult,
+    ) -> SurfpoolResult<GetAccountResult> {
+        let GetAccountResult::FoundCoupledAccount((pubkey, account), coupled, source) =
+            account_result
+        else {
+            return Ok(account_result);
+        };
+
+        let coupled = match coupled {
+            CoupledAccount::ProgramData(coupled_pubkey, fallback_account) => {
+                let local = svm_writer.inner.get_account_result(&coupled_pubkey)?;
+                let account = match local {
+                    GetAccountResult::None(_) => fallback_account,
+                    local => Some(local.map_account()?),
+                };
+                CoupledAccount::ProgramData(coupled_pubkey, account)
+            }
+            CoupledAccount::Mint(coupled_pubkey, fallback_account) => {
+                let local = svm_writer.inner.get_account_result(&coupled_pubkey)?;
+                let account = match local {
+                    GetAccountResult::None(_) => fallback_account,
+                    local => Some(local.map_account()?),
+                };
+                CoupledAccount::Mint(coupled_pubkey, account)
+            }
+        };
+
+        Ok(GetAccountResult::FoundCoupledAccount(
+            (pubkey, account),
+            coupled,
+            source,
+        ))
     }
 
     fn offline_account_owners(svm_writer: &SurfnetSvm) -> Vec<Pubkey> {
@@ -4680,7 +4720,7 @@ mod tests {
                 .unwrap();
         });
 
-        locker
+        let resolved = locker
             .resolve_account_after_fetch(
                 primary,
                 Some(GetAccountResult::FoundCoupledAccount(
@@ -4690,6 +4730,15 @@ mod tests {
                 )),
             )
             .unwrap();
+
+        match resolved.inner {
+            GetAccountResult::FoundCoupledAccount(
+                (_, _),
+                CoupledAccount::Mint(_, Some(returned_dependency)),
+                _,
+            ) => assert_eq!(returned_dependency, local_dependency),
+            other => panic!("expected a coupled token result, got {other:?}"),
+        }
 
         locker.with_svm_reader(|svm| {
             assert_eq!(
