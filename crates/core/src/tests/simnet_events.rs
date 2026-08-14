@@ -35,19 +35,19 @@ fn log_keeps_at_most_the_buffer_capacity() {
 }
 
 #[test]
-fn emit_delivers_the_abort_through_a_full_buffer() {
+fn an_abort_delivers_through_a_full_buffer() {
     let (svm, simnet_events_rx) = empty_events_channel();
 
     for i in 0..1024 {
         svm.simnet_events_tx.info(format!("noise {i}"));
     }
 
-    // Before the sender newtype, this event went through the same silent
-    // try_send as the noise and vanished. emit blocks until the reader
-    // makes room, so it arrives.
+    // The aborted() method is lossless: the buffer is full of noise, so
+    // the call blocks until the reader makes room, and the abort
+    // arrives.
     let tx = svm.simnet_events_tx.clone();
     let emitter = std::thread::spawn(move || {
-        tx.emit(SimnetEvent::Aborted("out of lamports".to_string()));
+        tx.aborted("out of lamports");
     });
 
     let mut received = Vec::new();

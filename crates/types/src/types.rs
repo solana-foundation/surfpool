@@ -626,7 +626,7 @@ impl SimnetEventsTx {
     /// Never call this while holding the SVM lock: the reader may need that
     /// lock to drain, so a blocked emit under the guard wedges every thread
     /// behind it.
-    pub fn emit(&self, event: SimnetEvent) {
+    fn emit(&self, event: SimnetEvent) {
         let _ = self.0.send(event);
     }
 
@@ -647,49 +647,49 @@ impl SimnetEventsTx {
         }
     }
 
-    /// Lossless ([`Self::emit`]): blocks on a full buffer; never call
+    /// Lossless: blocks on a full buffer; never call
     /// while holding the SVM lock.
     pub fn core_started(&self, replayed_transaction_count: u64) {
         self.emit(SimnetEvent::CoreStarted(replayed_transaction_count));
     }
 
-    /// Lossless ([`Self::emit`]): blocks on a full buffer; never call
+    /// Lossless: blocks on a full buffer; never call
     /// while holding the SVM lock.
     pub fn connected(&self, url: impl Into<String>) {
         self.emit(SimnetEvent::Connected(url.into()));
     }
 
-    /// Lossless ([`Self::emit`]): blocks on a full buffer; never call
+    /// Lossless: blocks on a full buffer; never call
     /// while holding the SVM lock.
     pub fn aborted(&self, reason: impl Into<String>) {
         self.emit(SimnetEvent::Aborted(reason.into()));
     }
 
-    /// Lossless ([`Self::emit`]): blocks on a full buffer; never call
+    /// Lossless: blocks on a full buffer; never call
     /// while holding the SVM lock.
     pub fn shutdown(&self) {
         self.emit(SimnetEvent::Shutdown);
     }
 
-    /// Lossless ([`Self::emit`]): blocks on a full buffer; never call
+    /// Lossless: blocks on a full buffer; never call
     /// while holding the SVM lock.
     pub fn clock_update(&self, command: ClockCommand) {
         self.emit(SimnetEvent::ClockUpdate(command));
     }
 
-    /// Lossless ([`Self::emit`]): blocks on a full buffer; never call
+    /// Lossless: blocks on a full buffer; never call
     /// while holding the SVM lock.
     pub fn epoch_info_update(&self, epoch_info: EpochInfo) {
         self.emit(SimnetEvent::EpochInfoUpdate(epoch_info));
     }
 
-    /// Lossless ([`Self::emit`]): blocks on a full buffer; never call
+    /// Lossless: blocks on a full buffer; never call
     /// while holding the SVM lock.
     pub fn runbook_started(&self, runbook_id: impl Into<String>) {
         self.emit(SimnetEvent::RunbookStarted(runbook_id.into()));
     }
 
-    /// Lossless ([`Self::emit`]): blocks on a full buffer; never call
+    /// Lossless: blocks on a full buffer; never call
     /// while holding the SVM lock.
     pub fn runbook_completed(
         &self,
