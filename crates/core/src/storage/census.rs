@@ -4,8 +4,16 @@
 //! storage layer's own resource events, so a workload's before/after delta is
 //! exact and assertable in tests. SQLite only: the PostgreSQL pool is
 //! process-shared by design and its sessions live on the server.
+//!
+//! Counting is always compiled in: the counters are a handful of relaxed
+//! atomics bumped at pool and connection lifecycle events, which are rare
+//! next to queries. Each event also logs at debug level under this module's
+//! target, so any build reports its storage resource movement when run with
+//! `RUST_LOG=surfpool_core::storage::census=debug`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use log::debug;
 
 static POOLS_CREATED: AtomicU64 = AtomicU64::new(0);
 static POOLS_REUSED: AtomicU64 = AtomicU64::new(0);
@@ -14,22 +22,27 @@ static CONNECTIONS_CLOSED: AtomicU64 = AtomicU64::new(0);
 static CONNECTIONS_PEAK: AtomicU64 = AtomicU64::new(0);
 
 pub fn pool_created() {
-    POOLS_CREATED.fetch_add(1, Ordering::Relaxed);
+    let total = POOLS_CREATED.fetch_add(1, Ordering::Relaxed) + 1;
+    debug!("pool created (pools created: {})", total);
 }
 
 /// Reuse exists only while pools live in a shared cache; a backend that owns
 /// its pool never reuses, and reports zero here.
 pub fn pool_reused() {
-    POOLS_REUSED.fetch_add(1, Ordering::Relaxed);
+    let total = POOLS_REUSED.fetch_add(1, Ordering::Relaxed) + 1;
+    debug!("pool reused (pools reused: {})", total);
 }
 
 pub fn connection_opened() {
     CONNECTIONS_OPENED.fetch_add(1, Ordering::Relaxed);
-    CONNECTIONS_PEAK.fetch_max(live_connections(), Ordering::Relaxed);
+    let live = live_connections();
+    CONNECTIONS_PEAK.fetch_max(live, Ordering::Relaxed);
+    debug!("connection opened (live: {})", live);
 }
 
 pub fn connection_closed() {
     CONNECTIONS_CLOSED.fetch_add(1, Ordering::Relaxed);
+    debug!("connection closed (live: {})", live_connections());
 }
 
 fn live_connections() -> u64 {
@@ -149,6 +162,7 @@ mod tests {
     #[test]
     #[ignore = "process-global counters; run alone with --ignored --nocapture"]
     fn dropping_backend_closes_connections() {
+        let _ = env_logger::builder().is_test(true).try_init();
         let temp_file = tempfile::NamedTempFile::new().unwrap();
         let db_path = temp_file.path().to_str().unwrap();
 
@@ -178,6 +192,7 @@ mod tests {
     fn census_workload() {
         const N: usize = 10;
 
+        let _ = env_logger::builder().is_test(true).try_init();
         let t0 = snapshot();
         for _ in 0..N {
             let tt = crate::storage::tests::TestType::sqlite();
