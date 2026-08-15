@@ -3,19 +3,22 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use log::debug;
 use serde::{Deserialize, Serialize};
 use surfpool_db::diesel::{
-    self, RunQueryDsl, connection::SimpleConnection, r2d2::Pool, sql_query, sql_types::Text,
+    self, RunQueryDsl, SqliteConnection,
+    connection::SimpleConnection,
+    r2d2::{ConnectionManager, Pool},
+    sql_query,
+    sql_types::Text,
 };
 
 use crate::storage::{
     Storage, StorageError, StorageResult,
-    census::{self, CountedConnection, CountingSqliteManager},
     diesel_common::{
         CountRecord, KeyRecord, KvRecord, ValueRecord, deserialize_value, serialize_key,
         serialize_value,
     },
 };
 
-type SqlitePool = Pool<CountingSqliteManager>;
+type SqlitePool = Pool<ConnectionManager<SqliteConnection>>;
 
 /// Applies pragmas when each pool connection is created.
 #[derive(Debug)]
@@ -23,10 +26,10 @@ struct SqlitePragmaCustomizer {
     is_file_based: bool,
 }
 
-impl diesel::r2d2::CustomizeConnection<CountedConnection, diesel::r2d2::Error>
+impl diesel::r2d2::CustomizeConnection<SqliteConnection, diesel::r2d2::Error>
     for SqlitePragmaCustomizer
 {
-    fn on_acquire(&self, conn: &mut CountedConnection) -> Result<(), diesel::r2d2::Error> {
+    fn on_acquire(&self, conn: &mut SqliteConnection) -> Result<(), diesel::r2d2::Error> {
         let pragmas = if self.is_file_based {
             "PRAGMA synchronous=NORMAL; PRAGMA temp_store=MEMORY; PRAGMA mmap_size=268435456; PRAGMA cache_size=-64000; PRAGMA busy_timeout=5000;"
         } else {
@@ -76,13 +79,12 @@ impl SqliteBackend {
         };
 
         let is_file_based = database_url != ":memory:";
-        let manager = CountingSqliteManager::new(&connection_string);
+        let manager = ConnectionManager::new(&connection_string);
         let pool = Pool::builder()
             .max_size(10)
             .connection_customizer(Box::new(SqlitePragmaCustomizer { is_file_based }))
             .build(manager)
             .map_err(|e| StorageError::PooledConnectionError(NAME.into(), e))?;
-        census::pool_created();
 
         // journal_mode=WAL persists to file; wal_autocheckpoint is per-connection
         if is_file_based {
@@ -221,7 +223,7 @@ where
         let mut conn = self.pool.get().map_err(|_| StorageError::LockError)?;
 
         let records = query
-            .load::<ValueRecord>(&mut **conn)
+            .load::<ValueRecord>(&mut *conn)
             .map_err(|e| StorageError::get(&self.table_name, NAME, key_str, e))?;
 
         if let Some(record) = records.into_iter().next() {
@@ -258,7 +260,7 @@ where
         let mut conn = self.pool.get().map_err(|_| StorageError::LockError)?;
 
         query
-            .execute(&mut **conn)
+            .execute(&mut *conn)
             .map_err(|e| StorageError::store(&self.table_name, NAME, &key_str, e))?;
 
         debug!("Value stored successfully in table '{}'", self.table_name);
@@ -291,7 +293,7 @@ where
             let mut conn = self.pool.get().map_err(|_| StorageError::LockError)?;
 
             delete_query
-                .execute(&mut **conn)
+                .execute(&mut *conn)
                 .map_err(|e| StorageError::delete(&self.table_name, NAME, &key_str, e))?;
 
             debug!(
@@ -317,7 +319,7 @@ where
         let mut conn = self.pool.get().map_err(|_| StorageError::LockError)?;
 
         delete_query
-            .execute(&mut **conn)
+            .execute(&mut *conn)
             .map_err(|e| StorageError::delete(&self.table_name, NAME, "*all*", e))?;
 
         debug!("Table '{}' cleared successfully", self.table_name);
@@ -336,7 +338,7 @@ where
         let mut conn = self.pool.get().map_err(|_| StorageError::LockError)?;
 
         let records = query
-            .load::<KeyRecord>(&mut **conn)
+            .load::<KeyRecord>(&mut *conn)
             .map_err(|e| StorageError::get_all_keys(&self.table_name, NAME, e))?;
 
         let mut keys = Vec::new();
@@ -370,7 +372,7 @@ where
         let mut conn = self.pool.get().map_err(|_| StorageError::LockError)?;
 
         let records = query
-            .load::<CountRecord>(&mut **conn)
+            .load::<CountRecord>(&mut *conn)
             .map_err(|e| StorageError::count(&self.table_name, NAME, e))?;
 
         let count = records.first().map(|r| r.count as u64).unwrap_or(0);
@@ -393,7 +395,7 @@ where
         let mut conn = self.pool.get().map_err(|_| StorageError::LockError)?;
 
         let records = query
-            .load::<KvRecord>(&mut **conn)
+            .load::<KvRecord>(&mut *conn)
             .map_err(|e| StorageError::get_all_key_value_pairs(&self.table_name, NAME, e))?;
 
         let iter = records.into_iter().filter_map(move |record| {
@@ -477,13 +479,13 @@ mod tests {
 
         let cache_result: Vec<PragmaInt> =
             diesel::sql_query("SELECT cache_size as value FROM pragma_cache_size")
-                .load(&mut **conn2)
+                .load(&mut *conn2)
                 .unwrap();
         assert_eq!(cache_result[0].value, -64000, "cache_size should be -64000");
 
         let timeout_result: Vec<PragmaInt> =
             diesel::sql_query("SELECT timeout as value FROM pragma_busy_timeout")
-                .load(&mut **conn2)
+                .load(&mut *conn2)
                 .unwrap();
         assert_eq!(timeout_result[0].value, 5000, "busy_timeout should be 5000");
     }
@@ -502,13 +504,13 @@ mod tests {
 
         let result: Vec<PragmaInt> =
             diesel::sql_query("SELECT synchronous as value FROM pragma_synchronous")
-                .load(&mut **conn2)
+                .load(&mut *conn2)
                 .unwrap();
         assert_eq!(result[0].value, 1, "synchronous should be NORMAL (1)");
 
         let temp_result: Vec<PragmaInt> =
             diesel::sql_query("SELECT temp_store as value FROM pragma_temp_store")
-                .load(&mut **conn2)
+                .load(&mut *conn2)
                 .unwrap();
         assert_eq!(temp_result[0].value, 2, "temp_store should be MEMORY (2)");
     }

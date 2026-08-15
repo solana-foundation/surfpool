@@ -1,5 +1,4 @@
 mod backend;
-pub mod census;
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
 mod diesel_common;
 mod fifo_map;
