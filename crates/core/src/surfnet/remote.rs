@@ -12,7 +12,7 @@ use solana_client::{
         RpcSignaturesForAddressConfig, RpcTokenAccountsFilter, RpcTransactionConfig,
     },
     rpc_filter::RpcFilterType,
-    rpc_request::{RpcRequest, TokenAccountsFilter},
+    rpc_request::{RpcError, RpcRequest, TokenAccountsFilter},
     rpc_response::{
         RpcAccountBalance, RpcConfirmedTransactionStatusWithSignature, RpcKeyedAccount, RpcResult,
         RpcTokenAccountBalance,
@@ -81,10 +81,20 @@ fn sanitized_client_error(error: &ClientError, datasource_url: &str) -> String {
             error.line(),
             error.column()
         ),
-        ClientErrorKind::RpcError(error) => error.to_string().replace(datasource_url, &endpoint),
+        ClientErrorKind::RpcError(error) => match error {
+            RpcError::RpcRequestError(_) | RpcError::ForUser(_) => {
+                format!("datasource RPC request failed for {endpoint}")
+            }
+            RpcError::RpcResponseError { code, .. } => {
+                format!("datasource RPC response error {code} from {endpoint}")
+            }
+            RpcError::ParseError(_) => {
+                format!("failed to parse the RPC response from {endpoint}")
+            }
+        },
         ClientErrorKind::SigningError(error) => error.to_string(),
         ClientErrorKind::TransactionError(error) => error.to_string(),
-        ClientErrorKind::Custom(error) => error.replace(datasource_url, &endpoint),
+        ClientErrorKind::Custom(_) => format!("datasource client error for {endpoint}"),
     }
 }
 
@@ -647,6 +657,8 @@ where
 mod tests {
     use std::sync::{Arc, Mutex};
 
+    use solana_client::rpc_request::RpcResponseErrorData;
+
     use super::*;
     use crate::surfnet::{locker::SurfnetSvmLocker, svm::SurfnetSvm};
 
@@ -755,7 +767,9 @@ mod tests {
         let message = error.to_string();
 
         assert!(message.contains(&signature.to_string()));
-        assert!(message.contains("provider unavailable"));
+        assert!(message.contains("datasource client error"));
+        assert!(message.contains("http://returns-error.example"));
+        assert!(!message.contains("provider unavailable"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -804,6 +818,43 @@ mod tests {
         assert!(!error.contains("SUPERSECRET"));
         assert!(!error.contains("private-path"));
         assert!(!error.contains("api-key"));
+    }
+
+    #[test]
+    fn provider_reflections_do_not_disclose_datasource_credentials() {
+        let datasource =
+            "https://user:SUPERSECRET@rpc.example.com/private/SUPERSECRET?api-key=SUPERSECRET";
+
+        for fragment in [
+            "user:SUPERSECRET",
+            "/private/SUPERSECRET",
+            "api-key=SUPERSECRET",
+        ] {
+            let errors = [
+                (
+                    ClientErrorKind::RpcError(RpcError::RpcResponseError {
+                        code: -32000,
+                        message: fragment.to_string(),
+                        data: RpcResponseErrorData::Empty,
+                    }),
+                    Some("-32000"),
+                ),
+                (ClientErrorKind::Custom(fragment.to_string()), None),
+            ];
+
+            for (error, expected_code) in errors {
+                let error = ClientError::from(error);
+                let message = sanitized_client_error(&error, datasource);
+
+                assert!(!message.contains("SUPERSECRET"));
+                assert!(!message.contains("private"));
+                assert!(!message.contains("api-key"));
+                assert!(message.contains("https://rpc.example.com"));
+                if let Some(code) = expected_code {
+                    assert!(message.contains(code));
+                }
+            }
+        }
     }
 
     /// A call that never completes, whether because the endpoint went quiet
