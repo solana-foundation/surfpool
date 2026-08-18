@@ -10,9 +10,9 @@ use solana_clock::Slot;
 use solana_pubkey::Pubkey;
 use solana_transaction::TransactionError;
 use solana_transaction_status::EncodeError;
+use surfpool_types::ScenarioError;
 
 use crate::storage::StorageError;
-use surfpool_types::ScenarioError;
 
 pub type SurfpoolResult<T> = std::result::Result<T, SurfpoolError>;
 
