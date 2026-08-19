@@ -1,5 +1,6 @@
 use std::{collections::HashMap, fmt::Display, sync::Arc};
 
+use agave_geyser_plugin_interface::geyser_plugin_interface::SlotStatus;
 use crossbeam_channel::Sender;
 use jsonrpc_core::Result as RpcError;
 use locker::SurfnetSvmLocker;
@@ -37,24 +38,6 @@ pub const FINALIZATION_SLOT_THRESHOLD: u64 = 31;
 pub const SLOTS_PER_EPOCH: u64 = 432000;
 
 pub type AccountFactory = Box<dyn Fn(SurfnetSvmLocker) -> GetAccountResult + Send + Sync>;
-
-/// Slot status for geyser plugin notifications.
-/// Mirrors `agave_geyser_plugin_interface::geyser_plugin_interface::SlotStatus`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GeyserSlotStatus {
-    /// Slot is being processed
-    Processed,
-    /// Slot has been rooted (finalized)
-    Rooted,
-    /// Slot has been confirmed
-    Confirmed,
-    /// First Shred Received
-    FirstShredReceived,
-    /// All shreds for the slot have been received.
-    Completed,
-    /// A new bank fork is created with the slot
-    CreatedBank,
-}
 
 /// Block metadata for geyser plugin notifications.
 #[derive(Debug, Clone)]
@@ -94,7 +77,7 @@ pub enum GeyserEvent {
     UpdateSlotStatus {
         slot: Slot,
         parent: Option<Slot>,
-        status: GeyserSlotStatus,
+        status: SlotStatus,
     },
     /// Notify plugins of block metadata.
     NotifyBlockMetadata(GeyserBlockMetadata),

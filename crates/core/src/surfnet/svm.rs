@@ -7,6 +7,7 @@ use std::{
 };
 
 use agave_feature_set::FeatureSet;
+use agave_geyser_plugin_interface::geyser_plugin_interface::SlotStatus;
 use base64::{Engine, prelude::BASE64_STANDARD};
 use chrono::Utc;
 use convert_case::Casing;
@@ -77,9 +78,9 @@ use uuid::Uuid;
 
 use super::{
     AccountSubscriptionData, BlockHeader, BlockIdentifier, FINALIZATION_SLOT_THRESHOLD,
-    GetAccountResult, GeyserBlockMetadata, GeyserEntryInfo, GeyserEvent, GeyserSlotStatus,
-    ProgramSubscriptionData, SignatureSubscriptionData, SignatureSubscriptionType,
-    SlotsUpdatesSubscriptionData, remote::SurfnetRemoteClient,
+    GetAccountResult, GeyserBlockMetadata, GeyserEntryInfo, GeyserEvent, ProgramSubscriptionData,
+    SignatureSubscriptionData, SignatureSubscriptionType, SlotsUpdatesSubscriptionData,
+    remote::SurfnetRemoteClient,
 };
 use crate::{
     error::{AirdropError, SurfpoolError, SurfpoolResult},
@@ -2465,7 +2466,7 @@ impl SurfnetSvm {
             .send(GeyserEvent::UpdateSlotStatus {
                 slot: new_slot,
                 parent: Some(parent_slot),
-                status: GeyserSlotStatus::CreatedBank,
+                status: SlotStatus::CreatedBank,
             })
             .ok();
 
@@ -2476,7 +2477,7 @@ impl SurfnetSvm {
             .send(GeyserEvent::UpdateSlotStatus {
                 slot,
                 parent: slot.checked_sub(1),
-                status: GeyserSlotStatus::Processed,
+                status: SlotStatus::Processed,
             })
             .ok();
 
@@ -2485,7 +2486,7 @@ impl SurfnetSvm {
             .send(GeyserEvent::UpdateSlotStatus {
                 slot,
                 parent: slot.checked_sub(1),
-                status: GeyserSlotStatus::Confirmed,
+                status: SlotStatus::Confirmed,
             })
             .ok();
         // Mirror the Confirmed Geyser event as an `OptimisticConfirmation`
@@ -2546,7 +2547,7 @@ impl SurfnetSvm {
                 .send(GeyserEvent::UpdateSlotStatus {
                     slot: root,
                     parent: root.checked_sub(1),
-                    status: GeyserSlotStatus::Rooted,
+                    status: SlotStatus::Rooted,
                 })
                 .ok();
             // Mirror the Rooted Geyser event as a `Root` notification for
@@ -6873,7 +6874,7 @@ mod tests {
             match event {
                 GeyserEvent::UpdateSlotStatus {
                     slot,
-                    status: GeyserSlotStatus::CreatedBank,
+                    status: SlotStatus::CreatedBank,
                     ..
                 } => {
                     assert!(

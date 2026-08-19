@@ -342,7 +342,7 @@ pub async fn start_local_surfnet_runloop(
         svm.geyser_events_tx.send(GeyserEvent::UpdateSlotStatus {
             slot,
             parent: slot.checked_sub(1),
-            status: crate::surfnet::GeyserSlotStatus::CreatedBank,
+            status: SlotStatus::CreatedBank,
         })
     });
 
@@ -841,17 +841,8 @@ fn start_geyser_runloop(
                         }
                     }
                     Ok(GeyserEvent::UpdateSlotStatus { slot, parent, status }) => {
-                        let slot_status = match status {
-                            crate::surfnet::GeyserSlotStatus::Processed => SlotStatus::Processed,
-                            crate::surfnet::GeyserSlotStatus::Confirmed => SlotStatus::Confirmed,
-                            crate::surfnet::GeyserSlotStatus::Rooted => SlotStatus::Rooted,
-                            crate::surfnet::GeyserSlotStatus::FirstShredReceived => SlotStatus::FirstShredReceived,
-                            crate::surfnet::GeyserSlotStatus::CreatedBank => SlotStatus::CreatedBank,
-                            crate::surfnet::GeyserSlotStatus::Completed => SlotStatus::Completed,
-                        };
-
                         for plugin in managed_plugins.iter().map(|p| &*p.plugin) {
-                            if let Err(e) = plugin.update_slot_status(slot, parent, &slot_status) {
+                            if let Err(e) = plugin.update_slot_status(slot, parent, &status) {
                                 simnet_events_tx.error(format!("Failed to update slot status in Geyser plugin: {:?}", e));
                             }
                         }
