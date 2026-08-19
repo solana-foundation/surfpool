@@ -238,15 +238,6 @@ pub async fn start_local_surfnet_runloop(
 
     let (plugin_commands_tx, plugin_commands_rx) = unbounded::<PluginCommand>();
 
-    let (_rpc_handle, _ws_handle, shutdown_rpc_servers) = start_rpc_servers_runloop(
-        &config,
-        &simnet_commands_tx,
-        svm_locker.clone(),
-        &remote_rpc_client,
-        plugin_commands_tx,
-    )
-    .await?;
-
     let simnet_config = simnet.clone();
 
     match start_geyser_runloop(
@@ -320,24 +311,12 @@ pub async fn start_local_surfnet_runloop(
 
         count
     });
-    // `Runloop` means nobody declares startup work, so the plan is empty.
-    // Seal it before CoreStarted, and an embedder waiting on that event
-    // observes a publicly ready surfnet. An external planner instead
-    // inspects the project after this point and seals its own plan.
-    if startup_planner == StartupPlanner::Runloop {
-        if let Err(error) = svm_locker.seal_startup_plan(vec![]) {
-            simnet_events_tx_cc.error(format!("Failed to seal startup plan: {error}"));
-        }
-    }
-    simnet_events_tx_cc.core_started(initial_transaction_count);
-
-    // Notify geyser plugins that startup is complete
-    let _ = svm_locker.with_svm_reader(|svm| svm.geyser_events_tx.send(GeyserEvent::EndOfStartup));
-
-    // Announce the genesis slot so plugins begin tracking it. Block production
-    // announces slot N+1 while closing slot N, so without this the first slot is
-    // never created from a plugin's perspective and its block data gets dropped.
     let _ = svm_locker.with_svm_reader(|svm| {
+        // Notify geyser plugins that startup is complete
+        svm.geyser_events_tx.send(GeyserEvent::EndOfStartup)?;
+        // Announce the genesis slot so plugins begin tracking it. Block production
+        // announces slot N+1 while closing slot N, so without this the first slot is
+        // never created from a plugin's perspective and its block data gets dropped.
         let slot = svm.get_latest_absolute_slot();
         svm.geyser_events_tx.send(GeyserEvent::UpdateSlotStatus {
             slot,
@@ -345,6 +324,29 @@ pub async fn start_local_surfnet_runloop(
             status: SlotStatus::CreatedBank,
         })
     });
+
+    // Do not accept RPC traffic until Geyser plugins have been told about the
+    // current slot. A transaction submitted as soon as the listener binds can
+    // otherwise emit block data for a slot the plugin is not tracking yet.
+    let (_rpc_handle, _ws_handle, shutdown_rpc_servers) = start_rpc_servers_runloop(
+        &config,
+        &simnet_commands_tx,
+        svm_locker.clone(),
+        &remote_rpc_client,
+        plugin_commands_tx,
+    )
+    .await?;
+
+    // `Runloop` means nobody declares startup work, so the plan is empty.
+    // Seal it before CoreStarted, and emit that public readiness signal only
+    // after the RPC listeners are accepting connections. An external planner
+    // instead inspects the project after this point and seals its own plan.
+    if startup_planner == StartupPlanner::Runloop {
+        if let Err(error) = svm_locker.seal_startup_plan(vec![]) {
+            simnet_events_tx_cc.error(format!("Failed to seal startup plan: {error}"));
+        }
+    }
+    simnet_events_tx_cc.core_started(initial_transaction_count);
 
     start_block_production_runloop(
         clock_event_rx,
