@@ -11,7 +11,7 @@ import type { SurfnetConfig } from '@solana/surfpool';
 
 import { createSurfnetCheatcodesRpc } from './cheatcodes.js';
 
-/** Lamports each `airdropAddresses` entry is topped up to when no amount is given. */
+/** Lamports each `airdropAddresses` entry is credited with when no amount is given. */
 const DEFAULT_AIRDROP_LAMPORTS = 10_000_000_000n;
 
 /** An address to fund, or anything carrying one (a signer, a PDA, an account). */
@@ -27,9 +27,9 @@ export type SurfpoolRpcOptions = Omit<SolanaRpcConfig<string>, 'rpcSubscriptions
 /** Startup funding applied to both modes. */
 type SurfpoolAirdropOptions = {
     /**
-     * Addresses (or signers) topped up to {@link SurfpoolAirdropOptions.airdropAmount}
-     * lamports while the client is being composed. Addresses already holding at
-     * least that much are left alone.
+     * Addresses (or signers) credited with {@link SurfpoolAirdropOptions.airdropAmount}
+     * lamports while the client is being composed. The amount is added to
+     * whatever the address already holds, the way a real airdrop behaves.
      */
     airdropAddresses?: readonly AirdropTarget[];
     /**
@@ -75,9 +75,9 @@ export type SurfpoolConfig = SurfpoolAttachConfig | SurfpoolEmbeddedConfig;
 /**
  * A `number` above `Number.MAX_SAFE_INTEGER` has already lost precision by the
  * time it is read, and a fractional one is not a lamport amount at all. A
- * negative amount is below every balance, so it would skip funding entirely
- * rather than do what it says. All three are rejected instead of silently
- * funding something other than what was asked for.
+ * negative amount would debit the address instead of funding it, which is not
+ * what an airdrop means. All three are rejected instead of silently funding
+ * something other than what was asked for.
  */
 function toLamports(amount: bigint | number = DEFAULT_AIRDROP_LAMPORTS): bigint {
     if (typeof amount === 'number' && !Number.isSafeInteger(amount)) {
@@ -91,10 +91,11 @@ function toLamports(amount: bigint | number = DEFAULT_AIRDROP_LAMPORTS): bigint 
 }
 
 /**
- * Tops each target up to `amount` lamports through the `setAccount` cheatcode,
- * leaving any account that already holds at least that much untouched. Only
- * the lamport balance is written, so an existing account keeps its data and
- * owner.
+ * Credits each target with `amount` lamports through the `setAccount`
+ * cheatcode. The cheatcode writes an absolute balance, so the current balance
+ * is read first and the amount added to it, matching what a real airdrop does
+ * to an address that already holds lamports. Only the lamport balance is
+ * written, so an existing account keeps its data and owner.
  */
 async function fundAirdropAddresses(
     client: {
@@ -109,10 +110,7 @@ async function fundAirdropAddresses(
             const address = typeof target === 'string' ? target : target.address;
             try {
                 const { value: balance } = await client.rpc.getBalance(address).send();
-                if (balance >= amount) {
-                    return;
-                }
-                await client.cheatcodes.setAccount(address, { lamports: amount }).send();
+                await client.cheatcodes.setAccount(address, { lamports: balance + amount }).send();
             } catch (error) {
                 throw new Error(`Failed to airdrop ${amount} lamports to ${address}`, { cause: error });
             }
@@ -249,8 +247,8 @@ function surfpoolAttachFunded(config: SurfpoolAttachConfigWithAirdrop) {
  * Surfpool instance (e.g. `surfpool start`) instead of booting one. No native
  * module is loaded, no `payer` is installed (the client must already have
  * one), and there is no `client.surfnet` handle. Because that payer is usually
- * unfunded on the running Surfnet, `airdropAddresses` tops it (and anything
- * else listed) up to `airdropAmount` lamports as the client is composed; the
+ * unfunded on the running Surfnet, `airdropAddresses` credits it (and anything
+ * else listed) with `airdropAmount` lamports as the client is composed; the
  * plugin then returns a promise, so `.use()` must be awaited.
  *
  * @example Embedded

@@ -274,17 +274,17 @@ test("attach mode airdrops configured addresses, accepting signers and bare addr
   }
 });
 
-test("attach mode honors airdropAmount and skips addresses already holding enough", async () => {
+test("attach mode honors airdropAmount and adds it to an existing balance", async () => {
   const balances = {
     SurfpoolTestOther111111111111111111111111111: 5_000_000_000,
     SurfpoolTestPayer11111111111111111111111111: 0,
   };
-  const funded = [];
+  const funded = new Map();
   const restore = mockFetch((request) => {
     if (request.method === "getBalance") {
       return { result: { context: { slot: 1 }, value: balances[request.params[0]] } };
     }
-    funded.push(request.params[0]);
+    funded.set(request.params[0], request.params[1].lamports);
     return { result: { context: { slot: 1 }, value: null } };
   });
   try {
@@ -296,13 +296,17 @@ test("attach mode honors airdropAmount and skips addresses already holding enoug
         rpcUrl: ENDPOINT,
       }),
     );
-    assert.deepEqual(funded, [payer.address]);
+    assert.equal(funded.get(payer.address), 2_000_000_000);
+    assert.equal(
+      funded.get("SurfpoolTestOther111111111111111111111111111"),
+      7_000_000_000,
+    );
   } finally {
     restore();
   }
 });
 
-test("attach mode rejects airdropAmount values that cannot represent a lamport top-up", async () => {
+test("attach mode rejects airdropAmount values that cannot represent a lamport amount", async () => {
   const restore = mockFetch(() => {
     throw new Error("no request should be made for an invalid amount");
   });
@@ -316,7 +320,7 @@ test("attach mode rejects airdropAmount values that cannot represent a lamport t
         /airdropAmount must be a safe integer or a bigint/,
       );
     }
-    // A negative amount is below every balance, so it would silently fund nothing.
+    // A negative amount would debit the address rather than fund it.
     for (const airdropAmount of [-1, -1n]) {
       const payer = fakePayer();
       await assert.rejects(
