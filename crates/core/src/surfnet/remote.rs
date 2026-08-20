@@ -1,4 +1,4 @@
-use std::{collections::HashMap, str::FromStr, time::Duration};
+use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use serde_json::json;
@@ -44,13 +44,12 @@ use crate::{
 
 /// How long one call to the datasource gets, start to finish.
 ///
-/// The HTTP client's timeout bounds a single attempt rather than a call:
-/// solana's sender retries a 429 up to five times and honours `Retry-After`
-/// for as much as 120 seconds each time, so a throttled datasource can hold a
-/// call for ten minutes with no individual attempt ever timing out. The value
-/// sits comfortably above that 30 second per-attempt timeout, since a deadline
-/// at or below it would cut off attempts that were going to succeed.
+/// Without this outer deadline, the HTTP timeout applies per attempt,
+/// so Solana retry/backoff handling can keep a datasource call alive
+/// for up to ten minutes.
 const DATASOURCE_DEADLINE: Duration = Duration::from_secs(60);
+const DATASOURCE_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+const DATASOURCE_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Bounds how long the sender it wraps may take, so a datasource that stops
 /// answering surfaces as an error rather than as a surfnet that appears stuck.
@@ -107,56 +106,27 @@ struct SurfpoolRpcClient {
 }
 
 impl SurfpoolRpcClient {
-    fn new<U: ToString>(remote_rpc_url: U) -> Self {
+    fn try_new<U: ToString>(remote_rpc_url: U) -> Result<Self, reqwest::Error> {
+        let client = reqwest::Client::builder()
+            .default_headers(HttpSender::default_headers())
+            .timeout(DATASOURCE_HTTP_TIMEOUT)
+            .pool_idle_timeout(DATASOURCE_POOL_IDLE_TIMEOUT)
+            .build()?;
         let sender = DeadlineSender::new(
-            HttpSender::new(remote_rpc_url.to_string()),
+            HttpSender::new_with_client(remote_rpc_url, client),
             DATASOURCE_DEADLINE,
         );
         let client = RpcClient::new_sender(
             sender,
             RpcClientConfig::with_commitment(CommitmentConfig::default()),
         );
-        SurfpoolRpcClient { client }
-    }
-
-    /// A variant that accepts invalid TLS certificates, for datasources
-    /// behind self-signed certs.
-    fn new_unsafe<U: ToString>(remote_rpc_url: U) -> Option<Self> {
-        use reqwest;
-
-        // Construction can fail after a fork (the daemonize path), so a
-        // failure logs and surfaces as None rather than a panic.
-        let client = match reqwest::Client::builder()
-            .danger_accept_invalid_certs(true)
-            .tls_built_in_root_certs(false)
-            .tls_built_in_webpki_certs(false)
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-        {
-            Ok(client) => client,
-            Err(e) => {
-                error!("unable to initialize datasource client: {}", e);
-                return None;
-            }
-        };
-        let sender = DeadlineSender::new(
-            HttpSender::new_with_client(remote_rpc_url, client),
-            DATASOURCE_DEADLINE,
-        );
-        let client = RpcClient::new_sender(sender, RpcClientConfig::default());
-        Some(SurfpoolRpcClient { client })
+        Ok(SurfpoolRpcClient { client })
     }
 }
 
+#[derive(Clone)]
 pub struct SurfnetRemoteClient {
-    pub client: RpcClient,
-}
-impl Clone for SurfnetRemoteClient {
-    fn clone(&self) -> Self {
-        let remote_rpc_url = self.client.url();
-        SurfnetRemoteClient::new_unsafe(remote_rpc_url)
-            .expect("unable to clone SurfnetRemoteClient")
-    }
+    pub client: Arc<RpcClient>,
 }
 
 pub trait SomeRemoteCtx {
@@ -172,14 +142,12 @@ impl SomeRemoteCtx for Option<SurfnetRemoteClient> {
 
 impl SurfnetRemoteClient {
     pub fn new<U: ToString>(remote_rpc_url: U) -> Self {
-        SurfnetRemoteClient {
-            client: SurfpoolRpcClient::new(remote_rpc_url).client,
-        }
+        Self::try_new(remote_rpc_url).expect("unable to initialize datasource client")
     }
 
-    pub fn new_unsafe<U: ToString>(remote_rpc_url: U) -> Option<Self> {
-        SurfpoolRpcClient::new_unsafe(remote_rpc_url).map(|rpc_client| SurfnetRemoteClient {
-            client: rpc_client.client,
+    pub fn try_new<U: ToString>(remote_rpc_url: U) -> Result<Self, reqwest::Error> {
+        SurfpoolRpcClient::try_new(remote_rpc_url).map(|rpc_client| SurfnetRemoteClient {
+            client: Arc::new(rpc_client.client),
         })
     }
 
@@ -572,6 +540,14 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cloned_remote_clients_share_the_rpc_client() {
+        let client = SurfnetRemoteClient::new("http://127.0.0.1:8899");
+        let cloned_client = client.clone();
+
+        assert!(Arc::ptr_eq(&client.client, &cloned_client.client));
+    }
 
     /// A call that never completes, whether because the endpoint went quiet
     /// or because its retry policy never gave control back. The deadline does

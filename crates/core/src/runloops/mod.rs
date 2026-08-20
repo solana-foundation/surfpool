@@ -186,12 +186,12 @@ pub async fn start_local_surfnet_runloop(
 
     let remote_rpc_client = match simnet.offline_mode {
         true => None,
-        false => SurfnetRemoteClient::new_unsafe(
+        false => Some(SurfnetRemoteClient::try_new(
             simnet
                 .remote_rpc_url
                 .as_ref()
                 .unwrap_or(&DEFAULT_MAINNET_RPC_URL.to_string()),
-        ),
+        )?),
     };
 
     svm_locker.initialize(&remote_rpc_client).await?;
@@ -567,8 +567,8 @@ pub async fn start_block_production_runloop(
                     SimnetCommand::FetchRemoteAccounts(pubkeys, remote_url) => {
                         // The submitter already marked RemoteAccounts as started;
                         // StartStartupTask precedes this command on the same channel.
-                        let fetch_result = match SurfnetRemoteClient::new_unsafe(&remote_url) {
-                            Some(remote_client) => match svm_locker
+                        let fetch_result = match SurfnetRemoteClient::try_new(&remote_url) {
+                            Ok(remote_client) => match svm_locker
                                 .get_multiple_accounts_with_remote_fallback(
                                     &remote_client,
                                     &pubkeys,
@@ -601,7 +601,9 @@ pub async fn start_block_production_runloop(
                                     "Failed to fetch remote accounts {pubkeys:?}: {error}"
                                 )),
                             },
-                            None => Err(format!("Invalid remote RPC URL: {remote_url}")),
+                            Err(error) => Err(format!(
+                                "Unable to initialize remote RPC client: {error}"
+                            )),
                         };
 
                         if let Err(error) = &fetch_result {
