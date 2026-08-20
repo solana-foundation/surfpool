@@ -64,11 +64,18 @@ test("embedded surfpool() boots a Surfnet and wires the full kit client", async 
 test("embedded surfpool() airdrops configured addresses at startup", async (t) => {
   const recipient = Surfnet.newKeypair().publicKey;
   const signerLike = { address: Surfnet.newKeypair().publicKey };
+  // Funded by the Surfnet itself before the plugin runs, so the plugin's own
+  // airdrop lands on an address that already holds lamports.
+  const preFunded = Surfnet.newKeypair().publicKey;
   const client = await createClient().use(
     surfpool({
-      airdropAddresses: [recipient, signerLike],
+      airdropAddresses: [recipient, signerLike, preFunded],
       airdropAmount: 3_000_000_000n,
-      surfnet: { offline: true },
+      surfnet: {
+        airdropAddresses: [preFunded],
+        airdropSol: 1_000_000_000,
+        offline: true,
+      },
     }),
   );
   t.after(() => client.surfnet.stop());
@@ -77,6 +84,9 @@ test("embedded surfpool() airdrops configured addresses at startup", async (t) =
   assert.equal(funded.value, 3_000_000_000n);
   const fundedSigner = await client.rpc.getBalance(signerLike.address).send();
   assert.equal(fundedSigner.value, 3_000_000_000n);
+  // Additive: the startup balance survives and the airdrop is added to it.
+  const toppedUp = await client.rpc.getBalance(preFunded).send();
+  assert.equal(toppedUp.value, 4_000_000_000n);
 });
 
 test("disposing the embedded client stops the Surfnet", async () => {
