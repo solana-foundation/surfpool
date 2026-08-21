@@ -51,8 +51,10 @@ use solana_message::{
 };
 use solana_pubkey::Pubkey;
 use solana_pubsub_client::nonblocking::pubsub_client::PubsubClient;
-use solana_rpc_client_api::config::RpcSignatureSubscribeConfig;
-use solana_rpc_client_api::response::{Response as RpcResponse, SlotUpdate};
+use solana_rpc_client_api::{
+    config::RpcSignatureSubscribeConfig,
+    response::{Response as RpcResponse, SlotUpdate},
+};
 use solana_secp256k1_program::{
     eth_address_from_pubkey, new_secp256k1_instruction_with_signature,
     sign_message as sign_secp256k1_message,
