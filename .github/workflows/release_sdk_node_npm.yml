@@ -159,7 +159,7 @@ jobs:
           node -e "require('@solana/surfpool'); console.log('require @solana/surfpool OK');"
           # The kit peers are optional and not auto-installed; installing them
           # here validates the documented opt-in flow for the ./kit entry.
-          npm install --no-audit --no-fund "@solana/kit@^7.0.0" "@solana/kit-plugin-rpc@^0.15.0" "@solana/kit-plugin-signer@^0.13.0"
+          npm install --no-audit --no-fund "@solana/kit@^8.0.0" "@solana/kit-plugin-rpc@^0.18.0" "@solana/kit-plugin-signer@^0.18.0"
           node -e "
             const kit = require('@solana/surfpool/kit');
             if (typeof kit.surfpool !== 'function') { throw new Error('missing surfpool export'); }
