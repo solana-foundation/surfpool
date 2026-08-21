@@ -13,6 +13,7 @@ import { createSurfnetCheatcodesRpc } from './cheatcodes.js';
 
 /** Lamports each `airdropAddresses` entry is credited with when no amount is given. */
 const DEFAULT_AIRDROP_LAMPORTS = 10_000_000_000n;
+const MAX_LAMPORTS = 2n ** 64n - 1n;
 
 /** An address to fund, or anything carrying one (a signer, a PDA, an account). */
 export type AirdropTarget = Address | { readonly address: Address };
@@ -78,7 +79,8 @@ export type SurfpoolConfig = SurfpoolAttachConfig | SurfpoolEmbeddedConfig;
  * A `number` above `Number.MAX_SAFE_INTEGER` has already lost precision by the
  * time it is read, and a fractional one is not a lamport amount at all. A
  * negative amount would debit the address instead of funding it, which is not
- * what an airdrop means. All three are rejected instead of silently funding
+ * what an airdrop means. An amount beyond `u64::MAX` cannot be represented as a
+ * lamport balance at all. All four are rejected instead of silently funding
  * something other than what was asked for.
  */
 function toLamports(amount: bigint | number = DEFAULT_AIRDROP_LAMPORTS): bigint {
@@ -89,6 +91,9 @@ function toLamports(amount: bigint | number = DEFAULT_AIRDROP_LAMPORTS): bigint 
     if (lamports < 0n) {
         throw new Error(`airdropAmount must not be negative; received ${amount}`);
     }
+    if (lamports > MAX_LAMPORTS) {
+        throw new Error(`airdropAmount must not exceed ${MAX_LAMPORTS} lamports; received ${amount}`);
+    }
     return lamports;
 }
 
@@ -97,7 +102,9 @@ function toLamports(amount: bigint | number = DEFAULT_AIRDROP_LAMPORTS): bigint 
  * cheatcode. The cheatcode writes an absolute balance, so the current balance
  * is read first and the amount added to it, matching what a real airdrop does
  * to an address that already holds lamports. Only the lamport balance is
- * written, so an existing account keeps its data and owner.
+ * written, so an existing account keeps its data and owner. A sum past
+ * `u64::MAX` is not a representable balance and is rejected before it reaches
+ * the cheatcode.
  */
 async function fundAirdropAddresses(
     client: {
@@ -116,7 +123,13 @@ async function fundAirdropAddresses(
         [...addresses].map(async address => {
             try {
                 const { value: balance } = await client.rpc.getBalance(address).send();
-                await client.cheatcodes.setAccount(address, { lamports: balance + amount }).send();
+                const lamports = balance + amount;
+                if (lamports > MAX_LAMPORTS) {
+                    throw new Error(
+                        `balance ${balance} plus airdropAmount ${amount} exceeds the maximum lamport balance ${MAX_LAMPORTS}`,
+                    );
+                }
+                await client.cheatcodes.setAccount(address, { lamports }).send();
             } catch (error) {
                 throw new Error(`Failed to airdrop ${amount} lamports to ${address}`, { cause: error });
             }

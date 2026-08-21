@@ -370,6 +370,43 @@ test("attach mode rejects airdropAmount values that cannot represent a lamport a
         /airdropAmount must not be negative/,
       );
     }
+    // A lamport balance is a u64 on the wire, so anything beyond that range is
+    // rejected here rather than by the RPC deserializer.
+    for (const airdropAmount of [2n ** 64n, 2n ** 70n]) {
+      const payer = fakePayer();
+      await assert.rejects(
+        createClient({ payer }).use(
+          surfpool({ airdropAddresses: [payer], airdropAmount, rpcUrl: ENDPOINT }),
+        ),
+        /airdropAmount must not exceed 18446744073709551615 lamports/,
+      );
+    }
+  } finally {
+    restore();
+  }
+});
+
+test("attach mode rejects an airdrop whose sum with the existing balance exceeds u64", async () => {
+  const restore = mockFetch((request) => {
+    if (request.method === "getBalance") {
+      return { result: { context: { slot: 1 }, value: 5_000_000_000 } };
+    }
+    throw new Error("no account should be written for an unrepresentable balance");
+  });
+  try {
+    const payer = fakePayer();
+    await assert.rejects(
+      createClient({ payer }).use(
+        surfpool({
+          airdropAddresses: [payer],
+          airdropAmount: 2n ** 64n - 1n,
+          rpcUrl: ENDPOINT,
+        }),
+      ),
+      (error) =>
+        /Failed to airdrop/.test(error.message) &&
+        /exceeds the maximum lamport balance 18446744073709551615/.test(error.cause.message),
+    );
   } finally {
     restore();
   }
