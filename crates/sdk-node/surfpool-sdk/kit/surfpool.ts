@@ -30,11 +30,13 @@ type SurfpoolAirdropOptions = {
      * Addresses (or signers) credited with {@link SurfpoolAirdropOptions.airdropAmount}
      * lamports while the client is being composed. The amount is added to
      * whatever the address already holds, the way a real airdrop behaves.
+     * Entries naming the same address are funded once.
      */
     airdropAddresses?: readonly AirdropTarget[];
     /**
      * Lamports to fund each entry of `airdropAddresses` with. Defaults to 10 SOL.
      * A `number` must be a safe integer; pass a `bigint` for amounts above 2^53.
+     * Zero funds nothing.
      */
     airdropAmount?: bigint | number;
 };
@@ -105,9 +107,13 @@ async function fundAirdropAddresses(
     targets: readonly AirdropTarget[],
     amount: bigint,
 ): Promise<void> {
+    if (amount === 0n) {
+        return;
+    }
+    // Collapsing aliases to a set of addresses funds each exactly once.
+    const addresses = new Set(targets.map(target => (typeof target === 'string' ? target : target.address)));
     await Promise.all(
-        targets.map(async target => {
-            const address = typeof target === 'string' ? target : target.address;
+        [...addresses].map(async address => {
             try {
                 const { value: balance } = await client.rpc.getBalance(address).send();
                 await client.cheatcodes.setAccount(address, { lamports: balance + amount }).send();

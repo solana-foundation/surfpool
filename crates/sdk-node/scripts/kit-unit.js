@@ -306,6 +306,46 @@ test("attach mode honors airdropAmount and adds it to an existing balance", asyn
   }
 });
 
+test("attach mode funds an address named twice exactly once", async () => {
+  const funded = [];
+  const restore = mockFetch((request) => {
+    if (request.method === "getBalance") {
+      return { result: { context: { slot: 1 }, value: 5_000_000_000 } };
+    }
+    funded.push([request.params[0], request.params[1].lamports]);
+    return { result: { context: { slot: 1 }, value: null } };
+  });
+  try {
+    const payer = fakePayer();
+    await createClient({ payer }).use(
+      surfpool({
+        // The signer and its own address are the same target spelled two ways.
+        airdropAddresses: [payer, payer.address],
+        airdropAmount: 2_000_000_000n,
+        rpcUrl: ENDPOINT,
+      }),
+    );
+    assert.deepEqual(funded, [[payer.address, 7_000_000_000]]);
+  } finally {
+    restore();
+  }
+});
+
+test("attach mode funds nothing when airdropAmount is zero", async () => {
+  const restore = mockFetch((request) => {
+    throw new Error(`no request should be made for a zero amount, got ${request.method}`);
+  });
+  try {
+    const payer = fakePayer();
+    const client = await createClient({ payer }).use(
+      surfpool({ airdropAddresses: [payer], airdropAmount: 0, rpcUrl: ENDPOINT }),
+    );
+    assert.equal(client.rpcUrl, ENDPOINT);
+  } finally {
+    restore();
+  }
+});
+
 test("attach mode rejects airdropAmount values that cannot represent a lamport amount", async () => {
   const restore = mockFetch(() => {
     throw new Error("no request should be made for an invalid amount");
