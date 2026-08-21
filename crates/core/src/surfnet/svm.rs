@@ -48,7 +48,10 @@ use solana_slot_hashes::MAX_ENTRIES as MAX_SLOT_HASHES_ENTRIES;
 use solana_system_interface::instruction as system_instruction;
 use solana_transaction::versioned::VersionedTransaction;
 use solana_transaction_error::TransactionError;
-use solana_transaction_status::{TransactionDetails, TransactionStatusMeta, UiConfirmedBlock};
+use solana_transaction_status::{
+    TransactionConfirmationStatus as RpcTransactionConfirmationStatus, TransactionDetails,
+    TransactionStatusMeta, UiConfirmedBlock,
+};
 use spl_token_2022_interface::extension::{
     BaseStateWithExtensions, StateWithExtensions, interest_bearing_mint::InterestBearingConfig,
     scaled_ui_amount::ScaledUiAmountConfig,
@@ -78,8 +81,9 @@ use uuid::Uuid;
 use super::{
     AccountSubscriptionData, BlockHeader, BlockIdentifier, FINALIZATION_SLOT_THRESHOLD,
     GetAccountResult, GeyserBlockMetadata, GeyserEntryInfo, GeyserEvent, GeyserSlotStatus,
-    ProgramSubscriptionData, SignatureSubscriptionData, SignatureSubscriptionType,
-    SlotsUpdatesSubscriptionData, remote::SurfnetRemoteClient,
+    LocalSignatureStatus, LocalSignatureStatusOrSubscription, ProgramSubscriptionData,
+    SignatureSubscriptionData, SignatureSubscriptionType, SlotsUpdatesSubscriptionData,
+    remote::SurfnetRemoteClient,
 };
 use crate::{
     error::{AirdropError, SurfpoolError, SurfpoolResult},
@@ -2937,6 +2941,46 @@ impl SurfnetSvm {
             .or_default()
             .push((subscription_type, tx));
         rx
+    }
+
+    /// Atomically returns a local signature status that already satisfies a subscription, or
+    /// registers the subscription before releasing the SVM write lock.
+    ///
+    /// This closes the check-then-subscribe race for WebSocket clients: a transaction cannot be
+    /// committed between the local status check and receiver registration. The compact status is
+    /// derived directly from the stored transaction metadata, avoiding transaction encoding.
+    pub fn get_local_signature_status_or_subscribe(
+        &mut self,
+        signature: &Signature,
+        subscription_type: SignatureSubscriptionType,
+    ) -> SurfpoolResult<LocalSignatureStatusOrSubscription> {
+        let current_slot = self.get_latest_absolute_slot();
+        if let Some(SurfnetTransactionStatus::Processed(transaction)) =
+            self.transactions.get(&signature.to_string())?
+        {
+            let (transaction, _) = transaction.as_ref();
+            let confirmation_status =
+                if current_slot >= transaction.slot + FINALIZATION_SLOT_THRESHOLD {
+                    RpcTransactionConfirmationStatus::Finalized
+                } else if current_slot > transaction.slot {
+                    RpcTransactionConfirmationStatus::Confirmed
+                } else {
+                    RpcTransactionConfirmationStatus::Processed
+                };
+
+            if subscription_type.is_satisfied_by(confirmation_status) {
+                return Ok(LocalSignatureStatusOrSubscription::Status(
+                    LocalSignatureStatus {
+                        slot: transaction.slot,
+                        err: transaction.meta.status.clone().err(),
+                    },
+                ));
+            }
+        }
+
+        Ok(LocalSignatureStatusOrSubscription::Subscription(
+            self.subscribe_for_signature_updates(signature, subscription_type),
+        ))
     }
 
     pub fn subscribe_for_account_updates(

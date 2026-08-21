@@ -1,6 +1,6 @@
 use std::{collections::HashMap, fmt::Display, sync::Arc};
 
-use crossbeam_channel::Sender;
+use crossbeam_channel::{Receiver, Sender};
 use jsonrpc_core::Result as RpcError;
 use locker::SurfnetSvmLocker;
 use solana_account::Account;
@@ -18,7 +18,9 @@ use solana_rpc_client_api::response::SlotUpdate;
 use solana_signature::Signature;
 use solana_transaction::versioned::VersionedTransaction;
 use solana_transaction_error::TransactionError;
-use solana_transaction_status::{EncodedConfirmedTransactionWithStatusMeta, TransactionStatus};
+use solana_transaction_status::{
+    EncodedConfirmedTransactionWithStatusMeta, TransactionConfirmationStatus, TransactionStatus,
+};
 use svm::SurfnetSvm;
 
 use crate::{
@@ -158,6 +160,22 @@ pub type SignatureSubscriptionData = (
     SignatureSubscriptionType,
     Sender<(Slot, Option<TransactionError>)>,
 );
+
+/// The status returned by an atomic signature lookup.
+///
+/// This deliberately contains only the fields needed to produce a
+/// `signatureNotification`; serializing the transaction is both unnecessary and would make the
+/// registration path needlessly expensive.
+pub struct LocalSignatureStatus {
+    pub slot: Slot,
+    pub err: Option<TransactionError>,
+}
+
+/// The outcome of atomically checking a local signature and registering for updates.
+pub enum LocalSignatureStatusOrSubscription {
+    Status(LocalSignatureStatus),
+    Subscription(Receiver<(Slot, Option<TransactionError>)>),
+}
 
 pub type AccountSubscriptionData =
     HashMap<Pubkey, Vec<(Option<UiAccountEncoding>, Sender<UiAccount>)>>;
@@ -325,6 +343,32 @@ impl SignatureSubscriptionType {
 
     pub const fn finalized() -> Self {
         SignatureSubscriptionType::Commitment(CommitmentLevel::Finalized)
+    }
+
+    /// Whether a transaction at `confirmation_status` has reached this subscription's target.
+    pub const fn is_satisfied_by(
+        &self,
+        confirmation_status: TransactionConfirmationStatus,
+    ) -> bool {
+        matches!(
+            (self, confirmation_status),
+            (Self::Received, _)
+                | (
+                    Self::Commitment(CommitmentLevel::Processed),
+                    TransactionConfirmationStatus::Processed
+                        | TransactionConfirmationStatus::Confirmed
+                        | TransactionConfirmationStatus::Finalized
+                )
+                | (
+                    Self::Commitment(CommitmentLevel::Confirmed),
+                    TransactionConfirmationStatus::Confirmed
+                        | TransactionConfirmationStatus::Finalized
+                )
+                | (
+                    Self::Commitment(CommitmentLevel::Finalized),
+                    TransactionConfirmationStatus::Finalized
+                )
+        )
     }
 }
 

@@ -114,6 +114,7 @@ p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
 test-case = { workspace = true }
 env_logger = "0.11"
 solana-ed25519-program = { workspace = true }
+solana-pubsub-client = { workspace = true }
 solana-secp256k1-program = { version = "3.0", default-features = false, features = ["bincode"] }
 solana-secp256r1-program = "3.0"
 tempfile = { workspace = true }
