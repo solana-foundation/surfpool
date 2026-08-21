@@ -192,7 +192,7 @@ jobs:
           npm install "./$(basename "${{ steps.pack.outputs.root_pack }}")"
           # The kit peers are optional and not auto-installed; installing them
           # here validates the documented opt-in flow.
-          npm install "@solana/kit@^7.0.0" "@solana/kit-plugin-rpc@^0.15.0" "@solana/kit-plugin-signer@^0.13.0"
+          npm install "@solana/kit@^8.0.0" "@solana/kit-plugin-rpc@^0.18.0" "@solana/kit-plugin-signer@^0.18.0"
           node - <<'EOF'
           const assert = require("node:assert/strict");
           const { createClient } = require("@solana/kit");
