@@ -71,15 +71,15 @@
   },
   "devDependencies": {
     "@napi-rs/cli": "^2.18.4",
-    "@solana/kit": "^7.0.0",
-    "@solana/kit-plugin-rpc": "^0.15.0",
-    "@solana/kit-plugin-signer": "^0.13.0",
+    "@solana/kit": "^8.0.0",
+    "@solana/kit-plugin-rpc": "^0.18.0",
+    "@solana/kit-plugin-signer": "^0.18.0",
     "typescript": "^5.7.0"
   },
   "peerDependencies": {
-    "@solana/kit": "^7.0.0",
-    "@solana/kit-plugin-rpc": "^0.15.0",
-    "@solana/kit-plugin-signer": "^0.13.0"
+    "@solana/kit": "^8.0.0",
+    "@solana/kit-plugin-rpc": "^0.18.0",
+    "@solana/kit-plugin-signer": "^0.18.0"
   },
   "peerDependenciesMeta": {
     "@solana/kit": {
