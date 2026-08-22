@@ -28,9 +28,9 @@ impl diesel::r2d2::CustomizeConnection<CountedConnection, diesel::r2d2::Error>
 {
     fn on_acquire(&self, conn: &mut CountedConnection) -> Result<(), diesel::r2d2::Error> {
         let pragmas = if self.is_file_based {
-            "PRAGMA synchronous=NORMAL; PRAGMA temp_store=MEMORY; PRAGMA mmap_size=268435456; PRAGMA cache_size=-64000; PRAGMA busy_timeout=5000;"
+            "PRAGMA busy_timeout=5000; PRAGMA synchronous=NORMAL; PRAGMA temp_store=MEMORY; PRAGMA mmap_size=268435456; PRAGMA cache_size=-64000;"
         } else {
-            "PRAGMA synchronous=OFF; PRAGMA temp_store=MEMORY; PRAGMA cache_size=-64000; PRAGMA busy_timeout=5000;"
+            "PRAGMA busy_timeout=5000; PRAGMA synchronous=OFF; PRAGMA temp_store=MEMORY; PRAGMA cache_size=-64000;"
         };
         conn.batch_execute(pragmas)
             .map_err(diesel::r2d2::Error::QueryError)
