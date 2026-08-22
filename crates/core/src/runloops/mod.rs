@@ -1144,6 +1144,66 @@ async fn start_ws_rpc_server_runloop(
 }
 
 #[cfg(test)]
+mod rpc_server_startup_tests {
+    use surfpool_types::RpcConfig;
+
+    use super::*;
+    use crate::tests::helpers::{TestSetup, get_free_port};
+
+    /// A WebSocket bind failure must come back as the bind error through
+    /// the startup channel, with an aborted event and no panic. The port
+    /// is squatted before the call, modeling a port lost between the
+    /// runloop's preflight check and the server bind.
+    #[cfg_attr(feature = "ignore_tests_ci", ignore = "flaky CI tests")]
+    #[test]
+    fn ws_bind_failure_reports_the_bind_error() {
+        let ws_port = get_free_port().unwrap();
+        let _squatter = std::net::TcpListener::bind(format!("127.0.0.1:{ws_port}")).unwrap();
+
+        let config = SurfpoolConfig {
+            rpc: RpcConfig {
+                bind_host: "127.0.0.1".to_string(),
+                ws_port,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let (setup, simnet_events_rx) = TestSetup::new_with_events(());
+        let simnet_events_tx = setup.context.svm_locker.simnet_events_tx();
+        let middleware = SurfpoolMiddleware::new(
+            setup.context.svm_locker.clone(),
+            &setup.context.simnet_commands_tx,
+            &config.rpc,
+            &None,
+            setup.context.plugin_commands_tx.clone(),
+        );
+
+        let result = hiro_system_kit::nestable_block_on(start_ws_rpc_server_runloop(
+            &config,
+            middleware,
+            simnet_events_tx,
+        ));
+        let error = match result {
+            Ok((_handle, close_handle)) => {
+                close_handle.close();
+                panic!("the squatted port should fail the bind");
+            }
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("Failed to start WebSocket RPC server"),
+            "the bind error should reach the caller, got: {error}"
+        );
+
+        let aborted = simnet_events_rx
+            .try_iter()
+            .any(|event| matches!(event, SimnetEvent::Aborted(_)));
+        assert!(aborted, "the failure should emit an aborted event");
+    }
+}
+
+#[cfg(test)]
 mod absent_after_hydration_tests {
     use solana_account::Account;
 
