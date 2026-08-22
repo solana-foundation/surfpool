@@ -43,7 +43,7 @@ libloading = { workspace = true }
 litesvm = { workspace = true }
 litesvm-token = { workspace = true }
 log = { workspace = true }
-reqwest = { workspace = true }
+reqwest = { workspace = true, features = ["rustls-tls"] }
 serde = { workspace = true }
 serde_derive = { workspace = true }                                  # must match the serde version, see https://github.com/serde-rs/serde/issues/2584#issuecomment-1685252251
 serde_json = { workspace = true }

@@ -1,4 +1,4 @@
-use std::{collections::HashMap, str::FromStr, time::Duration};
+use std::{collections::HashMap, str::FromStr, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use serde_json::json;
@@ -119,13 +119,19 @@ impl SurfpoolRpcClient {
         SurfpoolRpcClient { client }
     }
 
-    /// A variant that accepts invalid TLS certificates, for datasources
-    /// behind self-signed certs.
-    fn new_unsafe<U: ToString>(remote_rpc_url: U) -> Option<Self> {
+    /// A variant that accepts any TLS certificate, for datasources behind
+    /// self-signed certs. Anything the datasource returns is written straight
+    /// into the local bank, so an unverified transport lets an on-path
+    /// attacker choose the account state and program bytecode a surfnet runs
+    /// against: only reach this through the explicit
+    /// `--allow-insecure-remote-tls` opt-in, never by default.
+    fn new_without_tls_verification<U: ToString>(remote_rpc_url: U) -> Option<Self> {
         use reqwest;
 
         // Construction can fail after a fork (the daemonize path), so a
-        // failure logs and surfaces as None rather than a panic.
+        // failure logs and surfaces as None rather than a panic. The built-in
+        // root stores stay off because nothing consults them once every
+        // certificate is accepted, and loading them is what tends to fail here.
         let client = match reqwest::Client::builder()
             .danger_accept_invalid_certs(true)
             .tls_built_in_root_certs(false)
@@ -148,15 +154,15 @@ impl SurfpoolRpcClient {
     }
 }
 
+/// The datasource handle the rest of the surfnet holds.
+///
+/// The client sits behind an [`Arc`] so a clone shares the transport the
+/// original was built with. Rebuilding it from `client.url()` instead would
+/// carry the URL across but not the TLS posture, which is how every clone of a
+/// verified client used to end up unverified.
+#[derive(Clone)]
 pub struct SurfnetRemoteClient {
-    pub client: RpcClient,
-}
-impl Clone for SurfnetRemoteClient {
-    fn clone(&self) -> Self {
-        let remote_rpc_url = self.client.url();
-        SurfnetRemoteClient::new_unsafe(remote_rpc_url)
-            .expect("unable to clone SurfnetRemoteClient")
-    }
+    pub client: Arc<RpcClient>,
 }
 
 pub trait SomeRemoteCtx {
@@ -171,16 +177,42 @@ impl SomeRemoteCtx for Option<SurfnetRemoteClient> {
 }
 
 impl SurfnetRemoteClient {
+    /// A client that verifies the datasource's TLS certificate chain.
     pub fn new<U: ToString>(remote_rpc_url: U) -> Self {
         SurfnetRemoteClient {
-            client: SurfpoolRpcClient::new(remote_rpc_url).client,
+            client: Arc::new(SurfpoolRpcClient::new(remote_rpc_url).client),
         }
     }
 
-    pub fn new_unsafe<U: ToString>(remote_rpc_url: U) -> Option<Self> {
-        SurfpoolRpcClient::new_unsafe(remote_rpc_url).map(|rpc_client| SurfnetRemoteClient {
-            client: rpc_client.client,
+    /// A client that accepts any TLS certificate, for datasources behind
+    /// self-signed certs.
+    ///
+    /// Fetched accounts are written straight into the local bank, so an
+    /// unverified transport lets an on-path attacker choose the account state
+    /// and program bytecode a surfnet runs against. Reach this only through
+    /// the operator's explicit `--allow-insecure-remote-tls` opt-in, which
+    /// [`Self::new_with_tls_policy`] exists to carry.
+    pub fn new_without_tls_verification<U: ToString>(remote_rpc_url: U) -> Option<Self> {
+        SurfpoolRpcClient::new_without_tls_verification(remote_rpc_url).map(|rpc_client| {
+            SurfnetRemoteClient {
+                client: Arc::new(rpc_client.client),
+            }
         })
+    }
+
+    /// Builds a datasource client honouring the surfnet's TLS policy.
+    ///
+    /// `None` means the client could not be built at all, which only the
+    /// unverified path can report; the verified path always succeeds.
+    pub fn new_with_tls_policy<U: ToString>(
+        remote_rpc_url: U,
+        allow_insecure_tls: bool,
+    ) -> Option<Self> {
+        if allow_insecure_tls {
+            Self::new_without_tls_verification(remote_rpc_url)
+        } else {
+            Some(Self::new(remote_rpc_url))
+        }
     }
 
     pub async fn get_epoch_info(&self) -> SurfpoolResult<EpochInfo> {

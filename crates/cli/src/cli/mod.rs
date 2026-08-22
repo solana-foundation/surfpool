@@ -284,6 +284,14 @@ pub struct StartNetworkOptions {
         long_help = "Run without a remote RPC datasource. Use this to simulate an offline environment.\n\nExample: surfpool start --offline"
     )]
     pub offline: bool,
+    /// Accept any TLS certificate presented by the datasource RPC.
+    #[clap(
+        long = "allow-insecure-remote-tls",
+        action=ArgAction::SetTrue,
+        default_value = "false",
+        long_help = "Accept any TLS certificate presented by the datasource RPC, including self-signed and expired ones.\n\nAccounts fetched from the datasource are loaded straight into the local SVM, so this lets anyone able to intercept the connection choose the account state and program bytecode your surfnet runs against. Use it only for a datasource you control on a network you trust.\n\nExample: surfpool start --rpc-url https://localhost:8899 --allow-insecure-remote-tls"
+    )]
+    pub allow_insecure_remote_tls: bool,
 }
 
 #[derive(Args, PartialEq, Clone, Debug)]
@@ -678,6 +686,7 @@ impl StartSimnet {
             airdrop_token_amount: self.accounts.airdrop_token_amount,
             expiry: None,
             offline_mode: self.network.offline,
+            allow_insecure_remote_tls: self.network.allow_insecure_remote_tls,
             instruction_profiling_enabled: !self.observability.disable_instruction_profiling,
             max_profiles: self.observability.max_profiles,
             log_bytes_limit: if self.observability.log_bytes_limit == 0 {

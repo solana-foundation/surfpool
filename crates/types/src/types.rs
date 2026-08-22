@@ -845,6 +845,14 @@ pub enum StartupPlanner {
 pub struct SimnetConfig {
     pub offline_mode: bool,
     pub remote_rpc_url: Option<String>,
+    /// Accept any TLS certificate the datasource presents.
+    ///
+    /// Off unless the operator asks for it: fetched accounts are written
+    /// straight into the local bank, so skipping verification lets an on-path
+    /// attacker pick the account state and program bytecode this surfnet runs
+    /// against. Exists for datasources behind self-signed certs.
+    #[serde(default)]
+    pub allow_insecure_remote_tls: bool,
     pub slot_time: u64,
     pub block_production_mode: BlockProductionMode,
     pub airdrop_addresses: Vec<Pubkey>,
@@ -869,6 +877,7 @@ impl Default for SimnetConfig {
         Self {
             offline_mode: false,
             remote_rpc_url: Some(DEFAULT_MAINNET_RPC_URL.to_string()),
+            allow_insecure_remote_tls: false,
             slot_time: DEFAULT_SLOT_TIME_MS, // Default to 400ms to match CLI default
             block_production_mode: BlockProductionMode::Clock,
             airdrop_addresses: vec![],

@@ -186,11 +186,12 @@ pub async fn start_local_surfnet_runloop(
 
     let remote_rpc_client = match simnet.offline_mode {
         true => None,
-        false => SurfnetRemoteClient::new_unsafe(
+        false => SurfnetRemoteClient::new_with_tls_policy(
             simnet
                 .remote_rpc_url
                 .as_ref()
                 .unwrap_or(&DEFAULT_MAINNET_RPC_URL.to_string()),
+            simnet.allow_insecure_remote_tls,
         ),
     };
 
@@ -200,6 +201,14 @@ pub async fn start_local_surfnet_runloop(
         svm_locker
             .simnet_events_tx()
             .connected(remote_client.client.url());
+        // Arming the opt-in is worth saying out loud: from here on, anything
+        // able to intercept the datasource connection picks what lands in the
+        // local bank.
+        if simnet.allow_insecure_remote_tls {
+            svm_locker.simnet_events_tx().warn(
+                "TLS certificate verification is disabled for the datasource (--allow-insecure-remote-tls): fork data is not authenticated",
+            );
+        }
     }
     svm_locker
         .simnet_events_tx()
@@ -567,7 +576,10 @@ pub async fn start_block_production_runloop(
                     SimnetCommand::FetchRemoteAccounts(pubkeys, remote_url) => {
                         // The submitter already marked RemoteAccounts as started;
                         // StartStartupTask precedes this command on the same channel.
-                        let fetch_result = match SurfnetRemoteClient::new_unsafe(&remote_url) {
+                        let fetch_result = match SurfnetRemoteClient::new_with_tls_policy(
+                            &remote_url,
+                            simnet_config.allow_insecure_remote_tls,
+                        ) {
                             Some(remote_client) => match svm_locker
                                 .get_multiple_accounts_with_remote_fallback(
                                     &remote_client,
