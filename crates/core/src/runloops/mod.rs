@@ -244,8 +244,7 @@ pub async fn start_local_surfnet_runloop(
         svm_locker.clone(),
         &remote_rpc_client,
         plugin_commands_tx,
-    )
-    .await?;
+    )?;
 
     let simnet_config = simnet.clone();
 
@@ -940,7 +939,86 @@ fn start_geyser_runloop(
     Ok(handle)
 }
 
-async fn start_rpc_servers_runloop(
+/// One blocking RPC server, generic over the two jsonrpc flavors, for
+/// [`spawn_rpc_server_thread`]: expose the close handle, then serve until
+/// closed.
+trait RpcServer: Sized + Send + 'static {
+    type CloseHandle: Send + 'static;
+    fn close_handle(&self) -> Self::CloseHandle;
+    fn wait(self) -> Result<(), String>;
+}
+
+impl RpcServer for jsonrpc_http_server::Server {
+    type CloseHandle = jsonrpc_http_server::CloseHandle;
+    fn close_handle(&self) -> Self::CloseHandle {
+        jsonrpc_http_server::Server::close_handle(self)
+    }
+    fn wait(self) -> Result<(), String> {
+        jsonrpc_http_server::Server::wait(self);
+        Ok(())
+    }
+}
+
+/// The WebSocket server bundled with the runtime its pubsub tasks run on.
+/// The runtime must outlive the server, and dropping it here, on the
+/// serving thread after `wait` returns, keeps runtime drops out of async
+/// contexts, where they panic.
+struct WsServerWithRuntime {
+    server: jsonrpc_ws_server::Server,
+    _runtime: tokio::runtime::Runtime,
+}
+
+impl RpcServer for WsServerWithRuntime {
+    type CloseHandle = jsonrpc_ws_server::CloseHandle;
+    fn close_handle(&self) -> Self::CloseHandle {
+        self.server.close_handle()
+    }
+    fn wait(self) -> Result<(), String> {
+        self.server.wait().map_err(|e| format!("{:?}", e))
+    }
+}
+
+/// Runs one RPC server on a dedicated thread and reports how startup
+/// went: the close handle on success, the error on failure. The thread
+/// emits an aborted event before the error is published, so event
+/// consumers hear about a failed start regardless of what the caller does
+/// with the returned error, and a shutdown event when the server exits,
+/// even abnormally.
+fn spawn_rpc_server_thread<S: RpcServer>(
+    server_kind: &'static str,
+    simnet_events_tx: SimnetEventsTx,
+    start: impl FnOnce() -> Result<S, String> + Send + 'static,
+) -> Result<(JoinHandle<()>, S::CloseHandle), String> {
+    let (close_handle_tx, close_handle_rx) =
+        crossbeam_channel::bounded::<Result<S::CloseHandle, String>>(1);
+
+    let handle = hiro_system_kit::thread_named(&format!("{} Handler", server_kind))
+        .spawn(move || {
+            let server = match start() {
+                Ok(server) => server,
+                Err(e) => {
+                    let error = format!("Failed to start {} server: {}", server_kind, e);
+                    simnet_events_tx.aborted(error.clone());
+                    let _ = close_handle_tx.send(Err(error));
+                    return;
+                }
+            };
+            let _ = close_handle_tx.send(Ok(server.close_handle()));
+            if let Err(e) = server.wait() {
+                simnet_events_tx.aborted(format!("{} server exited: {}", server_kind, e));
+            }
+            simnet_events_tx.shutdown();
+        })
+        .map_err(|e| format!("Failed to spawn {} Handler thread: {:?}", server_kind, e))?;
+
+    let close_handle = close_handle_rx
+        .recv()
+        .map_err(|_| format!("Failed to receive {} server startup result", server_kind))??;
+
+    Ok((handle, close_handle))
+}
+
+fn start_rpc_servers_runloop(
     config: &SurfpoolConfig,
     simnet_commands_tx: &Sender<SimnetCommand>,
     svm_locker: SurfnetSvmLocker,
@@ -972,9 +1050,18 @@ async fn start_rpc_servers_runloop(
     );
 
     let (rpc_handle, rpc_close_handle) =
-        start_http_rpc_server_runloop(config, middleware.clone(), simnet_events_tx.clone()).await?;
+        start_http_rpc_server_runloop(config, middleware.clone(), simnet_events_tx.clone())?;
     let (ws_handle, ws_close_handle) =
-        start_ws_rpc_server_runloop(config, middleware, simnet_events_tx).await?;
+        match start_ws_rpc_server_runloop(config, middleware, simnet_events_tx) {
+            Ok(started) => started,
+            Err(e) => {
+                // The HTTP server is already serving; its close handle has
+                // no Drop, so propagating without closing would orphan it
+                // with its port bound.
+                rpc_close_handle.close();
+                return Err(e);
+            }
+        };
 
     let shutdown_rpc_servers: Box<dyn FnOnce() + Send> = Box::new(move || {
         rpc_close_handle.close();
@@ -984,7 +1071,7 @@ async fn start_rpc_servers_runloop(
     Ok((rpc_handle, ws_handle, shutdown_rpc_servers))
 }
 
-async fn start_http_rpc_server_runloop(
+fn start_http_rpc_server_runloop(
     config: &SurfpoolConfig,
     middleware: SurfpoolMiddleware,
     simnet_events_tx: SimnetEventsTx,
@@ -1021,39 +1108,16 @@ async fn start_http_rpc_server_runloop(
     io.extend_with(rpc::bank_data::SurfpoolBankDataRpc.to_delegate());
     io.extend_with(rpc::admin::SurfpoolAdminRpc.to_delegate());
 
-    let (close_handle_tx, close_handle_rx) =
-        crossbeam_channel::bounded::<Result<jsonrpc_http_server::CloseHandle, String>>(1);
-
-    let _handle = hiro_system_kit::thread_named("RPC Handler")
-        .spawn(move || {
-            let server = match ServerBuilder::new(io)
-                .cors(DomainsValidation::Disabled)
-                .threads(6)
-                .max_request_body_size(15 * 1024 * 1024)
-                .start_http(&server_bind)
-            {
-                Ok(server) => server,
-                Err(e) => {
-                    let error = format!("Failed to start RPC server: {:?}", e);
-                    let _ = close_handle_tx.send(Err(error.clone()));
-                    simnet_events_tx.aborted(error);
-                    return;
-                }
-            };
-
-            let _ = close_handle_tx.send(Ok(server.close_handle()));
-            server.wait();
-            simnet_events_tx.shutdown();
-        })
-        .map_err(|e| format!("Failed to spawn RPC Handler thread: {:?}", e))?;
-
-    let close_handle = close_handle_rx
-        .recv()
-        .map_err(|_| "Failed to receive HTTP RPC server startup result".to_string())??;
-
-    Ok((_handle, close_handle))
+    spawn_rpc_server_thread("HTTP RPC", simnet_events_tx, move || {
+        ServerBuilder::new(io)
+            .cors(DomainsValidation::Disabled)
+            .threads(6)
+            .max_request_body_size(15 * 1024 * 1024)
+            .start_http(&server_bind)
+            .map_err(|e| format!("{:?}", e))
+    })
 }
-async fn start_ws_rpc_server_runloop(
+fn start_ws_rpc_server_runloop(
     config: &SurfpoolConfig,
     middleware: SurfpoolMiddleware,
     simnet_events_tx: SimnetEventsTx,
@@ -1064,83 +1128,64 @@ async fn start_ws_rpc_server_runloop(
         .parse::<SocketAddr>()
         .map_err(|e| e.to_string())?;
 
-    let uid = std::sync::atomic::AtomicUsize::new(0);
-    let ws_middleware = SurfpoolWebsocketMiddleware::new(middleware.clone(), None);
+    spawn_rpc_server_thread("WebSocket RPC", simnet_events_tx, move || {
+        // The pubsub handler runs async tasks, so the server carries its
+        // own runtime, kept alongside it in [`WsServerWithRuntime`].
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("{:?}", e))?;
+        let tokio_handle = runtime.handle().clone();
 
-    let mut rpc_io = PubSubHandler::new(MetaIoHandler::with_middleware(ws_middleware));
+        let ws_middleware = SurfpoolWebsocketMiddleware::new(middleware.clone(), None);
+        let mut rpc_io = PubSubHandler::new(MetaIoHandler::with_middleware(ws_middleware));
+        rpc_io.extend_with(
+            rpc::ws::SurfpoolWsRpc {
+                uid: std::sync::atomic::AtomicUsize::new(0),
+                signature_subscription_map: Arc::new(RwLock::new(HashMap::new())),
+                account_subscription_map: Arc::new(RwLock::new(HashMap::new())),
+                program_subscription_map: Arc::new(RwLock::new(HashMap::new())),
+                slot_subscription_map: Arc::new(RwLock::new(HashMap::new())),
+                slots_updates_subscription_map: Arc::new(RwLock::new(HashMap::new())),
+                logs_subscription_map: Arc::new(RwLock::new(HashMap::new())),
+                snapshot_subscription_map: Arc::new(RwLock::new(HashMap::new())),
+                tokio_handle: tokio_handle.clone(),
+            }
+            .to_delegate(),
+        );
 
-    let (close_handle_tx, close_handle_rx) =
-        crossbeam_channel::bounded::<Result<jsonrpc_ws_server::CloseHandle, String>>(1);
-
-    let _ws_handle = hiro_system_kit::thread_named("WebSocket RPC Handler")
-        .spawn(move || {
-            // The pubsub handler needs to be able to run async tasks, so we create a Tokio runtime here
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .expect("Failed to build Tokio runtime");
-
-            let tokio_handle = runtime.handle();
-            rpc_io.extend_with(
-                rpc::ws::SurfpoolWsRpc {
-                    uid,
-                    signature_subscription_map: Arc::new(RwLock::new(HashMap::new())),
-                    account_subscription_map: Arc::new(RwLock::new(HashMap::new())),
-                    program_subscription_map: Arc::new(RwLock::new(HashMap::new())),
-                    slot_subscription_map: Arc::new(RwLock::new(HashMap::new())),
-                    slots_updates_subscription_map: Arc::new(RwLock::new(HashMap::new())),
-                    logs_subscription_map: Arc::new(RwLock::new(HashMap::new())),
-                    snapshot_subscription_map: Arc::new(RwLock::new(HashMap::new())),
-                    tokio_handle: tokio_handle.clone(),
-                }
-                .to_delegate(),
-            );
-            runtime.block_on(async move {
-                let server = match WsServerBuilder::new(rpc_io)
-                    .session_meta_extractor(move |ctx: &RequestContext| {
-                        // Create meta from context + session
-                        let runloop_context = RunloopContext {
-                            id: None,
-                            svm_locker: middleware.surfnet_svm.clone(),
-                            simnet_commands_tx: middleware.simnet_commands_tx.clone(),
-                            remote_rpc_client: middleware.remote_rpc_client.clone(),
-                            rpc_config: middleware.config.clone(),
-                            cheatcode_config: middleware.cheatcode_config.clone(),
-                            plugin_commands_tx: middleware.plugin_commands_tx.clone(),
-                        };
-                        Some(SurfpoolWebsocketMeta::new(
-                            runloop_context,
-                            Some(Arc::new(Session::new(ctx.sender()))),
-                        ))
-                    })
-                    .start(&ws_server_bind)
-                {
-                    Ok(server) => server,
-                    Err(e) => {
-                        let error = format!("Failed to start WebSocket RPC server: {:?}", e);
-                        let _ = close_handle_tx.send(Err(error.clone()));
-                        simnet_events_tx.aborted(error);
-                        return;
-                    }
+        let server = WsServerBuilder::new(rpc_io)
+            .session_meta_extractor(move |ctx: &RequestContext| {
+                // Create meta from context + session
+                let runloop_context = RunloopContext {
+                    id: None,
+                    svm_locker: middleware.surfnet_svm.clone(),
+                    simnet_commands_tx: middleware.simnet_commands_tx.clone(),
+                    remote_rpc_client: middleware.remote_rpc_client.clone(),
+                    rpc_config: middleware.config.clone(),
+                    cheatcode_config: middleware.cheatcode_config.clone(),
+                    plugin_commands_tx: middleware.plugin_commands_tx.clone(),
                 };
-                let _ = close_handle_tx.send(Ok(server.close_handle()));
-                // The server itself is blocking, so spawn it in a separate thread if needed
-                tokio::task::spawn_blocking(move || {
-                    server.wait().unwrap();
-                })
-                .await
-                .ok();
+                Some(SurfpoolWebsocketMeta::new(
+                    runloop_context,
+                    Some(Arc::new(Session::new(ctx.sender()))),
+                ))
+            })
+            // Hand the ws server our runtime instead of letting it build a
+            // private one: the library drops its private runtime when a
+            // bind fails, and a runtime dropped inside an async context
+            // panics, which masked bind errors as channel failures. The
+            // shared handle removes that runtime (and its worker threads)
+            // entirely.
+            .event_loop_executor(tokio_handle)
+            .start(&ws_server_bind)
+            .map_err(|e| format!("{:?}", e))?;
 
-                simnet_events_tx.shutdown();
-            });
+        Ok(WsServerWithRuntime {
+            server,
+            _runtime: runtime,
         })
-        .map_err(|e| format!("Failed to spawn WebSocket RPC Handler thread: {:?}", e))?;
-
-    let close_handle = close_handle_rx
-        .recv()
-        .map_err(|_| "Failed to receive WebSocket RPC server startup result".to_string())??;
-
-    Ok((_ws_handle, close_handle))
+    })
 }
 
 #[cfg(test)]
@@ -1179,12 +1224,7 @@ mod rpc_server_startup_tests {
             setup.context.plugin_commands_tx.clone(),
         );
 
-        let result = hiro_system_kit::nestable_block_on(start_ws_rpc_server_runloop(
-            &config,
-            middleware,
-            simnet_events_tx,
-        ));
-        let error = match result {
+        let error = match start_ws_rpc_server_runloop(&config, middleware, simnet_events_tx) {
             Ok((_handle, close_handle)) => {
                 close_handle.close();
                 panic!("the squatted port should fail the bind");
