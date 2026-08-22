@@ -444,16 +444,8 @@ impl SurfnetRemoteClient {
             .await
         {
             Ok(result) => result,
-            Err(_) => {
-                // Preserve the published method's return type. Error details may
-                // contain datasource credentials, so this compatibility path
-                // logs only the sanitized endpoint; fallible callers should use
-                // `try_get_transaction`.
-                error!(
-                    "Failed to fetch transaction {signature} from {}",
-                    sanitized_datasource_url(&self.client.url())
-                        .unwrap_or_else(|| "the datasource".to_string())
-                );
+            Err(e) => {
+                error!("{e}");
                 GetTransactionResult::None(signature)
             }
         }
