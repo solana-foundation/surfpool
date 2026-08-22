@@ -979,11 +979,12 @@ impl RpcServer for WsServerWithRuntime {
 }
 
 /// Runs one RPC server on a dedicated thread and reports how startup
-/// went: the close handle on success, the error on failure. The thread
-/// emits an aborted event before the error is published, so event
-/// consumers hear about a failed start regardless of what the caller does
-/// with the returned error, and a shutdown event when the server exits,
-/// even abnormally.
+/// went: the close handle on success, the error on failure. On failure
+/// the error is published on the handshake channel first and the aborted
+/// event emitted after: aborted() blocks on a full events buffer, and
+/// the caller waiting on the handshake may be the thread that drains
+/// events, so the reverse order can deadlock startup. The thread also
+/// emits a shutdown event when the server exits, even abnormally.
 fn spawn_rpc_server_thread<S: RpcServer>(
     server_kind: &'static str,
     simnet_events_tx: SimnetEventsTx,
@@ -998,8 +999,8 @@ fn spawn_rpc_server_thread<S: RpcServer>(
                 Ok(server) => server,
                 Err(e) => {
                     let error = format!("Failed to start {} server: {}", server_kind, e);
-                    simnet_events_tx.aborted(error.clone());
-                    let _ = close_handle_tx.send(Err(error));
+                    let _ = close_handle_tx.send(Err(error.clone()));
+                    simnet_events_tx.aborted(error);
                     return;
                 }
             };
@@ -1018,13 +1019,17 @@ fn spawn_rpc_server_thread<S: RpcServer>(
     Ok((handle, close_handle))
 }
 
+/// The HTTP and WebSocket server threads, and the closure that closes
+/// both servers.
+type RpcServerHandles = (JoinHandle<()>, JoinHandle<()>, Box<dyn FnOnce() + Send>);
+
 fn start_rpc_servers_runloop(
     config: &SurfpoolConfig,
     simnet_commands_tx: &Sender<SimnetCommand>,
     svm_locker: SurfnetSvmLocker,
     remote_rpc_client: &Option<SurfnetRemoteClient>,
     plugin_commands_tx: Sender<PluginCommand>,
-) -> Result<(JoinHandle<()>, JoinHandle<()>, Box<dyn FnOnce() + Send>), String> {
+) -> Result<RpcServerHandles, String> {
     let rpc_addr: SocketAddr = config
         .rpc
         .get_rpc_base_url()
@@ -1236,9 +1241,17 @@ mod rpc_server_startup_tests {
             "the bind error should reach the caller, got: {error}"
         );
 
-        let aborted = simnet_events_rx
-            .try_iter()
-            .any(|event| matches!(event, SimnetEvent::Aborted(_)));
+        // The aborted event is emitted after the handshake error, so a
+        // nonblocking poll here could run before it exists; drain
+        // blocking, bounded by a deadline.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let aborted = loop {
+            match simnet_events_rx.recv_deadline(deadline) {
+                Ok(SimnetEvent::Aborted(_)) => break true,
+                Ok(_) => continue,
+                Err(_) => break false,
+            }
+        };
         assert!(aborted, "the failure should emit an aborted event");
     }
 }
