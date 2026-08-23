@@ -1313,10 +1313,18 @@ impl Rpc for SurfpoolWsRpc {
 
             tokio::select! {
                 notification = rx => {
-                    // An Err here means the SVM-side registry dropped the sender: the waiter
-                    // was swept, so there is nothing left to deliver.
-                    if let Ok(notification) = notification {
-                        Self::notify_signature_subscriber(&active, &sub_id, notification);
+                    match notification {
+                        Ok(notification) => {
+                            Self::notify_signature_subscriber(&active, &sub_id, notification);
+                        }
+                        // The registry dropped the sender (a network reset, or a swept
+                        // waiter): this subscription can no longer resolve, so drop the
+                        // entry rather than let the sink outlive it.
+                        Err(_) => {
+                            if let Ok(mut guard) = active.write() {
+                                guard.remove(&sub_id);
+                            }
+                        }
                     }
                 }
                 // Unsubscribe removed the entry and dropped the cancel sender: end the task.

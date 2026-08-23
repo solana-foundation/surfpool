@@ -1889,6 +1889,11 @@ impl SurfnetSvm {
         self.runbook_executions.clear();
         self.streamed_accounts.clear()?;
         self.scheduled_overrides.clear()?;
+        // Recorded stages describe transactions the reset just wiped,
+        // and the rewound clock would misjudge them; dropping the
+        // senders resolves every open subscription as
+        // unable-to-complete instead.
+        self.signature_subscriptions = SignatureSubscriptions::default();
 
         let current_time = chrono::Utc::now().timestamp_millis() as u64;
         self.updated_at = current_time;

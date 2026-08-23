@@ -18,7 +18,7 @@
 
 use std::collections::HashMap;
 
-use solana_clock::Slot;
+use solana_clock::{MAX_PROCESSING_AGE, Slot};
 use solana_commitment_config::CommitmentLevel;
 use solana_signature::Signature;
 use solana_transaction_error::TransactionError;
@@ -107,9 +107,14 @@ struct SignatureLifecycle {
 
 impl SignatureLifecycle {
     /// Whether the entry still carries information: a waiter to
-    /// complete, or a stage the persistent store cannot answer for.
+    /// complete, or a stage the persistent store cannot answer for
+    /// (`Received` and `Failed` are never stored; `Executed` is).
     fn is_live(&self) -> bool {
-        !self.waiters.is_empty() || matches!(self.stage, Some(TxStage::Received { .. }))
+        !self.waiters.is_empty()
+            || matches!(
+                self.stage,
+                Some(TxStage::Received { .. } | TxStage::Failed { .. })
+            )
     }
 }
 
@@ -222,14 +227,21 @@ impl SignatureSubscriptions {
     /// Re-evaluates every waiter against the clock. Called once per
     /// produced block: this is where `Executed` stages cross the
     /// confirmed and finalized boundaries. Also the sweep: waiters
-    /// whose receiver was dropped are removed, and `Received` stages
-    /// old enough that their transaction can no longer land are
+    /// whose receiver was dropped are removed, and `Received` and
+    /// `Failed` stages older than the blockhash validity window are
     /// forgotten.
     pub fn tick(&mut self, current_slot: Slot) {
         self.lifecycles.retain(|_, lifecycle| {
             Self::drain(lifecycle, current_slot);
-            if let Some(TxStage::Received { slot }) = &lifecycle.stage
-                && current_slot >= slot.saturating_add(FINALIZATION_SLOT_THRESHOLD)
+            // 150 slots, per MAX_PROCESSING_AGE: past that, a Received
+            // transaction's blockhash can no longer be current and a
+            // Failed one's error no longer describes anything a client
+            // could still act on. (A durable-nonce transaction can
+            // outlive the window; its late subscriber falls back to the
+            // waiter path, an accepted residual.)
+            if let Some(TxStage::Received { slot } | TxStage::Failed { slot, .. }) =
+                &lifecycle.stage
+                && current_slot >= slot.saturating_add(MAX_PROCESSING_AGE as u64)
             {
                 lifecycle.stage = None;
             }
@@ -252,7 +264,12 @@ impl SignatureSubscriptions {
         target: SignatureSubscriptionType,
     ) -> SignatureSubscribeOutcome {
         let (tx, rx) = oneshot::channel();
-        let known_locally = lifecycle.stage.is_some();
+        // Executed only: a Received or Failed stage cannot answer a
+        // commitment target locally, and the pre-machine flow consulted
+        // the remote for exactly those signatures. Counting them here
+        // would suppress the remote lookup for a signature stuck at
+        // Received locally that exists remotely.
+        let known_locally = matches!(lifecycle.stage, Some(TxStage::Executed { .. }));
         lifecycle.waiters.push(Waiter { target, tx });
         SignatureSubscribeOutcome::Wait { rx, known_locally }
     }
@@ -488,10 +505,63 @@ mod tests {
     fn stale_received_stages_are_forgotten() {
         let mut subs = SignatureSubscriptions::default();
         subs.record(&sig(1), TxStage::Received { slot: 5 }, 5);
-        subs.tick(5 + FINALIZATION_SLOT_THRESHOLD - 1);
+        subs.tick(5 + MAX_PROCESSING_AGE as u64 - 1);
         assert_eq!(subs.lifecycles.len(), 1);
-        subs.tick(5 + FINALIZATION_SLOT_THRESHOLD);
+        subs.tick(5 + MAX_PROCESSING_AGE as u64);
         assert!(subs.lifecycles.is_empty());
+    }
+
+    #[test]
+    fn late_subscriber_is_answered_from_a_retained_failed_stage() {
+        // The persistent store never sees a simulation failure, so the
+        // registry is the only place a late processed-target subscriber
+        // can learn the error from.
+        let mut subs = SignatureSubscriptions::default();
+        let err = TransactionError::BlockhashNotFound;
+        subs.record(
+            &sig(1),
+            TxStage::Failed {
+                slot: 5,
+                err: err.clone(),
+            },
+            5,
+        );
+        let n = expect_now(subs.subscribe(&sig(1), processed(), None, 6));
+        assert_eq!(
+            n,
+            SignatureNotification::Processed {
+                slot: 5,
+                err: Some(err)
+            }
+        );
+        subs.tick(5 + MAX_PROCESSING_AGE as u64);
+        assert!(subs.lifecycles.is_empty());
+    }
+
+    #[test]
+    fn only_executed_stages_count_as_known_locally() {
+        // A Received-stuck signature cannot answer a commitment target
+        // locally; reporting it as known would suppress the remote
+        // lookup the pre-machine flow performed for it.
+        let mut subs = SignatureSubscriptions::default();
+        subs.record(&sig(1), TxStage::Received { slot: 5 }, 5);
+        match subs.subscribe(&sig(1), processed(), None, 5) {
+            SignatureSubscribeOutcome::Wait { known_locally, .. } => {
+                assert!(!known_locally)
+            }
+            SignatureSubscribeOutcome::Now(n) => panic!("expected Wait, got Now({n:?})"),
+        }
+        match subs.subscribe(
+            &sig(2),
+            finalized(),
+            Some(TxStage::Executed { slot: 5, err: None }),
+            5,
+        ) {
+            SignatureSubscribeOutcome::Wait { known_locally, .. } => {
+                assert!(known_locally)
+            }
+            SignatureSubscribeOutcome::Now(n) => panic!("expected Wait, got Now({n:?})"),
+        }
     }
 
     #[test]
