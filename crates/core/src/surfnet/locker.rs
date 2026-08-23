@@ -83,7 +83,7 @@ use crate::{
         utils::{convert_transaction_metadata_from_canonical, verify_pubkey},
     },
     storage::StorageResult,
-    surfnet::FINALIZATION_SLOT_THRESHOLD,
+    surfnet::{FINALIZATION_SLOT_THRESHOLD, confirmation_status_at},
     types::{
         GeyserAccountUpdate, OfflineAccountConfig, RemoteRpcResult, SurfnetTransactionStatus,
         TimeTravelConfig, TokenAccount, TransactionLoadedAddresses, TransactionWithStatusMeta,
@@ -1262,13 +1262,7 @@ impl SurfnetSvmLocker {
                             meta: tx_with_meta.meta.clone(),
                         });
 
-                        let confirmation_status = match current_slot {
-                            cs if cs == slot => SolanaTransactionConfirmationStatus::Processed,
-                            cs if cs < slot + FINALIZATION_SLOT_THRESHOLD => {
-                                SolanaTransactionConfirmationStatus::Confirmed
-                            }
-                            _ => SolanaTransactionConfirmationStatus::Finalized,
-                        };
+                        let confirmation_status = confirmation_status_at(slot, current_slot);
 
                         Some(Record {
                             signature: sig,
@@ -1438,13 +1432,7 @@ impl SurfnetSvmLocker {
                         }
 
                         // Determine confirmation status
-                        let confirmation_status = match current_slot {
-                            cs if cs == slot => SolanaTransactionConfirmationStatus::Processed,
-                            cs if cs < slot + FINALIZATION_SLOT_THRESHOLD => {
-                                SolanaTransactionConfirmationStatus::Confirmed
-                            }
-                            _ => SolanaTransactionConfirmationStatus::Finalized,
-                        };
+                        let confirmation_status = confirmation_status_at(slot, current_slot);
 
                         // Reconstruct the memo summary the same way a full Agave validator
                         // does, reusing its canonical extractor. `account_keys()` on the

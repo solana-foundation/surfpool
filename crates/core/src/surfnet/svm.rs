@@ -284,7 +284,6 @@ impl Default for SurfnetSvmConfig {
 /// remote RPC connections, transaction processing, and account management.
 ///
 /// It also exposes channels to listen for simulation events (`SimnetEvent`) and Geyser plugin events (`GeyserEvent`).
-#[derive(Clone)]
 pub struct SurfnetSvm {
     pub inner: SurfnetLiteSvm,
     pub remote_rpc_url: Option<String>,

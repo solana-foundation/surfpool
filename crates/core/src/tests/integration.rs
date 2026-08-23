@@ -3971,7 +3971,7 @@ async fn test_get_local_signatures_without_limit(test_type: TestType) {
     let rpc_server = SurfnetCheatcodesRpc::empty();
     let (svm_instance, _simnet_events_rx, _geyser_events_rx) = test_type.initialize_svm();
 
-    let svm_locker_for_context = SurfnetSvmLocker::new(svm_instance.clone());
+    let svm_locker_for_context = SurfnetSvmLocker::new(svm_instance.clone_for_profiling());
 
     let (simnet_cmd_tx, _simnet_cmd_rx) = crossbeam_unbounded::<SimnetCommand>();
     let (plugin_commands_tx, _plugin_commands_rx) = crossbeam_channel::unbounded::<PluginCommand>();
@@ -4076,7 +4076,7 @@ async fn test_get_local_signatures_without_limit(test_type: TestType) {
 async fn test_get_local_signatures_with_limit(test_type: TestType) {
     let rpc_server = SurfnetCheatcodesRpc::empty();
     let (svm_instance, _simnet_events_rx, _geyser_events_rx) = test_type.initialize_svm();
-    let svm_locker_for_context = SurfnetSvmLocker::new(svm_instance.clone());
+    let svm_locker_for_context = SurfnetSvmLocker::new(svm_instance.clone_for_profiling());
 
     let (simnet_cmd_tx, _simnet_cmd_rx) = crossbeam_unbounded::<SimnetCommand>();
     let (plugin_commands_tx, _plugin_commands_rx) = crossbeam_channel::unbounded::<PluginCommand>();
@@ -6917,18 +6917,6 @@ async fn test_remote_get_multiple_accounts_ordering(test_type: TestType) {
 
 // websocket rpc methods tests
 
-/// Unwraps a subscribe outcome into its pending receiver.
-fn expect_signature_wait(
-    outcome: SignatureSubscribeOutcome,
-) -> tokio::sync::oneshot::Receiver<SignatureNotification> {
-    match outcome {
-        SignatureSubscribeOutcome::Wait { rx, .. } => rx,
-        SignatureSubscribeOutcome::Now(notification) => {
-            panic!("expected a pending subscription, got immediate {notification:?}")
-        }
-    }
-}
-
 #[test_case(SignatureSubscriptionType::processed() ; "processed commitment")]
 #[test_case(SignatureSubscriptionType::received() ; "received commitment")]
 #[test_case(SignatureSubscriptionType::confirmed() ; "confirmed commitment")]
@@ -6961,11 +6949,10 @@ async fn test_ws_signature_subscribe(subscription_type: SignatureSubscriptionTyp
     let signature = tx.signatures[0];
 
     // subscribe before the transaction is known to the surfnet
-    let notification_rx = expect_signature_wait(
-        svm_locker
-            .subscribe_signature(&signature, subscription_type.clone())
-            .unwrap(),
-    );
+    let notification_rx = svm_locker
+        .subscribe_signature(&signature, subscription_type.clone())
+        .unwrap()
+        .expect_wait();
 
     // process the transaction
     let (status_tx, _status_rx) = unbounded();
@@ -7046,11 +7033,10 @@ async fn test_ws_signature_subscribe_failed_transaction(test_type: TestType) {
 
     // subscribe with processed commitment
     let subscription_type = SignatureSubscriptionType::processed();
-    let notification_rx = expect_signature_wait(
-        svm_locker
-            .subscribe_signature(&signature, subscription_type)
-            .unwrap(),
-    );
+    let notification_rx = svm_locker
+        .subscribe_signature(&signature, subscription_type)
+        .unwrap()
+        .expect_wait();
 
     // process the transaction (should fail)
     let (status_tx, _status_rx) = unbounded();
@@ -7113,21 +7099,18 @@ async fn test_ws_signature_subscribe_multiple_subscribers(test_type: TestType) {
     let signature = tx.signatures[0];
 
     // create multiple subscriptions to the same signature
-    let notification_rx1 = expect_signature_wait(
-        svm_locker
-            .subscribe_signature(&signature, SignatureSubscriptionType::processed())
-            .unwrap(),
-    );
-    let notification_rx2 = expect_signature_wait(
-        svm_locker
-            .subscribe_signature(&signature, SignatureSubscriptionType::processed())
-            .unwrap(),
-    );
-    let notification_rx3 = expect_signature_wait(
-        svm_locker
-            .subscribe_signature(&signature, SignatureSubscriptionType::confirmed())
-            .unwrap(),
-    );
+    let notification_rx1 = svm_locker
+        .subscribe_signature(&signature, SignatureSubscriptionType::processed())
+        .unwrap()
+        .expect_wait();
+    let notification_rx2 = svm_locker
+        .subscribe_signature(&signature, SignatureSubscriptionType::processed())
+        .unwrap()
+        .expect_wait();
+    let notification_rx3 = svm_locker
+        .subscribe_signature(&signature, SignatureSubscriptionType::confirmed())
+        .unwrap()
+        .expect_wait();
 
     // process the transaction
     let (status_tx, _status_rx) = unbounded();
@@ -7201,11 +7184,10 @@ async fn test_ws_signature_subscribe_before_transaction_exists(test_type: TestTy
 
     // subscribe before the transaction exists
     let subscription_type = SignatureSubscriptionType::processed();
-    let notification_rx = expect_signature_wait(
-        svm_locker
-            .subscribe_signature(&signature, subscription_type)
-            .unwrap(),
-    );
+    let notification_rx = svm_locker
+        .subscribe_signature(&signature, subscription_type)
+        .unwrap()
+        .expect_wait();
 
     // small delay to ensure the subscription is registered
     tokio::time::sleep(Duration::from_millis(100)).await;

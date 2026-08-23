@@ -16,7 +16,7 @@
 //! carry neither, so the map is bounded by in-flight work rather than
 //! transaction history.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, hash_map::Entry};
 
 use solana_clock::{MAX_PROCESSING_AGE, Slot};
 use solana_commitment_config::CommitmentLevel;
@@ -24,7 +24,9 @@ use solana_signature::Signature;
 use solana_transaction_error::TransactionError;
 use tokio::sync::oneshot;
 
-use super::{FINALIZATION_SLOT_THRESHOLD, SignatureSubscriptionType};
+use solana_transaction_status::TransactionConfirmationStatus;
+
+use super::{SignatureSubscriptionType, confirmation_status_at};
 
 /// The recorded lifecycle stage of a signature.
 ///
@@ -94,6 +96,25 @@ pub enum SignatureSubscribeOutcome {
     },
 }
 
+#[cfg(test)]
+impl SignatureSubscribeOutcome {
+    /// Unwraps a pending subscription's receiver.
+    pub fn expect_wait(self) -> oneshot::Receiver<SignatureNotification> {
+        match self {
+            SignatureSubscribeOutcome::Wait { rx, .. } => rx,
+            SignatureSubscribeOutcome::Now(n) => panic!("expected Wait, got Now({n:?})"),
+        }
+    }
+
+    /// Unwraps an immediately resolved subscription's notification.
+    pub fn expect_now(self) -> SignatureNotification {
+        match self {
+            SignatureSubscribeOutcome::Now(n) => n,
+            SignatureSubscribeOutcome::Wait { .. } => panic!("expected Now, got Wait"),
+        }
+    }
+}
+
 struct Waiter {
     target: SignatureSubscriptionType,
     tx: oneshot::Sender<SignatureNotification>,
@@ -125,15 +146,6 @@ pub struct SignatureSubscriptions {
     lifecycles: HashMap<Signature, SignatureLifecycle>,
 }
 
-/// A cloned registry is empty. SVM clones exist for profiling and
-/// bundle sandboxes, which must not complete live subscribers'
-/// waiters; one-shot delivery cannot be shared between two SVMs.
-impl Clone for SignatureSubscriptions {
-    fn clone(&self) -> Self {
-        Self::default()
-    }
-}
-
 fn commitment_rank(level: CommitmentLevel) -> u8 {
     match level {
         CommitmentLevel::Processed => 1,
@@ -142,19 +154,33 @@ fn commitment_rank(level: CommitmentLevel) -> u8 {
     }
 }
 
-fn executed_rank(executed_slot: Slot, current_slot: Slot) -> u8 {
-    if current_slot >= executed_slot.saturating_add(FINALIZATION_SLOT_THRESHOLD) {
-        3
-    } else if current_slot > executed_slot {
-        2
-    } else {
-        1
+fn status_rank(status: TransactionConfirmationStatus) -> u8 {
+    match status {
+        TransactionConfirmationStatus::Processed => 1,
+        TransactionConfirmationStatus::Confirmed => 2,
+        TransactionConfirmationStatus::Finalized => 3,
+    }
+}
+
+/// The payload a satisfied `target` resolves to. The satisfaction
+/// decision belongs to the caller: `try_notification` decides from a
+/// recorded stage, the ws remote path from the remote's own
+/// confirmation status.
+pub(crate) fn notification_for(
+    target: &SignatureSubscriptionType,
+    slot: Slot,
+    err: Option<TransactionError>,
+) -> SignatureNotification {
+    match target {
+        SignatureSubscriptionType::Received => SignatureNotification::Received { slot },
+        SignatureSubscriptionType::Commitment(_) => SignatureNotification::Processed { slot, err },
     }
 }
 
 /// The notification `target` resolves to at `stage`, or `None` while
-/// the stage does not yet satisfy the target. The single home of both
-/// the satisfaction rule and the payload rule.
+/// the stage does not yet satisfy the target. The satisfaction rule in
+/// one place; the slot-distance ladder itself lives in
+/// [`confirmation_status_at`].
 pub(crate) fn try_notification(
     target: &SignatureSubscriptionType,
     stage: &TxStage,
@@ -162,22 +188,15 @@ pub(crate) fn try_notification(
 ) -> Option<SignatureNotification> {
     match (target, stage) {
         (SignatureSubscriptionType::Received, stage) => {
-            Some(SignatureNotification::Received { slot: stage.slot() })
+            Some(notification_for(target, stage.slot(), None))
         }
         (SignatureSubscriptionType::Commitment(level), TxStage::Executed { slot, err }) => {
-            (executed_rank(*slot, current_slot) >= commitment_rank(*level)).then(|| {
-                SignatureNotification::Processed {
-                    slot: *slot,
-                    err: err.clone(),
-                }
-            })
+            (status_rank(confirmation_status_at(*slot, current_slot)) >= commitment_rank(*level))
+                .then(|| notification_for(target, *slot, err.clone()))
         }
-        (SignatureSubscriptionType::Commitment(level), TxStage::Failed { slot, err }) => {
-            (*level == CommitmentLevel::Processed).then(|| SignatureNotification::Processed {
-                slot: *slot,
-                err: Some(err.clone()),
-            })
-        }
+        (SignatureSubscriptionType::Commitment(level), TxStage::Failed { slot, err }) => (*level
+            == CommitmentLevel::Processed)
+            .then(|| notification_for(target, *slot, Some(err.clone()))),
         (SignatureSubscriptionType::Commitment(_), TxStage::Received { .. }) => None,
     }
 }
@@ -195,21 +214,41 @@ impl SignatureSubscriptions {
         known_stage: Option<TxStage>,
         current_slot: Slot,
     ) -> SignatureSubscribeOutcome {
-        let lifecycle = self.lifecycles.entry(*signature).or_default();
-        if let Some(stage) = known_stage {
-            Self::advance(lifecycle, stage);
+        match self.lifecycles.entry(*signature) {
+            // An immediately satisfied subscription on an unknown
+            // signature never touches the map.
+            Entry::Vacant(vacant) => {
+                if let Some(stage) = &known_stage
+                    && let Some(notification) = try_notification(&target, stage, current_slot)
+                {
+                    return SignatureSubscribeOutcome::Now(notification);
+                }
+                let mut lifecycle = SignatureLifecycle {
+                    stage: known_stage,
+                    waiters: Vec::new(),
+                };
+                let outcome = Self::wait(&mut lifecycle, target);
+                vacant.insert(lifecycle);
+                outcome
+            }
+            Entry::Occupied(mut occupied) => {
+                let lifecycle = occupied.get_mut();
+                if let Some(stage) = known_stage {
+                    Self::advance(lifecycle, stage);
+                }
+                let outcome = match &lifecycle.stage {
+                    Some(stage) => match try_notification(&target, stage, current_slot) {
+                        Some(notification) => SignatureSubscribeOutcome::Now(notification),
+                        None => Self::wait(lifecycle, target),
+                    },
+                    None => Self::wait(lifecycle, target),
+                };
+                if !occupied.get().is_live() {
+                    occupied.remove();
+                }
+                outcome
+            }
         }
-        let outcome = match &lifecycle.stage {
-            Some(stage) => match try_notification(&target, stage, current_slot) {
-                Some(notification) => SignatureSubscribeOutcome::Now(notification),
-                None => Self::wait(lifecycle, target),
-            },
-            None => Self::wait(lifecycle, target),
-        };
-        if !lifecycle.is_live() {
-            self.lifecycles.remove(signature);
-        }
-        outcome
     }
 
     /// Records a stage transition and completes the waiters it
@@ -278,18 +317,16 @@ impl SignatureSubscriptions {
         let stage = lifecycle.stage.clone();
         let waiters = std::mem::take(&mut lifecycle.waiters);
         for waiter in waiters {
-            if waiter.tx.is_closed() {
-                continue;
-            }
             let notification = stage
                 .as_ref()
                 .and_then(|stage| try_notification(&waiter.target, stage, current_slot));
             match notification {
-                // A send failure means the receiver was dropped after
-                // the is_closed check: the same outcome as a sweep.
+                // A send to a dropped receiver fails harmlessly: the
+                // same outcome as the sweep below.
                 Some(notification) => {
                     let _ = waiter.tx.send(notification);
                 }
+                None if waiter.tx.is_closed() => {}
                 None => lifecycle.waiters.push(waiter),
             }
         }
@@ -299,6 +336,7 @@ impl SignatureSubscriptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::surfnet::FINALIZATION_SLOT_THRESHOLD;
 
     fn sig(n: u8) -> Signature {
         Signature::from([n; 64])
@@ -316,24 +354,10 @@ mod tests {
         SignatureSubscriptionType::Commitment(CommitmentLevel::Finalized)
     }
 
-    fn expect_wait(outcome: SignatureSubscribeOutcome) -> oneshot::Receiver<SignatureNotification> {
-        match outcome {
-            SignatureSubscribeOutcome::Wait { rx, .. } => rx,
-            SignatureSubscribeOutcome::Now(n) => panic!("expected Wait, got Now({n:?})"),
-        }
-    }
-
-    fn expect_now(outcome: SignatureSubscribeOutcome) -> SignatureNotification {
-        match outcome {
-            SignatureSubscribeOutcome::Now(n) => n,
-            SignatureSubscribeOutcome::Wait { .. } => panic!("expected Now, got Wait"),
-        }
-    }
-
     #[test]
     fn transition_completes_a_registered_waiter() {
         let mut subs = SignatureSubscriptions::default();
-        let mut rx = expect_wait(subs.subscribe(&sig(1), processed(), None, 10));
+        let mut rx = subs.subscribe(&sig(1), processed(), None, 10).expect_wait();
         assert!(rx.try_recv().is_err());
         subs.record(
             &sig(1),
@@ -360,7 +384,9 @@ mod tests {
         // With the stage recorded, the late subscriber resolves now.
         let mut subs = SignatureSubscriptions::default();
         subs.record(&sig(1), TxStage::Received { slot: 7 }, 7);
-        let n = expect_now(subs.subscribe(&sig(1), SignatureSubscriptionType::Received, None, 7));
+        let n = subs
+            .subscribe(&sig(1), SignatureSubscriptionType::Received, None, 7)
+            .expect_now();
         assert_eq!(n, SignatureNotification::Received { slot: 7 });
     }
 
@@ -368,7 +394,7 @@ mod tests {
     fn received_stage_does_not_satisfy_commitment_targets() {
         let mut subs = SignatureSubscriptions::default();
         subs.record(&sig(1), TxStage::Received { slot: 7 }, 7);
-        let mut rx = expect_wait(subs.subscribe(&sig(1), processed(), None, 7));
+        let mut rx = subs.subscribe(&sig(1), processed(), None, 7).expect_wait();
         subs.record(&sig(1), TxStage::Executed { slot: 8, err: None }, 8);
         assert_eq!(
             rx.try_recv().unwrap(),
@@ -379,20 +405,22 @@ mod tests {
     #[test]
     fn received_target_resolves_from_executed_stage_with_received_variant() {
         let mut subs = SignatureSubscriptions::default();
-        let n = expect_now(subs.subscribe(
-            &sig(1),
-            SignatureSubscriptionType::Received,
-            Some(TxStage::Executed { slot: 5, err: None }),
-            5,
-        ));
+        let n = subs
+            .subscribe(
+                &sig(1),
+                SignatureSubscriptionType::Received,
+                Some(TxStage::Executed { slot: 5, err: None }),
+                5,
+            )
+            .expect_now();
         assert_eq!(n, SignatureNotification::Received { slot: 5 });
     }
 
     #[test]
     fn ticks_advance_executed_stages_across_commitment_boundaries() {
         let mut subs = SignatureSubscriptions::default();
-        let mut confirmed_rx = expect_wait(subs.subscribe(&sig(1), confirmed(), None, 10));
-        let mut finalized_rx = expect_wait(subs.subscribe(&sig(1), finalized(), None, 10));
+        let mut confirmed_rx = subs.subscribe(&sig(1), confirmed(), None, 10).expect_wait();
+        let mut finalized_rx = subs.subscribe(&sig(1), finalized(), None, 10).expect_wait();
         subs.record(
             &sig(1),
             TxStage::Executed {
@@ -430,15 +458,17 @@ mod tests {
         // already holds: the waiter must carry the executed stage into
         // the registry, or no tick could ever complete it.
         let mut subs = SignatureSubscriptions::default();
-        let mut rx = expect_wait(subs.subscribe(
-            &sig(1),
-            finalized(),
-            Some(TxStage::Executed {
-                slot: 10,
-                err: None,
-            }),
-            11,
-        ));
+        let mut rx = subs
+            .subscribe(
+                &sig(1),
+                finalized(),
+                Some(TxStage::Executed {
+                    slot: 10,
+                    err: None,
+                }),
+                11,
+            )
+            .expect_wait();
         subs.tick(10 + FINALIZATION_SLOT_THRESHOLD);
         assert_eq!(
             rx.try_recv().unwrap(),
@@ -452,8 +482,8 @@ mod tests {
     #[test]
     fn failed_stage_satisfies_processed_only_and_never_advances() {
         let mut subs = SignatureSubscriptions::default();
-        let mut processed_rx = expect_wait(subs.subscribe(&sig(1), processed(), None, 10));
-        let mut confirmed_rx = expect_wait(subs.subscribe(&sig(1), confirmed(), None, 10));
+        let mut processed_rx = subs.subscribe(&sig(1), processed(), None, 10).expect_wait();
+        let mut confirmed_rx = subs.subscribe(&sig(1), confirmed(), None, 10).expect_wait();
         let err = TransactionError::BlockhashNotFound;
         subs.record(
             &sig(1),
@@ -479,7 +509,7 @@ mod tests {
     fn stages_never_regress() {
         let mut subs = SignatureSubscriptions::default();
         // The confirmed-target waiter keeps the entry live at Executed.
-        let mut rx = expect_wait(subs.subscribe(&sig(1), confirmed(), None, 9));
+        let mut rx = subs.subscribe(&sig(1), confirmed(), None, 9).expect_wait();
         subs.record(&sig(1), TxStage::Executed { slot: 9, err: None }, 9);
         // A received recorded after execution (a duplicate submission)
         // must not regress the stage: were Received to win, this tick
@@ -495,7 +525,7 @@ mod tests {
     #[test]
     fn dropped_receivers_are_swept() {
         let mut subs = SignatureSubscriptions::default();
-        let rx = expect_wait(subs.subscribe(&sig(1), confirmed(), None, 10));
+        let rx = subs.subscribe(&sig(1), confirmed(), None, 10).expect_wait();
         drop(rx);
         subs.tick(11);
         assert!(subs.lifecycles.is_empty());
@@ -526,7 +556,7 @@ mod tests {
             },
             5,
         );
-        let n = expect_now(subs.subscribe(&sig(1), processed(), None, 6));
+        let n = subs.subscribe(&sig(1), processed(), None, 6).expect_now();
         assert_eq!(
             n,
             SignatureNotification::Processed {
@@ -567,12 +597,14 @@ mod tests {
     #[test]
     fn immediate_satisfaction_registers_no_entry() {
         let mut subs = SignatureSubscriptions::default();
-        let n = expect_now(subs.subscribe(
-            &sig(1),
-            processed(),
-            Some(TxStage::Executed { slot: 4, err: None }),
-            4,
-        ));
+        let n = subs
+            .subscribe(
+                &sig(1),
+                processed(),
+                Some(TxStage::Executed { slot: 4, err: None }),
+                4,
+            )
+            .expect_now();
         assert_eq!(n, SignatureNotification::Processed { slot: 4, err: None });
         assert!(subs.lifecycles.is_empty());
     }

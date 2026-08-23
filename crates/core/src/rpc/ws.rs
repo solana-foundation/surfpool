@@ -31,7 +31,7 @@ use crate::{
     rpc::utils::MAX_SUPPORTED_TRANSACTION_VERSION,
     surfnet::{
         GetTransactionResult, SignatureNotification, SignatureSubscribeOutcome,
-        SignatureSubscriptionType,
+        SignatureSubscriptionType, signature_subscriptions::notification_for,
     },
 };
 
@@ -1295,18 +1295,13 @@ impl Rpc for SurfpoolWsRpc {
                         .confirmation_status
                         .is_some_and(|status| subscription_type.is_satisfied_by(status))
                 {
-                    let notification = match subscription_type {
-                        SignatureSubscriptionType::Received => {
-                            SignatureNotification::Received { slot: tx.slot }
-                        }
-                        SignatureSubscriptionType::Commitment(_) => {
-                            SignatureNotification::Processed {
-                                slot: tx.slot,
-                                err: tx.err,
-                            }
-                        }
-                    };
-                    Self::notify_signature_subscriber(&active, &sub_id, notification);
+                    // Satisfaction is judged by the remote's own confirmation status;
+                    // only the payload rule is shared with the registry.
+                    Self::notify_signature_subscriber(
+                        &active,
+                        &sub_id,
+                        notification_for(&subscription_type, tx.slot, tx.err),
+                    );
                     return;
                 }
             }
