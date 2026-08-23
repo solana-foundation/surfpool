@@ -52,6 +52,15 @@ pub enum TxStage {
     },
 }
 
+/// The stage ordering `advance` enforces. Variant order is the
+/// ordering; the derived `Ord` owns it.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum TxStageKind {
+    Received,
+    Failed,
+    Executed,
+}
+
 impl TxStage {
     fn slot(&self) -> Slot {
         match self {
@@ -61,11 +70,11 @@ impl TxStage {
         }
     }
 
-    fn order(&self) -> u8 {
+    fn kind(&self) -> TxStageKind {
         match self {
-            TxStage::Received { .. } => 0,
-            TxStage::Failed { .. } => 1,
-            TxStage::Executed { .. } => 2,
+            TxStage::Received { .. } => TxStageKind::Received,
+            TxStage::Failed { .. } => TxStageKind::Failed,
+            TxStage::Executed { .. } => TxStageKind::Executed,
         }
     }
 }
@@ -146,19 +155,36 @@ pub struct SignatureSubscriptions {
     lifecycles: HashMap<Signature, SignatureLifecycle>,
 }
 
-fn commitment_rank(level: CommitmentLevel) -> u8 {
-    match level {
-        CommitmentLevel::Processed => 1,
-        CommitmentLevel::Confirmed => 2,
-        CommitmentLevel::Finalized => 3,
+/// The commitment lattice both foreign types project into: a
+/// subscription's target level and a transaction's confirmation status
+/// have no common comparison in the solana crates, so satisfaction
+/// compares their projections here. Variant order is the ordering; the
+/// derived `Ord` owns it, and the two `From` impls read name-to-name,
+/// so a mismapping is visible at a glance.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum CommitmentRank {
+    Processed,
+    Confirmed,
+    Finalized,
+}
+
+impl From<CommitmentLevel> for CommitmentRank {
+    fn from(level: CommitmentLevel) -> Self {
+        match level {
+            CommitmentLevel::Processed => CommitmentRank::Processed,
+            CommitmentLevel::Confirmed => CommitmentRank::Confirmed,
+            CommitmentLevel::Finalized => CommitmentRank::Finalized,
+        }
     }
 }
 
-fn status_rank(status: TransactionConfirmationStatus) -> u8 {
-    match status {
-        TransactionConfirmationStatus::Processed => 1,
-        TransactionConfirmationStatus::Confirmed => 2,
-        TransactionConfirmationStatus::Finalized => 3,
+impl From<TransactionConfirmationStatus> for CommitmentRank {
+    fn from(status: TransactionConfirmationStatus) -> Self {
+        match status {
+            TransactionConfirmationStatus::Processed => CommitmentRank::Processed,
+            TransactionConfirmationStatus::Confirmed => CommitmentRank::Confirmed,
+            TransactionConfirmationStatus::Finalized => CommitmentRank::Finalized,
+        }
     }
 }
 
@@ -191,8 +217,9 @@ pub(crate) fn try_notification(
             Some(notification_for(target, stage.slot(), None))
         }
         (SignatureSubscriptionType::Commitment(level), TxStage::Executed { slot, err }) => {
-            (status_rank(confirmation_status_at(*slot, current_slot)) >= commitment_rank(*level))
-                .then(|| notification_for(target, *slot, err.clone()))
+            (CommitmentRank::from(confirmation_status_at(*slot, current_slot))
+                >= CommitmentRank::from(*level))
+            .then(|| notification_for(target, *slot, err.clone()))
         }
         (SignatureSubscriptionType::Commitment(level), TxStage::Failed { slot, err }) => (*level
             == CommitmentLevel::Processed)
@@ -292,7 +319,7 @@ impl SignatureSubscriptions {
         let advances = lifecycle
             .stage
             .as_ref()
-            .is_none_or(|current| stage.order() > current.order());
+            .is_none_or(|current| stage.kind() > current.kind());
         if advances {
             lifecycle.stage = Some(stage);
         }
