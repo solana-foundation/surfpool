@@ -99,8 +99,9 @@ use crate::{
     runloops::start_local_surfnet_runloop,
     storage::tests::TestType,
     surfnet::{
-        FINALIZATION_SLOT_THRESHOLD, GeyserEvent, LocalSignatureStatusOrSubscription,
-        PluginCommand, SignatureSubscriptionType, locker::SurfnetSvmLocker, svm::SurfnetSvm,
+        FINALIZATION_SLOT_THRESHOLD, GeyserEvent, PluginCommand, SignatureNotification,
+        SignatureSubscribeOutcome, SignatureSubscriptionType, TxStage, locker::SurfnetSvmLocker,
+        svm::SurfnetSvm,
     },
     tests::helpers::get_free_port,
     types::{TimeTravelConfig, TransactionLoadedAddresses},
@@ -6916,6 +6917,18 @@ async fn test_remote_get_multiple_accounts_ordering(test_type: TestType) {
 
 // websocket rpc methods tests
 
+/// Unwraps a subscribe outcome into its pending receiver.
+fn expect_signature_wait(
+    outcome: SignatureSubscribeOutcome,
+) -> tokio::sync::oneshot::Receiver<SignatureNotification> {
+    match outcome {
+        SignatureSubscribeOutcome::Wait { rx, .. } => rx,
+        SignatureSubscribeOutcome::Now(notification) => {
+            panic!("expected a pending subscription, got immediate {notification:?}")
+        }
+    }
+}
+
 #[test_case(SignatureSubscriptionType::processed() ; "processed commitment")]
 #[test_case(SignatureSubscriptionType::received() ; "received commitment")]
 #[test_case(SignatureSubscriptionType::confirmed() ; "confirmed commitment")]
@@ -6947,9 +6960,12 @@ async fn test_ws_signature_subscribe(subscription_type: SignatureSubscriptionTyp
     );
     let signature = tx.signatures[0];
 
-    // subscribe with processed commitment
-    let notification_rx =
-        svm_locker.subscribe_for_signature_updates(&signature, subscription_type.clone());
+    // subscribe before the transaction is known to the surfnet
+    let notification_rx = expect_signature_wait(
+        svm_locker
+            .subscribe_signature(&signature, subscription_type.clone())
+            .unwrap(),
+    );
 
     // process the transaction
     let (status_tx, _status_rx) = unbounded();
@@ -6969,22 +6985,29 @@ async fn test_ws_signature_subscribe(subscription_type: SignatureSubscriptionTyp
         _ => {}
     }
 
-    // wait for the notification
-    let notification = notification_rx.recv_timeout(Duration::from_secs(5));
-    assert!(
-        notification.is_ok(),
-        "Should receive {} notification",
-        subscription_type
-    );
+    // wait for the notification, and check the payload variant matches
+    // the subscription target
+    let notification = tokio::time::timeout(Duration::from_secs(5), notification_rx)
+        .await
+        .unwrap_or_else(|_| panic!("Should receive {} notification", subscription_type))
+        .expect("the waiter should complete rather than be swept");
 
-    let (slot, error_opt) = notification.unwrap();
-    assert!(
-        error_opt.is_none(),
-        "Transaction should succeed without error"
-    );
+    match (&subscription_type, &notification) {
+        (SignatureSubscriptionType::Received, SignatureNotification::Received { .. }) => {}
+        (
+            SignatureSubscriptionType::Commitment(_),
+            SignatureNotification::Processed { err, .. },
+        ) => {
+            assert!(err.is_none(), "Transaction should succeed without error");
+        }
+        _ => panic!(
+            "{} subscription received mismatched payload {:?}",
+            subscription_type, notification
+        ),
+    }
     println!(
-        "✓ Received {} signature notification at slot {}",
-        subscription_type, slot
+        "✓ Received {} signature notification: {:?}",
+        subscription_type, notification
     );
 }
 
@@ -7023,7 +7046,11 @@ async fn test_ws_signature_subscribe_failed_transaction(test_type: TestType) {
 
     // subscribe with processed commitment
     let subscription_type = SignatureSubscriptionType::processed();
-    let notification_rx = svm_locker.subscribe_for_signature_updates(&signature, subscription_type);
+    let notification_rx = expect_signature_wait(
+        svm_locker
+            .subscribe_signature(&signature, subscription_type)
+            .unwrap(),
+    );
 
     // process the transaction (should fail)
     let (status_tx, _status_rx) = unbounded();
@@ -7038,17 +7065,18 @@ async fn test_ws_signature_subscribe_failed_transaction(test_type: TestType) {
         .await;
 
     // wait for the notification with error
-    let notification = notification_rx.recv_timeout(Duration::from_secs(5));
-    assert!(
-        notification.is_ok(),
-        "Should receive notification for failed transaction"
-    );
+    let notification = tokio::time::timeout(Duration::from_secs(5), notification_rx)
+        .await
+        .expect("Should receive notification for failed transaction")
+        .expect("the waiter should complete rather than be swept");
 
-    let (slot, error_opt) = notification.unwrap();
-    assert!(error_opt.is_some(), "Failed transaction should have error");
+    let SignatureNotification::Processed { slot, err } = notification else {
+        panic!("a processed subscription should resolve to a Processed payload");
+    };
+    assert!(err.is_some(), "Failed transaction should have error");
     println!(
         "✓ Received signature notification for failed transaction at slot {} with error: {:?}",
-        slot, error_opt
+        slot, err
     );
 }
 
@@ -7085,12 +7113,21 @@ async fn test_ws_signature_subscribe_multiple_subscribers(test_type: TestType) {
     let signature = tx.signatures[0];
 
     // create multiple subscriptions to the same signature
-    let notification_rx1 = svm_locker
-        .subscribe_for_signature_updates(&signature, SignatureSubscriptionType::processed());
-    let notification_rx2 = svm_locker
-        .subscribe_for_signature_updates(&signature, SignatureSubscriptionType::processed());
-    let notification_rx3 = svm_locker
-        .subscribe_for_signature_updates(&signature, SignatureSubscriptionType::confirmed());
+    let notification_rx1 = expect_signature_wait(
+        svm_locker
+            .subscribe_signature(&signature, SignatureSubscriptionType::processed())
+            .unwrap(),
+    );
+    let notification_rx2 = expect_signature_wait(
+        svm_locker
+            .subscribe_signature(&signature, SignatureSubscriptionType::processed())
+            .unwrap(),
+    );
+    let notification_rx3 = expect_signature_wait(
+        svm_locker
+            .subscribe_signature(&signature, SignatureSubscriptionType::confirmed())
+            .unwrap(),
+    );
 
     // process the transaction
     let (status_tx, _status_rx) = unbounded();
@@ -7107,24 +7144,24 @@ async fn test_ws_signature_subscribe_multiple_subscribers(test_type: TestType) {
 
     // all processed subscriptions should receive notification
     assert!(
-        notification_rx1
-            .recv_timeout(Duration::from_secs(5))
-            .is_ok(),
+        tokio::time::timeout(Duration::from_secs(5), notification_rx1)
+            .await
+            .is_ok_and(|received| received.is_ok()),
         "Subscriber 1 should receive notification"
     );
     assert!(
-        notification_rx2
-            .recv_timeout(Duration::from_secs(5))
-            .is_ok(),
+        tokio::time::timeout(Duration::from_secs(5), notification_rx2)
+            .await
+            .is_ok_and(|received| received.is_ok()),
         "Subscriber 2 should receive notification"
     );
 
     // confirm the block for confirmed subscription
     svm_locker.confirm_current_block(&None).await.unwrap();
     assert!(
-        notification_rx3
-            .recv_timeout(Duration::from_secs(5))
-            .is_ok(),
+        tokio::time::timeout(Duration::from_secs(5), notification_rx3)
+            .await
+            .is_ok_and(|received| received.is_ok()),
         "Confirmed subscriber should receive notification"
     );
 
@@ -7164,7 +7201,11 @@ async fn test_ws_signature_subscribe_before_transaction_exists(test_type: TestTy
 
     // subscribe before the transaction exists
     let subscription_type = SignatureSubscriptionType::processed();
-    let notification_rx = svm_locker.subscribe_for_signature_updates(&signature, subscription_type);
+    let notification_rx = expect_signature_wait(
+        svm_locker
+            .subscribe_signature(&signature, subscription_type)
+            .unwrap(),
+    );
 
     // small delay to ensure the subscription is registered
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -7183,14 +7224,15 @@ async fn test_ws_signature_subscribe_before_transaction_exists(test_type: TestTy
         .unwrap();
 
     // should still receive notification
-    let notification = notification_rx.recv_timeout(Duration::from_secs(5));
-    assert!(
-        notification.is_ok(),
-        "Should receive notification even when subscribed before transaction"
-    );
+    let notification = tokio::time::timeout(Duration::from_secs(5), notification_rx)
+        .await
+        .expect("Should receive notification even when subscribed before transaction")
+        .expect("the waiter should complete rather than be swept");
 
-    let (slot, error_opt) = notification.unwrap();
-    assert!(error_opt.is_none(), "Transaction should succeed");
+    let SignatureNotification::Processed { slot, err } = notification else {
+        panic!("a processed subscription should resolve to a Processed payload");
+    };
+    assert!(err.is_none(), "Transaction should succeed");
     println!(
         "✓ Subscription before transaction works correctly at slot {}",
         slot
@@ -7203,27 +7245,26 @@ fn test_atomic_signature_subscription_returns_live_receiver_for_absent_signature
     let locker = SurfnetSvmLocker::new(svm);
     let signature = Signature::new_unique();
 
-    let receiver = match locker
-        .get_local_signature_status_or_subscribe(&signature, SignatureSubscriptionType::processed())
+    let mut receiver = match locker
+        .subscribe_signature(&signature, SignatureSubscriptionType::processed())
         .expect("an absent signature should register successfully")
     {
-        LocalSignatureStatusOrSubscription::Subscription(receiver) => receiver,
-        LocalSignatureStatusOrSubscription::Status(_) => {
-            panic!("an absent signature must return a subscription receiver")
+        SignatureSubscribeOutcome::Wait { rx, known_locally } => {
+            assert!(!known_locally, "an absent signature is not locally known");
+            rx
+        }
+        SignatureSubscribeOutcome::Now(_) => {
+            panic!("an absent signature must return a pending waiter")
         }
     };
 
     locker.with_svm_writer(|svm| {
-        svm.notify_signature_subscribers(
-            SignatureSubscriptionType::processed(),
-            &signature,
-            svm.get_latest_absolute_slot(),
-            None,
-        );
+        let slot = svm.get_latest_absolute_slot();
+        svm.record_signature_stage(&signature, TxStage::Executed { slot, err: None });
     });
 
     assert!(
-        receiver.recv_timeout(Duration::from_secs(1)).is_ok(),
+        receiver.try_recv().is_ok(),
         "the returned receiver should remain live after atomic registration"
     );
 }
@@ -7266,22 +7307,22 @@ async fn test_atomic_signature_subscription_returns_committed_local_status() {
         .expect("transaction should be committed locally");
 
     match locker
-        .get_local_signature_status_or_subscribe(&signature, SignatureSubscriptionType::processed())
+        .subscribe_signature(&signature, SignatureSubscriptionType::processed())
         .expect("the atomic lookup should succeed")
     {
-        LocalSignatureStatusOrSubscription::Status(status) => {
-            assert!(
-                status.err.is_none(),
-                "the committed transaction should succeed"
-            );
+        SignatureSubscribeOutcome::Now(SignatureNotification::Processed { slot, err }) => {
+            assert!(err.is_none(), "the committed transaction should succeed");
             assert_eq!(
-                status.slot,
+                slot,
                 locker.with_svm_reader(|svm| svm.get_latest_absolute_slot()),
                 "the immediate status should use the transaction metadata slot"
             );
         }
-        LocalSignatureStatusOrSubscription::Subscription(_) => {
-            panic!("a committed processed transaction must not register a new receiver")
+        SignatureSubscribeOutcome::Now(notification) => {
+            panic!("a processed subscription should resolve to Processed, got {notification:?}")
+        }
+        SignatureSubscribeOutcome::Wait { .. } => {
+            panic!("a committed processed transaction must not register a new waiter")
         }
     }
 }
@@ -7323,12 +7364,18 @@ async fn test_atomic_higher_commitment_subscription_waits_for_promotion() {
         .await
         .expect("transaction should be committed locally");
 
-    let receiver = match locker
-        .get_local_signature_status_or_subscribe(&signature, SignatureSubscriptionType::confirmed())
+    let mut receiver = match locker
+        .subscribe_signature(&signature, SignatureSubscriptionType::confirmed())
         .expect("the atomic lookup should succeed")
     {
-        LocalSignatureStatusOrSubscription::Subscription(receiver) => receiver,
-        LocalSignatureStatusOrSubscription::Status(_) => {
+        SignatureSubscribeOutcome::Wait { rx, known_locally } => {
+            assert!(
+                known_locally,
+                "a committed transaction is locally known even while its waiter is pending"
+            );
+            rx
+        }
+        SignatureSubscribeOutcome::Now(_) => {
             panic!("a processed transaction must wait for confirmed commitment")
         }
     };
@@ -7342,7 +7389,9 @@ async fn test_atomic_higher_commitment_subscription_waits_for_promotion() {
         .await
         .expect("the current block should confirm");
     assert!(
-        receiver.recv_timeout(Duration::from_secs(1)).is_ok(),
+        tokio::time::timeout(Duration::from_secs(1), receiver)
+            .await
+            .is_ok_and(|received| received.is_ok()),
         "the pending receiver should be notified at confirmed commitment"
     );
 }

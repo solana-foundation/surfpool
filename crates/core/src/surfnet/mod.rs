@@ -1,6 +1,6 @@
 use std::{collections::HashMap, fmt::Display, sync::Arc};
 
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::Sender;
 use jsonrpc_core::Result as RpcError;
 use locker::SurfnetSvmLocker;
 use solana_account::Account;
@@ -17,7 +17,6 @@ use solana_pubkey::Pubkey;
 use solana_rpc_client_api::response::SlotUpdate;
 use solana_signature::Signature;
 use solana_transaction::versioned::VersionedTransaction;
-use solana_transaction_error::TransactionError;
 use solana_transaction_status::{
     EncodedConfirmedTransactionWithStatusMeta, TransactionConfirmationStatus, TransactionStatus,
 };
@@ -32,8 +31,11 @@ use crate::{
 pub mod locker;
 pub mod noop_program;
 pub mod remote;
+pub mod signature_subscriptions;
 pub mod surfnet_lite_svm;
 pub mod svm;
+
+pub use signature_subscriptions::{SignatureNotification, SignatureSubscribeOutcome, TxStage};
 
 pub const FINALIZATION_SLOT_THRESHOLD: u64 = 31;
 pub const SLOTS_PER_EPOCH: u64 = 432000;
@@ -154,27 +156,6 @@ pub struct BlockHeader {
 pub enum SurfnetDataConnection {
     Offline,
     Connected(String, EpochInfo),
-}
-
-pub type SignatureSubscriptionData = (
-    SignatureSubscriptionType,
-    Sender<(Slot, Option<TransactionError>)>,
-);
-
-/// The status returned by an atomic signature lookup.
-///
-/// This deliberately contains only the fields needed to produce a
-/// `signatureNotification`; serializing the transaction is both unnecessary and would make the
-/// registration path needlessly expensive.
-pub struct LocalSignatureStatus {
-    pub slot: Slot,
-    pub err: Option<TransactionError>,
-}
-
-/// The outcome of atomically checking a local signature and registering for updates.
-pub enum LocalSignatureStatusOrSubscription {
-    Status(LocalSignatureStatus),
-    Subscription(Receiver<(Slot, Option<TransactionError>)>),
 }
 
 pub type AccountSubscriptionData =
