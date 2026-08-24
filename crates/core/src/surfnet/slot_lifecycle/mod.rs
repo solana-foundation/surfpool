@@ -1,14 +1,6 @@
 //! The per-slot lifecycle every geyser slot-status emission derives from.
 //!
-//! A slot is announced (`CreatedBank`) before any of its block data is
-//! emitted, advances through `Processed`, `Confirmed`, and `Rooted` in
-//! that order and at most once each, or dies (`Dead`) when a clock warp
-//! abandons it before it is produced. Block production, the startup
-//! task, the warp handlers, and a network reset all drive the same
-//! transition relation instead of each emitting statuses by hand, so
-//! the ordering and existence obligations of the lifecycle contract
-//! (NOTES/747/lifecycle-contract.md) are properties of one table rather
-//! than of the discipline at every site.
+#![doc = include_str!("../slot-lifecycle.md")]
 
 use std::collections::HashMap;
 
@@ -24,8 +16,11 @@ pub(crate) mod spec;
 /// forgotten once emitted, so the registry holds only live slots.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) enum SlotStage {
+    /// `CreatedBank` has been emitted; the slot awaits its block.
     Announced,
+    /// The slot's block was produced (`Processed` emitted).
     Processed,
+    /// The slot's block was confirmed (`Confirmed` emitted).
     Confirmed,
 }
 
@@ -45,7 +40,9 @@ fn emission(slot: Slot, status: SlotStatus) -> SlotEmission {
     }
 }
 
-/// The registry of live slots and their stages.
+/// The registry of live slots and their stages. The [module
+/// documentation](self) carries the full state table and the
+/// transition diagram.
 #[derive(Debug, Clone, Default)]
 pub struct SlotLifecycle {
     stages: HashMap<Slot, SlotStage>,

@@ -231,3 +231,60 @@ fn production_grammar_keeps_exactly_the_open_slot_announced() {
     }
     assert!(seen.len() > 100, "the grammar explored a real state space");
 }
+
+/// The generated blocks of `slot-lifecycle.md`, named by their markers.
+fn generated_blocks() -> Vec<(&'static str, String)> {
+    vec![
+        ("per-slot-table", spec::render_per_slot_table()),
+        ("diagram", spec::render_diagram()),
+    ]
+}
+
+const SPEC_DOC_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/surfnet/slot-lifecycle.md");
+
+fn read_spec_doc() -> String {
+    std::fs::read_to_string(SPEC_DOC_PATH)
+        .unwrap_or_else(|error| panic!("could not read {SPEC_DOC_PATH}: {error}"))
+}
+
+/// The character range between a block's markers, exclusive of both.
+fn region(text: &str, name: &str) -> (usize, usize) {
+    let begin = format!("<!-- BEGIN GENERATED: {name} -->\n");
+    let end = format!("<!-- END GENERATED: {name} -->");
+    let start = text
+        .find(&begin)
+        .unwrap_or_else(|| panic!("{SPEC_DOC_PATH} has no {begin:?} marker"))
+        + begin.len();
+    let stop = text[start..]
+        .find(&end)
+        .unwrap_or_else(|| panic!("{SPEC_DOC_PATH} has no {end:?} marker"))
+        + start;
+    (start, stop)
+}
+
+#[test]
+fn the_spec_document_is_current() {
+    let text = read_spec_doc();
+    for (name, content) in generated_blocks() {
+        let (start, stop) = region(&text, name);
+        assert_eq!(
+            &text[start..stop],
+            content,
+            "the {name} block in slot-lifecycle.md disagrees with the spec; \
+             run `cargo surfpool-update-slot-spec` and review the diff"
+        );
+    }
+}
+
+#[test]
+#[ignore = "writes slot-lifecycle.md; run via cargo surfpool-update-slot-spec"]
+fn regenerate_the_slot_spec_tables() {
+    let mut text = read_spec_doc();
+    for (name, content) in generated_blocks() {
+        let (start, stop) = region(&text, name);
+        text.replace_range(start..stop, &content);
+    }
+    std::fs::write(SPEC_DOC_PATH, text)
+        .unwrap_or_else(|error| panic!("could not write {SPEC_DOC_PATH}: {error}"));
+    eprintln!("regenerated the spec tables in {SPEC_DOC_PATH}");
+}
