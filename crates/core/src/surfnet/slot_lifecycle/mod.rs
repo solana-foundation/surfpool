@@ -15,10 +15,15 @@ use std::collections::HashMap;
 use agave_geyser_plugin_interface::geyser_plugin_interface::SlotStatus;
 use solana_clock::Slot;
 
+#[cfg(test)]
+mod reachability_tests;
+#[cfg(test)]
+pub(crate) mod spec;
+
 /// A slot's recorded stage. `Rooted` and `Dead` are terminal and are
 /// forgotten once emitted, so the registry holds only live slots.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SlotStage {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) enum SlotStage {
     Announced,
     Processed,
     Confirmed,
@@ -59,9 +64,9 @@ impl SlotLifecycle {
     }
 
     /// The slot's block was produced. Called after the slot's block data
-    /// has been emitted, which is the data-before-seal order the contract
-    /// asks for. An unannounced slot is announced first, so no data-
-    /// carrying slot can go unannounced even from a path that forgot.
+    /// has been emitted, which is the data-before-confirmation order the
+    /// contract asks for. An unannounced slot is announced first, so no
+    /// data-carrying slot can go unannounced even from a path that forgot.
     pub fn produce(&mut self, slot: Slot) -> Vec<SlotEmission> {
         let mut out = self.announce(slot);
         if self.advance(slot, SlotStage::Announced, SlotStage::Processed) {
@@ -70,7 +75,7 @@ impl SlotLifecycle {
         out
     }
 
-    /// The slot's block was confirmed (the seal).
+    /// The slot's block was confirmed.
     pub fn confirm(&mut self, slot: Slot) -> Vec<SlotEmission> {
         if self.advance(slot, SlotStage::Processed, SlotStage::Confirmed) {
             vec![emission(slot, SlotStatus::Confirmed)]
@@ -85,7 +90,7 @@ impl SlotLifecycle {
             Some(SlotStage::Confirmed) => vec![emission(slot, SlotStatus::Rooted)],
             Some(stage) => {
                 // Rooting a slot that never confirmed would skip a status;
-                // keep the record and emit nothing (O4).
+                // keep the record and emit nothing.
                 self.stages.insert(slot, stage);
                 vec![]
             }
@@ -112,6 +117,13 @@ impl SlotLifecycle {
         }
         out.extend(self.announce(to));
         out
+    }
+
+    /// The recorded stage of a slot, if it is live. The spec and the
+    /// reachability sweep read the registry only through this accessor.
+    #[cfg(test)]
+    pub(crate) fn stage(&self, slot: Slot) -> Option<SlotStage> {
+        self.stages.get(&slot).copied()
     }
 
     /// Forgets every slot (a network reset).
@@ -180,8 +192,8 @@ mod tests {
 
     #[test]
     fn a_forward_warp_kills_the_orphan_and_announces_the_destination() {
-        // E1 and L1 as one cell: the open slot 3 was announced by
-        // closing slot 2 and never produced; the warp lands on 9.
+        // The open slot 3 was announced by closing slot 2 and never
+        // produced; the warp lands on 9.
         let mut life = SlotLifecycle::default();
         life.announce(3);
         let out = life.warp(3, 9);
@@ -194,7 +206,7 @@ mod tests {
 
     #[test]
     fn a_warp_landing_on_the_open_slot_changes_nothing() {
-        // The O4 trap: an unconditional announce here would double-announce.
+        // An unconditional announce here would double-announce.
         let mut life = SlotLifecycle::default();
         life.announce(3);
         assert!(life.warp(3, 3).is_empty());
