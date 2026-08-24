@@ -1,7 +1,9 @@
 export { createSurfnetCheatcodesRpc, DEFAULT_SURFNET_ENDPOINT, surfnetCheatcodes } from './cheatcodes.js';
 export { surfpool } from './surfpool.js';
 export type {
+    AirdropTarget,
     SurfpoolAttachConfig,
+    SurfpoolAttachConfigWithAirdrop,
     SurfpoolConfig,
     SurfpoolEmbeddedConfig,
     SurfpoolRpcOptions,

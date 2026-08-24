@@ -20,16 +20,18 @@ use solana_client::{
         RpcResponseContext, RpcSignatureResult,
     },
 };
-use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
+use solana_commitment_config::CommitmentConfig;
 use solana_pubkey::Pubkey;
 use solana_rpc_client_api::response::{Response as RpcResponse, SlotInfo, SlotUpdate};
 use solana_signature::Signature;
-use solana_transaction_status::{TransactionConfirmationStatus, UiTransactionEncoding};
+use solana_transaction_status::UiTransactionEncoding;
 
 use super::{State, SurfnetRpcContext, SurfpoolWebsocketMeta};
 use crate::{
     rpc::utils::MAX_SUPPORTED_TRANSACTION_VERSION,
-    surfnet::{GetTransactionResult, SignatureSubscriptionType},
+    surfnet::{
+        GetTransactionResult, LocalSignatureStatusOrSubscription, SignatureSubscriptionType,
+    },
 };
 
 /// Configuration for account subscription requests.
@@ -1100,6 +1102,50 @@ pub struct SurfpoolWsRpc {
     pub tokio_handle: tokio::runtime::Handle,
 }
 
+impl SurfpoolWsRpc {
+    /// Send the one notification a signature subscription is allowed to produce and remove its
+    /// sink from the active subscription map.
+    fn notify_signature_subscriber(
+        active: &Arc<RwLock<HashMap<SubscriptionId, Sink<RpcResponse<RpcSignatureResult>>>>>,
+        sub_id: &SubscriptionId,
+        subscription_type: &SignatureSubscriptionType,
+        slot: u64,
+        err: Option<solana_transaction_error::TransactionError>,
+        is_received_event: bool,
+    ) -> bool {
+        let Ok(mut guard) = active.write() else {
+            log::error!("Failed to acquire write lock on signature_subscription_map");
+            return false;
+        };
+
+        let Some(sink) = guard.remove(sub_id) else {
+            return false;
+        };
+
+        let result = match (subscription_type, is_received_event) {
+            (SignatureSubscriptionType::Received, true) => sink.notify(Ok(RpcResponse {
+                context: RpcResponseContext::new(slot),
+                value: RpcSignatureResult::ReceivedSignature(
+                    ReceivedSignatureResult::ReceivedSignature,
+                ),
+            })),
+            _ => sink.notify(Ok(RpcResponse {
+                context: RpcResponseContext::new(slot),
+                value: RpcSignatureResult::ProcessedSignature(ProcessedSignatureResult {
+                    err: err.map(Into::into),
+                }),
+            })),
+        };
+
+        if let Err(error) = result {
+            log::error!("Failed to notify client about signature update: {error}");
+            return false;
+        }
+
+        true
+    }
+}
+
 impl Rpc for SurfpoolWsRpc {
     type Metadata = Option<SurfpoolWebsocketMeta>;
 
@@ -1195,77 +1241,83 @@ impl Rpc for SurfpoolWsRpc {
                     return;
                 }
             };
-            // get the signature from the SVM to see if it's already been processed
-            let tx_result = match svm_locker
-                .get_transaction(
-                    &remote_ctx.map(|(r, _)| r),
-                    &signature,
-                    rpc_transaction_config,
-                )
-                .await
+            // Check local history first. A remote miss can take arbitrarily long, so it must not
+            // be part of the window between the final local check and receiver registration.
+            let local_tx_result =
+                match svm_locker.get_transaction_local(&signature, &rpc_transaction_config) {
+                    Ok(res) => res,
+                    Err(e) => {
+                        if let Ok(mut guard) = active.write() {
+                            if let Some(sink) = guard.remove(&sub_id) {
+                                let _ = sink.notify(Err(e.into()));
+                            }
+                        }
+                        return;
+                    }
+                };
+
+            // Preserve the historical remote lookup for signatures that were not executed
+            // locally. Its result is intentionally not inserted into the SVM.
+            let tx_result = if local_tx_result.is_none() {
+                match remote_ctx.as_ref() {
+                    Some((remote_client, _)) => {
+                        remote_client
+                            .get_transaction(
+                                signature,
+                                rpc_transaction_config.clone(),
+                                svm_locker.get_latest_absolute_slot(),
+                            )
+                            .await
+                    }
+                    None => local_tx_result,
+                }
+            } else {
+                local_tx_result
+            };
+
+            if let GetTransactionResult::FoundTransaction(_, _, tx) = tx_result {
+                if tx
+                    .confirmation_status
+                    .is_some_and(|status| subscription_type.is_satisfied_by(status))
+                {
+                    Self::notify_signature_subscriber(
+                        &active,
+                        &sub_id,
+                        &subscription_type,
+                        tx.slot,
+                        tx.err,
+                        false,
+                    );
+                    return;
+                }
+            }
+
+            // Check local status and install the receiver while holding one SVM write lock. A
+            // locally committed transaction therefore cannot be missed after a remote miss.
+            let rx = match svm_locker
+                .get_local_signature_status_or_subscribe(&signature, subscription_type.clone())
             {
-                Ok(res) => res,
-                Err(e) => {
+                Ok(LocalSignatureStatusOrSubscription::Status(status)) => {
+                    Self::notify_signature_subscriber(
+                        &active,
+                        &sub_id,
+                        &subscription_type,
+                        status.slot,
+                        status.err,
+                        false,
+                    );
+                    return;
+                }
+                Ok(LocalSignatureStatusOrSubscription::Subscription(rx)) => rx,
+                Err(error) => {
                     if let Ok(mut guard) = active.write() {
                         if let Some(sink) = guard.remove(&sub_id) {
-                            let _ = sink.notify(Err(e.into()));
+                            let _ = sink.notify(Err(error.into()));
                         }
                     }
                     return;
                 }
             };
-
-            // if we already had the transaction, check if its confirmation status matches the desired status set by the subscription
-            // if so, notify the user and complete the subscription
-            // otherwise, subscribe to the transaction updates
-            if let GetTransactionResult::FoundTransaction(_, _, tx) = tx_result {
-                match (&subscription_type, tx.confirmation_status) {
-                    (&SignatureSubscriptionType::Received, _)
-                    | (
-                        &SignatureSubscriptionType::Commitment(CommitmentLevel::Processed),
-                        Some(TransactionConfirmationStatus::Processed),
-                    )
-                    | (
-                        &SignatureSubscriptionType::Commitment(CommitmentLevel::Processed),
-                        Some(TransactionConfirmationStatus::Confirmed),
-                    )
-                    | (
-                        &SignatureSubscriptionType::Commitment(CommitmentLevel::Processed),
-                        Some(TransactionConfirmationStatus::Finalized),
-                    )
-                    | (
-                        &SignatureSubscriptionType::Commitment(CommitmentLevel::Confirmed),
-                        Some(TransactionConfirmationStatus::Confirmed),
-                    )
-                    | (
-                        &SignatureSubscriptionType::Commitment(CommitmentLevel::Confirmed),
-                        Some(TransactionConfirmationStatus::Finalized),
-                    )
-                    | (
-                        &SignatureSubscriptionType::Commitment(CommitmentLevel::Finalized),
-                        Some(TransactionConfirmationStatus::Finalized),
-                    ) => {
-                        if let Ok(mut guard) = active.write() {
-                            if let Some(sink) = guard.remove(&sub_id) {
-                                let _ = sink.notify(Ok(RpcResponse {
-                                    context: RpcResponseContext::new(tx.slot),
-                                    value: RpcSignatureResult::ProcessedSignature(
-                                        ProcessedSignatureResult {
-                                            err: tx.err.map(|e| e.into()),
-                                        },
-                                    ),
-                                }));
-                            }
-                        }
-                        return;
-                    }
-                    _ => {}
-                }
-            }
-
-            // update our surfnet SVM to subscribe to the signature updates
-            let rx =
-                svm_locker.subscribe_for_signature_updates(&signature, subscription_type.clone());
 
             loop {
                 let (slot, some_err) = match rx.try_recv() {
@@ -1289,39 +1341,15 @@ impl Rpc for SurfpoolWsRpc {
                     }
                 };
 
-                let Ok(mut guard) = active.write() else {
-                    log::error!("Failed to acquire read lock on signature_subscription_map");
-                    break;
-                };
-
-                let Some(sink) = guard.remove(&sub_id) else {
-                    log::error!("Failed to get sink for subscription ID");
-                    break;
-                };
-
-                let res = match subscription_type {
-                    SignatureSubscriptionType::Received => sink.notify(Ok(RpcResponse {
-                        context: RpcResponseContext::new(slot),
-                        value: RpcSignatureResult::ReceivedSignature(
-                            ReceivedSignatureResult::ReceivedSignature,
-                        ),
-                    })),
-                    SignatureSubscriptionType::Commitment(_) => sink.notify(Ok(RpcResponse {
-                        context: RpcResponseContext::new(slot),
-                        value: RpcSignatureResult::ProcessedSignature(ProcessedSignatureResult {
-                            err: some_err.map(|e| e.into()),
-                        }),
-                    })),
-                };
-
-                if guard.is_empty() {
-                    break;
-                }
-
-                if let Err(e) = res {
-                    log::error!("Failed to notify client about account update: {e}");
-                    break;
-                }
+                Self::notify_signature_subscriber(
+                    &active,
+                    &sub_id,
+                    &subscription_type,
+                    slot,
+                    some_err,
+                    true,
+                );
+                break;
             }
         });
     }

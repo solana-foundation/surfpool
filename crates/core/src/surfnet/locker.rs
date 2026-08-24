@@ -65,8 +65,8 @@ use uuid::Uuid;
 
 use super::{
     AccountFactory, AccountSource, CoupledAccount, GetAccountResult, GetTransactionResult,
-    GeyserEvent, SignatureSubscriptionType, SurfnetSvm, remote::SurfnetRemoteClient,
-    svm::AccountUpdatePolicy,
+    GeyserEvent, LocalSignatureStatusOrSubscription, SignatureSubscriptionType, SurfnetSvm,
+    remote::SurfnetRemoteClient, svm::AccountUpdatePolicy,
 };
 use crate::{
     error::{AirdropError, SurfpoolError, SurfpoolResult},
@@ -3952,6 +3952,18 @@ impl SurfnetSvmLocker {
     ) -> Receiver<(Slot, Option<TransactionError>)> {
         self.with_svm_writer(|svm_writer| {
             svm_writer.subscribe_for_signature_updates(signature, subscription_type.clone())
+        })
+    }
+
+    /// Atomically checks whether a local transaction already satisfies a signature
+    /// subscription, otherwise registers its receiver under the SVM write lock.
+    pub fn get_local_signature_status_or_subscribe(
+        &self,
+        signature: &Signature,
+        subscription_type: SignatureSubscriptionType,
+    ) -> SurfpoolResult<LocalSignatureStatusOrSubscription> {
+        self.with_svm_writer(|svm_writer| {
+            svm_writer.get_local_signature_status_or_subscribe(signature, subscription_type)
         })
     }
 

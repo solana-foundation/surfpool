@@ -130,6 +130,7 @@ solana-nonce = { version = "3.0", default-features = false }
 solana-packet = { version = "4.0", default-features = false }
 solana-program-option = { version = "3.0", default-features = false }
 solana-program-pack = { version = "3.1", default-features = false }
+solana-pubsub-client = { version = "4.0", default-features = false }
 solana-pubkey = { version = "3.0", default-features = false }
 solana-rpc-client = { version = "4.0", default-features = false }
 solana-rpc-client-api = { version = "4.0", default-features = false }

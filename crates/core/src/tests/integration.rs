@@ -1,4 +1,13 @@
-use std::{str::FromStr, sync::Arc, time::Duration};
+use std::{
+    io::{Read, Write},
+    net::TcpListener,
+    str::FromStr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use base64::Engine;
 use crossbeam_channel::{
@@ -7,7 +16,10 @@ use crossbeam_channel::{
 use ed25519_dalek::Signer as DalekSigner;
 use jsonrpc_core::{
     Error, Result as JsonRpcResult,
-    futures::future::{self, join_all},
+    futures::{
+        StreamExt,
+        future::{self, join_all},
+    },
 };
 use jsonrpc_core_client::transports::http;
 use p256::ecdsa::{
@@ -38,12 +50,17 @@ use solana_message::{
     v0::{self, MessageAddressTableLookup},
 };
 use solana_pubkey::Pubkey;
-use solana_rpc_client_api::response::{Response as RpcResponse, SlotUpdate};
+use solana_pubsub_client::nonblocking::pubsub_client::PubsubClient;
+use solana_rpc_client_api::{
+    config::RpcSignatureSubscribeConfig,
+    response::{Response as RpcResponse, SlotUpdate},
+};
 use solana_secp256k1_program::{
     eth_address_from_pubkey, new_secp256k1_instruction_with_signature,
     sign_message as sign_secp256k1_message,
 };
 use solana_secp256r1_program::new_secp256r1_instruction_with_signature;
+use solana_signature::Signature;
 use solana_signer::Signer;
 use solana_system_interface::{
     instruction as system_instruction, instruction::transfer, program as system_program,
@@ -82,8 +99,8 @@ use crate::{
     runloops::start_local_surfnet_runloop,
     storage::tests::TestType,
     surfnet::{
-        FINALIZATION_SLOT_THRESHOLD, GeyserEvent, PluginCommand, SignatureSubscriptionType,
-        locker::SurfnetSvmLocker, svm::SurfnetSvm,
+        FINALIZATION_SLOT_THRESHOLD, GeyserEvent, LocalSignatureStatusOrSubscription,
+        PluginCommand, SignatureSubscriptionType, locker::SurfnetSvmLocker, svm::SurfnetSvm,
     },
     tests::helpers::get_free_port,
     types::{TimeTravelConfig, TransactionLoadedAddresses},
@@ -7178,6 +7195,361 @@ async fn test_ws_signature_subscribe_before_transaction_exists(test_type: TestTy
         "✓ Subscription before transaction works correctly at slot {}",
         slot
     );
+}
+
+#[test]
+fn test_atomic_signature_subscription_returns_live_receiver_for_absent_signature() {
+    let (svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+    let locker = SurfnetSvmLocker::new(svm);
+    let signature = Signature::new_unique();
+
+    let receiver = match locker
+        .get_local_signature_status_or_subscribe(&signature, SignatureSubscriptionType::processed())
+        .expect("an absent signature should register successfully")
+    {
+        LocalSignatureStatusOrSubscription::Subscription(receiver) => receiver,
+        LocalSignatureStatusOrSubscription::Status(_) => {
+            panic!("an absent signature must return a subscription receiver")
+        }
+    };
+
+    locker.with_svm_writer(|svm| {
+        svm.notify_signature_subscribers(
+            SignatureSubscriptionType::processed(),
+            &signature,
+            svm.get_latest_absolute_slot(),
+            None,
+        );
+    });
+
+    assert!(
+        receiver.recv_timeout(Duration::from_secs(1)).is_ok(),
+        "the returned receiver should remain live after atomic registration"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_atomic_signature_subscription_returns_committed_local_status() {
+    use crossbeam_channel::unbounded;
+
+    let (svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+    let locker = SurfnetSvmLocker::new(svm);
+    let payer = Keypair::new();
+    let recipient = Pubkey::new_unique();
+    locker
+        .airdrop(&payer.pubkey(), LAMPORTS_PER_SOL)
+        .unwrap()
+        .unwrap();
+    let recent_blockhash = locker.with_svm_reader(|svm| svm.latest_blockhash());
+    let transaction = Transaction::new_signed_with_payer(
+        &[system_instruction::transfer(
+            &payer.pubkey(),
+            &recipient,
+            1_000_000,
+        )],
+        Some(&payer.pubkey()),
+        &[&payer],
+        recent_blockhash,
+    );
+    let signature = transaction.signatures[0];
+
+    let (status_tx, _status_rx) = unbounded();
+    locker
+        .process_transaction(
+            &None,
+            VersionedTransaction::from(transaction),
+            status_tx,
+            false,
+            false,
+        )
+        .await
+        .expect("transaction should be committed locally");
+
+    match locker
+        .get_local_signature_status_or_subscribe(&signature, SignatureSubscriptionType::processed())
+        .expect("the atomic lookup should succeed")
+    {
+        LocalSignatureStatusOrSubscription::Status(status) => {
+            assert!(
+                status.err.is_none(),
+                "the committed transaction should succeed"
+            );
+            assert_eq!(
+                status.slot,
+                locker.with_svm_reader(|svm| svm.get_latest_absolute_slot()),
+                "the immediate status should use the transaction metadata slot"
+            );
+        }
+        LocalSignatureStatusOrSubscription::Subscription(_) => {
+            panic!("a committed processed transaction must not register a new receiver")
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_atomic_higher_commitment_subscription_waits_for_promotion() {
+    use crossbeam_channel::unbounded;
+
+    let (svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+    let locker = SurfnetSvmLocker::new(svm);
+    let payer = Keypair::new();
+    let recipient = Pubkey::new_unique();
+    locker
+        .airdrop(&payer.pubkey(), LAMPORTS_PER_SOL)
+        .unwrap()
+        .unwrap();
+    let recent_blockhash = locker.with_svm_reader(|svm| svm.latest_blockhash());
+    let transaction = Transaction::new_signed_with_payer(
+        &[system_instruction::transfer(
+            &payer.pubkey(),
+            &recipient,
+            1_000_000,
+        )],
+        Some(&payer.pubkey()),
+        &[&payer],
+        recent_blockhash,
+    );
+    let signature = transaction.signatures[0];
+
+    let (status_tx, _status_rx) = unbounded();
+    locker
+        .process_transaction(
+            &None,
+            VersionedTransaction::from(transaction),
+            status_tx,
+            false,
+            false,
+        )
+        .await
+        .expect("transaction should be committed locally");
+
+    let receiver = match locker
+        .get_local_signature_status_or_subscribe(&signature, SignatureSubscriptionType::confirmed())
+        .expect("the atomic lookup should succeed")
+    {
+        LocalSignatureStatusOrSubscription::Subscription(receiver) => receiver,
+        LocalSignatureStatusOrSubscription::Status(_) => {
+            panic!("a processed transaction must wait for confirmed commitment")
+        }
+    };
+    assert!(
+        receiver.try_recv().is_err(),
+        "the confirmed receiver must remain pending before promotion"
+    );
+
+    locker
+        .confirm_current_block(&None)
+        .await
+        .expect("the current block should confirm");
+    assert!(
+        receiver.recv_timeout(Duration::from_secs(1)).is_ok(),
+        "the pending receiver should be notified at confirmed commitment"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_ws_signature_subscribe_does_not_miss_local_commit_during_remote_lookup() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("the delayed datasource should bind");
+    listener
+        .set_nonblocking(true)
+        .expect("the delayed datasource should be non-blocking");
+    let remote_url = format!("http://{}", listener.local_addr().unwrap());
+    let (transaction_lookup_tx, transaction_lookup_rx) = crossbeam_channel::bounded(1);
+    let (release_lookup_tx, release_lookup_rx) = crossbeam_channel::bounded(1);
+    let stop_mock = Arc::new(AtomicBool::new(false));
+    let mock_stop = Arc::clone(&stop_mock);
+
+    let mock_server = std::thread::spawn(move || {
+        while !mock_stop.load(Ordering::Relaxed) {
+            let Ok((mut stream, _)) = listener.accept() else {
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
+            };
+
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let bytes_read = stream.read(&mut buffer).expect("mock should read request");
+                request.extend_from_slice(&buffer[..bytes_read]);
+                let Some(headers_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let headers = std::str::from_utf8(&request[..headers_end])
+                    .expect("request headers should be UTF-8");
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("Content-Length")
+                            .then_some(value.trim())
+                    })
+                    .expect("request should include Content-Length")
+                    .parse::<usize>()
+                    .expect("Content-Length should be numeric");
+                if request.len() < headers_end + 4 + content_length {
+                    continue;
+                }
+
+                let body = &request[headers_end + 4..headers_end + 4 + content_length];
+                let request_json: serde_json::Value =
+                    serde_json::from_slice(body).expect("request body should be JSON-RPC");
+                let method = request_json["method"]
+                    .as_str()
+                    .expect("JSON-RPC request should name its method");
+                if method == "getTransaction" {
+                    transaction_lookup_tx
+                        .send(())
+                        .expect("test should still wait for the remote lookup");
+                    release_lookup_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("test should release the remote lookup");
+                }
+
+                let result = match method {
+                    "getEpochInfo" => serde_json::json!({
+                        "absoluteSlot": 0,
+                        "blockHeight": 0,
+                        "epoch": 0,
+                        "slotIndex": 0,
+                        "slotsInEpoch": 432000,
+                        "transactionCount": null,
+                    }),
+                    "getEpochSchedule" => serde_json::json!({
+                        "slotsPerEpoch": 432000,
+                        "leaderScheduleSlotOffset": 432000,
+                        "warmup": false,
+                        "firstNormalEpoch": 0,
+                        "firstNormalSlot": 0,
+                    }),
+                    "getTransaction" => serde_json::Value::Null,
+                    unexpected => panic!("unexpected datasource method: {unexpected}"),
+                };
+                let response = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "result": result,
+                    "id": request_json["id"].clone(),
+                })
+                .to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response.len(),
+                    response,
+                )
+                .expect("mock should respond to request");
+                break;
+            }
+        }
+    });
+
+    let bind_host = "127.0.0.1";
+    let bind_port = get_free_port().unwrap();
+    let ws_port = get_free_port().unwrap();
+    let payer = Keypair::new();
+    let config = SurfpoolConfig {
+        simnets: vec![SimnetConfig {
+            block_production_mode: BlockProductionMode::Manual,
+            remote_rpc_url: Some(remote_url),
+            airdrop_addresses: vec![payer.pubkey()],
+            airdrop_token_amount: LAMPORTS_PER_SOL,
+            ..SimnetConfig::default()
+        }],
+        rpc: RpcConfig {
+            bind_host: bind_host.to_string(),
+            bind_port,
+            ws_port,
+            ..Default::default()
+        },
+        ..SurfpoolConfig::default()
+    };
+    let (svm, simnet_events_rx, geyser_events_rx) = TestType::no_db().initialize_svm();
+    let locker = SurfnetSvmLocker::new(svm);
+    let (commands_tx, commands_rx) = unbounded();
+    let runloop = spawn_runloop(
+        locker.clone(),
+        config,
+        (commands_tx, commands_rx),
+        geyser_events_rx,
+    )
+    .expect("the surfnet should start");
+    wait_for_ready_and_connected(&simnet_events_rx).expect("the surfnet should connect");
+
+    let recipient = Pubkey::new_unique();
+    let recent_blockhash = locker.with_svm_reader(|svm| svm.latest_blockhash());
+    let transaction = Transaction::new_signed_with_payer(
+        &[system_instruction::transfer(
+            &payer.pubkey(),
+            &recipient,
+            1_000_000,
+        )],
+        Some(&payer.pubkey()),
+        &[&payer],
+        recent_blockhash,
+    );
+    let signature = transaction.signatures[0];
+    let ws_client = PubsubClient::new(format!("ws://{bind_host}:{ws_port}"))
+        .await
+        .expect("the WebSocket RPC server should accept connections");
+    let (mut notifications, unsubscribe) = ws_client
+        .signature_subscribe(
+            &signature,
+            Some(RpcSignatureSubscribeConfig {
+                commitment: Some(CommitmentConfig::processed()),
+                enable_received_notification: None,
+            }),
+        )
+        .await
+        .expect("the signature subscription should be established");
+
+    transaction_lookup_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("signatureSubscribe should be waiting on the delayed getTransaction lookup");
+    let (status_tx, _status_rx) = unbounded();
+    locker
+        .process_transaction(
+            &None,
+            VersionedTransaction::from(transaction),
+            status_tx,
+            false,
+            false,
+        )
+        .await
+        .expect("the local transaction should commit while remote lookup is blocked");
+    release_lookup_tx
+        .send(())
+        .expect("the delayed lookup should still be waiting");
+
+    let notification = tokio::time::timeout(Duration::from_secs(2), notifications.next())
+        .await
+        .expect("a processed signature notification should arrive")
+        .expect("the signature subscription should remain open");
+    assert!(
+        matches!(
+            notification.value,
+            solana_rpc_client_api::response::RpcSignatureResult::ProcessedSignature(ref result)
+                if result.err.is_none()
+        ),
+        "expected one successful processed signature notification, got {notification:?}"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), notifications.next())
+            .await
+            .is_err(),
+        "a signature subscription must send exactly one notification"
+    );
+
+    unsubscribe().await;
+    drop(notifications);
+    ws_client
+        .shutdown()
+        .await
+        .expect("the WebSocket client should close");
+    runloop.stop().expect("the surfnet should stop");
+    stop_mock.store(true, Ordering::Relaxed);
+    mock_server
+        .join()
+        .expect("the delayed datasource should stop");
 }
 
 #[test_case(TestType::sqlite(); "with on-disk sqlite db")]

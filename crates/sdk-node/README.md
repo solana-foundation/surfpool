@@ -82,6 +82,27 @@ const client = await createClient()
   .use(surfpool({ rpcUrl: "http://127.0.0.1:8899" }));
 ```
 
+That payer is usually unfunded on the running Surfnet. `airdropAddresses`
+credits each listed address or signer while the client is composed, so no
+separate cheatcode call is needed before sending a transaction:
+
+```ts
+const client = await createClient()
+  .use(payer(myPayer))
+  .use(
+    surfpool({
+      airdropAddresses: [myPayer, someRecipient],
+      airdropAmount: 5_000_000_000n, // lamports, defaults to 10 SOL
+      rpcUrl: "http://127.0.0.1:8899",
+    }),
+  );
+```
+
+Funding is additive, like a real airdrop: `airdropAmount` is added to whatever
+the address already holds, and only the lamport balance is written, so existing
+account data and owner survive. A failure to fund throws, naming the address.
+The option works in embedded mode too, alongside the pre-funded payer.
+
 For one-off use without a client, `createSurfnetCheatcodesRpc(url)` returns a
 standalone `Rpc<SurfnetCheatcodesApi>`, and `surfnetCheatcodes()` installs
 `client.cheatcodes` on any existing client.
