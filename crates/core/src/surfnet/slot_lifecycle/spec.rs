@@ -331,44 +331,45 @@ pub(crate) fn render_per_slot_table() -> String {
     out
 }
 
-/// The machine's advancing edges rendered as a preformatted block, for
-/// `slot-lifecycle.md`. The two warp edges are the set-level rules,
-/// spelled beside the table-driven ones.
-pub(crate) fn render_diagram() -> String {
-    let mut out = String::from("```text\n");
-    for row in PER_SLOT {
-        if let To(stage) = row.next
-            && row.state != Some(stage)
-        {
-            out.push_str(&format!(
-                "{:<11} --{}--> {:<10} emits {}\n",
-                stage_name(row.state),
-                event_name(row.event),
-                stage_name(Some(stage)),
-                row.emits
-                    .iter()
-                    .map(|status| status_name(*status))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            ));
-        }
-        if row.next == Forgotten {
-            out.push_str(&format!(
-                "{:<11} --{}--> {:<10} emits {}\n",
-                stage_name(row.state),
-                event_name(row.event),
-                "(forgotten)",
-                row.emits
-                    .iter()
-                    .map(|status| status_name(*status))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            ));
-        }
+/// A stage as a mermaid state reference: `(absent)` is the start
+/// pseudo-state, since a slot's record begins at its first event.
+fn stage_ref(state: Option<SlotStage>) -> &'static str {
+    match state {
+        None => "[*]",
+        Some(stage) => stage_name(Some(stage)),
     }
-    out.push_str("Announced   --warp away--> (forgotten) emits Dead\n");
-    out.push_str("(any stage)  --warp back--> (forgotten) emits Dead, every rewritten slot\n");
-    out.push_str("```\n");
+}
+
+/// The machine's advancing edges rendered as a mermaid state diagram,
+/// for `slot-lifecycle.md`. The two warp edges are the set-level
+/// rules, spelled beside the table-driven ones; `(forgotten)` is the
+/// end pseudo-state. The fence sits inside `BEGIN MERMAID` markers so
+/// the render pipeline can pre-draw it for cargo doc.
+pub(crate) fn render_diagram() -> String {
+    let mut out =
+        String::from("<!-- BEGIN MERMAID: machine-edges -->\n```mermaid\nstateDiagram-v2\n");
+    for row in PER_SLOT {
+        let target = match row.next {
+            To(stage) if row.state != Some(stage) => stage_name(Some(stage)),
+            Forgotten => "[*]",
+            _ => continue,
+        };
+        out.push_str(&format!(
+            "    {} --> {} : {} ({})\n",
+            stage_ref(row.state),
+            target,
+            event_name(row.event),
+            row.emits
+                .iter()
+                .map(|status| status_name(*status))
+                .collect::<Vec<_>>()
+                .join(", "),
+        ));
+    }
+    out.push_str("    Announced --> [*] : warp away (Dead)\n");
+    out.push_str("    state \"any stage\" as any_stage\n");
+    out.push_str("    any_stage --> [*] : warp back (Dead, every rewritten slot)\n");
+    out.push_str("```\n<!-- END MERMAID: machine-edges -->\n");
     out
 }
 

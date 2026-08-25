@@ -1,6 +1,6 @@
 //! The per-slot lifecycle every geyser slot-status emission derives from.
 //!
-#![doc = include_str!("../slot-lifecycle.md")]
+#![doc = include_str!(concat!(env!("OUT_DIR"), "/slot-lifecycle.rustdoc.md"))]
 
 use std::collections::HashMap;
 

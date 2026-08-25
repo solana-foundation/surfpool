@@ -295,3 +295,197 @@ fn regenerate_the_slot_spec_tables() {
         .unwrap_or_else(|error| panic!("could not write {SPEC_DOC_PATH}: {error}"));
     eprintln!("regenerated the spec tables in {SPEC_DOC_PATH}");
 }
+
+// The diagram pipeline below mirrors the startup spec's
+// (`types/src/startup/surfnet_startup_reachability_tests.rs`); the
+// helpers are duplicated because they live in that crate's test-only
+// module and exporting them would put test scaffolding in the library.
+
+/// Every mermaid region of `slot-lifecycle.md`, as (name, fenced source).
+fn diagram_sources() -> Vec<(String, String)> {
+    let text = read_spec_doc();
+    let mut sources = vec![];
+    let mut rest = text.as_str();
+    while let Some(start) = rest.find("<!-- BEGIN MERMAID: ") {
+        let name_start = start + "<!-- BEGIN MERMAID: ".len();
+        let name_end = rest[name_start..]
+            .find(" -->")
+            .expect("a mermaid marker name")
+            + name_start;
+        let name = rest[name_start..name_end].to_string();
+        let body_start = name_end + " -->".len();
+        let end_marker = format!("<!-- END MERMAID: {name} -->");
+        let end = rest.find(&end_marker).expect("a closing mermaid marker");
+        sources.push((name, rest[body_start..end].trim().to_string()));
+        rest = &rest[end + end_marker.len()..];
+    }
+    sources
+}
+
+/// FNV-1a, implemented locally: the pin must be stable across Rust
+/// releases, which std's `DefaultHasher` does not promise.
+fn fnv1a(text: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in text.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+fn diagram_svg_path(name: &str) -> String {
+    format!(
+        "{}/src/surfnet/diagrams/{name}.svg",
+        env!("CARGO_MANIFEST_DIR")
+    )
+}
+
+/// Replaces each distinct random token after `state-id-` with its
+/// first-occurrence index, rewriting every reference to it the same
+/// way, so internal id links inside the SVG stay consistent.
+fn normalize_state_ids(svg: &str) -> String {
+    const MARKER: &str = "state-id-";
+    let mut tokens: Vec<String> = vec![];
+    let mut output = String::with_capacity(svg.len());
+    let mut rest = svg;
+    while let Some(found) = rest.find(MARKER) {
+        let after = found + MARKER.len();
+        let token_len = rest[after..]
+            .bytes()
+            .take_while(u8::is_ascii_alphanumeric)
+            .count();
+        let token = rest[after..after + token_len].to_string();
+        let index = match tokens.iter().position(|seen| *seen == token) {
+            Some(index) => index,
+            None => {
+                tokens.push(token);
+                tokens.len() - 1
+            }
+        };
+        output.push_str(&rest[..after]);
+        output.push_str(&format!("d{index}"));
+        rest = &rest[after + token_len..];
+    }
+    output.push_str(rest);
+    output
+}
+
+/// Each rendered SVG pins the hash of the mermaid source it was
+/// rendered from, so editing a diagram without re-rendering fails
+/// here, and CI needs no mermaid toolchain to detect the drift.
+#[test]
+fn the_diagrams_match_their_renderings() {
+    for (name, source) in diagram_sources() {
+        let path = diagram_svg_path(&name);
+        let svg = std::fs::read_to_string(&path).unwrap_or_else(|error| {
+            panic!(
+                "could not read {path}: {error}; run `cargo \
+                 surfpool-render-slot-diagrams`"
+            )
+        });
+        let expected = format!("<!-- mermaid-fnv1a: {:016x} -->", fnv1a(&source));
+        assert!(
+            svg.starts_with(&expected),
+            "{name}: the rendered SVG is stale; run `cargo \
+             surfpool-render-slot-diagrams`"
+        );
+    }
+}
+
+/// Renders each mermaid region to `src/surfnet/diagrams/<name>.svg`
+/// and pins the source hash. Ignored so a plain test run never needs
+/// the mermaid CLI; `cargo surfpool-render-slot-diagrams` runs it.
+///
+/// Determinism boundary: with the id fixes below, re-rendering an
+/// unchanged source is byte-stable on one machine, and CI never
+/// compares SVG bytes at all (the check test pins the source hash),
+/// so environments can differ without breaking anything. Across
+/// machines, Chromium versions and font fallbacks still move text
+/// metrics, so a re-render on different hardware may churn measured
+/// coordinates; that churn is confined to commits that edit a
+/// diagram. Byte-stability across machines would need a pinned
+/// render container, which this mechanism deliberately omits.
+#[test]
+#[ignore = "runs mmdc; invoke via cargo surfpool-render-slot-diagrams"]
+fn render_the_slot_diagrams() {
+    for (name, source) in diagram_sources() {
+        let body: String = source
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("```"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let input = std::env::temp_dir().join(format!("{name}.mmd"));
+        let rendered = std::env::temp_dir().join(format!("{name}.svg"));
+        let config = std::env::temp_dir().join(format!("{name}.mermaid.json"));
+        std::fs::write(&input, &body).expect("write the mermaid source");
+        // Deterministic ids, seeded by the diagram name: mermaid
+        // otherwise embeds a random token in every render, and a
+        // re-render with an unchanged source would dirty the tree.
+        //
+        // htmlLabels off, everywhere: HTML labels sit in foreignObject
+        // boxes that clip at their measured edge, and SVG text
+        // overflows visibly instead. State diagrams read the flowchart
+        // key for edge labels, so all three keys are needed.
+        //
+        // The font stack must carry no quotes: rustdoc's markdown
+        // pipeline applies smart punctuation to the text inside the
+        // inlined SVG's style block, so a quoted "trebuchet ms"
+        // arrives as a curly-quoted unknown font and the browser falls
+        // back to a wider face than the one mmdc measured, clipping
+        // every label. Quote-free names survive, and mmdc then
+        // measures the same face the browser renders.
+        std::fs::write(
+            &config,
+            format!(
+                r#"{{"deterministicIds": true, "deterministicIDSeed": "{name}",
+                     "htmlLabels": false, "state": {{"htmlLabels": false}},
+                     "flowchart": {{"htmlLabels": false}},
+                     "themeVariables": {{"fontFamily": "verdana, arial, sans-serif"}}}}"#
+            ),
+        )
+        .expect("write the mermaid config");
+
+        let status = std::process::Command::new("mmdc")
+            .arg("-i")
+            .arg(&input)
+            .arg("-o")
+            .arg(&rendered)
+            .arg("-c")
+            .arg(&config)
+            .status()
+            .expect("mmdc should be installed: npm i -g @mermaid-js/mermaid-cli");
+        assert!(status.success(), "mmdc failed for {name}");
+
+        let svg = std::fs::read_to_string(&rendered).expect("read the rendered svg");
+        // mmdc can prepend an XML declaration; rustdoc wants raw <svg>.
+        let svg = svg.trim_start_matches(|c| c != '<');
+        let svg = if svg.starts_with("<?xml") {
+            &svg[svg.find("?>").map(|i| i + 2).unwrap_or(0)..]
+        } else {
+            svg
+        };
+        // The deterministicIds config misses the internal ids of
+        // composite states, which carry a fresh random token on every
+        // render; normalize them so an unchanged source re-renders
+        // byte-identically and never dirties the tree.
+        let svg = normalize_state_ids(svg);
+        let svg = svg.as_str();
+        let path = diagram_svg_path(&name);
+        std::fs::create_dir_all(
+            std::path::Path::new(&path)
+                .parent()
+                .expect("the diagrams directory"),
+        )
+        .expect("create the diagrams directory");
+        std::fs::write(
+            &path,
+            format!(
+                "<!-- mermaid-fnv1a: {:016x} -->\n{}",
+                fnv1a(&source),
+                svg.trim_start()
+            ),
+        )
+        .expect("write the pinned svg");
+        eprintln!("rendered {path}");
+    }
+}

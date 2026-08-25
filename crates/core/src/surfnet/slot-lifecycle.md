@@ -26,15 +26,19 @@ machine to, so what you read here is what runs.
 ## The machine, as edges
 
 <!-- BEGIN GENERATED: diagram -->
-```text
-(absent)    --announce--> Announced  emits CreatedBank
-(absent)    --produce--> Processed  emits CreatedBank, Processed
-Announced   --produce--> Processed  emits Processed
-Processed   --confirm--> Confirmed  emits Confirmed
-Confirmed   --root--> (forgotten) emits Rooted
-Announced   --warp away--> (forgotten) emits Dead
-(any stage)  --warp back--> (forgotten) emits Dead, every rewritten slot
+<!-- BEGIN MERMAID: machine-edges -->
+```mermaid
+stateDiagram-v2
+    [*] --> Announced : announce (CreatedBank)
+    [*] --> Processed : produce (CreatedBank, Processed)
+    Announced --> Processed : produce (Processed)
+    Processed --> Confirmed : confirm (Confirmed)
+    Confirmed --> [*] : root (Rooted)
+    Announced --> [*] : warp away (Dead)
+    state "any stage" as any_stage
+    any_stage --> [*] : warp back (Dead, every rewritten slot)
 ```
+<!-- END MERMAID: machine-edges -->
 <!-- END GENERATED: diagram -->
 
 ## Warp, rooting, and clear
@@ -108,5 +112,8 @@ boundary.
 State a rule change in `PER_SLOT` (or the warp/clear arms) first, then
 change the machine; the sweep names the first disagreement. Then run
 `cargo surfpool-update-slot-spec` to regenerate the blocks above, and
-review that diff as the observable change. The prose here is authored:
-revise it when a rule changes meaning.
+review that diff as the observable change. When the diagram changed,
+also run `cargo surfpool-render-slot-diagrams` (needs `mmdc`) to
+re-render the SVG that cargo doc splices in place of the fence; a
+stale render fails `the_diagrams_match_their_renderings`. The prose
+here is authored: revise it when a rule changes meaning.
