@@ -1,7 +1,8 @@
 A slot is announced (`CreatedBank`) before any of its block data is
 emitted, advances through `Processed`, `Confirmed`, and `Rooted` in that
-order and at most once each, or dies (`Dead`) when a clock warp abandons
-it before it is produced. Block production, the startup task, the warp
+order and at most once each, or dies (`Dead`): a clock warp abandons the
+open slot it leaves behind, and a backward warp kills every slot the new
+timeline rewrites. Block production, the startup task, the warp
 handlers, and a network reset all drive this one transition relation
 instead of each emitting statuses by hand.
 
@@ -32,21 +33,29 @@ Announced   --produce--> Processed  emits Processed
 Processed   --confirm--> Confirmed  emits Confirmed
 Confirmed   --root--> (forgotten) emits Rooted
 Announced   --warp away--> (forgotten) emits Dead
-(any slot the new timeline rewrites)--> (forgotten), backward warps only
+(any stage)  --warp back--> (forgotten) emits Dead, every rewritten slot
 ```
 <!-- END GENERATED: diagram -->
 
-## Warp and clear
+## Warp, rooting, and clear
 
-A warp and a reset are set-level operations, deliberately kept out of
-the table:
+Warps, rooting, and a reset are set-level operations, deliberately
+kept out of the table:
 
-- A warp from the open slot `f` to `t` kills the abandoned slot (`f`
-  was announced and never produced, so it is emitted `Dead` and
-  forgotten), forgets every slot at or past `t` when the warp is
-  backward (the new timeline rewrites them), and then announces `t`
-  through the table's own announce cell, so a warp landing on a slot
-  already on record announces nothing.
+- A forward warp from the open slot `f` to `t` kills the abandoned
+  slot (`f` was announced and never produced, so it is emitted `Dead`
+  and forgotten) and announces `t` through the table's own announce
+  cell, so a warp landing on a slot already on record announces
+  nothing.
+- A backward warp is a reorg: every slot at or past `t` dies (`Dead`,
+  in slot order), whatever its stage, and `t` is then re-announced.
+  The new timeline replays the killed slots, so their statuses appear
+  again; at-most-once holds per bank, and a reorg makes a new bank.
+- Rooting is a threshold, not a single slot: when finality reaches
+  slot `r`, every confirmed slot at or below `r` roots, in slot order,
+  each through the table's root cell. The registry decides which slots
+  are due from its own record, so a history with gaps (a warp) roots
+  exactly what it confirmed.
 - A reset forgets every slot; the caller announces the new open slot.
 
 ## What the table cannot hold
@@ -61,10 +70,22 @@ and live in code order rather than in cells:
   sends `EndOfStartup` before the RPC listeners bind, so nothing
   external can emit block data for a slot a plugin is not tracking.
 
-Interleavings (who runs between which writer sections) are checked in
-the Promela models kept with the review notes, not here; the sweeps in
+Interleavings (who runs between which writer sections) are out of
+scope for this document; the sweeps in
 `slot_lifecycle/reachability_tests.rs` cover every reachable state and
 event of the sequential machine.
+
+## Limits
+
+Two histories fall outside the registry's record:
+
+- A restart in persistent mode starts an empty registry. Slots
+  confirmed by an earlier process get no further statuses in either
+  stream: nothing roots them, and nothing replays them.
+- A network reset erases the world: every live slot is forgotten with
+  no terminal status, and the new genesis is announced. This is the
+  one path that drops a slot without a `Rooted` or a `Dead`; a warp,
+  by contrast, kills what it abandons.
 
 ## Maintenance
 
