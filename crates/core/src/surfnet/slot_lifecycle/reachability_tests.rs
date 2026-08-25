@@ -16,11 +16,11 @@
 //!    spec cell.
 //!
 //! 2. Production's grammar: a driver that calls the registry as the SVM does
-//!    (close a block, warp, reset) establishes the state invariant on which
-//!    the contract's Existence and Liveness rest: at every reachable point,
-//!    exactly one slot is Announced, and it is the open slot. A second
-//!    Announced slot would be an orphan nobody will resolve; an unannounced
-//!    open slot would emit untracked data.
+//!    (close a block, warp, reset) establishes the state invariant the
+//!    emission guarantees rest on: at every reachable point, exactly one
+//!    slot is Announced, and it is the open slot. A second Announced slot
+//!    would be an orphan nobody will resolve; an unannounced open slot
+//!    would emit untracked data.
 
 use std::collections::{HashSet, VecDeque};
 
@@ -63,6 +63,7 @@ fn drive(life: &mut SlotLifecycle, event: &Event) -> Vec<SlotEmission> {
         Event::Produce(slot) => life.produce(*slot),
         Event::Confirm(slot) => life.confirm(*slot),
         Event::Root(slot) => life.root(*slot),
+        Event::RootThrough(threshold) => life.root_through(*threshold),
         Event::Warp { from, to } => life.warp(*from, *to),
         Event::Clear => {
             life.clear();
@@ -78,6 +79,7 @@ fn alphabet() -> Vec<Event> {
         events.push(Event::Produce(slot));
         events.push(Event::Confirm(slot));
         events.push(Event::Root(slot));
+        events.push(Event::RootThrough(slot));
     }
     for from in 0..SLOTS {
         for to in 0..SLOTS {
@@ -207,9 +209,7 @@ fn production_grammar_keeps_exactly_the_open_slot_announced() {
                     }
                     life.produce(open);
                     life.confirm(open);
-                    if let Some(root) = open.checked_sub(ROOT_DEPTH) {
-                        life.root(root);
-                    }
+                    life.root_through((open + 1).saturating_sub(ROOT_DEPTH));
                     life.announce(open + 1);
                     open + 1
                 }
@@ -229,7 +229,14 @@ fn production_grammar_keeps_exactly_the_open_slot_announced() {
             }
         }
     }
-    assert!(seen.len() > 100, "the grammar explored a real state space");
+    // `root_through` keeps the steady-state registry at two slots (the
+    // confirmed tip and the open slot), so the space is linear in
+    // MAX_SLOT rather than combinatorial; the bound guards against the
+    // grammar collapsing, not against tight rooting.
+    assert!(
+        seen.len() > 2 * MAX_SLOT as usize,
+        "the grammar explored a real state space"
+    );
 }
 
 /// The generated blocks of `slot-lifecycle.md`, named by their markers.

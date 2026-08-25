@@ -239,7 +239,7 @@ pub async fn start_local_surfnet_runloop(
     let (plugin_commands_tx, plugin_commands_rx) = unbounded::<PluginCommand>();
 
     // Startup before traffic: plugins observe startup completion and the open slot
-    // before the RPC listeners bind, so external traffic can't emit block data for 
+    // before the RPC listeners bind, so external traffic can't emit block data for
     // a slot that a plugin is not tracking yet.
     let _ = svm_locker.with_svm_reader(|svm| svm.geyser_events_tx.send(GeyserEvent::EndOfStartup));
     svm_locker.with_svm_writer(|svm_writer| svm_writer.announce_open_slot());
@@ -469,18 +469,7 @@ pub async fn start_block_production_runloop(
                         }
 
                         svm_locker.with_svm_writer(|svm_writer| {
-                            let open_slot = svm_writer.get_latest_absolute_slot();
-                            svm_writer.inner.set_sysvar(&clock);
-                            svm_writer.updated_at = clock.unix_timestamp as u64 * 1_000;
-                            svm_writer.latest_epoch_info.absolute_slot = clock.slot;
-                            svm_writer.latest_epoch_info.epoch = clock.epoch;
-                            svm_writer.latest_epoch_info.slot_index = clock.slot;
-                            svm_writer.latest_epoch_info.epoch = clock.epoch;
-                            svm_writer.latest_epoch_info.absolute_slot = clock.slot + clock.epoch * svm_writer.latest_epoch_info.slots_in_epoch;
-                            svm_writer.simnet_events_tx.system_clock_updated(clock);
-                            // The slot that was open dies unless the warp landed on it, and the
-                            // destination is announced.
-                            svm_writer.warp_slot_lifecycle(open_slot);
+                            svm_writer.warp_clock(clock);
                         });
                     }
                     SimnetCommand::UpdateInternalClockWithConfirmation(_, clock, response_tx) => {
@@ -491,19 +480,8 @@ pub async fn start_block_production_runloop(
                             ));
                         }
 
-                        let epoch_info = svm_locker.with_svm_writer(|svm_writer| {
-                            let open_slot = svm_writer.get_latest_absolute_slot();
-                            svm_writer.inner.set_sysvar(&clock);
-                            svm_writer.updated_at = clock.unix_timestamp as u64 * 1_000;
-                            svm_writer.latest_epoch_info.absolute_slot = clock.slot;
-                            svm_writer.latest_epoch_info.epoch = clock.epoch;
-                            svm_writer.latest_epoch_info.slot_index = clock.slot;
-                            svm_writer.latest_epoch_info.epoch = clock.epoch;
-                            svm_writer.latest_epoch_info.absolute_slot = clock.slot + clock.epoch * svm_writer.latest_epoch_info.slots_in_epoch;
-                            svm_writer.simnet_events_tx.system_clock_updated(clock);
-                            svm_writer.warp_slot_lifecycle(open_slot);
-                            svm_writer.latest_epoch_info.clone()
-                        });
+                        let epoch_info = svm_locker
+                            .with_svm_writer(|svm_writer| svm_writer.warp_clock(clock));
 
                         // Send confirmation back
                         let _ = response_tx.send(epoch_info);

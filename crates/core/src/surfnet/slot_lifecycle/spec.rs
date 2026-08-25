@@ -16,11 +16,12 @@
 //! totality stopped being credible. Smaller registries make do with a
 //! named test per cell and hand-written rustdoc.
 //!
-//! Warp and clear are not cells: they are set-level operations over the
-//! whole registry, stated in [`expected_emissions`] and
-//! [`expected_view`] directly, with the warp's announce step routed
-//! through the table's announce row so the two encodings cannot drift
-//! on what announcing means.
+//! Warp, root-through, and clear are not cells: they are set-level
+//! operations over the whole registry, stated in
+//! [`expected_emissions`] and [`expected_view`] directly, with the
+//! warp's announce step and each root-through root routed through the
+//! table's own rows so the two encodings cannot drift on what
+//! announcing or rooting means.
 //!
 //! Maintenance procedure for changing a state, event, or transition:
 //!
@@ -54,6 +55,9 @@ pub(crate) enum Event {
     Confirm(Slot),
     /// The slot was rooted.
     Root(Slot),
+    /// Finality reached `threshold`: every confirmed slot at or below
+    /// it roots, in slot order, each through the table's root cell.
+    RootThrough(Slot),
     /// The clock jumped from the open slot `from` to `to`.
     Warp { from: Slot, to: Slot },
     /// A network reset forgot every slot.
@@ -187,18 +191,32 @@ pub(crate) fn expected_emissions(view: &View, event: &Event) -> Vec<(Slot, Statu
         Event::Produce(slot) => apply_cell(&mut view, *slot, E::Produce),
         Event::Confirm(slot) => apply_cell(&mut view, *slot, E::Confirm),
         Event::Root(slot) => apply_cell(&mut view, *slot, E::Root),
+        Event::RootThrough(threshold) => {
+            let due: Vec<Slot> = view
+                .iter()
+                .filter(|(slot, stage)| **slot <= *threshold && **stage == SConfirmed)
+                .map(|(slot, _)| *slot)
+                .collect();
+            due.into_iter()
+                .flat_map(|slot| apply_cell(&mut view, slot, E::Root))
+                .collect()
+        }
         Event::Warp { from, to } => {
-            // Set-level rules: the abandoned open slot dies, a backward
-            // warp forgets every slot the new timeline rewrites, and
-            // the destination is announced through the table's own
-            // announce cell.
+            // Set-level rules: a backward warp kills every slot the new
+            // timeline rewrites (`Dead`, ascending; the abandoned open
+            // slot is among them), a forward warp kills only the
+            // abandoned open slot, and the destination is announced
+            // through the table's own announce cell.
             let mut out = vec![];
-            if from != to && view.get(from) == Some(&Announced) {
+            if to < from {
+                let rewritten: Vec<Slot> = view.keys().copied().filter(|slot| slot >= to).collect();
+                for slot in rewritten {
+                    view.remove(&slot);
+                    out.push((slot, S::Dead));
+                }
+            } else if from != to && view.get(from) == Some(&Announced) {
                 view.remove(from);
                 out.push((*from, S::Dead));
-            }
-            if to < from {
-                view.retain(|slot, _| slot < to);
             }
             out.extend(apply_cell(&mut view, *to, E::Announce));
             out
@@ -223,12 +241,21 @@ pub(crate) fn expected_view(view: &View, event: &Event) -> View {
         Event::Root(slot) => {
             apply_cell(&mut next, *slot, E::Root);
         }
-        Event::Warp { from, to } => {
-            if from != to && next.get(from) == Some(&Announced) {
-                next.remove(from);
+        Event::RootThrough(threshold) => {
+            let due: Vec<Slot> = next
+                .iter()
+                .filter(|(slot, stage)| **slot <= *threshold && **stage == SConfirmed)
+                .map(|(slot, _)| *slot)
+                .collect();
+            for slot in due {
+                apply_cell(&mut next, slot, E::Root);
             }
+        }
+        Event::Warp { from, to } => {
             if to < from {
                 next.retain(|slot, _| slot < to);
+            } else if from != to && next.get(from) == Some(&Announced) {
+                next.remove(from);
             }
             apply_cell(&mut next, *to, E::Announce);
         }
@@ -340,7 +367,7 @@ pub(crate) fn render_diagram() -> String {
         }
     }
     out.push_str("Announced   --warp away--> (forgotten) emits Dead\n");
-    out.push_str("(any slot the new timeline rewrites)--> (forgotten), backward warps only\n");
+    out.push_str("(any stage)  --warp back--> (forgotten) emits Dead, every rewritten slot\n");
     out.push_str("```\n");
     out
 }
