@@ -128,6 +128,11 @@ impl SlotLifecycle {
     /// kills only the open slot, which was announced and never
     /// produced. The destination is announced if it is not already; a
     /// backward warp therefore re-announces the slot it lands on.
+    ///
+    /// Slots already rooted are no longer on record, so a warp at or
+    /// below the root line kills them without a `Dead`; the
+    /// destination's announce is the consumer's replacement signal
+    /// (see the [module documentation](self)).
     pub fn warp(&mut self, from: Slot, to: Slot) -> Vec<SlotEmission> {
         let mut out = vec![];
         if to < from {

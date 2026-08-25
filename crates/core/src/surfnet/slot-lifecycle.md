@@ -51,6 +51,14 @@ kept out of the table:
   in slot order), whatever its stage, and `t` is then re-announced.
   The new timeline replays the killed slots, so their statuses appear
   again; at-most-once holds per bank, and a reorg makes a new bank.
+- A backward warp may land at or below the root line (time travel to
+  the current epoch does exactly this). Rooted slots left the registry
+  when they rooted, so they die without a `Dead`; the landing emits a
+  `CreatedBank` at or below anything a consumer saw `Rooted`, with no
+  recorded parent when the registry holds nothing below it. That
+  announce is the discontinuity signal: a consumer treats a
+  `CreatedBank` for a slot it saw rooted as a timeline replacement,
+  dropping its state for every slot at or above it.
 - Rooting is a threshold, not a single slot: when finality reaches
   slot `r`, every confirmed slot at or below `r` roots, in slot order,
   each through the table's root cell. The registry decides which slots
@@ -84,8 +92,16 @@ Two histories fall outside the registry's record:
   stream: nothing roots them, and nothing replays them.
 - A network reset erases the world: every live slot is forgotten with
   no terminal status, and the new genesis is announced. This is the
-  one path that drops a slot without a `Rooted` or a `Dead`; a warp,
-  by contrast, kills what it abandons.
+  one path that drops a live slot without a `Rooted` or a `Dead`; a
+  warp, by contrast, kills what it abandons.
+
+Warps split the guarantees in two. Within a bank, the per-slot
+guarantees are unconditional: announced before data, data before
+confirmation, statuses in order and at most once. Across timelines,
+rooted-is-final and slot monotonicity hold only until the operator
+warps across them: time travel is a cheatcode, and the operator who
+calls it suspends exactly those two guarantees, at one announced
+boundary.
 
 ## Maintenance
 

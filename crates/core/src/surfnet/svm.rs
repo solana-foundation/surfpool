@@ -3128,6 +3128,13 @@ impl SurfnetSvm {
     /// re-announced, to be replayed by the new timeline. Time travel to
     /// the current slot lands there, because the command handlers
     /// confirm a block before applying the clock.
+    ///
+    /// A destination at or below the root line goes further: rooted
+    /// slots are no longer on record, so they die without a `Dead`, and
+    /// the landing `CreatedBank` (parentless when nothing below it is
+    /// on record) is the consumer's signal to drop everything at or
+    /// above it and resync. The module documentation for
+    /// [`super::slot_lifecycle`] states that contract.
     pub fn warp_clock(&mut self, clock: Clock) -> EpochInfo {
         let open_slot = self.get_latest_absolute_slot();
         self.inner.set_sysvar(&clock);
