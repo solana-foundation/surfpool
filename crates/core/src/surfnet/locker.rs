@@ -15,7 +15,7 @@ use solana_account_decoder::{
     UiAccount, UiAccountEncoding, UiDataSliceConfig,
     parse_account_data::AccountAdditionalDataV3,
     parse_bpf_loader::{BpfUpgradeableLoaderAccountType, UiProgram, parse_bpf_upgradeable_loader},
-    parse_token::UiTokenAmount,
+    parse_token::{UiTokenAmount, real_number_string_trimmed},
 };
 use solana_address_lookup_table_interface::state::AddressLookupTable;
 use solana_client::{
@@ -3037,8 +3037,8 @@ impl SurfnetSvmLocker {
                     amount: UiTokenAmount {
                         amount: token_account.amount().to_string(),
                         decimals: mint_decimals,
-                        ui_amount: Some(format_ui_amount(token_account.amount(), mint_decimals)),
-                        ui_amount_string: format_ui_amount_string(
+                        ui_amount: format_ui_amount(token_account.amount(), mint_decimals),
+                        ui_amount_string: real_number_string_trimmed(
                             token_account.amount(),
                             mint_decimals,
                         ),
@@ -4548,26 +4548,13 @@ fn update_programdata_account(
     }
 }
 
-pub fn format_ui_amount_string(amount: u64, decimals: u8) -> String {
-    if decimals > 0 {
-        let divisor = 10u64.pow(decimals as u32);
-        format!(
-            "{:.decimals$}",
-            amount as f64 / divisor as f64,
-            decimals = decimals as usize
-        )
-    } else {
-        amount.to_string()
-    }
-}
-
-pub fn format_ui_amount(amount: u64, decimals: u8) -> f64 {
-    if decimals > 0 {
-        let divisor = 10u64.pow(decimals as u32);
-        amount as f64 / divisor as f64
-    } else {
-        amount as f64
-    }
+/// Scales a raw token amount by its mint's decimals for `UiTokenAmount::ui_amount`.
+///
+/// `None` when `decimals` is too large for `10^decimals` to fit a `usize`.
+pub fn format_ui_amount(amount: u64, decimals: u8) -> Option<f64> {
+    10_usize
+        .checked_pow(decimals as u32)
+        .map(|divisor| amount as f64 / divisor as f64)
 }
 
 #[cfg(test)]
@@ -7026,5 +7013,15 @@ mod tests {
             886_u64 * 432_000,
             "first slot should align with mainnet epoch boundaries when warmup is disabled"
         );
+    }
+
+    #[test]
+    fn test_format_ui_amount_scales_by_decimals() {
+        assert_eq!(format_ui_amount(0, 0), Some(0.0));
+        assert_eq!(format_ui_amount(1_500_000, 6), Some(1.5));
+        assert_eq!(format_ui_amount(42, 0), Some(42.0));
+        // `Mint::decimals` is an unvalidated u8; 10^decimals stops fitting a usize well
+        // before 255, and the field is Option<f64> so those mints have somewhere to land.
+        assert_eq!(format_ui_amount(1, 255), None);
     }
 }

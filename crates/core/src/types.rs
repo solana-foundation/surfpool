@@ -9,7 +9,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use solana_account::Account;
 use solana_account_decoder::{
     parse_account_data::{AccountAdditionalDataV3, SplTokenAdditionalDataV2},
-    parse_token::UiTokenAmount,
+    parse_token::{UiTokenAmount, real_number_string_trimmed},
 };
 use solana_clock::{Epoch, Slot};
 use solana_hash::Hash;
@@ -60,7 +60,7 @@ use txtx_addon_kit::indexmap::IndexMap;
 
 use crate::{
     error::{SurfpoolError, SurfpoolResult},
-    surfnet::locker::{format_ui_amount, format_ui_amount_string},
+    surfnet::locker::format_ui_amount,
 };
 
 /// Helper function to serialize a Pod type to base64
@@ -513,10 +513,10 @@ impl TransactionWithStatusMeta {
                             account_index: *i as u8,
                             mint: a.mint().to_string(),
                             ui_token_amount: UiTokenAmount {
-                                ui_amount: Some(format_ui_amount(a.amount(), mint.decimals())),
+                                ui_amount: format_ui_amount(a.amount(), mint.decimals()),
                                 decimals: mint.decimals(),
                                 amount: a.amount().to_string(),
-                                ui_amount_string: format_ui_amount_string(
+                                ui_amount_string: real_number_string_trimmed(
                                     a.amount(),
                                     mint.decimals(),
                                 ),
@@ -535,10 +535,10 @@ impl TransactionWithStatusMeta {
                             account_index: *i as u8,
                             mint: a.mint().to_string(),
                             ui_token_amount: UiTokenAmount {
-                                ui_amount: Some(format_ui_amount(a.amount(), mint.decimals())),
+                                ui_amount: format_ui_amount(a.amount(), mint.decimals()),
                                 decimals: mint.decimals(),
                                 amount: a.amount().to_string(),
-                                ui_amount_string: format_ui_amount_string(
+                                ui_amount_string: real_number_string_trimmed(
                                     a.amount(),
                                     mint.decimals(),
                                 ),
@@ -729,10 +729,10 @@ impl TransactionWithStatusMeta {
                 account_index: *i as u8,
                 mint: a.mint().to_string(),
                 ui_token_amount: UiTokenAmount {
-                    ui_amount: Some(format_ui_amount(a.amount(), mint.decimals())),
+                    ui_amount: format_ui_amount(a.amount(), mint.decimals()),
                     decimals: mint.decimals(),
                     amount: a.amount().to_string(),
-                    ui_amount_string: format_ui_amount_string(a.amount(), mint.decimals()),
+                    ui_amount_string: real_number_string_trimmed(a.amount(), mint.decimals()),
                 },
                 owner: a.owner().to_string(),
                 program_id: token_program.to_string(),
