@@ -85,8 +85,8 @@ juniper_codegen = { version = "0.16.0", default-features = false }
 juniper_graphql_ws = { version = "0.4.0", default-features = false }
 lazy_static = "1.5.0"
 libloading = "0.7.4"
-litesvm = { git = "https://github.com/MicaiahReid/litesvm", branch = "feat/txv1", features = ["nodejs-internal", "precompiles"] }
-litesvm-token = { git = "https://github.com/MicaiahReid/litesvm", branch = "feat/txv1" }
+litesvm = { version = "0.16.0", features = ["nodejs-internal", "precompiles"] }
+litesvm-token = { version = "0.16.0" }
 log = "0.4.27"
 mime_guess = { version = "2.0.4", default-features = false }
 mustache = "0.9.0"
