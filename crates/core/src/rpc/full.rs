@@ -2745,7 +2745,7 @@ mod tests {
         MessageHeader,
         legacy::Message as LegacyMessage,
         v0::Message as V0Message,
-        v1::{MAX_TRANSACTION_SIZE, Message as V1Message},
+        v1::{MAX_TRANSACTION_SIZE, Message as V1Message, TransactionConfig},
     };
     use solana_pubkey::Pubkey;
     use solana_signer::Signer;
@@ -2780,7 +2780,15 @@ mod tests {
         recent_blockhash: &Hash,
     ) -> VersionedTransaction {
         let msg = VersionedMessage::V1(
-            V1Message::try_compile(&payer, instructions, *recent_blockhash).unwrap(),
+            V1Message::try_compile_with_config(
+                &payer,
+                instructions,
+                *recent_blockhash,
+                TransactionConfig::empty()
+                    .with_compute_unit_limit(20_000)
+                    .with_loaded_accounts_data_size_limit(20_000),
+            )
+            .unwrap(),
         );
         VersionedTransaction::try_new(msg, signers).unwrap()
     }
@@ -3305,7 +3313,7 @@ mod tests {
                 data: UiAccountData::Binary(BASE64_STANDARD.encode(""), UiAccountEncoding::Base64),
                 owner: system_program::id().to_string(),
                 executable: false,
-                rent_epoch: 0,
+                rent_epoch: 18446744073709551615,
                 space: Some(0),
             })]),
             "Wrong account content"
@@ -3402,7 +3410,7 @@ mod tests {
                 data: UiAccountData::Binary(BASE64_STANDARD.encode(""), UiAccountEncoding::Base64),
                 owner: system_program::id().to_string(),
                 executable: false,
-                rent_epoch: 0,
+                rent_epoch: 18446744073709551615,
                 space: Some(0),
             })]),
             "Wrong account content"
@@ -3751,8 +3759,8 @@ mod tests {
                                 VersionedMessage::Legacy(_) | VersionedMessage::V0(_) => None,
                                 VersionedMessage::V1(_) => Some(UiTransactionConfig {
                                     priority_fee: None,
-                                    compute_unit_limit: None,
-                                    loaded_accounts_data_size_limit: None,
+                                    compute_unit_limit: Some(20_000),
+                                    loaded_accounts_data_size_limit: Some(20_000),
                                     heap_size: None
                                 }),
                             },
