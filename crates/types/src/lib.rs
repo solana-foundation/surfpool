@@ -15,5 +15,6 @@ pub use crossbeam_channel as channel;
 pub use features::*;
 pub use jito_bundles::*;
 pub use scenarios::*;
+pub use solana_account_decoder_client_types::UiAccountEncoding;
 pub use types::*;
 pub use verified_tokens::{TokenInfo, VERIFIED_TOKENS_BY_SYMBOL};
