@@ -155,6 +155,30 @@ impl SurfpoolError {
         Self(error)
     }
 
+    pub fn get_epoch_schedule<T>(e: T) -> Self
+    where
+        T: ToString,
+    {
+        let mut error = Error::internal_error();
+        error.data = Some(json!(format!(
+            "Failed to fetch the epoch schedule from remote: {}",
+            e.to_string()
+        )));
+        Self(error)
+    }
+
+    pub fn get_slot<T>(e: T) -> Self
+    where
+        T: ToString,
+    {
+        let mut error = Error::internal_error();
+        error.data = Some(json!(format!(
+            "Failed to fetch the current slot from remote: {}",
+            e.to_string()
+        )));
+        Self(error)
+    }
+
     pub fn get_token_accounts<T>(owner: Pubkey, filter: &TokenAccountsFilter, e: T) -> Self
     where
         T: ToString,
@@ -393,6 +417,25 @@ impl SurfpoolError {
     {
         let error =
             Error::invalid_params(format!("Address lookup {pubkey} contains an invalid index"));
+        Self(error)
+    }
+
+    /// A lookup table that exists but has been deactivated, so it cannot be used at the slot
+    /// being executed.
+    ///
+    /// Different from [`SurfpoolError::invalid_lookup_index`]. Here the indices are correct and
+    /// the table itself cannot be used at this slot, so reporting an invalid index would send
+    /// the caller looking in the wrong place.
+    ///
+    /// Both slots are named because `deactivation_slot` can be later than `slot`: a surfnet
+    /// executing at a past slot reads the table as it stands today.
+    pub fn inactive_lookup_table<P>(pubkey: P, deactivation_slot: u64, slot: u64) -> Self
+    where
+        P: Display,
+    {
+        let error = Error::invalid_params(format!(
+            "Address lookup table {pubkey} was deactivated at slot {deactivation_slot} and cannot be used at slot {slot}"
+        ));
         Self(error)
     }
 
