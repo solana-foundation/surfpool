@@ -17,7 +17,7 @@ use solana_account_decoder::{
     parse_bpf_loader::{BpfUpgradeableLoaderAccountType, UiProgram, parse_bpf_upgradeable_loader},
     parse_token::UiTokenAmount,
 };
-use solana_address_lookup_table_interface::state::AddressLookupTable;
+use solana_address_lookup_table_interface::{error::AddressLookupError, state::AddressLookupTable};
 use solana_client::{
     rpc_client::SerializableTransaction,
     rpc_config::{
@@ -3205,15 +3205,26 @@ impl SurfnetSvmLocker {
                 )
             })?;
 
+            // A table deactivated after `current_slot` is also outside the `SlotHashes`
+            // window, so `lookup` reports it as missing. That is not an invalid index, and
+            // reporting it as one would point the caller at the wrong problem.
+            let lookup_error = |err: AddressLookupError| match err {
+                AddressLookupError::LookupTableAccountNotFound => {
+                    SurfpoolError::inactive_lookup_table(
+                        address_table_lookup.account_key,
+                        current_slot,
+                    )
+                }
+                _ => SurfpoolError::invalid_lookup_index(address_table_lookup.account_key),
+            };
+
             let writable = lookup_table
                 .lookup(
                     current_slot,
                     &address_table_lookup.writable_indexes,
                     &slot_hashes,
                 )
-                .map_err(|_ix_err| {
-                    SurfpoolError::invalid_lookup_index(address_table_lookup.account_key)
-                })?;
+                .map_err(lookup_error)?;
 
             let readable = lookup_table
                 .lookup(
@@ -3221,9 +3232,7 @@ impl SurfnetSvmLocker {
                     &address_table_lookup.readonly_indexes,
                     &slot_hashes,
                 )
-                .map_err(|_ix_err| {
-                    SurfpoolError::invalid_lookup_index(address_table_lookup.account_key)
-                })?;
+                .map_err(lookup_error)?;
 
             let MessageAddressTableLookup {
                 account_key,

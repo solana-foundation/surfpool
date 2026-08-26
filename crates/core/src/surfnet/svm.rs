@@ -1126,6 +1126,30 @@ impl SurfnetSvm {
         self.reconstruct_sysvars();
     }
 
+    /// Initializes the SVM at a past point in time.
+    ///
+    /// Same as [`SurfnetSvm::initialize`], but the clock reports `block_time`, a Unix timestamp
+    /// in seconds, instead of the current time.
+    ///
+    /// Returns `false` if `block_time` is before the Unix epoch. The clock then keeps the
+    /// current time, and the caller has to tell the user.
+    #[must_use = "a false return means the clock reports the current time, not the block's"]
+    pub fn initialize_at_block_time(
+        &mut self,
+        epoch_info: EpochInfo,
+        epoch_schedule: EpochSchedule,
+        block_time: i64,
+    ) -> bool {
+        self.initialize(epoch_info, epoch_schedule);
+        let Ok(block_time) = u64::try_from(block_time) else {
+            return false;
+        };
+        self.genesis_updated_at = block_time.saturating_mul(1_000);
+        self.updated_at = self.genesis_updated_at;
+        self.reconstruct_sysvars();
+        true
+    }
+
     pub fn set_profile_instructions(&mut self, do_profile_instructions: bool) {
         self.instruction_profiling_enabled = do_profile_instructions;
     }
@@ -4181,6 +4205,63 @@ impl SurfnetSvm {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_initialize_at_block_time_pins_slot_epoch_and_clock() {
+        use solana_clock::Clock;
+
+        // A mainnet-scale slot, and the block time the datasource reports for it.
+        const TX_SLOT: u64 = 373_000_000;
+        const TX_BLOCK_TIME: i64 = 1_760_000_000;
+
+        let (mut svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+        let epoch_schedule = EpochSchedule::default();
+        let (epoch, slot_index) = epoch_schedule.get_epoch_and_slot_index(TX_SLOT);
+        let epoch_info = EpochInfo {
+            epoch,
+            slot_index,
+            slots_in_epoch: epoch_schedule.get_slots_in_epoch(epoch),
+            absolute_slot: TX_SLOT,
+            block_height: TX_SLOT,
+            transaction_count: None,
+        };
+
+        let pinned = svm.initialize_at_block_time(epoch_info, epoch_schedule, TX_BLOCK_TIME);
+
+        assert!(pinned, "a block time after 1970 should pin the clock");
+        let clock: Clock = svm.inner.get_sysvar();
+        assert_eq!(svm.genesis_slot, TX_SLOT);
+        assert_eq!(clock.slot, TX_SLOT);
+        assert_eq!(clock.epoch, epoch);
+        assert_eq!(
+            clock.unix_timestamp, TX_BLOCK_TIME,
+            "the clock should report the transaction's block time, not the wall clock"
+        );
+    }
+
+    #[test]
+    fn test_initialize_at_block_time_falls_back_to_wall_clock_before_the_unix_epoch() {
+        use solana_clock::Clock;
+
+        let (mut svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+        let epoch_schedule = EpochSchedule::default();
+        let mut epoch_info = svm.latest_epoch_info.clone();
+        epoch_info.absolute_slot = 1_000;
+
+        let pinned = svm.initialize_at_block_time(epoch_info, epoch_schedule, -1);
+
+        assert!(
+            !pinned,
+            "a block time before 1970 should report that the clock was left alone"
+        );
+        let clock: Clock = svm.inner.get_sysvar();
+        let now = Utc::now().timestamp();
+        assert!(
+            (clock.unix_timestamp - now).abs() < 60,
+            "a negative block time should leave the clock on the wall clock, got {}",
+            clock.unix_timestamp
+        );
+    }
+
     use agave_feature_set::{
         blake3_syscall_enabled, curve25519_syscall_enabled, disable_fees_sysvar,
         enable_extend_program_checked, enable_loader_v4, enable_sbpf_v1_deployment_and_execution,
