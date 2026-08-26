@@ -11073,7 +11073,7 @@ async fn test_send_transaction_skip_sig_verify_processes_and_updates_state(test_
     let svm_locker = SurfnetSvmLocker::new(surfnet_svm);
 
     let _runloop = spawn_runloop(
-        svm_locker,
+        svm_locker.clone(),
         config,
         (simnet_commands_tx, simnet_commands_rx),
         geyser_events_rx,
@@ -11146,6 +11146,7 @@ async fn test_send_transaction_skip_sig_verify_processes_and_updates_state(test_
         },
         skip_sig_verify: Some(true),
     };
+    let signature = tx.signatures[0];
     let _sig = full_client
         .send_transaction(data, Some(send_config))
         .await
@@ -11161,6 +11162,13 @@ async fn test_send_transaction_skip_sig_verify_processes_and_updates_state(test_
         }
     })
     .await;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while svm_locker.0.read().await.is_transaction_pending(&signature) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the runloop should clear the pending signature after processing");
 
     // Assert recipient received the transfer
     let final_recipient_balance = minimal_client

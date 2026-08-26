@@ -94,6 +94,12 @@ enum ProcessTransactionResult {
     ExecutionFailure(FailedTransactionMetadata),
 }
 
+struct LocalTransactionLookup {
+    result: GetTransactionResult,
+    is_pending: bool,
+    latest_absolute_slot: Slot,
+}
+
 pub struct SvmAccessContext<T> {
     pub slot: Slot,
     pub latest_epoch_info: EpochInfo,
@@ -1604,6 +1610,19 @@ impl SurfnetSvmLocker {
 
 /// Functions for getting transactions from the underlying SurfnetSvm instance or remote client
 impl SurfnetSvmLocker {
+    pub(crate) fn mark_transaction_pending(&self, signature: Signature) {
+        self.with_svm_writer(|svm_writer| svm_writer.mark_transaction_pending(signature));
+    }
+
+    pub(crate) fn mark_transaction_complete(&self, signature: &Signature) {
+        self.with_svm_writer(|svm_writer| svm_writer.mark_transaction_complete(signature));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_transaction_pending(&self, signature: &Signature) -> bool {
+        self.with_svm_reader(|svm_reader| svm_reader.is_transaction_pending(signature))
+    }
+
     /// Retrieves a transaction by signature, using local or remote based on context.
     pub async fn get_transaction(
         &self,
@@ -1645,11 +1664,26 @@ impl SurfnetSvmLocker {
         signature: &Signature,
         config: &RpcTransactionConfig,
     ) -> SurfpoolResult<GetTransactionResult> {
+        Ok(self
+            .get_transaction_local_with_pending(signature, config)?
+            .result)
+    }
+
+    fn get_transaction_local_with_pending(
+        &self,
+        signature: &Signature,
+        config: &RpcTransactionConfig,
+    ) -> SurfpoolResult<LocalTransactionLookup> {
         self.with_svm_reader(|svm_reader| {
             let latest_absolute_slot = svm_reader.get_latest_absolute_slot();
+            let is_pending = svm_reader.is_transaction_pending(signature);
 
             let Some(entry) = svm_reader.transactions.get(&signature.to_string())? else {
-                return Ok(GetTransactionResult::None(*signature));
+                return Ok(LocalTransactionLookup {
+                    result: GetTransactionResult::None(*signature),
+                    is_pending,
+                    latest_absolute_slot,
+                });
             };
 
             let (transaction_with_status_meta, _) = entry.expect_processed();
@@ -1664,16 +1698,20 @@ impl SurfnetSvmLocker {
                 config.max_supported_transaction_version,
                 true,
             )?;
-            Ok(GetTransactionResult::found_transaction(
-                *signature,
-                EncodedConfirmedTransactionWithStatusMeta {
-                    slot,
-                    transaction: encoded,
-                    block_time,
-                    transaction_index: None,
-                },
+            Ok(LocalTransactionLookup {
+                result: GetTransactionResult::found_transaction(
+                    *signature,
+                    EncodedConfirmedTransactionWithStatusMeta {
+                        slot,
+                        transaction: encoded,
+                        block_time,
+                        transaction_index: None,
+                    },
+                    latest_absolute_slot,
+                ),
+                is_pending,
                 latest_absolute_slot,
-            ))
+            })
         })
     }
 
@@ -1684,14 +1722,14 @@ impl SurfnetSvmLocker {
         signature: &Signature,
         config: RpcTransactionConfig,
     ) -> SurfpoolResult<GetTransactionResult> {
-        let local_result = self.get_transaction_local(signature, &config)?;
-        let latest_absolute_slot = self.get_latest_absolute_slot();
-        if local_result.is_none() {
+        let local_lookup = self.get_transaction_local_with_pending(signature, &config)?;
+
+        if local_lookup.result.is_none() && !local_lookup.is_pending {
             client
-                .try_get_transaction(*signature, config, latest_absolute_slot)
+                .try_get_transaction(*signature, config, local_lookup.latest_absolute_slot)
                 .await
         } else {
-            Ok(local_result)
+            Ok(local_lookup.result)
         }
     }
 }
