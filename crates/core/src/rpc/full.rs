@@ -1637,8 +1637,11 @@ impl Full for SurfpoolFullRpc {
         &self,
         meta: Self::Metadata,
         signature_strs: Vec<String>,
-        _config: Option<RpcSignatureStatusConfig>,
+        config: Option<RpcSignatureStatusConfig>,
     ) -> BoxFuture<Result<RpcResponse<Vec<Option<TransactionStatus>>>>> {
+        let search_transaction_history = config
+            .map(|config| config.search_transaction_history)
+            .unwrap_or(false);
         let signatures = match signature_strs
             .iter()
             .map(|s| {
@@ -1658,7 +1661,11 @@ impl Full for SurfpoolFullRpc {
             Ok(res) => res,
             Err(e) => return e.into(),
         };
-        let remote_client = remote_ctx.map(|(r, _)| r);
+        let remote_client = if search_transaction_history {
+            remote_ctx.map(|(remote_client, _)| remote_client)
+        } else {
+            None
+        };
 
         Box::pin(async move {
             // Capture the context slot once at the beginning to ensure consistency
@@ -2762,6 +2769,7 @@ mod tests {
     };
     use surfpool_types::{SimnetCommand, TransactionConfirmationStatus};
     use test_case::test_case;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
     use crate::{
@@ -3111,6 +3119,83 @@ mod tests {
             invalid_txs,
             "incorrect number of invalid txs"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_signature_statuses_respects_search_transaction_history() {
+        let missing_signature = Signature::new_unique();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test datasource should bind");
+        let address = listener
+            .local_addr()
+            .expect("test datasource should have an address");
+        let datasource_request = tokio::spawn(async move {
+            let (mut stream, _) = listener
+                .accept()
+                .await
+                .expect("history lookup should reach the datasource");
+            let mut request = [0; 4096];
+            let bytes_read = stream
+                .read(&mut request)
+                .await
+                .expect("test datasource should read the request");
+            let request = String::from_utf8_lossy(&request[..bytes_read]);
+            assert!(request.contains("getTransaction"));
+
+            let body = r#"{"jsonrpc":"2.0","result":null,"id":0}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("test datasource should write the response");
+        });
+
+        let mut setup = TestSetup::new(SurfpoolFullRpc);
+        setup.context.remote_rpc_client =
+            Some(SurfnetRemoteClient::new(format!("http://{address}")));
+
+        for config in [
+            None,
+            Some(RpcSignatureStatusConfig {
+                search_transaction_history: false,
+            }),
+        ] {
+            let response = setup
+                .rpc
+                .get_signature_statuses(
+                    Some(setup.context.clone()),
+                    vec![missing_signature.to_string()],
+                    config,
+                )
+                .await
+                .expect("recent-status lookups must not query the datasource");
+
+            assert_eq!(response.value.len(), 1);
+            assert!(response.value[0].is_none());
+        }
+
+        let result = setup
+            .rpc
+            .get_signature_statuses(
+                Some(setup.context),
+                vec![missing_signature.to_string()],
+                Some(RpcSignatureStatusConfig {
+                    search_transaction_history: true,
+                }),
+            )
+            .await
+            .expect("history lookup should accept a missing upstream transaction");
+
+        assert_eq!(result.value.len(), 1);
+        assert!(result.value[0].is_none());
+        datasource_request
+            .await
+            .expect("test datasource should receive the history lookup");
     }
 
     #[test]
