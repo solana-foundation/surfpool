@@ -633,7 +633,7 @@ impl SimnetEventsTx {
     /// Routes a pre-built event by its class: telemetry and guard-context
     /// state events go through `log`, lifecycle events through `emit`. For
     /// forwarding buffered events (the startup replay); a new call site
-   /// names its event instead.
+    /// names its event instead.
     pub fn forward(&self, event: SimnetEvent) {
         match &event {
             SimnetEvent::InfoLog(..)
