@@ -204,6 +204,45 @@ impl SpecDoc {
     }
 }
 
+/// A file whose entire content is generated: the markerless
+/// counterpart of a `SpecDoc`'s guarded regions, for artifacts with no
+/// hand-written surroundings (a Promela cells file, for one).
+pub struct GeneratedFile {
+    /// The generated file.
+    pub path: &'static str,
+    /// The cargo alias that regenerates it.
+    pub update_alias: &'static str,
+}
+
+impl GeneratedFile {
+    /// Holds the file equal to its fresh render.
+    pub fn assert_current(&self, content: &str) {
+        let on_disk = std::fs::read_to_string(self.path).unwrap_or_else(|error| {
+            panic!(
+                "could not read {}: {error}; run `cargo {}`",
+                self.path, self.update_alias
+            )
+        });
+        assert!(
+            on_disk == content,
+            "{} disagrees with its render; run `cargo {}` and review the diff",
+            self.path,
+            self.update_alias
+        );
+    }
+
+    /// Writes the fresh render. Callers keep this behind an ignored
+    /// test so a plain test run never writes to the source tree.
+    pub fn regenerate(&self, content: &str) {
+        if let Some(parent) = Path::new(self.path).parent() {
+            std::fs::create_dir_all(parent).expect("create the generated file's directory");
+        }
+        std::fs::write(self.path, content)
+            .unwrap_or_else(|error| panic!("could not write {}: {error}", self.path));
+        eprintln!("rewrote {}", self.path);
+    }
+}
+
 /// Every mermaid region in the document: its name and its fenced
 /// source. The source in the document is the diagram; each crate's
 /// build script swaps the region for its pre-rendered SVG in the

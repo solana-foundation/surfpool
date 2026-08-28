@@ -30,7 +30,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-use surfpool_spec_harness::SpecDoc;
+use surfpool_spec_harness::{GeneratedFile, SpecDoc};
 
 use super::*;
 
@@ -193,6 +193,31 @@ fn the_document_matches_the_spec() {
 #[ignore = "writes startup-lifecycle.md; run via cargo surfpool-update-startup-spec"]
 fn regenerate_the_startup_spec_tables() {
     spec_doc().regenerate(&generated_blocks());
+}
+
+/// The Promela cells beside the startup model, generated from the spec
+/// tables so the model's transition relation cannot drift from them.
+fn pml_cells() -> GeneratedFile {
+    GeneratedFile {
+        path: concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/models/startup/startup_cells.pml"
+        ),
+        update_alias: "surfpool-update-startup-pml",
+    }
+}
+
+#[test]
+fn the_pml_cells_are_current() {
+    pml_cells().assert_current(&spec::render_promela_cells());
+}
+
+/// Ignored so a plain test run never writes to the source tree;
+/// `cargo surfpool-update-startup-pml` runs it explicitly.
+#[test]
+#[ignore = "writes startup_cells.pml; run via cargo surfpool-update-startup-pml"]
+fn regenerate_the_startup_pml_cells() {
+    pml_cells().regenerate(&spec::render_promela_cells());
 }
 
 /// Every generated block, named by its marker in the document. Three
@@ -449,14 +474,7 @@ fn render_table(headers: [&str; 3], rows: &[[String; 3]]) -> String {
     table
 }
 
-fn task_state_name(state: SurfnetStartupTaskState) -> &'static str {
-    match state {
-        SurfnetStartupTaskState::Pending => "Pending",
-        SurfnetStartupTaskState::Running => "Running",
-        SurfnetStartupTaskState::Succeeded => "Succeeded",
-        SurfnetStartupTaskState::Failed => "Failed",
-    }
-}
+use spec::task_state_name;
 
 fn sweep() -> Observed {
     let commands = commands();

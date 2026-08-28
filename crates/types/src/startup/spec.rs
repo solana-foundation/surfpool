@@ -256,6 +256,25 @@ pub fn plan_state_name(state: PlanState) -> &'static str {
     }
 }
 
+/// The table's name for a task state.
+pub fn task_state_name(state: SurfnetStartupTaskState) -> &'static str {
+    match state {
+        SurfnetStartupTaskState::Pending => "Pending",
+        SurfnetStartupTaskState::Running => "Running",
+        SurfnetStartupTaskState::Succeeded => "Succeeded",
+        SurfnetStartupTaskState::Failed => "Failed",
+    }
+}
+
+/// The spec's name for a task kind; the match makes a new kind a
+/// compile error here until it decides its name.
+pub fn task_kind_name(task: SurfnetStartupTask) -> &'static str {
+    match task {
+        SurfnetStartupTask::RemoteAccounts => "RemoteAccounts",
+        SurfnetStartupTask::RunbookExecutions => "RunbookExecutions",
+    }
+}
+
 /// Every task kind. The match beside it makes omission a compile
 /// error: a new variant fails there until this list grows, and the
 /// list is what extends the sweep's alphabet and the generated tables.
@@ -407,6 +426,121 @@ pub fn projection_rows() -> [ProjectionRow; 6] {
             meaning: "Hydration has completed (or was unnecessary); runbook execution is the remaining startup work.",
         },
     ]
+}
+
+/// One transition table's Promela rendering: which rows, which event
+/// list orders the inlines, and how states and events spell in the
+/// emitted text.
+struct PromelaTable<'a, State: Copy + PartialEq, Event: Copy + PartialEq> {
+    rows: &'a [Row<State, Event>],
+    events: &'a [Event],
+    event_name: fn(Event) -> &'static str,
+    state_macro: fn(State) -> String,
+    /// The inline family: `apply_<prefix>_<event>`.
+    prefix: &'static str,
+    /// The Promela lvalue the inlines read and write.
+    state_var: &'static str,
+    /// The inline's parameter list, without parentheses.
+    params: &'static str,
+}
+
+impl<State: Copy + PartialEq, Event: Copy + PartialEq> PromelaTable<'_, State, Event> {
+    /// One inline per event column, one branch per table row, in table
+    /// order. `To` assigns; `Refuse` leaves the state untouched, as
+    /// the machine's error return does. Totality of the table is what
+    /// lets the `if` carry no `else` arm.
+    fn render(&self) -> String {
+        let mut out = String::new();
+        for &event in self.events {
+            out.push_str(&format!(
+                "inline apply_{}_{}({}) {{\n    if\n",
+                self.prefix,
+                (self.event_name)(event),
+                self.params
+            ));
+            for row in self.rows.iter().filter(|row| row.event == event) {
+                let guard = format!(
+                    "    :: {} == {}",
+                    self.state_var,
+                    (self.state_macro)(row.state)
+                );
+                match row.next {
+                    To(state) => out.push_str(&format!(
+                        "{guard} -> {} = {}\n",
+                        self.state_var,
+                        (self.state_macro)(state)
+                    )),
+                    Refuse => out.push_str(&format!("{guard} -> skip /* Refuse */\n")),
+                }
+            }
+            out.push_str("    fi\n}\n\n");
+        }
+        out
+    }
+}
+
+/// The spec tables as Promela: state encodings, the two state
+/// variables, and one apply inline per event. The encodings follow the
+/// spec's list order, so Promela's zero-initialized globals start in
+/// the first-listed state (Unsealed, Pending), which is the machine's
+/// default.
+pub fn render_promela_cells() -> String {
+    let mut out = String::from(
+        "/* GENERATED: the startup spec tables as Promela cells.\n\
+         \x20* Source: crates/types/src/startup/spec.rs (PLAN_TABLE, TASK_TABLE).\n\
+         \x20* Regenerate: cargo surfpool-update-startup-pml. Do not edit.\n\
+         \x20*\n\
+         \x20* State encodings follow the spec's list order, so Promela's\n\
+         \x20* zero-initialized globals start in the first-listed state\n\
+         \x20* (Unsealed, Pending), which is the machine's default.\n\
+         \x20*/\n\n",
+    );
+
+    out.push_str(&format!("#define NTASKS {}\n", TASK_KINDS.len()));
+    for (index, &kind) in TASK_KINDS.iter().enumerate() {
+        out.push_str(&format!("#define KIND_{} {index}\n", task_kind_name(kind)));
+    }
+    out.push('\n');
+    for (index, &state) in PLAN_STATES.iter().enumerate() {
+        out.push_str(&format!(
+            "#define PLAN_{} {index}\n",
+            plan_state_name(state)
+        ));
+    }
+    out.push('\n');
+    for (index, &state) in TASK_STATES.iter().enumerate() {
+        out.push_str(&format!(
+            "#define TASK_{} {index}\n",
+            task_state_name(state)
+        ));
+    }
+    out.push_str("\nbyte plan_state;\nbyte task_state[NTASKS];\n\n");
+
+    out.push_str(
+        &PromelaTable {
+            rows: PLAN_TABLE,
+            events: &PlanEvent::ALL,
+            event_name: PlanEvent::name,
+            state_macro: |state| format!("PLAN_{}", plan_state_name(state)),
+            prefix: "plan",
+            state_var: "plan_state",
+            params: "",
+        }
+        .render(),
+    );
+    out.push_str(
+        &PromelaTable {
+            rows: TASK_TABLE,
+            events: &TaskEvent::ALL,
+            event_name: TaskEvent::name,
+            state_macro: |state| format!("TASK_{}", task_state_name(state)),
+            prefix: "task",
+            state_var: "task_state[i]",
+            params: "i",
+        }
+        .render(),
+    );
+    out
 }
 
 #[cfg(test)]
