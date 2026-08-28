@@ -28,7 +28,7 @@ pub struct SpecDoc {
 }
 
 impl SpecDoc {
-    pub fn read(&self) -> String {
+    fn read(&self) -> String {
         std::fs::read_to_string(self.path)
             .unwrap_or_else(|error| panic!("could not read {}: {error}", self.path))
     }
@@ -88,31 +88,6 @@ impl SpecDoc {
         eprintln!("rewrote the generated blocks in {}", self.path);
     }
 
-    /// Every mermaid region in the document: its name and its fenced
-    /// source. The source in the document is the diagram; each crate's
-    /// build script swaps the region for its pre-rendered SVG in the
-    /// rustdoc variant, so GitHub renders the fence and rustdoc renders
-    /// the drawing.
-    pub fn mermaid_sources(&self) -> Vec<(String, String)> {
-        let text = self.read();
-        let mut sources = vec![];
-        let mut rest = text.as_str();
-        while let Some(start) = rest.find("<!-- BEGIN MERMAID: ") {
-            let name_start = start + "<!-- BEGIN MERMAID: ".len();
-            let name_end = rest[name_start..]
-                .find(" -->")
-                .expect("a mermaid marker name")
-                + name_start;
-            let name = rest[name_start..name_end].to_string();
-            let body_start = name_end + " -->".len();
-            let end_marker = format!("<!-- END MERMAID: {name} -->");
-            let end = rest.find(&end_marker).expect("a closing mermaid marker");
-            sources.push((name, rest[body_start..end].trim().to_string()));
-            rest = &rest[end + end_marker.len()..];
-        }
-        sources
-    }
-
     fn svg_path(&self, name: &str) -> String {
         format!("{}/{name}.svg", self.diagrams_dir)
     }
@@ -121,7 +96,7 @@ impl SpecDoc {
     /// rendered from, so editing a diagram without re-rendering fails
     /// here, and CI needs no mermaid toolchain to detect the drift.
     pub fn assert_diagrams_current(&self) {
-        for (name, source) in self.mermaid_sources() {
+        for (name, source) in mermaid_regions(&self.read()) {
             let path = self.svg_path(&name);
             let svg = std::fs::read_to_string(&path).unwrap_or_else(|error| {
                 panic!(
@@ -152,7 +127,7 @@ impl SpecDoc {
     /// diagram. Byte-stability across machines would need a pinned
     /// render container, which this mechanism deliberately omits.
     pub fn render_diagrams(&self) {
-        for (name, source) in self.mermaid_sources() {
+        for (name, source) in mermaid_regions(&self.read()) {
             let body: String = source
                 .lines()
                 .filter(|line| !line.trim_start().starts_with("```"))
@@ -227,6 +202,30 @@ impl SpecDoc {
             eprintln!("rendered {path}");
         }
     }
+}
+
+/// Every mermaid region in the document: its name and its fenced
+/// source. The source in the document is the diagram; each crate's
+/// build script swaps the region for its pre-rendered SVG in the
+/// rustdoc variant, so GitHub renders the fence and rustdoc renders
+/// the drawing.
+fn mermaid_regions(text: &str) -> Vec<(String, String)> {
+    let mut sources = vec![];
+    let mut rest = text;
+    while let Some(start) = rest.find("<!-- BEGIN MERMAID: ") {
+        let name_start = start + "<!-- BEGIN MERMAID: ".len();
+        let name_end = rest[name_start..]
+            .find(" -->")
+            .expect("a mermaid marker name")
+            + name_start;
+        let name = rest[name_start..name_end].to_string();
+        let body_start = name_end + " -->".len();
+        let end_marker = format!("<!-- END MERMAID: {name} -->");
+        let end = rest.find(&end_marker).expect("a closing mermaid marker");
+        sources.push((name, rest[body_start..end].trim().to_string()));
+        rest = &rest[end + end_marker.len()..];
+    }
+    sources
 }
 
 /// FNV-1a, implemented locally: the pin must be stable across Rust
@@ -318,22 +317,9 @@ mod tests {
     }
 
     #[test]
-    fn mermaid_sources_walk_every_region() {
-        // mermaid_sources reads from disk, so exercise the walk through
-        // a temporary document.
-        let path = std::env::temp_dir().join("spec-harness-mermaid-walk.md");
-        std::fs::write(&path, FIXTURE).expect("write the fixture");
-        let doc = SpecDoc {
-            path: Box::leak(
-                path.to_str()
-                    .expect("utf-8 path")
-                    .to_string()
-                    .into_boxed_str(),
-            ),
-            ..doc()
-        };
+    fn mermaid_regions_walk_every_region() {
         assert_eq!(
-            doc.mermaid_sources(),
+            mermaid_regions(FIXTURE),
             vec![(
                 "flow".to_string(),
                 "```mermaid\nstateDiagram-v2\n```".to_string()
