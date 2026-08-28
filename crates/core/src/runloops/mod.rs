@@ -940,8 +940,8 @@ fn start_geyser_runloop(
 }
 
 /// One blocking RPC server, generic over the two jsonrpc flavors, for
-/// [`spawn_rpc_server_thread`]: expose the close handle, then serve until
-/// closed.
+/// The server shape [`spawn_rpc_server_thread`] drives: expose the close
+/// handle, then serve until closed.
 trait RpcServer: Sized + Send + 'static {
     type CloseHandle: Send + 'static;
     fn close_handle(&self) -> Self::CloseHandle;
@@ -1135,7 +1135,7 @@ fn start_ws_rpc_server_runloop(
 
     spawn_rpc_server_thread("WebSocket RPC", simnet_events_tx, move || {
         // The pubsub handler runs async tasks, so the server carries its
-        // own runtime, kept alongside it in [`WsServerWithRuntime`].
+        // own runtime.
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -1161,7 +1161,6 @@ fn start_ws_rpc_server_runloop(
 
         let server = WsServerBuilder::new(rpc_io)
             .session_meta_extractor(move |ctx: &RequestContext| {
-                // Create meta from context + session
                 let runloop_context = RunloopContext {
                     id: None,
                     svm_locker: middleware.surfnet_svm.clone(),
