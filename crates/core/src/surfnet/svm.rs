@@ -3059,7 +3059,7 @@ impl SurfnetSvm {
     /// millisecond wall-clock sample the ws variants carry; a caller
     /// emitting several batches for one block passes the same sample to
     /// all of them.
-    pub fn emit_slot_statuses(&mut self, emissions: Vec<SlotEmission>, ws_timestamp: u64) {
+    fn emit_slot_statuses(&mut self, emissions: Vec<SlotEmission>, ws_timestamp: u64) {
         for SlotEmission {
             slot,
             parent,
@@ -3151,7 +3151,7 @@ impl SurfnetSvm {
     /// Resolves the slot lifecycle across a clock warp: the slot that was open before
     /// (`from`) dies unless the warp landed on it, and the new open slot is announced if
     /// it is not already.
-    pub fn warp_slot_lifecycle(&mut self, from: Slot) {
+    fn warp_slot_lifecycle(&mut self, from: Slot) {
         let to = self.get_latest_absolute_slot();
         let emissions = self.slot_lifecycle.warp(from, to);
         let ws_timestamp = Utc::now().timestamp_millis().max(0) as u64;
