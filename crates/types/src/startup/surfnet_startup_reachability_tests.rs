@@ -196,14 +196,16 @@ fn regenerate_the_startup_spec_tables() {
 }
 
 /// Every generated block, named by its marker in the document. Three
-/// render from the spec module; the observed block renders from the
-/// sweep.
+/// render from the spec module; the observed table and the lifecycle
+/// diagram render from the sweep.
 fn generated_blocks() -> Vec<(&'static str, String)> {
+    let observed = sweep();
     vec![
         ("plan-lifecycle", render_plan_lifecycle()),
         ("task-lifecycle", render_task_lifecycle()),
         ("projection", render_projection()),
-        ("observed", sweep().render()),
+        ("observed", observed.render()),
+        ("diagram", observed.render_lifecycle_diagram()),
         ("links", render_links()),
     ]
 }
@@ -459,6 +461,7 @@ fn task_state_name(state: SurfnetStartupTaskState) -> &'static str {
 fn sweep() -> Observed {
     let commands = commands();
     let initial = SurfnetStartupStatus::default();
+    let initial_phase = phase_name(initial.phase());
 
     let mut seen = HashSet::new();
     seen.insert(format!("{initial:?}"));
@@ -468,6 +471,7 @@ fn sweep() -> Observed {
     let mut reached = HashSet::new();
     let mut events: BTreeMap<&'static str, BTreeSet<&'static str>> = BTreeMap::new();
     let mut successors: BTreeMap<&'static str, BTreeSet<&'static str>> = BTreeMap::new();
+    let mut edges: BTreeMap<(&'static str, &'static str), BTreeSet<&'static str>> = BTreeMap::new();
     let mut adequacy: BTreeMap<&'static str, (usize, usize)> = BTreeMap::new();
 
     while let Some(state) = frontier.pop() {
@@ -498,6 +502,10 @@ fn sweep() -> Observed {
                         .entry(phase)
                         .or_default()
                         .insert(phase_name(next.phase()));
+                    edges
+                        .entry((phase, phase_name(next.phase())))
+                        .or_default()
+                        .insert(event);
                     assert!(
                         !terminal,
                         "{transition:?} accepted from terminal state: {state:?}"
@@ -566,8 +574,10 @@ fn sweep() -> Observed {
         visited,
         attempted: visited * commands.len(),
         accepted,
+        initial: initial_phase,
         events,
         successors,
+        edges,
     }
 }
 
@@ -597,8 +607,13 @@ struct Observed {
     visited: usize,
     attempted: usize,
     accepted: usize,
+    /// The phase the default state starts in: the diagram's start edge.
+    initial: &'static str,
     events: BTreeMap<&'static str, BTreeSet<&'static str>>,
     successors: BTreeMap<&'static str, BTreeSet<&'static str>>,
+    /// Accepted phase moves keyed (from, to), each with the events
+    /// that made it: the successor map with its events kept.
+    edges: BTreeMap<(&'static str, &'static str), BTreeSet<&'static str>>,
 }
 
 impl Observed {
@@ -638,6 +653,52 @@ impl Observed {
             self.visited, self.attempted, self.accepted,
         ));
         block
+    }
+
+    /// The phase graph as a mermaid state diagram: every advancing move
+    /// the sweep observed, labeled by the events that made it. A move
+    /// that leaves the phase in place is recorded in the observed table
+    /// and omitted here. The annotations are authored, like a
+    /// projection row's meaning. The fence sits inside `BEGIN MERMAID`
+    /// markers so the render pipeline can pre-draw it for cargo doc.
+    fn render_lifecycle_diagram(&self) -> String {
+        let mut out =
+            String::from("<!-- BEGIN MERMAID: lifecycle -->\n```mermaid\nstateDiagram-v2\n");
+        out.push_str(&format!("    [*] --> {}\n", self.initial));
+        for phase in PHASE_ORDER {
+            let name = phase_name(phase);
+            // A description replaces the node's displayed id, so the
+            // name leads the label or it appears nowhere.
+            out.push_str(&format!("    {name} : {name}<br/>{}\n", phase_note(phase)));
+            for target in PHASE_ORDER.map(phase_name) {
+                if target == name {
+                    continue;
+                }
+                if let Some(events) = self.edges.get(&(name, target)) {
+                    out.push_str(&format!(
+                        "    {name} --> {target} : {}\n",
+                        events.iter().copied().collect::<Vec<_>>().join(", ")
+                    ));
+                }
+            }
+        }
+        out.push_str("```\n<!-- END MERMAID: lifecycle -->\n");
+        out
+    }
+}
+
+/// The diagram's note under a phase. Authored, like a projection row's
+/// meaning; the match makes a new phase a compile error here until it
+/// decides its note.
+fn phase_note(phase: SurfnetStartupPhase) -> &'static str {
+    match phase {
+        SurfnetStartupPhase::Planning => {
+            "inspect project configuration,<br/>compute and seal the required task set"
+        }
+        SurfnetStartupPhase::CloningRemoteAccounts => "account hydration outstanding",
+        SurfnetStartupPhase::ExecutingRunbooks => "runbook execution outstanding",
+        SurfnetStartupPhase::Ready => "first publicly observable state",
+        SurfnetStartupPhase::Failed => "terminal, reason recorded",
     }
 }
 
