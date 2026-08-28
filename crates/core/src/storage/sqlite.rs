@@ -88,8 +88,7 @@ impl SqliteBackend {
             .max_size(10)
             // r2d2's `min_idle` defaults to `max_size`, so the pool would open
             // all ten connections (and their descriptors) the moment the
-            // backend is built. Start at one and grow on demand; the postgres
-            // backend has always set this.
+            // backend is built. Start at one and grow on demand
             .min_idle(Some(1))
             .connection_customizer(Box::new(SqlitePragmaCustomizer { is_file_based }))
             .build(manager)
