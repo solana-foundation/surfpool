@@ -22,9 +22,8 @@ use solana_clock::{MAX_PROCESSING_AGE, Slot};
 use solana_commitment_config::CommitmentLevel;
 use solana_signature::Signature;
 use solana_transaction_error::TransactionError;
-use tokio::sync::oneshot;
-
 use solana_transaction_status::TransactionConfirmationStatus;
+use tokio::sync::oneshot;
 
 use super::{SignatureSubscriptionType, confirmation_status_at};
 
