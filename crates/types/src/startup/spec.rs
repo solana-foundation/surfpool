@@ -87,6 +87,34 @@ pub fn compat_list_agrees_with_phase(
     anchor_would_proceed == startup_is_over
 }
 
+/// A cell's successor: the machine moves to a state, or refuses the
+/// event, leaving the state untouched and the caller with an error.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Next<State> {
+    To(State),
+    Refuse,
+}
+
+/// One cell of a transition table. Listing every (state, event) pair,
+/// refusals included, keeps the lookup total and shows each refusal
+/// decided rather than defaulted; `the_plan_table_is_total` and
+/// `the_task_table_is_total` assert the listings are complete.
+pub struct Row<State, Event> {
+    pub state: State,
+    pub event: Event,
+    pub next: Next<State>,
+}
+
+const fn row<State, Event>(state: State, event: Event, next: Next<State>) -> Row<State, Event> {
+    Row { state, event, next }
+}
+
+use Next::{Refuse, To};
+use PlanEvent as PE;
+use PlanState as PS;
+use SurfnetStartupTaskState as TS;
+use TaskEvent as TE;
+
 /// A task-level event, named as the spec's tables name it.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum TaskEvent {
@@ -115,19 +143,39 @@ pub const TASK_STATES: [SurfnetStartupTaskState; 4] = [
     SurfnetStartupTaskState::Failed,
 ];
 
-/// The task lifecycle: the state an event moves a task to, or `None`
-/// where the move is refused. `Succeeded` and `Failed` accept nothing;
-/// work can fail before it starts, and cannot finish before it starts.
+/// The task lifecycle as data: every (state, event) cell, refusals
+/// included. `Succeeded` and `Failed` accept nothing; work can fail
+/// before it starts, and cannot finish before it starts.
+#[rustfmt::skip]
+pub const TASK_TABLE: &[Row<SurfnetStartupTaskState, TaskEvent>] = &[
+    //   state          event          next
+    row( TS::Pending,   TE::Started,   To(TS::Running)   ),
+    row( TS::Pending,   TE::Succeeded, Refuse            ), // cannot finish before it starts
+    row( TS::Pending,   TE::Failed,    To(TS::Failed)    ), // work can fail before it starts
+    row( TS::Running,   TE::Started,   Refuse            ), // started at most once
+    row( TS::Running,   TE::Succeeded, To(TS::Succeeded) ),
+    row( TS::Running,   TE::Failed,    To(TS::Failed)    ),
+    row( TS::Succeeded, TE::Started,   Refuse            ), // terminal
+    row( TS::Succeeded, TE::Succeeded, Refuse            ),
+    row( TS::Succeeded, TE::Failed,    Refuse            ),
+    row( TS::Failed,    TE::Started,   Refuse            ), // terminal
+    row( TS::Failed,    TE::Succeeded, Refuse            ),
+    row( TS::Failed,    TE::Failed,    Refuse            ),
+];
+
+/// The task table's answer for (state, event): the state the event
+/// moves a task to, or `None` where the table refuses the move.
 pub fn task_transition(
     from: SurfnetStartupTaskState,
     event: TaskEvent,
 ) -> Option<SurfnetStartupTaskState> {
-    use SurfnetStartupTaskState::*;
-    match (from, event) {
-        (Pending, TaskEvent::Started) => Some(Running),
-        (Running, TaskEvent::Succeeded) => Some(Succeeded),
-        (Pending | Running, TaskEvent::Failed) => Some(Failed),
-        _ => None,
+    let cell = TASK_TABLE
+        .iter()
+        .find(|row| row.state == from && row.event == event)
+        .expect("the_task_table_is_total guarantees every cell exists");
+    match cell.next {
+        To(state) => Some(state),
+        Refuse => None,
     }
 }
 
@@ -172,14 +220,30 @@ pub const PLAN_STATES: [PlanState; 3] = [
     PlanState::PlanningFailed,
 ];
 
-/// The plan lifecycle: the state an event moves the plan to, or `None`
-/// where the move is refused. Sealing and a planning failure exist only
-/// unsealed; `Sealed` and `PlanningFailed` accept nothing.
+/// The plan lifecycle as data: every (state, event) cell, refusals
+/// included. Sealing and a planning failure exist only unsealed;
+/// `Sealed` and `PlanningFailed` accept nothing.
+#[rustfmt::skip]
+pub const PLAN_TABLE: &[Row<PlanState, PlanEvent>] = &[
+    //   state               event       next
+    row( PS::Unsealed,       PE::Sealed, To(PS::Sealed)         ),
+    row( PS::Unsealed,       PE::Failed, To(PS::PlanningFailed) ),
+    row( PS::Sealed,         PE::Sealed, Refuse                 ), // sealed at most once
+    row( PS::Sealed,         PE::Failed, Refuse                 ), // failure after sealing is a task failure
+    row( PS::PlanningFailed, PE::Sealed, Refuse                 ), // terminal
+    row( PS::PlanningFailed, PE::Failed, Refuse                 ),
+];
+
+/// The plan table's answer for (state, event): the state the event
+/// moves the plan to, or `None` where the table refuses the move.
 pub fn plan_transition(from: PlanState, event: PlanEvent) -> Option<PlanState> {
-    match (from, event) {
-        (PlanState::Unsealed, PlanEvent::Sealed) => Some(PlanState::Sealed),
-        (PlanState::Unsealed, PlanEvent::Failed) => Some(PlanState::PlanningFailed),
-        _ => None,
+    let cell = PLAN_TABLE
+        .iter()
+        .find(|row| row.state == from && row.event == event)
+        .expect("the_plan_table_is_total guarantees every cell exists");
+    match cell.next {
+        To(state) => Some(state),
+        Refuse => None,
     }
 }
 
@@ -343,4 +407,48 @@ pub fn projection_rows() -> [ProjectionRow; 6] {
             meaning: "Hydration has completed (or was unnecessary); runbook execution is the remaining startup work.",
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_plan_table_is_total() {
+        for state in PLAN_STATES {
+            for event in PlanEvent::ALL {
+                let count = PLAN_TABLE
+                    .iter()
+                    .filter(|row| row.state == state && row.event == event)
+                    .count();
+                assert_eq!(
+                    count,
+                    1,
+                    "the cell ({}, {}) must appear exactly once",
+                    plan_state_name(state),
+                    event.name()
+                );
+            }
+        }
+        assert_eq!(PLAN_TABLE.len(), PLAN_STATES.len() * PlanEvent::ALL.len());
+    }
+
+    #[test]
+    fn the_task_table_is_total() {
+        for state in TASK_STATES {
+            for event in TaskEvent::ALL {
+                let count = TASK_TABLE
+                    .iter()
+                    .filter(|row| row.state == state && row.event == event)
+                    .count();
+                assert_eq!(
+                    count,
+                    1,
+                    "the cell ({state:?}, {}) must appear exactly once",
+                    event.name()
+                );
+            }
+        }
+        assert_eq!(TASK_TABLE.len(), TASK_STATES.len() * TaskEvent::ALL.len());
+    }
 }
