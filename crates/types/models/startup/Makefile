@@ -69,9 +69,18 @@ define graph_section
 	echo '```' >> $(GRAPHS)
 endef
 
-.PHONY: all check cells graphs clean
+.PHONY: all check cells graphs clean help
 
-all: check
+all: check ## run every verdict
+
+help: ## show this table
+	@printf '\n\033[36m%s\033[0m   spin: %s\n\n' 'startup lifecycle model' '$(SPIN)'
+	@printf '  \033[1m%-12s %s\033[0m\n' 'you type' 'what happens'
+	@awk 'BEGIN { FS = ":.*##" } \
+		/^[A-Za-z_-]+:.*##/ { d = $$2; sub(/^ +/, "", d); \
+			printf "  \033[36mmake %-7s\033[0m %s\n", $$1, d }' \
+		$(firstword $(MAKEFILE_LIST))
+	@printf '\n'
 
 check: ## every documented verdict
 	$(call check_clean,steady,,,every schedule of sealing and concurrent task runs ends startup Ready or Failed)
