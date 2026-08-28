@@ -87,6 +87,11 @@
  * -DSKIPSTART  runner KIND_RemoteAccounts completes without starting;
  *              the cells refuse it and the end assert fires (the
  *              witness that the verdicts run through the cells).
+ * -DWEDGE      runners wait for a sealed plan instead of the end of
+ *              planning; the planning-failure path never seals, the
+ *              runners block forever, and pan reports the invalid end
+ *              state (the wedge witness: Spin catches a worker that
+ *              can block forever, not only wrong states).
  * -DLTL        declares the two ltl claims; select one with -ltl.
  *
  * Promela notation
@@ -110,6 +115,11 @@
  *      never finishes; pan prints the assert with every #define
  *      resolved, so the Makefile greps plan_state, a symbol the
  *      expansion keeps
+ * spin -DWEDGE -search startup.pml
+ *   -> invalid end state (at depth 3), errors: 1
+ *      the trail replay shows both runners parked on the mutated
+ *      wait with plan_state = PLAN_PlanningFailed and Done parked on
+ *      its join at done_workers = 1
  * spin -DLTL -search -a -ltl ready_stable startup.pml
  *   -> errors: 0
  *      readiness once observed is never observed absent
@@ -161,7 +171,14 @@ active proctype Sealer() {
 }
 
 proctype Runner(byte i) {
+#ifdef WEDGE
+    /* the mutation: wait for a sealed plan instead of the end of
+     * planning; a planning failure never seals, so this runner blocks
+     * forever and the join in Done never completes */
+    (plan_state == PLAN_Sealed);
+#else
     (plan_state != PLAN_Unsealed);         /* planning ended */
+#endif
     if
     :: declared[i] ->
 #ifdef SKIPSTART
