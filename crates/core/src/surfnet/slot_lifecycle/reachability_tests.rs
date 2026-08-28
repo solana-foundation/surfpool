@@ -223,7 +223,12 @@ fn production_grammar_keeps_exactly_the_open_slot_announced() {
                     open
                 }
             };
-            check(open, &life, "an op");
+            let what = match op {
+                Op::CloseBlock => "close_block",
+                Op::Warp(_) => "a warp",
+                Op::Reset => "a reset",
+            };
+            check(open, &life, what);
             if seen.insert(snapshot(open, &life)) {
                 queue.push_back((open, life));
             }
