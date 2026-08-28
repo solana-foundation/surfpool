@@ -440,6 +440,31 @@ mod tests {
         value: i64,
     }
 
+    /// Every pool's housekeeping runs on the one process-wide scheduler.
+    /// r2d2's fallback is a private three-thread scheduler per pool, under
+    /// the same `r2d2-worker-{}` thread name, so a pool builder that loses
+    /// its `thread_pool(...)` call shows up here as a count above three.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_pools_share_one_scheduler() {
+        let _backend1 = SqliteBackend::open(":memory:", "surfnet1").unwrap();
+        let _backend2 = SqliteBackend::open(":memory:", "surfnet2").unwrap();
+
+        let workers = std::fs::read_dir("/proc/self/task")
+            .unwrap()
+            .flatten()
+            .filter(|task| {
+                std::fs::read_to_string(task.path().join("comm"))
+                    .map(|name| name.starts_with("r2d2-worker"))
+                    .unwrap_or(false)
+            })
+            .count();
+        assert!(
+            workers <= 3,
+            "expected at most 3 r2d2 housekeeping threads process-wide, found {workers}"
+        );
+    }
+
     /// Stores opened on one backend share its connection pool.
     #[test]
     fn test_stores_share_the_backend_pool() {
