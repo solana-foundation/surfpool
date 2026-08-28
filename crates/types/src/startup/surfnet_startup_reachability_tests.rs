@@ -30,6 +30,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
+use surfpool_spec_harness::SpecDoc;
+
 use super::*;
 
 /// Any fixed instant. The projection check below cares whether an entry
@@ -167,20 +169,22 @@ fn every_reachable_state_upholds_the_startup_invariants() {
     sweep();
 }
 
+/// The spec document beside this module, with the cargo aliases that
+/// regenerate it.
+fn spec_doc() -> SpecDoc {
+    SpecDoc {
+        path: concat!(env!("CARGO_MANIFEST_DIR"), "/src/startup-lifecycle.md"),
+        diagrams_dir: concat!(env!("CARGO_MANIFEST_DIR"), "/src/diagrams"),
+        update_alias: "surfpool-update-startup-spec",
+        render_alias: "surfpool-render-startup-diagrams",
+    }
+}
+
 /// The document claims its tables are generated; holding every block
 /// equal to a fresh render is what keeps that claim true.
 #[test]
 fn the_document_matches_the_spec() {
-    let text = read_spec();
-    for (name, content) in generated_blocks() {
-        let (start, end) = region(&text, name);
-        assert!(
-            text[start..end] == content,
-            "the {name} block in startup-lifecycle.md disagrees with the \
-             spec. Expected:\n\n{content}\nRun `cargo \
-             surfpool-update-startup-spec` to regenerate every table."
-        );
-    }
+    spec_doc().assert_blocks_current(&generated_blocks());
 }
 
 /// Ignored so a plain test run never writes to the source tree;
@@ -188,14 +192,7 @@ fn the_document_matches_the_spec() {
 #[test]
 #[ignore = "writes startup-lifecycle.md; run via cargo surfpool-update-startup-spec"]
 fn regenerate_the_startup_spec_tables() {
-    let mut text = read_spec();
-    for (name, content) in generated_blocks() {
-        let (start, end) = region(&text, name);
-        text.replace_range(start..end, &content);
-    }
-    std::fs::write(SPEC_PATH, text)
-        .unwrap_or_else(|error| panic!("could not write {SPEC_PATH}: {error}"));
-    eprintln!("regenerated the spec tables in {SPEC_PATH}");
+    spec_doc().regenerate(&generated_blocks());
 }
 
 /// Every generated block, named by its marker in the document. Three
@@ -644,203 +641,21 @@ impl Observed {
     }
 }
 
-const SPEC_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/startup-lifecycle.md");
-
-fn read_spec() -> String {
-    std::fs::read_to_string(SPEC_PATH)
-        .unwrap_or_else(|error| panic!("could not read {SPEC_PATH}: {error}"))
-}
-
-/// The byte range between `name`'s generated markers.
-fn region(text: &str, name: &str) -> (usize, usize) {
-    let begin = format!("<!-- BEGIN GENERATED: {name} -->\n");
-    let end_marker = format!("<!-- END GENERATED: {name} -->");
-    let start = text
-        .find(&begin)
-        .unwrap_or_else(|| panic!("{SPEC_PATH} has no {begin:?} marker"))
-        + begin.len();
-    let end = text[start..]
-        .find(&end_marker)
-        .unwrap_or_else(|| panic!("{SPEC_PATH} has no {end_marker:?} marker"))
-        + start;
-    // A second copy of the block would be neither checked nor
-    // regenerated, so refuse the ambiguity.
-    assert!(
-        text[end..].find(&begin).is_none(),
-        "{SPEC_PATH} has more than one {name} block"
-    );
-    (start, end)
-}
-
-/// Every mermaid region in the spec: its name and its fenced source.
-/// The source in the document is the diagram; `build.rs` swaps each
-/// region for its pre-rendered SVG in the rustdoc variant, so GitHub
-/// renders the fence and rustdoc renders the drawing.
-fn diagram_sources() -> Vec<(String, String)> {
-    let text = read_spec();
-    let mut sources = vec![];
-    let mut rest = text.as_str();
-    while let Some(start) = rest.find("<!-- BEGIN MERMAID: ") {
-        let name_start = start + "<!-- BEGIN MERMAID: ".len();
-        let name_end = rest[name_start..]
-            .find(" -->")
-            .expect("a mermaid marker name")
-            + name_start;
-        let name = rest[name_start..name_end].to_string();
-        let body_start = name_end + " -->".len();
-        let end_marker = format!("<!-- END MERMAID: {name} -->");
-        let end = rest.find(&end_marker).expect("a closing mermaid marker");
-        sources.push((name, rest[body_start..end].trim().to_string()));
-        rest = &rest[end + end_marker.len()..];
-    }
-    sources
-}
-
-/// FNV-1a, implemented locally: the pin must be stable across Rust
-/// releases, which std's `DefaultHasher` does not promise.
-fn fnv1a(text: &str) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in text.bytes() {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
-}
-
-fn diagram_svg_path(name: &str) -> String {
-    format!("{}/src/diagrams/{name}.svg", env!("CARGO_MANIFEST_DIR"))
-}
-
-/// Replaces each distinct random token after `state-id-` with its
-/// first-occurrence index, rewriting every reference to it the same
-/// way, so internal id links inside the SVG stay consistent.
-fn normalize_state_ids(svg: &str) -> String {
-    const MARKER: &str = "state-id-";
-    let mut tokens: Vec<String> = vec![];
-    let mut output = String::with_capacity(svg.len());
-    let mut rest = svg;
-    while let Some(found) = rest.find(MARKER) {
-        let after = found + MARKER.len();
-        let token_len = rest[after..]
-            .bytes()
-            .take_while(u8::is_ascii_alphanumeric)
-            .count();
-        let token = rest[after..after + token_len].to_string();
-        let index = match tokens.iter().position(|seen| *seen == token) {
-            Some(index) => index,
-            None => {
-                tokens.push(token);
-                tokens.len() - 1
-            }
-        };
-        output.push_str(&rest[..after]);
-        output.push_str(&format!("d{index}"));
-        rest = &rest[after + token_len..];
-    }
-    output.push_str(rest);
-    output
-}
-
 /// Each rendered SVG pins the hash of the mermaid source it was
 /// rendered from, so editing a diagram without re-rendering fails
 /// here, and CI needs no mermaid toolchain to detect the drift.
 #[test]
 fn the_diagrams_match_their_renderings() {
-    for (name, source) in diagram_sources() {
-        let path = diagram_svg_path(&name);
-        let svg = std::fs::read_to_string(&path).unwrap_or_else(|error| {
-            panic!(
-                "could not read {path}: {error}; run `cargo \
-                 surfpool-render-startup-diagrams`"
-            )
-        });
-        let expected = format!("<!-- mermaid-fnv1a: {:016x} -->", fnv1a(&source));
-        assert!(
-            svg.starts_with(&expected),
-            "{name}: the rendered SVG is stale; run `cargo \
-             surfpool-render-startup-diagrams`"
-        );
-    }
+    spec_doc().assert_diagrams_current();
 }
 
 /// Renders each mermaid region to `src/diagrams/<name>.svg` and pins
 /// the source hash. Ignored so a plain test run never needs the
 /// mermaid CLI; `cargo surfpool-render-startup-diagrams` runs it.
-///
-/// Determinism boundary: with the id fixes below, re-rendering an
-/// unchanged source is byte-stable on one machine, and CI never
-/// compares SVG bytes at all (the check test pins the source hash),
-/// so environments can differ without breaking anything. Across
-/// machines, Chromium versions and font fallbacks still move text
-/// metrics, so a re-render on different hardware may churn measured
-/// coordinates; that churn is confined to commits that edit a
-/// diagram. Byte-stability across machines would need a pinned
-/// render container, which this mechanism deliberately omits.
 #[test]
 #[ignore = "runs mmdc; invoke via cargo surfpool-render-startup-diagrams"]
 fn render_the_startup_diagrams() {
-    for (name, source) in diagram_sources() {
-        let body: String = source
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("```"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let input = std::env::temp_dir().join(format!("{name}.mmd"));
-        let rendered = std::env::temp_dir().join(format!("{name}.svg"));
-        let config = std::env::temp_dir().join(format!("{name}.mermaid.json"));
-        std::fs::write(&input, &body).expect("write the mermaid source");
-        // Deterministic ids, seeded by the diagram name: mermaid
-        // otherwise embeds a random token in every render, and a
-        // re-render with an unchanged source would dirty the tree.
-        std::fs::write(
-            &config,
-            format!(r#"{{"deterministicIds": true, "deterministicIDSeed": "{name}"}}"#),
-        )
-        .expect("write the mermaid config");
-
-        let status = std::process::Command::new("mmdc")
-            .arg("-i")
-            .arg(&input)
-            .arg("-o")
-            .arg(&rendered)
-            .arg("-c")
-            .arg(&config)
-            .status()
-            .expect("mmdc should be installed: npm i -g @mermaid-js/mermaid-cli");
-        assert!(status.success(), "mmdc failed for {name}");
-
-        let svg = std::fs::read_to_string(&rendered).expect("read the rendered svg");
-        // mmdc can prepend an XML declaration; rustdoc wants raw <svg>.
-        let svg = svg.trim_start_matches(|c| c != '<');
-        let svg = if svg.starts_with("<?xml") {
-            &svg[svg.find("?>").map(|i| i + 2).unwrap_or(0)..]
-        } else {
-            svg
-        };
-        // The deterministicIds config misses the internal ids of
-        // composite states, which carry a fresh random token on every
-        // render; normalize them so an unchanged source re-renders
-        // byte-identically and never dirties the tree.
-        let svg = normalize_state_ids(svg);
-        let svg = svg.as_str();
-        let path = diagram_svg_path(&name);
-        std::fs::create_dir_all(
-            std::path::Path::new(&path)
-                .parent()
-                .expect("the diagrams directory"),
-        )
-        .expect("create the diagrams directory");
-        std::fs::write(
-            &path,
-            format!(
-                "<!-- mermaid-fnv1a: {:016x} -->\n{}",
-                fnv1a(&source),
-                svg.trim_start()
-            ),
-        )
-        .expect("write the pinned svg");
-        eprintln!("rendered {path}");
-    }
+    spec_doc().render_diagrams();
 }
 
 /// Forges a state the machine cannot derive, to demonstrate the rule
