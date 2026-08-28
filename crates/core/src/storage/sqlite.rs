@@ -30,6 +30,9 @@ impl diesel::r2d2::CustomizeConnection<SqliteConnection, diesel::r2d2::Error>
     for SqlitePragmaCustomizer
 {
     fn on_acquire(&self, conn: &mut SqliteConnection) -> Result<(), diesel::r2d2::Error> {
+        // busy_timeout comes first: until it is set, the connection runs with
+        // SQLite's default timeout of zero, so setup against a locked database
+        // fails immediately and r2d2 discards and replaces the connection.
         let pragmas = if self.is_file_based {
             "PRAGMA busy_timeout=5000; PRAGMA synchronous=NORMAL; PRAGMA temp_store=MEMORY; PRAGMA mmap_size=268435456; PRAGMA cache_size=-64000;"
         } else {
