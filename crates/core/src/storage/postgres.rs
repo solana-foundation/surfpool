@@ -358,3 +358,84 @@ where
         Ok(Box::new(iter))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Barrier};
+
+    use super::*;
+    use crate::storage::tests::{POSTGRES_TEST_URL_ENV, random_surfnet_id};
+
+    fn test_url() -> Option<String> {
+        std::env::var(POSTGRES_TEST_URL_ENV).ok()
+    }
+
+    fn random_table_name() -> String {
+        format!("ddl_race_{}", random_surfnet_id().replace('-', ""))
+    }
+
+    fn drop_tables(url: &str, tables: &[String]) {
+        let pool = get_or_create_shared_pool(url).unwrap();
+        let mut conn = pool.get().unwrap();
+        for table in tables {
+            let _ = conn.batch_execute(&format!("DROP TABLE IF EXISTS {}", table));
+        }
+    }
+
+    /// Two sessions running CREATE TABLE IF NOT EXISTS for the same new
+    /// table can both pass the existence check; the loser's catalog
+    /// insert then fails with a duplicate key on pg_type_typname_nsp_index
+    /// and storage construction fails over a table that exists. Each
+    /// attempt uses a fresh table name so every attempt replays the
+    /// creation window that CI replays once per container.
+    #[test]
+    fn concurrent_open_store_survives_the_create_race() {
+        let Some(url) = test_url() else {
+            println!("skipping: {} not set", POSTGRES_TEST_URL_ENV);
+            return;
+        };
+        const ATTEMPTS: usize = 50;
+        const SESSIONS: usize = 4;
+
+        let mut tables = Vec::with_capacity(ATTEMPTS);
+        let mut lost = 0usize;
+        let mut first_loss = None;
+        for _ in 0..ATTEMPTS {
+            let table = random_table_name();
+            tables.push(table.clone());
+            let barrier = Arc::new(Barrier::new(SESSIONS));
+            let handles: Vec<_> = (0..SESSIONS)
+                .map(|_| {
+                    let url = url.clone();
+                    let table = table.clone();
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        let backend =
+                            PostgresBackend::open(&url, &random_surfnet_id()).unwrap();
+                        barrier.wait();
+                        backend.open_store::<String, String>(&table).map(|_| ())
+                    })
+                })
+                .collect();
+            let mut attempt_lost = false;
+            for handle in handles {
+                if let Err(e) = handle.join().unwrap() {
+                    attempt_lost = true;
+                    first_loss.get_or_insert(e);
+                }
+            }
+            if attempt_lost {
+                lost += 1;
+            }
+        }
+        drop_tables(&url, &tables);
+
+        assert!(
+            lost == 0,
+            "lost the DDL race in {}/{} attempts; first loss: {:?}",
+            lost,
+            ATTEMPTS,
+            first_loss.unwrap()
+        );
+    }
+}
