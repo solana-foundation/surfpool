@@ -379,6 +379,8 @@ where
 mod tests {
     use std::sync::{Arc, Barrier};
 
+    use surfpool_db::diesel::QueryableByName;
+
     use super::*;
     use crate::storage::tests::{POSTGRES_TEST_URL_ENV, random_surfnet_id};
 
@@ -452,6 +454,75 @@ mod tests {
             lost,
             ATTEMPTS,
             first_loss.unwrap()
+        );
+    }
+
+    #[derive(QueryableByName)]
+    struct LockProbe {
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        free: bool,
+    }
+
+    /// True when no session holds the DDL advisory lock for this table.
+    /// Probes with try-lock from a fresh transaction; the probe's own
+    /// lock evaporates when its transaction ends.
+    ///
+    /// The probe connection is established outside the pool on purpose:
+    /// advisory locks are reentrant within a session, so a probe drawn
+    /// from the pool can land on the very connection that leaked the
+    /// lock and report it free. A dedicated connection is a distinct
+    /// session by construction, which is what the probe's question is
+    /// about.
+    fn ddl_lock_is_free(url: &str, table: &str) -> bool {
+        let mut conn = diesel::PgConnection::establish(url).unwrap();
+        conn.transaction(|conn| {
+            sql_query(
+                "SELECT pg_try_advisory_xact_lock(hashtext('surfpool:ddl:' || $1)) AS free",
+            )
+            .bind::<Text, _>(table)
+            .get_result::<LockProbe>(conn)
+            .map(|row| row.free)
+        })
+        .unwrap()
+    }
+
+    /// The lock is transaction-scoped, so a successful construction leaves
+    /// it free for the next session the moment its transaction commits.
+    #[test]
+    fn ddl_lock_is_released_after_successful_create() {
+        let Some(url) = test_url() else {
+            println!("skipping: {} not set", POSTGRES_TEST_URL_ENV);
+            return;
+        };
+        let table = random_table_name();
+        let backend = PostgresBackend::open(&url, &random_surfnet_id()).unwrap();
+        backend.open_store::<String, String>(&table).unwrap();
+        let free = ddl_lock_is_free(&url, &table);
+        drop_tables(&url, std::slice::from_ref(&table));
+        assert!(free, "the DDL advisory lock outlived a successful create");
+    }
+
+    /// The wedge regression: an error between lock and unlock must not
+    /// leak the lock into the pool, where it would park every later
+    /// constructor of this table forever. A table name that breaks the
+    /// CREATE forces the error path after the lock is taken; the database
+    /// releases the lock when the transaction rolls back.
+    #[test]
+    fn ddl_lock_is_released_after_failed_create() {
+        let Some(url) = test_url() else {
+            println!("skipping: {} not set", POSTGRES_TEST_URL_ENV);
+            return;
+        };
+        let table = "ddl race bad name"; // spaces break the unquoted CREATE
+        let backend = PostgresBackend::open(&url, &random_surfnet_id()).unwrap();
+        let result = backend.open_store::<String, String>(table);
+        assert!(
+            result.is_err(),
+            "a syntactically broken CREATE should fail construction"
+        );
+        assert!(
+            ddl_lock_is_free(&url, table),
+            "the DDL advisory lock outlived a failed create"
         );
     }
 }
