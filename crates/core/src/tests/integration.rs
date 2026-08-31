@@ -48,6 +48,7 @@ use solana_keypair::Keypair;
 use solana_message::{
     AddressLookupTableAccount, Message, MessageHeader, VersionedMessage, legacy,
     v0::{self, MessageAddressTableLookup},
+    v1::{self, TransactionConfig},
 };
 use solana_pubkey::Pubkey;
 use solana_pubsub_client::nonblocking::pubsub_client::PubsubClient;
@@ -11124,6 +11125,11 @@ async fn test_confidential_balance_deposit_round_trip(test_type: TestType) {
     );
 }
 
+#[test_case(TestType::sqlite(); "with on-disk sqlite db")]
+#[test_case(TestType::in_memory(); "with in-memory sqlite db")]
+#[test_case(TestType::no_db(); "with no db")]
+#[cfg_attr(feature = "postgres", test_case(TestType::postgres(); "with postgres db"))]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_duplicate_transaction_rejected(test_type: TestType) {
     let (svm_instance, _simnet_events_rx, _geyser_events_rx) = test_type.initialize_svm();
     let svm_locker = SurfnetSvmLocker::new(svm_instance);
@@ -11859,4 +11865,486 @@ async fn test_request_airdrop_rejects_below_rent_amount() {
         .expect_err("requestAirdrop below rent exemption must return an RPC error");
     assert_eq!(err.code, jsonrpc_core::ErrorCode::InvalidParams);
     assert!(err.message.contains("rent-exempt minimum"));
+}
+
+fn build_v1_transaction(
+    payer: &Keypair,
+    instructions: &[Instruction],
+    recent_blockhash: Hash,
+    config: TransactionConfig,
+) -> VersionedTransaction {
+    let message = v1::Message::try_compile_with_config(
+        &payer.pubkey(),
+        instructions,
+        recent_blockhash,
+        config,
+    )
+    .expect("v1 message should compile");
+    VersionedTransaction::try_new(VersionedMessage::V1(message), &[payer])
+        .expect("v1 transaction should sign")
+}
+
+async fn process_v1_transaction_and_get_fee_and_cus(
+    svm_locker: &SurfnetSvmLocker,
+    transaction: VersionedTransaction,
+) -> (u64, u64) {
+    let signature = transaction.signatures[0];
+    let (status_tx, status_rx) = crossbeam_unbounded();
+    svm_locker
+        .process_transaction(&None, transaction, status_tx, false, true)
+        .await
+        .expect("v1 transaction processing should complete");
+
+    match status_rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(TransactionStatusEvent::Success(_)) => {}
+        other => panic!("expected v1 transaction success, got {other:?}"),
+    }
+
+    svm_locker.with_svm_reader(|svm| {
+        let tx_status = svm
+            .transactions
+            .get(&signature.to_string())
+            .expect("transaction lookup should not fail")
+            .expect("processed transaction should be stored");
+        let (tx_with_status_meta, _) = tx_status.expect_processed();
+        (
+            tx_with_status_meta.meta.fee,
+            tx_with_status_meta
+                .meta
+                .compute_units_consumed
+                .unwrap_or_default(),
+        )
+    })
+}
+
+async fn process_v1_transaction_and_get_fee(
+    svm_locker: &SurfnetSvmLocker,
+    transaction: VersionedTransaction,
+) -> u64 {
+    process_v1_transaction_and_get_fee_and_cus(svm_locker, transaction)
+        .await
+        .0
+}
+
+async fn process_v1_transaction_and_get_rejection_message(
+    svm_locker: &SurfnetSvmLocker,
+    transaction: VersionedTransaction,
+    sigverify: bool,
+) -> String {
+    let (status_tx, status_rx) = crossbeam_unbounded();
+    let result = svm_locker
+        .process_transaction(&None, transaction, status_tx, false, sigverify)
+        .await;
+
+    match status_rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(TransactionStatusEvent::SimulationFailure((error, _)))
+        | Ok(TransactionStatusEvent::ExecutionFailure((error, _))) => {
+            assert!(
+                result.is_ok(),
+                "runtime transaction failures should be reported on the status channel"
+            );
+            error.to_string()
+        }
+        Ok(TransactionStatusEvent::VerificationFailure(error)) => {
+            assert!(
+                result.is_err(),
+                "verification failures should also be returned from process_transaction"
+            );
+            error
+        }
+        other => panic!("expected v1 transaction rejection, got {other:?}"),
+    }
+}
+
+fn funded_v1_test_svm(payer: &Keypair) -> SurfnetSvmLocker {
+    let (mut svm_instance, _simnet_events_rx, _geyser_events_rx) =
+        TestType::no_db().initialize_svm();
+    svm_instance
+        .airdrop(&payer.pubkey(), LAMPORTS_PER_SOL)
+        .expect("airdrop should not fail")
+        .expect("airdrop should fund payer");
+    SurfnetSvmLocker::new(svm_instance)
+}
+
+/// [TransactionConfig] that will work with a transfer ix with a default system account
+fn default_transaction_config() -> TransactionConfig {
+    TransactionConfig::empty()
+        // transfer ix consumes 150 CUs
+        .with_compute_unit_limit(150)
+        .with_loaded_accounts_data_size_limit(149)
+}
+
+/// Fetch account and assert that it does not exist. Panics if the account exists.
+fn assert_account_does_not_exist(svm_locker: &SurfnetSvmLocker, pubkey: &Pubkey, fail_msg: &str) {
+    let account = svm_locker
+        .with_svm_reader(|svm| svm.get_account(pubkey))
+        .expect("account lookup should not fail");
+    assert!(account.is_none(), "{}", fail_msg);
+}
+
+/// Fetch account and assert that it has the expected lamports. Panics if the account does not exist.
+fn assert_account_lamports(
+    svm_locker: &SurfnetSvmLocker,
+    pubkey: &Pubkey,
+    expected_lamports: u64,
+    fail_msg: &str,
+) {
+    let account = svm_locker
+        .with_svm_reader(|svm| svm.get_account(pubkey))
+        .expect("account lookup should not fail")
+        .expect("account should exist");
+    assert_eq!(account.lamports, expected_lamports, "{}", fail_msg);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_v1_tx_sigverify_accepts_valid_signature() {
+    let payer = Keypair::new();
+    let recipient = Pubkey::new_unique();
+    let svm_locker = funded_v1_test_svm(&payer);
+    let recent_blockhash = svm_locker.with_svm_reader(|svm| svm.latest_blockhash());
+    let transaction = build_v1_transaction(
+        &payer,
+        &[transfer(&payer.pubkey(), &recipient, 1_000_000)],
+        recent_blockhash,
+        default_transaction_config(),
+    );
+
+    process_v1_transaction_and_get_fee(&svm_locker, transaction).await;
+
+    assert_account_lamports(
+        &svm_locker,
+        &recipient,
+        1_000_000,
+        "valid v1 transaction should execute transfer",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_v1_tx_sigverify_rejects_signed_config_mutation() {
+    let payer = Keypair::new();
+    let recipient = Pubkey::new_unique();
+    let svm_locker = funded_v1_test_svm(&payer);
+    let recent_blockhash = svm_locker.with_svm_reader(|svm| svm.latest_blockhash());
+    let mut transaction = build_v1_transaction(
+        &payer,
+        &[transfer(&payer.pubkey(), &recipient, 1_000_000)],
+        recent_blockhash,
+        default_transaction_config().with_priority_fee(42_000),
+    );
+    let VersionedMessage::V1(message) = &mut transaction.message else {
+        panic!("expected v1 transaction");
+    };
+    message.config = message.config.with_priority_fee(42_001);
+
+    let error =
+        process_v1_transaction_and_get_rejection_message(&svm_locker, transaction, true).await;
+    assert!(
+        error.contains("Transaction did not pass signature verification"),
+        "mutating a signed v1 config field should fail signature verification, got: {error}"
+    );
+
+    assert_account_does_not_exist(
+        &svm_locker,
+        &recipient,
+        "signature verification failure should not execute the transfer",
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_v1_tx_send_transaction_respects_sigverify_flag() {
+    let payer = Keypair::new();
+    let recipient = Pubkey::new_unique();
+    let svm_locker = funded_v1_test_svm(&payer);
+    let recent_blockhash = svm_locker.with_svm_reader(|svm| svm.latest_blockhash());
+    let mut invalid_signature_tx = build_v1_transaction(
+        &payer,
+        &[transfer(&payer.pubkey(), &recipient, 1_000_000)],
+        recent_blockhash,
+        default_transaction_config(),
+    );
+    invalid_signature_tx.signatures[0] = solana_signature::Signature::new_unique();
+
+    let error = process_v1_transaction_and_get_rejection_message(
+        &svm_locker,
+        invalid_signature_tx.clone(),
+        true,
+    )
+    .await;
+    assert!(
+        error.contains("Transaction did not pass signature verification"),
+        "v1 transaction with invalid signature should be rejected, got: {error}"
+    );
+
+    let (status_tx, status_rx) = crossbeam_unbounded();
+    svm_locker
+        .process_transaction(&None, invalid_signature_tx, status_tx, false, false)
+        .await
+        .expect("skip signature verification should allow the v1 transaction to process");
+    match status_rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(TransactionStatusEvent::Success(_)) => {}
+        other => panic!("expected v1 transaction success with sigverify disabled, got {other:?}"),
+    }
+
+    assert_account_lamports(
+        &svm_locker,
+        &recipient,
+        1_000_000,
+        "v1 transaction with sigverify disabled should execute transfer",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_v1_tx_priority_fee_config_is_charged() {
+    let payer_without_priority_fee = Keypair::new();
+    let payer_with_priority_fee = Keypair::new();
+    let recipient = Pubkey::new_unique();
+    let priority_fee = 42_000;
+
+    let no_priority_fee_svm = funded_v1_test_svm(&payer_without_priority_fee);
+    let no_priority_fee_blockhash =
+        no_priority_fee_svm.with_svm_reader(|svm| svm.latest_blockhash());
+    let no_priority_fee_tx = build_v1_transaction(
+        &payer_without_priority_fee,
+        &[transfer(
+            &payer_without_priority_fee.pubkey(),
+            &recipient,
+            1_000_000,
+        )],
+        no_priority_fee_blockhash,
+        default_transaction_config(),
+    );
+    let no_priority_fee =
+        process_v1_transaction_and_get_fee(&no_priority_fee_svm, no_priority_fee_tx).await;
+
+    let priority_fee_svm = funded_v1_test_svm(&payer_with_priority_fee);
+    let priority_fee_blockhash = priority_fee_svm.with_svm_reader(|svm| svm.latest_blockhash());
+    let priority_fee_tx = build_v1_transaction(
+        &payer_with_priority_fee,
+        &[transfer(
+            &payer_with_priority_fee.pubkey(),
+            &recipient,
+            1_000_000,
+        )],
+        priority_fee_blockhash,
+        default_transaction_config().with_priority_fee(priority_fee),
+    );
+    let fee_with_priority_fee =
+        process_v1_transaction_and_get_fee(&priority_fee_svm, priority_fee_tx).await;
+
+    assert_eq!(fee_with_priority_fee - no_priority_fee, priority_fee);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_v1_tx_heap_size_config_bounds_are_rejected_by_surfpool() {
+    const MIN_HEAP_FRAME_BYTES: u32 = 32 * 1024;
+    const MAX_HEAP_FRAME_BYTES: u32 = 256 * 1024;
+    const TRANSFER_LAMPORTS: u64 = 1_000_000;
+
+    let payer = Keypair::new();
+    let svm_locker = funded_v1_test_svm(&payer);
+
+    for heap_size in [MIN_HEAP_FRAME_BYTES, MAX_HEAP_FRAME_BYTES] {
+        let recipient = Pubkey::new_unique();
+        let recent_blockhash = svm_locker.with_svm_reader(|svm| svm.latest_blockhash());
+        let transaction = build_v1_transaction(
+            &payer,
+            &[transfer(&payer.pubkey(), &recipient, TRANSFER_LAMPORTS)],
+            recent_blockhash,
+            default_transaction_config().with_heap_size(heap_size),
+        );
+        process_v1_transaction_and_get_fee(&svm_locker, transaction).await;
+
+        assert_account_lamports(
+            &svm_locker,
+            &recipient,
+            TRANSFER_LAMPORTS,
+            "v1 transaction with valid heap size should execute transfer",
+        );
+    }
+
+    for heap_size in [
+        MIN_HEAP_FRAME_BYTES - 1,
+        MIN_HEAP_FRAME_BYTES + 1,
+        MAX_HEAP_FRAME_BYTES + 1,
+    ] {
+        let recipient = Pubkey::new_unique();
+        let recent_blockhash = svm_locker.with_svm_reader(|svm| svm.latest_blockhash());
+        let transaction = build_v1_transaction(
+            &payer,
+            &[transfer(&payer.pubkey(), &recipient, TRANSFER_LAMPORTS)],
+            recent_blockhash,
+            default_transaction_config().with_heap_size(heap_size),
+        );
+        let error =
+            process_v1_transaction_and_get_rejection_message(&svm_locker, transaction, true).await;
+        assert!(
+            error.to_ascii_lowercase().contains("sanitize")
+                || error.to_ascii_lowercase().contains("invalid"),
+            "invalid v1 heap size {heap_size} should be rejected by Surfpool, got: {error}"
+        );
+
+        assert_account_does_not_exist(
+            &svm_locker,
+            &recipient,
+            &format!("invalid heap size {heap_size} should not execute the transfer"),
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_v1_tx_ignores_invalid_compute_budget_instruction() {
+    let payer = Keypair::new();
+    let recipient = Pubkey::new_unique();
+    let svm_locker = funded_v1_test_svm(&payer);
+    let recent_blockhash = svm_locker.with_svm_reader(|svm| svm.latest_blockhash());
+    let baseline_transaction = build_v1_transaction(
+        &payer,
+        &[transfer(&payer.pubkey(), &recipient, 1_000_000)],
+        recent_blockhash,
+        default_transaction_config(),
+    );
+    let (_, baseline_cus) =
+        process_v1_transaction_and_get_fee_and_cus(&svm_locker, baseline_transaction).await;
+
+    let second_recipient = Pubkey::new_unique();
+    let second_recent_blockhash = svm_locker.with_svm_reader(|svm| svm.latest_blockhash());
+    let invalid_compute_budget_ix = Instruction {
+        program_id: solana_compute_budget_interface::id(),
+        accounts: vec![],
+        data: vec![u8::MAX],
+    };
+    let transaction = build_v1_transaction(
+        &payer,
+        &[
+            invalid_compute_budget_ix,
+            transfer(&payer.pubkey(), &second_recipient, 1_000_000),
+        ],
+        second_recent_blockhash,
+        // Extra and compute limit account data size is needed to load compute budget account
+        default_transaction_config()
+            .with_loaded_accounts_data_size_limit(298)
+            .with_compute_unit_limit(3_000),
+    );
+
+    let (_, cus_with_noop_compute_budget_ix) =
+        process_v1_transaction_and_get_fee_and_cus(&svm_locker, transaction).await;
+    assert!(
+        cus_with_noop_compute_budget_ix > baseline_cus,
+        "v1 compute-budget instruction should consume compute units as a successful no-op"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_v1_tx_ignores_duplicate_compute_budget_configuration_instructions() {
+    let payer = Keypair::new();
+    let recipient = Pubkey::new_unique();
+    let svm_locker = funded_v1_test_svm(&payer);
+    let recent_blockhash = svm_locker.with_svm_reader(|svm| svm.latest_blockhash());
+    let baseline_transaction = build_v1_transaction(
+        &payer,
+        &[transfer(&payer.pubkey(), &recipient, 1_000_000)],
+        recent_blockhash,
+        default_transaction_config(),
+    );
+    let (baseline_fee, baseline_cus) =
+        process_v1_transaction_and_get_fee_and_cus(&svm_locker, baseline_transaction).await;
+
+    let second_recipient = Pubkey::new_unique();
+    let second_recent_blockhash = svm_locker.with_svm_reader(|svm| svm.latest_blockhash());
+    let transaction = build_v1_transaction(
+        &payer,
+        &[
+            ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
+            ComputeBudgetInstruction::set_compute_unit_limit(1_399_999),
+            ComputeBudgetInstruction::set_compute_unit_price(1_000),
+            ComputeBudgetInstruction::set_compute_unit_price(2_000),
+            transfer(&payer.pubkey(), &second_recipient, 1_000_000),
+        ],
+        second_recent_blockhash,
+        // Extra compute limit and account data size is needed to load compute budget account
+        default_transaction_config()
+            .with_loaded_accounts_data_size_limit(298)
+            .with_compute_unit_limit(3_000),
+    );
+
+    let (fee_with_ignored_compute_budget_ixs, cus_with_noop_compute_budget_ixs) =
+        process_v1_transaction_and_get_fee_and_cus(&svm_locker, transaction).await;
+
+    assert_eq!(
+        fee_with_ignored_compute_budget_ixs, baseline_fee,
+        "v1 compute-budget price instructions should not configure prioritization fees"
+    );
+    assert!(
+        cus_with_noop_compute_budget_ixs > baseline_cus,
+        "v1 compute-budget instructions should consume compute units as successful no-ops"
+    );
+
+    assert_account_lamports(
+        &svm_locker,
+        &second_recipient,
+        1_000_000,
+        "v1 transaction with duplicate compute-budget instructions should execute transfer",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_v1_tx_insufficient_loaded_account_data_size_limit_rejects_transaction() {
+    let payer = Keypair::new();
+    let recipient = Pubkey::new_unique();
+    let svm_locker = funded_v1_test_svm(&payer);
+    let recent_blockhash = svm_locker.with_svm_reader(|svm| svm.latest_blockhash());
+    let transaction = build_v1_transaction(
+        &payer,
+        &[transfer(&payer.pubkey(), &recipient, 1_000_000)],
+        recent_blockhash,
+        TransactionConfig::empty()
+            // sufficient compute unit limit
+            .with_compute_unit_limit(150)
+            // insufficient loaded accounts data size limit
+            .with_loaded_accounts_data_size_limit(148),
+    );
+
+    let error =
+        process_v1_transaction_and_get_rejection_message(&svm_locker, transaction, true).await;
+    assert_eq!(
+        error,
+        "Transaction exceeded max loaded accounts data size cap"
+    );
+
+    assert_account_does_not_exist(
+        &svm_locker,
+        &recipient,
+        "invalid v1 transaction should not execute the transfer",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_v1_tx_insufficient_compute_unit_limit_rejects_transaction() {
+    let payer = Keypair::new();
+    let recipient = Pubkey::new_unique();
+    let svm_locker = funded_v1_test_svm(&payer);
+    let recent_blockhash = svm_locker.with_svm_reader(|svm| svm.latest_blockhash());
+    let transaction = build_v1_transaction(
+        &payer,
+        &[transfer(&payer.pubkey(), &recipient, 1_000_000)],
+        recent_blockhash,
+        TransactionConfig::empty()
+            // insufficient compute unit limit
+            .with_compute_unit_limit(149)
+            // sufficient loaded accounts data size limit
+            .with_loaded_accounts_data_size_limit(149),
+    );
+
+    let error =
+        process_v1_transaction_and_get_rejection_message(&svm_locker, transaction, true).await;
+    assert_eq!(
+        error,
+        "Error processing Instruction 0: Computational budget exceeded"
+    );
+
+    assert_account_does_not_exist(
+        &svm_locker,
+        &recipient,
+        "invalid v1 transaction should not execute the transfer",
+    );
 }

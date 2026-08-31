@@ -305,11 +305,53 @@ pub fn adjust_default_transaction_config(config: &mut RpcTransactionConfig) {
 #[cfg(test)]
 mod tests {
     use solana_keypair::Keypair;
-    use solana_message::{MessageHeader, compiled_instruction::CompiledInstruction, v1};
+    use solana_message::{
+        MESSAGE_VERSION_PREFIX, MessageHeader, compiled_instruction::CompiledInstruction, legacy,
+        v0, v1,
+    };
     use solana_signer::Signer;
     use solana_transaction::versioned::VersionedTransaction;
 
     use super::*;
+
+    fn signed_legacy_transaction(data_len: usize) -> VersionedTransaction {
+        let payer = Keypair::new();
+        let message = VersionedMessage::Legacy(legacy::Message {
+            header: MessageHeader {
+                num_required_signatures: 1,
+                num_readonly_signed_accounts: 0,
+                num_readonly_unsigned_accounts: 1,
+            },
+            account_keys: vec![payer.pubkey(), Pubkey::new_unique()],
+            recent_blockhash: Hash::default(),
+            instructions: vec![CompiledInstruction {
+                program_id_index: 1,
+                accounts: vec![0],
+                data: vec![0; data_len],
+            }],
+        });
+        VersionedTransaction::try_new(message, &[&payer]).unwrap()
+    }
+
+    fn signed_v0_transaction(data_len: usize) -> VersionedTransaction {
+        let payer = Keypair::new();
+        let message = VersionedMessage::V0(v0::Message {
+            header: MessageHeader {
+                num_required_signatures: 1,
+                num_readonly_signed_accounts: 0,
+                num_readonly_unsigned_accounts: 1,
+            },
+            account_keys: vec![payer.pubkey(), Pubkey::new_unique()],
+            recent_blockhash: Hash::default(),
+            instructions: vec![CompiledInstruction {
+                program_id_index: 1,
+                accounts: vec![0],
+                data: vec![0; data_len],
+            }],
+            address_table_lookups: vec![],
+        });
+        VersionedTransaction::try_new(message, &[&payer]).unwrap()
+    }
 
     fn signed_v1_transaction(data_len: usize) -> VersionedTransaction {
         let payer = Keypair::new();
@@ -339,6 +381,22 @@ mod tests {
     }
 
     #[test]
+    fn uses_expected_wire_size_limits_by_transaction_version() {
+        let legacy_wire = wincode::serialize(&signed_legacy_transaction(0)).unwrap();
+        assert_eq!(wire_size_limit(&legacy_wire), PACKET_DATA_SIZE);
+        assert_ne!(legacy_wire[0], V1_PREFIX);
+
+        let v0_wire = wincode::serialize(&signed_v0_transaction(0)).unwrap();
+        assert_eq!(wire_size_limit(&v0_wire), PACKET_DATA_SIZE);
+        assert_ne!(v0_wire[0], V1_PREFIX);
+        assert_eq!(v0_wire[1 + 64], MESSAGE_VERSION_PREFIX);
+
+        let v1_wire = wincode::serialize(&signed_v1_transaction(0)).unwrap();
+        assert_eq!(wire_size_limit(&v1_wire), MAX_TRANSACTION_SIZE);
+        assert_eq!(v1_wire[0], V1_PREFIX);
+    }
+
+    #[test]
     fn decodes_signed_v1_transaction_larger_than_legacy_packet() {
         let transaction = signed_v1_transaction(PACKET_DATA_SIZE);
         let wire = wincode::serialize(&transaction).unwrap();
@@ -357,7 +415,27 @@ mod tests {
     }
 
     #[test]
-    fn rejects_oversized_v1_and_legacy_wire_payloads() {
+    fn rejects_oversized_legacy_v0_and_v1_wire_payloads() {
+        let oversized_legacy = wincode::serialize(&signed_legacy_transaction(PACKET_DATA_SIZE))
+            .expect("legacy transaction should serialize");
+        assert!(oversized_legacy.len() > PACKET_DATA_SIZE);
+        let legacy_error = decode_and_deserialize::<VersionedTransaction>(
+            BASE64_STANDARD.encode(oversized_legacy),
+            TransactionBinaryEncoding::Base64,
+        )
+        .unwrap_err();
+        assert!(legacy_error.message.contains("max: 1232 bytes"));
+
+        let oversized_v0 = wincode::serialize(&signed_v0_transaction(PACKET_DATA_SIZE))
+            .expect("v0 transaction should serialize");
+        assert!(oversized_v0.len() > PACKET_DATA_SIZE);
+        let v0_error = decode_and_deserialize::<VersionedTransaction>(
+            BASE64_STANDARD.encode(oversized_v0),
+            TransactionBinaryEncoding::Base64,
+        )
+        .unwrap_err();
+        assert!(v0_error.message.contains("max: 1232 bytes"));
+
         let mut oversized_v1 = vec![0; MAX_TRANSACTION_SIZE + 1];
         oversized_v1[0] = V1_PREFIX;
         let v1_error = decode_and_deserialize::<VersionedTransaction>(
@@ -366,14 +444,6 @@ mod tests {
         )
         .unwrap_err();
         assert!(v1_error.message.contains("max: 4096 bytes"));
-
-        let oversized_legacy = vec![0; PACKET_DATA_SIZE + 1];
-        let legacy_error = decode_and_deserialize::<VersionedTransaction>(
-            BASE64_STANDARD.encode(oversized_legacy),
-            TransactionBinaryEncoding::Base64,
-        )
-        .unwrap_err();
-        assert!(legacy_error.message.contains("max: 1232 bytes"));
     }
 
     #[test]
