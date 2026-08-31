@@ -338,6 +338,8 @@ pub struct SurfnetSvm {
     pub non_circulating_supply: u64,
     pub non_circulating_accounts: Vec<String>,
     pub genesis_config: GenesisConfig,
+    /// Genesis hash fetched from the remote RPC during startup, when configured.
+    pub cached_genesis_hash: Option<Hash>,
     pub inflation: Inflation,
     /// A global monotonically increasing atomic number, which can be used to tell the order of the account update.
     /// For example, when an account is updated in the same slot multiple times,
@@ -608,6 +610,7 @@ impl SurfnetSvm {
             non_circulating_supply: self.non_circulating_supply,
             non_circulating_accounts: self.non_circulating_accounts.clone(),
             genesis_config: self.genesis_config.clone(),
+            cached_genesis_hash: self.cached_genesis_hash,
             inflation: self.inflation,
             write_version: self.write_version,
             feature_set: self.feature_set.clone(),
@@ -1065,6 +1068,7 @@ impl SurfnetSvm {
             non_circulating_supply: 0,
             non_circulating_accounts: Vec::new(),
             genesis_config: GenesisConfig::default(),
+            cached_genesis_hash: None,
             inflation: Inflation::default(),
             write_version: 0,
             registered_idls: registered_idls_db,

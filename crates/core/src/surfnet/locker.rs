@@ -260,14 +260,16 @@ impl SurfnetSvmLocker {
             return Ok(());
         };
 
-        let (mut epoch_info, epoch_schedule) = {
+        let (mut epoch_info, epoch_schedule, genesis_hash) = {
             let epoch_info = remote_client.get_epoch_info().await?;
             let epoch_schedule = remote_client.get_epoch_schedule().await?;
-            (epoch_info, epoch_schedule)
+            let genesis_hash = remote_client.get_genesis_hash().await?;
+            (epoch_info, epoch_schedule, genesis_hash)
         };
         epoch_info.transaction_count = None;
 
         self.with_svm_writer(move |svm_writer| {
+            svm_writer.cached_genesis_hash = Some(genesis_hash);
             svm_writer.initialize(epoch_info, epoch_schedule);
         });
         Ok(())
@@ -3816,19 +3818,31 @@ impl SurfnetSvmLocker {
     }
 
     pub fn get_genesis_hash_local(&self) -> SvmAccessContext<Hash> {
-        self.with_contextualized_svm_reader(|svm_reader| svm_reader.genesis_config.hash())
+        self.with_contextualized_svm_reader(|svm_reader| {
+            svm_reader
+                .cached_genesis_hash
+                .unwrap_or_else(|| svm_reader.genesis_config.hash())
+        })
     }
 
     pub async fn get_genesis_hash(
         &self,
         remote_ctx: &Option<SurfnetRemoteClient>,
     ) -> SurfpoolContextualizedResult<Hash> {
-        if let Some(client) = remote_ctx {
+        if self.with_svm_reader(|svm_reader| svm_reader.cached_genesis_hash.is_none())
+            && let Some(client) = remote_ctx
+        {
             let remote_hash = client.get_genesis_hash().await?;
-            Ok(self.with_contextualized_svm_reader(|_| remote_hash))
-        } else {
-            Ok(self.get_genesis_hash_local())
+            self.with_svm_writer(|svm_writer| {
+                // Startup normally populates this first. Keep the check so a concurrent
+                // cache-miss request cannot replace a value that another request just stored.
+                if svm_writer.cached_genesis_hash.is_none() {
+                    svm_writer.cached_genesis_hash = Some(remote_hash);
+                }
+            });
         }
+
+        Ok(self.get_genesis_hash_local())
     }
 }
 
@@ -4559,13 +4573,25 @@ pub fn format_ui_amount(amount: u64, decimals: u8) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::{
+        collections::HashMap,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
+    use async_trait::async_trait;
     use solana_account::Account;
     use solana_account_decoder::UiAccountEncoding;
+    use solana_client::{
+        nonblocking::rpc_client::RpcClient, rpc_client::RpcClientConfig, rpc_request::RpcRequest,
+    };
     use solana_epoch_schedule::EpochSchedule;
     use solana_keypair::Keypair;
     use solana_message::{Message, VersionedMessage};
+    use solana_rpc_client::rpc_sender::{RpcSender, RpcTransportStats};
+    use solana_rpc_client_api::client_error::Result as ClientResult;
     use solana_sdk_ids::system_program;
     use solana_signer::Signer;
     use solana_system_interface::instruction as system_instruction;
@@ -4597,6 +4623,87 @@ mod tests {
             0x00, 0x00, 0x00, 0xa0, 0x7c, 0x1a, 0x38, 0x63, 0x0a, 0x00, 0x00, 0x94, 0xa6, 0xb9,
             0xb5, 0x00, 0x00, 0x00, 0x00, 0x8c, 0x5e, 0x6d, 0x16, 0x00, 0x00, 0x00, 0x00, 0x00,
         ]
+    }
+
+    struct StartupRpcSender {
+        genesis_hash: Hash,
+        requests: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl RpcSender for StartupRpcSender {
+        async fn send(
+            &self,
+            request: RpcRequest,
+            _params: serde_json::Value,
+        ) -> ClientResult<serde_json::Value> {
+            self.requests.fetch_add(1, Ordering::Relaxed);
+
+            Ok(match request {
+                RpcRequest::GetEpochInfo => serde_json::json!({
+                    "epoch": 1,
+                    "slotIndex": 2,
+                    "slotsInEpoch": 432000,
+                    "absoluteSlot": 2,
+                    "blockHeight": 2,
+                    "transactionCount": null,
+                }),
+                RpcRequest::GetEpochSchedule => {
+                    serde_json::to_value(EpochSchedule::without_warmup()).unwrap()
+                }
+                RpcRequest::GetGenesisHash => serde_json::json!(self.genesis_hash.to_string()),
+                _ => panic!("unexpected startup RPC request: {request:?}"),
+            })
+        }
+
+        fn get_transport_stats(&self) -> RpcTransportStats {
+            RpcTransportStats::default()
+        }
+
+        fn url(&self) -> String {
+            "http://startup.example".to_string()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn initialize_fetches_and_caches_genesis_hash() {
+        let (surfnet_svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+        let svm_locker = SurfnetSvmLocker::new(surfnet_svm);
+        let expected_hash = Hash::new_from_array([8; 32]);
+        let requests = Arc::new(AtomicUsize::new(0));
+        let remote_client = SurfnetRemoteClient {
+            client: RpcClient::new_sender(
+                StartupRpcSender {
+                    genesis_hash: expected_hash,
+                    requests: Arc::clone(&requests),
+                },
+                RpcClientConfig::default(),
+            ),
+        };
+        let remote_ctx = Some(remote_client);
+
+        svm_locker
+            .initialize(&remote_ctx)
+            .await
+            .expect("startup RPC calls should succeed");
+
+        assert_eq!(
+            svm_locker
+                .get_genesis_hash(&remote_ctx)
+                .await
+                .expect("cached genesis hash should be available")
+                .inner,
+            expected_hash
+        );
+        assert_eq!(
+            svm_locker
+                .get_genesis_hash(&remote_ctx)
+                .await
+                .expect("cached genesis hash should remain available")
+                .inner,
+            expected_hash
+        );
+        assert_eq!(requests.load(Ordering::Relaxed), 3);
     }
 
     #[cfg(feature = "sqlite")]
@@ -7013,6 +7120,26 @@ mod tests {
             886_u64 * 432_000,
             "first slot should align with mainnet epoch boundaries when warmup is disabled"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_genesis_hash_uses_cached_hash_when_remote_is_configured() {
+        let (surfnet_svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+        let svm_locker = SurfnetSvmLocker::new(surfnet_svm);
+        let expected_hash = Hash::new_from_array([7; 32]);
+
+        svm_locker.with_svm_writer(|svm_writer| {
+            svm_writer.cached_genesis_hash = Some(expected_hash);
+        });
+
+        // If the cache were ignored, this deliberately unreachable endpoint would be queried.
+        let remote_client = SurfnetRemoteClient::new("http://127.0.0.1:1");
+        let result = svm_locker
+            .get_genesis_hash(&Some(remote_client))
+            .await
+            .expect("cached genesis hash should not require the remote RPC");
+
+        assert_eq!(result.inner, expected_hash);
     }
 
     #[test]
