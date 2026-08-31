@@ -85,8 +85,8 @@ juniper_codegen = { version = "0.16.0", default-features = false }
 juniper_graphql_ws = { version = "0.4.0", default-features = false }
 lazy_static = "1.5.0"
 libloading = "0.7.4"
-litesvm = { version = "0.14.0", features = ["nodejs-internal", "precompiles"] }
-litesvm-token = "0.14.0"
+litesvm = { git = "https://github.com/MicaiahReid/litesvm", branch = "feat/txv1", features = ["nodejs-internal", "precompiles"] }
+litesvm-token = { git = "https://github.com/MicaiahReid/litesvm", branch = "feat/txv1" }
 log = "0.4.27"
 mime_guess = { version = "2.0.4", default-features = false }
 mustache = "0.9.0"
@@ -186,7 +186,11 @@ txtx-core = { version = "0.4.18" }
 txtx-gql = { version = "0.3.11" }
 txtx-supervisor-ui = { version = "0.2.11", default-features = false }
 
-# [patch.crates-io]
+[patch.crates-io]
+# Agave 4.2 pins solana-keypair 3.1.2 while other Solana 4.2 crates require
+# solana-signature 3.4.1; the local patch keeps that mix compiling.
+solana-keypair = { path = "crates/vendor/solana-keypair" }
+
 # Local
 # txtx-addon-kit = { path = "../txtx/crates/txtx-addon-kit" }
 # txtx-core = { path = "../txtx/crates/txtx-core" }

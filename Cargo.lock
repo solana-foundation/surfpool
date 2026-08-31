@@ -5011,9 +5011,8 @@ checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
 
 [[package]]
 name = "litesvm"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75f63c450e355f92115e6ef13177bd53e22a0ffc16638d81ae282c1379c5364a"
+version = "0.15.3"
+source = "git+https://github.com/MicaiahReid/litesvm?branch=feat%2Ftxv1#025e03f13d3a388043037e2743811e88c2d3d639"
 dependencies = [
  "agave-feature-set",
  "agave-precompiles",
@@ -5038,6 +5037,7 @@ dependencies = [
  "solana-epoch-schedule 3.2.0",
  "solana-feature-gate-interface 4.0.0",
  "solana-fee",
+ "solana-fee-calculator 3.2.2",
  "solana-fee-structure",
  "solana-hash 4.5.0",
  "solana-instruction 3.4.0",
@@ -5055,8 +5055,10 @@ dependencies = [
  "solana-program-error 3.0.1",
  "solana-program-runtime",
  "solana-rent 4.3.0",
+ "solana-runtime-transaction",
  "solana-sdk-ids 3.1.0",
  "solana-sha256-hasher 3.1.0",
+ "solana-short-vec 3.2.2",
  "solana-signature",
  "solana-signer",
  "solana-slot-hashes 3.1.0",
@@ -5080,9 +5082,8 @@ dependencies = [
 
 [[package]]
 name = "litesvm-token"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "86cce45acda3911a98a578f1d1af19b8a357cb255f25230469b66439fbc011f1"
+version = "0.15.3"
+source = "git+https://github.com/MicaiahReid/litesvm?branch=feat%2Ftxv1#025e03f13d3a388043037e2743811e88c2d3d639"
 dependencies = [
  "litesvm",
  "smallvec",
@@ -9126,8 +9127,6 @@ dependencies = [
 [[package]]
 name = "solana-keypair"
 version = "3.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "263d614c12aa267a3278703175fd6440552ca61bc960b5a02a4482720c53438b"
 dependencies = [
  "ed25519-dalek 2.2.0",
  "ed25519-dalek-bip32",

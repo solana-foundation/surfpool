@@ -1,0 +1,41 @@
+[package]
+name = "solana-keypair"
+description = "Concrete implementation of a Solana `Signer`."
+documentation = "https://docs.rs/solana-keypair"
+version = "3.1.2"
+rust-version = "1.81.0"
+authors = { workspace = true }
+repository = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+edition = { workspace = true }
+
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
+all-features = true
+rustdoc-args = ["--cfg=docsrs"]
+
+[features]
+seed-derivable = [
+    "dep:solana-derivation-path",
+    "dep:solana-seed-derivable",
+    "dep:ed25519-dalek-bip32",
+]
+
+[dependencies]
+ed25519-dalek = { workspace = true, features = ["rand_core"] }
+ed25519-dalek-bip32 = { workspace = true, optional = true }
+five8 = { workspace = true }
+five8_core = { workspace = true } # needed to force five8 to use the newest version with `core::error::Error` support
+rand = { workspace = true }
+solana-address = { workspace = true, features = ["decode"] }
+solana-derivation-path = { workspace = true, optional = true }
+solana-seed-derivable = { workspace = true, optional = true }
+solana-seed-phrase = { workspace = true }
+solana-signature = { workspace = true, features = ["std", "verify"] }
+solana-signer = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+static_assertions = { workspace = true }
+tiny-bip39 = { workspace = true }
