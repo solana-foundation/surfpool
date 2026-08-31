@@ -428,8 +428,7 @@ mod tests {
                     let table = table.clone();
                     let barrier = barrier.clone();
                     std::thread::spawn(move || {
-                        let backend =
-                            PostgresBackend::open(&url, &random_surfnet_id()).unwrap();
+                        let backend = PostgresBackend::open(&url, &random_surfnet_id()).unwrap();
                         barrier.wait();
                         backend.open_store::<String, String>(&table).map(|_| ())
                     })
@@ -476,12 +475,10 @@ mod tests {
     fn ddl_lock_is_free(url: &str, table: &str) -> bool {
         let mut conn = diesel::PgConnection::establish(url).unwrap();
         conn.transaction(|conn| {
-            sql_query(
-                "SELECT pg_try_advisory_xact_lock(hashtext('surfpool:ddl:' || $1)) AS free",
-            )
-            .bind::<Text, _>(table)
-            .get_result::<LockProbe>(conn)
-            .map(|row| row.free)
+            sql_query("SELECT pg_try_advisory_xact_lock(hashtext('surfpool:ddl:' || $1)) AS free")
+                .bind::<Text, _>(table)
+                .get_result::<LockProbe>(conn)
+                .map(|row| row.free)
         })
         .unwrap()
     }
