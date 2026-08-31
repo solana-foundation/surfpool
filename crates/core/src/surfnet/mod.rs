@@ -77,9 +77,16 @@ pub struct GeyserEntryInfo {
     pub starting_transaction_index: usize,
 }
 
+/// Transaction data forwarded to Geyser plugins.
+pub struct GeyserTransactionEvent {
+    pub transaction_with_status_meta: TransactionWithStatusMeta,
+    pub versioned_transaction: Option<VersionedTransaction>,
+    pub index: usize,
+}
+
 #[allow(clippy::large_enum_variant)]
 pub enum GeyserEvent {
-    NotifyTransaction(TransactionWithStatusMeta, Option<VersionedTransaction>),
+    NotifyTransaction(GeyserTransactionEvent),
     UpdateAccount(GeyserAccountUpdate),
     /// Account update sent at startup (before block production begins).
     /// These updates should be sent to geyser plugins with is_startup=true.

@@ -81,9 +81,9 @@ use uuid::Uuid;
 use super::{
     AccountSource, AccountSubscriptionData, BlockHeader, BlockIdentifier, CoupledAccount,
     FINALIZATION_SLOT_THRESHOLD, GetAccountResult, GeyserBlockMetadata, GeyserEntryInfo,
-    GeyserEvent, GeyserSlotStatus, LocalSignatureStatus, LocalSignatureStatusOrSubscription,
-    ProgramSubscriptionData, SignatureSubscriptionData, SignatureSubscriptionType,
-    SlotsUpdatesSubscriptionData, remote::SurfnetRemoteClient,
+    GeyserEvent, GeyserSlotStatus, GeyserTransactionEvent, LocalSignatureStatus,
+    LocalSignatureStatusOrSubscription, ProgramSubscriptionData, SignatureSubscriptionData,
+    SignatureSubscriptionType, SlotsUpdatesSubscriptionData, remote::SurfnetRemoteClient,
 };
 use crate::{
     error::{AirdropError, SurfpoolError, SurfpoolResult},
@@ -427,10 +427,11 @@ fn remove_pubkey_from_index(
 /// can be drained on bundle commit to replay events onto the original VM. Construct via
 /// [`SurfnetSvm::clone_for_bundle_sandbox`] and consume via [`SurfnetSvm::commit_sandbox`] on
 /// success or simply drop on failure to discard all in-progress state.
-pub struct BundleSandbox {
-    pub svm: SurfnetSvm,
-    pub geyser_rx: Receiver<GeyserEvent>,
-    pub simnet_rx: Receiver<SimnetEvent>,
+pub(crate) struct BundleSandbox {
+    pub(crate) svm: SurfnetSvm,
+    pub(crate) geyser_rx: Receiver<GeyserEvent>,
+    pub(crate) simnet_rx: Receiver<SimnetEvent>,
+    pub(crate) confirmation_queue_base_len: usize,
 }
 
 /// Generic helper: drain the overlay state of `sandbox_storage` (which must be an
@@ -664,7 +665,8 @@ impl SurfnetSvm {
     /// On bundle failure, simply dropping the returned [`BundleSandbox`] discards every
     /// buffered event, every overlay write, and the cloned `LiteSVM` state — the original
     /// VM is left byte-identical to its pre-bundle state.
-    pub fn clone_for_bundle_sandbox(&self) -> BundleSandbox {
+    pub(crate) fn clone_for_bundle_sandbox(&self) -> BundleSandbox {
+        let confirmation_queue_base_len = self.transactions_queued_for_confirmation.len();
         let mut svm = self.clone_for_profiling();
         let (geyser_tx, geyser_rx) = crossbeam_channel::unbounded();
         let (simnet_tx, simnet_rx) = SimnetEventsTx::unbounded();
@@ -674,6 +676,7 @@ impl SurfnetSvm {
             svm,
             geyser_rx,
             simnet_rx,
+            confirmation_queue_base_len,
         }
     }
 
@@ -681,8 +684,8 @@ impl SurfnetSvm {
     ///
     /// This is the second half of the atomic Jito bundle pipeline. It must be invoked only
     /// after every transaction in the bundle succeeded inside the sandbox. The caller must
-    /// hold an exclusive writer guard on `self`'s `SurfnetSvmLocker` so that no other RPC
-    /// path can observe a half-committed state.
+    /// retain the same exclusive writer guard on `self`'s `SurfnetSvmLocker` from sandbox
+    /// creation through this commit so no live state can diverge from the sandbox base.
     ///
     /// Order of operations is **state mutations first, side-effects second**:
     ///   1. Drain every overlay-wrapped storage field from the sandbox onto `self`'s
@@ -693,9 +696,9 @@ impl SurfnetSvm {
     ///   3. Drain the sandbox's account-DB overlay (`inner.db`) onto `self.inner.db` so any
     ///      SQLite-backed account persistence reflects the bundle's mutations.
     ///   4. Pull forward counters (`write_version`, `transactions_processed`), per-account
-    ///      update slots, pending confirmation/finalization queues, perf samples, and the
-    ///      recent-blockhash deque from the sandbox.
-    ///   5. Drain the sandbox's buffered geyser events; replay each onto `self.geyser_events_tx`.
+    ///      update slots, perf samples, and the recent-blockhash deque from the sandbox. Append
+    ///      only confirmation entries created in the sandbox.
+    ///   5. Replay the sandbox's buffered Geyser events with their original indices.
     ///      For each `UpdateAccount` event, also fire `notify_account_subscribers` /
     ///      `notify_program_subscribers` on `self` (the sandbox's registries were emptied,
     ///      so those notifications could not have been delivered during sandbox execution).
@@ -708,7 +711,7 @@ impl SurfnetSvm {
     ///      ladder identically to txs submitted via `sendTransaction`).
     ///
     /// Returns the ordered list of signatures committed by the bundle.
-    pub fn commit_sandbox(
+    pub(crate) fn commit_sandbox(
         &mut self,
         sandbox: BundleSandbox,
         bundle_status_tx: Sender<TransactionStatusEvent>,
@@ -717,7 +720,21 @@ impl SurfnetSvm {
             mut svm,
             geyser_rx,
             simnet_rx,
+            confirmation_queue_base_len,
         } = sandbox;
+
+        let sandbox_slot = svm.get_latest_absolute_slot();
+        let live_slot = self.get_latest_absolute_slot();
+        if sandbox_slot != live_slot {
+            warn!(
+                "Rejecting bundle sandbox with mismatched slot: sandbox_slot={}, live_slot={}",
+                sandbox_slot, live_slot
+            );
+            return Err(SurfpoolError::bundle_sandbox_slot_mismatch(
+                sandbox_slot,
+                live_slot,
+            ));
+        }
 
         // 1. Drain all overlay storages onto self's real storages.
         commit_overlay_storage(svm.blocks.as_ref(), self.blocks.as_mut())?;
@@ -786,11 +803,12 @@ impl SurfnetSvm {
         self.perf_samples = svm.perf_samples.clone();
         self.recent_blockhashes = svm.recent_blockhashes.clone();
 
-        // Push sandbox's queued txs onto self's queues, rewriting the per-tx status channel
-        // to the bundle's status channel so the runloop's Confirmed/Finalized promotions
-        // flow through a single channel (the caller drops the receiver).
+        // Append only confirmation entries created in the sandbox.
         let mut signatures = Vec::new();
-        for (tx, _sandbox_status_tx, err) in svm.transactions_queued_for_confirmation.drain(..) {
+        for (tx, _sandbox_status_tx, err) in svm
+            .transactions_queued_for_confirmation
+            .drain(confirmation_queue_base_len..)
+        {
             signatures.push(tx.signatures[0]);
             self.transactions_queued_for_confirmation.push_back((
                 tx,
@@ -798,17 +816,6 @@ impl SurfnetSvm {
                 err,
             ));
         }
-        for (slot, tx, _sandbox_status_tx, err) in
-            svm.transactions_queued_for_finalization.drain(..)
-        {
-            self.transactions_queued_for_finalization.push_back((
-                slot,
-                tx,
-                bundle_status_tx.clone(),
-                err,
-            ));
-        }
-
         // 5. Drain buffered geyser events; replay onto self's real channel; for each
         //    UpdateAccount, also fire account/program subscribers on self's registries.
         while let Ok(event) = geyser_rx.try_recv() {
@@ -1196,39 +1203,48 @@ impl SurfnetSvm {
                 )),
             };
 
+            let transaction_with_status_meta = TransactionWithStatusMeta {
+                slot,
+                transaction: tx.clone(),
+                meta: TransactionStatusMeta {
+                    status: Ok(()),
+                    fee: 5000,
+                    pre_balances: vec![
+                        airdrop_account_before.lamports,
+                        recipient_account_before.lamports,
+                        system_account_before.lamports,
+                    ],
+                    post_balances: vec![
+                        airdrop_account_after.lamports,
+                        recipient_account_after.lamports,
+                        system_account_after.lamports,
+                    ],
+                    inner_instructions: Some(vec![]),
+                    log_messages: Some(tx_result.logs.clone()),
+                    pre_token_balances: Some(vec![]),
+                    post_token_balances: Some(vec![]),
+                    rewards: Some(vec![]),
+                    loaded_addresses: LoadedAddresses::default(),
+                    return_data: Some(tx_result.return_data.clone()),
+                    compute_units_consumed: Some(tx_result.compute_units_consumed),
+                    cost_units: None,
+                },
+            };
             self.transactions.store(
                 tx.get_signature().to_string(),
                 SurfnetTransactionStatus::processed(
-                    TransactionWithStatusMeta {
-                        slot,
-                        transaction: tx.clone(),
-                        meta: TransactionStatusMeta {
-                            status: Ok(()),
-                            fee: 5000,
-                            pre_balances: vec![
-                                airdrop_account_before.lamports,
-                                recipient_account_before.lamports,
-                                system_account_before.lamports,
-                            ],
-                            post_balances: vec![
-                                airdrop_account_after.lamports,
-                                recipient_account_after.lamports,
-                                system_account_after.lamports,
-                            ],
-                            inner_instructions: Some(vec![]),
-                            log_messages: Some(tx_result.logs.clone()),
-                            pre_token_balances: Some(vec![]),
-                            post_token_balances: Some(vec![]),
-                            rewards: Some(vec![]),
-                            loaded_addresses: LoadedAddresses::default(),
-                            return_data: Some(tx_result.return_data.clone()),
-                            compute_units_consumed: Some(tx_result.compute_units_consumed),
-                            cost_units: None,
-                        },
-                    },
+                    transaction_with_status_meta.clone(),
                     HashSet::from([*pubkey]),
                 ),
             )?;
+            let transaction_index = self.transactions_queued_for_confirmation.len();
+            let _ = self.geyser_events_tx.send(GeyserEvent::NotifyTransaction(
+                GeyserTransactionEvent {
+                    transaction_with_status_meta,
+                    versioned_transaction: Some(tx.clone()),
+                    index: transaction_index,
+                },
+            ));
             self.notify_signature_subscribers(
                 SignatureSubscriptionType::processed(),
                 tx.get_signature(),
@@ -4236,6 +4252,91 @@ mod tests {
                 .is_err()
         );
         assert!(!startup.has_changed().unwrap());
+    }
+
+    #[test]
+    fn airdrops_emit_ordered_geyser_transaction_indices() {
+        let (mut svm, _events_rx, geyser_rx) = SurfnetSvm::default();
+        let recipients = [Pubkey::new_unique(), Pubkey::new_unique()];
+        let signatures = recipients.map(|recipient| {
+            svm.airdrop(&recipient, 1_000_000)
+                .expect("airdrop should complete")
+                .expect("airdrop should succeed")
+                .signature
+        });
+
+        let notifications = geyser_rx
+            .try_iter()
+            .filter_map(|event| match event {
+                GeyserEvent::NotifyTransaction(event) => Some((
+                    event.transaction_with_status_meta.transaction.signatures[0],
+                    event.index,
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(notifications, vec![(signatures[0], 0), (signatures[1], 1)]);
+    }
+
+    #[test]
+    fn bundle_commit_rejects_sandbox_from_previous_slot_before_side_effects() {
+        let (mut live_svm, _events_rx, live_geyser_rx) = SurfnetSvm::default();
+        let recipient = Pubkey::new_unique();
+        let mut sandbox = live_svm.clone_for_bundle_sandbox();
+
+        let sandbox_slot = sandbox.svm.get_latest_absolute_slot();
+        let sandbox_airdrop = sandbox
+            .svm
+            .airdrop(&recipient, 1_000_000)
+            .expect("sandbox airdrop should succeed")
+            .expect("sandbox airdrop should return a transaction");
+
+        live_svm
+            .confirm_current_block()
+            .expect("live slot should advance");
+        let live_slot = live_svm.get_latest_absolute_slot();
+        assert_eq!(live_slot, sandbox_slot + 1);
+
+        let expected_chain_tip = live_svm.chain_tip.clone();
+        let expected_transactions_processed = live_svm.transactions_processed;
+        let expected_write_version = live_svm.write_version;
+        let expected_confirmation_queue_len = live_svm.transactions_queued_for_confirmation.len();
+        let (bundle_status_tx, _bundle_status_rx) = unbounded();
+
+        let error = live_svm
+            .commit_sandbox(sandbox, bundle_status_tx)
+            .expect_err("a sandbox from a closed slot must not commit");
+
+        assert!(error.to_string().contains(&format!(
+            "Bundle sandbox slot {sandbox_slot} does not match live slot {live_slot}"
+        )));
+        assert_eq!(live_svm.get_latest_absolute_slot(), live_slot);
+        assert_eq!(live_svm.chain_tip, expected_chain_tip);
+        assert_eq!(
+            live_svm.transactions_processed,
+            expected_transactions_processed
+        );
+        assert_eq!(live_svm.write_version, expected_write_version);
+        assert_eq!(
+            live_svm.transactions_queued_for_confirmation.len(),
+            expected_confirmation_queue_len
+        );
+        assert!(
+            live_svm
+                .get_account(&recipient)
+                .expect("live account lookup should succeed")
+                .is_none(),
+            "stale sandbox account state must not reach the live SVM"
+        );
+        assert!(live_geyser_rx.try_iter().all(|event| {
+            !matches!(
+                event,
+                GeyserEvent::NotifyTransaction(event)
+                    if event.transaction_with_status_meta.transaction.signatures[0]
+                        == sandbox_airdrop.signature
+            )
+        }));
     }
 
     fn build_transfer_transaction(

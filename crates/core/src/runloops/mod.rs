@@ -733,13 +733,13 @@ fn start_geyser_runloop(
                     Err(e) => {
                         break format!("Failed to read new transaction to send to Geyser plugin: {e}");
                     },
-                    Ok(GeyserEvent::NotifyTransaction(transaction_with_status_meta, versioned_transaction)) => {
+                    Ok(GeyserEvent::NotifyTransaction(event)) => {
 
                         if !indexing_enabled {
                             continue;
                         }
 
-                        let transaction = match versioned_transaction {
+                        let transaction = match event.versioned_transaction {
                             Some(tx) => tx,
                             None => {
                                 log_warn("Unable to index sanitized transaction".to_string());
@@ -751,13 +751,13 @@ fn start_geyser_runloop(
                             signature: &transaction.signatures[0],
                             is_vote: false,
                             transaction: &transaction,
-                            transaction_status_meta: &transaction_with_status_meta.meta,
-                            index: 0,
+                            transaction_status_meta: &event.transaction_with_status_meta.meta,
+                            index: event.index,
                             message_hash: &transaction.message.hash(),
                         };
 
                         for plugin in managed_plugins.iter().map(|p| &*p.plugin) {
-                            if let Err(e) = plugin.notify_transaction(ReplicaTransactionInfoVersions::V0_0_3(&transaction_replica), transaction_with_status_meta.slot) {
+                            if let Err(e) = plugin.notify_transaction(ReplicaTransactionInfoVersions::V0_0_3(&transaction_replica), event.transaction_with_status_meta.slot) {
                                 log_error(format!("Failed to notify Geyser plugin of new transaction: {:?}", e))
                             };
                         }

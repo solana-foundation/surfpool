@@ -65,8 +65,8 @@ use uuid::Uuid;
 
 use super::{
     AccountFactory, AccountSource, CoupledAccount, GetAccountResult, GetTransactionResult,
-    GeyserEvent, LocalSignatureStatusOrSubscription, SignatureSubscriptionType, SurfnetSvm,
-    remote::SurfnetRemoteClient, svm::AccountUpdatePolicy,
+    GeyserEvent, GeyserTransactionEvent, LocalSignatureStatusOrSubscription,
+    SignatureSubscriptionType, SurfnetSvm, remote::SurfnetRemoteClient, svm::AccountUpdatePolicy,
 };
 use crate::{
     error::{AirdropError, SurfpoolError, SurfpoolResult},
@@ -87,12 +87,6 @@ use crate::{
         TimeTravelConfig, TokenAccount, TransactionLoadedAddresses, TransactionWithStatusMeta,
     },
 };
-
-enum ProcessTransactionResult {
-    Success(TransactionMetadata),
-    SimulationFailure(FailedTransactionMetadata),
-    ExecutionFailure(FailedTransactionMetadata),
-}
 
 pub struct SvmAccessContext<T> {
     pub slot: Slot,
@@ -2165,10 +2159,9 @@ impl SurfnetSvmLocker {
 
     #[allow(clippy::too_many_arguments)]
     fn handle_execution_failure(
-        &self,
+        svm_writer: &mut SurfnetSvm,
         failed_transaction_metadata: FailedTransactionMetadata,
         transaction: VersionedTransaction,
-        simulated_slot: Slot,
         pubkeys_from_message: &[Pubkey],
         accounts_before: &[Option<Account>],
         token_accounts_before: &[(usize, TokenAccount)],
@@ -2187,7 +2180,7 @@ impl SurfnetSvmLocker {
 
         let accounts_after = pubkeys_from_message
             .iter()
-            .map(|p| self.with_svm_reader(|svm_reader| svm_reader.inner.get_account(p)))
+            .map(|p| svm_writer.inner.get_account(p))
             .collect::<SurfpoolResult<Vec<Option<Account>>>>()?;
 
         for (pubkey, (before, after)) in pubkeys_from_message
@@ -2195,97 +2188,93 @@ impl SurfnetSvmLocker {
             .zip(accounts_before.iter().zip(accounts_after.iter()))
         {
             if before.ne(&after) {
-                self.with_svm_writer(|svm_writer| {
-                    if let Some(after) = &after {
-                        let _ = svm_writer.update_account_registries(pubkey, after);
-                        svm_writer.notify_account_subscribers(pubkey, &after);
-                        svm_writer.notify_program_subscribers(pubkey, &after);
-                    } else {
-                        svm_writer.notify_account_subscribers(pubkey, &Account::default());
-                        svm_writer.notify_program_subscribers(pubkey, &Account::default());
-                    }
-                });
+                if let Some(after) = &after {
+                    let _ = svm_writer.update_account_registries(pubkey, after);
+                    svm_writer.notify_account_subscribers(pubkey, after);
+                    svm_writer.notify_program_subscribers(pubkey, after);
+                } else {
+                    svm_writer.notify_account_subscribers(pubkey, &Account::default());
+                    svm_writer.notify_program_subscribers(pubkey, &Account::default());
+                }
             }
         }
 
-        let token_mints = self
-            .with_svm_reader(|svm_reader| {
-                token_accounts_before
-                    .iter()
-                    .map(|(_, a)| {
-                        svm_reader
-                            .token_mints
-                            .get(&a.mint().to_string())
-                            .ok()
-                            .flatten()
-                            .ok_or(SurfpoolError::token_mint_not_found(a.mint()))
-                    })
-                    .collect::<Result<Vec<_>, SurfpoolError>>()
+        let token_mints = token_accounts_before
+            .iter()
+            .map(|(_, a)| {
+                svm_writer
+                    .token_mints
+                    .get(&a.mint().to_string())
+                    .ok()
+                    .flatten()
+                    .ok_or(SurfpoolError::token_mint_not_found(a.mint()))
             })
+            .collect::<Result<Vec<_>, SurfpoolError>>()
             .unwrap_or_default();
 
         if do_propagate {
             let meta_canonical = convert_transaction_metadata_from_canonical(&meta);
-            let simnet_events_tx = self.simnet_events_tx();
-            simnet_events_tx.error(format!("Transaction execution failed: {}", err));
+            svm_writer
+                .simnet_events_tx
+                .error(format!("Transaction execution failed: {}", err));
             let _ = status_tx.try_send(TransactionStatusEvent::ExecutionFailure((
                 err.clone(),
                 meta_canonical.clone(),
             )));
 
-            self.with_svm_writer(|svm_writer| {
-                let transaction_with_status_meta = TransactionWithStatusMeta::from_failure(
-                    simulated_slot,
-                    transaction.clone(),
-                    &FailedTransactionMetadata {
-                        err: err.clone(),
-                        meta: meta.clone(),
-                    },
-                    accounts_before,
-                    &accounts_after,
-                    token_accounts_before,
-                    token_mints,
-                    token_programs,
-                    loaded_addresses.clone().unwrap_or_default(),
-                );
-                svm_writer.transactions.store(
-                    signature.to_string(),
-                    SurfnetTransactionStatus::processed(
-                        transaction_with_status_meta.clone(),
-                        HashSet::new(),
-                    ),
-                )?;
+            let slot = svm_writer.get_latest_absolute_slot();
+            let transaction_index = svm_writer.transactions_queued_for_confirmation.len();
+            let transaction_with_status_meta = TransactionWithStatusMeta::from_failure(
+                slot,
+                transaction.clone(),
+                &FailedTransactionMetadata {
+                    err: err.clone(),
+                    meta: meta.clone(),
+                },
+                accounts_before,
+                &accounts_after,
+                token_accounts_before,
+                token_mints,
+                token_programs,
+                loaded_addresses.clone().unwrap_or_default(),
+            );
+            svm_writer.transactions.store(
+                signature.to_string(),
+                SurfnetTransactionStatus::processed(
+                    transaction_with_status_meta.clone(),
+                    HashSet::new(),
+                ),
+            )?;
 
-                let _ = svm_writer
-                    .geyser_events_tx
-                    .send(GeyserEvent::NotifyTransaction(
-                        transaction_with_status_meta,
-                        Some(transaction.clone()),
-                    ));
+            let _ = svm_writer
+                .geyser_events_tx
+                .send(GeyserEvent::NotifyTransaction(GeyserTransactionEvent {
+                    transaction_with_status_meta,
+                    versioned_transaction: Some(transaction.clone()),
+                    index: transaction_index,
+                }));
 
-                svm_writer.transactions_queued_for_confirmation.push_back((
-                    transaction.clone(),
-                    status_tx.clone(),
-                    Some(err.clone()),
-                ));
+            svm_writer.transactions_queued_for_confirmation.push_back((
+                transaction.clone(),
+                status_tx.clone(),
+                Some(err.clone()),
+            ));
 
-                svm_writer.notify_signature_subscribers(
-                    SignatureSubscriptionType::processed(),
-                    &signature,
-                    simulated_slot,
-                    Some(err.clone()),
-                );
-                svm_writer.notify_logs_subscribers(
-                    &signature,
-                    Some(err.clone()),
-                    log_messages.clone(),
-                    CommitmentLevel::Processed,
-                );
-                svm_writer
-                    .simnet_events_tx
-                    .transaction_processed(meta_canonical, Some(err));
-                Ok::<(), SurfpoolError>(())
-            })?;
+            svm_writer.notify_signature_subscribers(
+                SignatureSubscriptionType::processed(),
+                &signature,
+                slot,
+                Some(err.clone()),
+            );
+            svm_writer.notify_logs_subscribers(
+                &signature,
+                Some(err.clone()),
+                log_messages.clone(),
+                CommitmentLevel::Processed,
+            );
+            svm_writer
+                .simnet_events_tx
+                .transaction_processed(meta_canonical, Some(err));
         }
         Ok(ProfileResult::new(
             pre_execution_capture,
@@ -2298,10 +2287,9 @@ impl SurfnetSvmLocker {
 
     #[allow(clippy::too_many_arguments)]
     fn handle_execution_success(
-        &self,
+        svm_writer: &mut SurfnetSvm,
         transaction_metadata: TransactionMetadata,
         transaction: VersionedTransaction,
-        simulated_slot: Slot,
         pubkeys_from_message: &[Pubkey],
         loaded_addresses: &Option<LoadedAddresses>,
         accounts_before: &[Option<Account>],
@@ -2315,7 +2303,7 @@ impl SurfnetSvmLocker {
         let logs = transaction_metadata.logs.clone();
         let signature = transaction.signatures[0];
 
-        let post_execution_capture = self.with_svm_writer(|svm_writer| {
+        let post_execution_capture = {
             let accounts_after = pubkeys_from_message
                 .iter()
                 .map(|p| svm_writer.inner.get_account_no_db(p))
@@ -2423,10 +2411,12 @@ impl SurfnetSvmLocker {
                 .collect::<Result<Vec<_>, SurfpoolError>>()?;
 
             if do_propagate {
+                let slot = svm_writer.get_latest_absolute_slot();
+                let transaction_index = svm_writer.transactions_queued_for_confirmation.len();
                 let transaction_meta =
                     convert_transaction_metadata_from_canonical(&transaction_metadata);
                 let transaction_with_status_meta = TransactionWithStatusMeta::new(
-                    svm_writer.get_latest_absolute_slot(),
+                    slot,
                     transaction.clone(),
                     transaction_metadata,
                     accounts_before,
@@ -2452,10 +2442,11 @@ impl SurfnetSvmLocker {
 
                 let _ = svm_writer
                     .geyser_events_tx
-                    .send(GeyserEvent::NotifyTransaction(
+                    .send(GeyserEvent::NotifyTransaction(GeyserTransactionEvent {
                         transaction_with_status_meta,
                         versioned_transaction,
-                    ));
+                        index: transaction_index,
+                    }));
 
                 svm_writer.transactions_queued_for_confirmation.push_back((
                     transaction.clone(),
@@ -2466,7 +2457,7 @@ impl SurfnetSvmLocker {
                 svm_writer.notify_signature_subscribers(
                     SignatureSubscriptionType::processed(),
                     &signature,
-                    simulated_slot,
+                    slot,
                     None,
                 );
                 svm_writer.notify_logs_subscribers(
@@ -2481,7 +2472,7 @@ impl SurfnetSvmLocker {
             }
 
             Ok::<ExecutionCapture, SurfpoolError>(post_execution_capture)
-        })?;
+        }?;
 
         Ok(ProfileResult::new(
             pre_execution_capture,
@@ -2507,78 +2498,56 @@ impl SurfnetSvmLocker {
         status_tx: &Sender<TransactionStatusEvent>,
         do_propagate: bool,
     ) -> SurfpoolResult<ProfileResult> {
-        let res = match self
-            .do_process_transaction_internal(transaction.clone(), skip_preflight, sigverify)
-            .await
-        {
-            ProcessTransactionResult::Success(transaction_metadata) => self
-                .handle_execution_success(
-                    transaction_metadata,
-                    transaction,
-                    self.get_latest_absolute_slot(),
-                    transaction_accounts,
-                    loaded_addresses,
-                    accounts_before,
-                    token_accounts_before,
-                    token_programs,
-                    pre_execution_capture,
-                    status_tx,
-                    do_propagate,
-                )?,
-            ProcessTransactionResult::SimulationFailure(failed_transaction_metadata) => self
-                .handle_simulation_failure(
+        if !skip_preflight {
+            if let Err(failed) = self.with_svm_reader(|svm_reader| {
+                svm_reader.simulate_transaction(transaction.clone(), sigverify)
+            }) {
+                return Ok(self.handle_simulation_failure(
                     transaction.signatures[0],
-                    failed_transaction_metadata,
+                    failed,
                     pre_execution_capture,
                     self.get_latest_absolute_slot(),
                     status_tx.clone(),
                     do_propagate,
-                ),
-            ProcessTransactionResult::ExecutionFailure(failed) => self.handle_execution_failure(
-                failed,
-                transaction,
-                self.get_latest_absolute_slot(),
-                transaction_accounts,
-                accounts_before,
-                token_accounts_before,
-                token_programs,
-                loaded_addresses,
-                pre_execution_capture,
-                status_tx.clone(),
-                do_propagate,
-            )?,
-        };
-        Ok(res)
-    }
-
-    async fn do_process_transaction_internal(
-        &self,
-        transaction: VersionedTransaction,
-        skip_preflight: bool,
-        sigverify: bool,
-    ) -> ProcessTransactionResult {
-        // if not skipping preflight, simulate the transaction
-        if !skip_preflight {
-            if let Err(e) = self.with_svm_reader(|svm_reader| {
-                svm_reader
-                    .simulate_transaction(transaction.clone(), sigverify)
-                    .map_err(ProcessTransactionResult::SimulationFailure)
-            }) {
-                return e;
+                ));
             }
         }
 
-        match self.with_svm_writer(|svm_writer| {
-            svm_writer
-                .send_transaction(transaction, false /* cu_analysis_enabled */, sigverify)
-                .map_err(|e| {
-                    debug!("Transaction execution failure: {:?}", e.meta);
-                    ProcessTransactionResult::ExecutionFailure(e)
-                })
-                .map(ProcessTransactionResult::Success)
-        }) {
-            Ok(res) => res,
-            Err(res) => res,
+        let mut svm_writer = self.0.write().await;
+        match svm_writer.send_transaction(
+            transaction.clone(),
+            false, /* cu_analysis_enabled */
+            sigverify,
+        ) {
+            Ok(transaction_metadata) => Self::handle_execution_success(
+                &mut svm_writer,
+                transaction_metadata,
+                transaction,
+                transaction_accounts,
+                loaded_addresses,
+                accounts_before,
+                token_accounts_before,
+                token_programs,
+                pre_execution_capture,
+                status_tx,
+                do_propagate,
+            ),
+            Err(failed) => {
+                debug!("Transaction execution failure: {:?}", failed.meta);
+                Self::handle_execution_failure(
+                    &mut svm_writer,
+                    failed,
+                    transaction,
+                    transaction_accounts,
+                    accounts_before,
+                    token_accounts_before,
+                    token_programs,
+                    loaded_addresses,
+                    pre_execution_capture,
+                    status_tx.clone(),
+                    do_propagate,
+                )
+            }
         }
     }
 }
@@ -5532,7 +5501,7 @@ mod tests {
                 Ok(crate::surfnet::GeyserEvent::UpdateAccount(update)) => {
                     account_updates.push(update);
                 }
-                Ok(crate::surfnet::GeyserEvent::NotifyTransaction(_, _)) => {
+                Ok(crate::surfnet::GeyserEvent::NotifyTransaction(_)) => {
                     got_transaction_notify = true;
                 }
                 Ok(_) => {}
@@ -5567,6 +5536,80 @@ mod tests {
                 "Account update should carry transaction signature"
             );
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn same_slot_transactions_emit_ordered_geyser_indices() {
+        use crossbeam_channel::unbounded;
+        use solana_keypair::Keypair;
+        use solana_message::{Message, VersionedMessage};
+        use solana_signer::Signer;
+        use solana_system_interface::instruction as system_instruction;
+        use solana_transaction::versioned::VersionedTransaction;
+
+        let (svm, _events_rx, geyser_rx) = SurfnetSvm::default();
+        let locker = SurfnetSvmLocker::new(svm);
+        let payer = Keypair::new();
+        let payer_pubkey = payer.pubkey();
+
+        locker
+            .with_svm_writer(|svm| {
+                svm.set_account(
+                    &payer_pubkey,
+                    Account {
+                        lamports: 1_000_000_000,
+                        owner: solana_system_interface::program::id(),
+                        ..Account::default()
+                    },
+                )
+            })
+            .expect("payer funding should succeed");
+        let blockhash = locker.latest_absolute_blockhash();
+        let mut expected_signatures = Vec::new();
+
+        for amount in [1_000_000, 2_000_000_000] {
+            let message = Message::new_with_blockhash(
+                &[system_instruction::transfer(
+                    &payer_pubkey,
+                    &Pubkey::new_unique(),
+                    amount,
+                )],
+                Some(&payer_pubkey),
+                &blockhash,
+            );
+            let transaction = VersionedTransaction::try_new(
+                VersionedMessage::Legacy(message),
+                &[payer.insecure_clone()],
+            )
+            .expect("transaction should sign");
+            expected_signatures.push(transaction.signatures[0]);
+
+            let (status_tx, _status_rx) = unbounded();
+            locker
+                .process_transaction(&None, transaction, status_tx, true, true)
+                .await
+                .expect("transaction processing should complete");
+        }
+
+        let notifications = geyser_rx
+            .try_iter()
+            .filter_map(|event| match event {
+                crate::surfnet::GeyserEvent::NotifyTransaction(event) => Some((
+                    event.transaction_with_status_meta.transaction.signatures[0],
+                    event.index,
+                    event.transaction_with_status_meta.meta.status.is_ok(),
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            notifications,
+            vec![
+                (expected_signatures[0], 0, true),
+                (expected_signatures[1], 1, false),
+            ]
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -85,6 +85,14 @@ impl From<solana_client::client_error::ClientError> for SurfpoolError {
 }
 
 impl SurfpoolError {
+    pub(crate) fn bundle_sandbox_slot_mismatch(sandbox_slot: Slot, live_slot: Slot) -> Self {
+        let mut error = Error::internal_error();
+        error.data = Some(json!(format!(
+            "Bundle sandbox slot {sandbox_slot} does not match live slot {live_slot}"
+        )));
+        Self(error)
+    }
+
     pub fn from_try_send_error<T>(e: TrySendError<T>) -> Self {
         let mut error = Error::internal_error();
         error.data = Some(json!(format!(

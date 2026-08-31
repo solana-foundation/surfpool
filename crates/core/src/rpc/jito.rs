@@ -307,18 +307,15 @@ impl Jito for SurfpoolJitoRpc {
                 decoded_txs.push(tx);
             }
 
-            // -- Phase A: Sandbox execution -------------------------------------------------
-            // Take a brief read lock on the original VM to construct a sandbox whose storages
-            // are overlay-wrapped, whose subscription registries are empty (no live WS leak),
-            // and whose event channels buffer into receivers we hold here.
-            let bundle_sandbox = ctx
-                .svm_locker
-                .with_svm_reader(|svm_reader| svm_reader.clone_for_bundle_sandbox());
+            // Keep the live VM stable while the bundle executes and commits.
+            let mut live_svm_guard = ctx.svm_locker.0.write().await;
+            let bundle_sandbox = live_svm_guard.clone_for_bundle_sandbox();
 
             let BundleSandbox {
                 svm: sandbox_svm,
                 geyser_rx,
                 simnet_rx,
+                confirmation_queue_base_len,
             } = bundle_sandbox;
 
             let sandbox_locker = SurfnetSvmLocker::new(sandbox_svm);
@@ -392,10 +389,8 @@ impl Jito for SurfpoolJitoRpc {
                 }
             }
 
-            // -- Phase B: Atomic commit -----------------------------------------------------
             // All bundle transactions succeeded on the sandbox. Extract the sandbox SVM (the
-            // only remaining Arc reference is the local `sandbox_locker`), reassemble the
-            // BundleSandbox and call commit_sandbox under the original VM's writer lock.
+            // only remaining Arc reference is the local `sandbox_locker`) and commit it.
             let sandbox_svm = match Arc::try_unwrap(sandbox_locker.0) {
                 Ok(rwlock) => rwlock.into_inner(),
                 Err(_) => {
@@ -408,6 +403,7 @@ impl Jito for SurfpoolJitoRpc {
                 svm: sandbox_svm,
                 geyser_rx,
                 simnet_rx,
+                confirmation_queue_base_len,
             };
 
             // Use a discardable status channel for the bundle. The runloop will use it to
@@ -415,15 +411,12 @@ impl Jito for SurfpoolJitoRpc {
             // silently.
             let (bundle_status_tx, _bundle_status_rx) = crossbeam_channel::unbounded();
 
-            ctx.svm_locker
-                .with_svm_writer(move |original| {
-                    original.commit_sandbox(reassembled, bundle_status_tx)
-                })
-                .map_err(|e| {
-                    Error::invalid_params(format!(
-                        "Jito bundle commit failed after successful sandbox execution: {e}"
-                    ))
-                })?;
+            live_svm_guard
+                .commit_sandbox(reassembled, bundle_status_tx)
+                .map_err(Error::from)?;
+
+            // store_bundle reacquires the same lock.
+            drop(live_svm_guard);
 
             // Calculate bundle ID by hashing comma-separated signatures (Jito-compatible)
             // https://github.com/jito-foundation/jito-solana/blob/master/sdk/src/bundle/mod.rs#L21
@@ -708,6 +701,7 @@ impl Jito for SurfpoolJitoRpc {
                 svm: sandbox_svm,
                 geyser_rx: _geyser_rx, // discarded on drop
                 simnet_rx: _simnet_rx, // discarded on drop
+                ..
             } = bundle_sandbox;
             let sandbox_locker = SurfnetSvmLocker::new(sandbox_svm);
 
@@ -1424,6 +1418,104 @@ mod tests {
             bundle_id, expected_bundle_id,
             "Bundle ID should match SHA-256 of comma-separated signatures"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_send_bundle_keeps_slot_stable_through_commit() {
+        let payer = Keypair::new();
+        let setup = TestSetup::new(SurfpoolJitoRpc);
+        let recent_blockhash = setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm| svm.latest_blockhash());
+        let initial_slot = setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm| svm.get_latest_absolute_slot());
+
+        setup
+            .context
+            .svm_locker
+            .0
+            .write()
+            .await
+            .airdrop(&payer.pubkey(), 10 * LAMPORTS_PER_SOL)
+            .expect("airdrop should complete")
+            .expect("airdrop should succeed");
+
+        let transactions = (0..MAX_BUNDLE_SIZE)
+            .map(|_| {
+                build_v0_transaction(
+                    &payer.pubkey(),
+                    &[&payer],
+                    &[system_instruction::transfer(
+                        &payer.pubkey(),
+                        &Pubkey::new_unique(),
+                        LAMPORTS_PER_SOL,
+                    )],
+                    &recent_blockhash,
+                )
+            })
+            .collect::<Vec<_>>();
+        let signatures = transactions
+            .iter()
+            .map(|transaction| transaction.signatures[0])
+            .collect::<Vec<_>>();
+        let encoded_transactions = transactions
+            .iter()
+            .map(|transaction| bs58::encode(bincode::serialize(transaction).unwrap()).into_string())
+            .collect::<Vec<_>>();
+
+        let bundle_context = setup.context.clone();
+        let bundle_task = tokio::spawn(async move {
+            SurfpoolJitoRpc
+                .send_bundle(Some(bundle_context), encoded_transactions, None)
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match setup.context.svm_locker.0.try_write() {
+                    Ok(guard) => drop(guard),
+                    Err(_) => break,
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("sendBundle should lock the live SVM");
+
+        let slot_locker = setup.context.svm_locker.clone();
+        let slot_task = tokio::spawn(async move {
+            slot_locker
+                .0
+                .write()
+                .await
+                .confirm_current_block()
+                .expect("slot advance should succeed");
+        });
+
+        let (bundle_result, slot_result) = tokio::join!(bundle_task, slot_task);
+        bundle_result
+            .expect("sendBundle task should complete")
+            .expect("bundle should commit");
+        slot_result.expect("slot task should complete");
+
+        let transaction_slots = setup.context.svm_locker.with_svm_reader(|svm| {
+            signatures
+                .iter()
+                .map(|signature| {
+                    svm.transactions
+                        .get(&signature.to_string())
+                        .expect("transaction lookup should succeed")
+                        .expect("bundle transaction should be stored")
+                        .expect_processed()
+                        .0
+                        .slot
+                })
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(transaction_slots, vec![initial_slot; MAX_BUNDLE_SIZE]);
     }
 
     #[tokio::test(flavor = "multi_thread")]
