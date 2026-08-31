@@ -187,10 +187,6 @@ txtx-gql = { version = "0.3.11" }
 txtx-supervisor-ui = { version = "0.2.11", default-features = false }
 
 [patch.crates-io]
-# Agave 4.2 pins solana-keypair 3.1.2 while other Solana 4.2 crates require
-# solana-signature 3.4.1; the local patch keeps that mix compiling.
-solana-keypair = { path = "crates/vendor/solana-keypair" }
-
 # Local
 # txtx-addon-kit = { path = "../txtx/crates/txtx-addon-kit" }
 # txtx-core = { path = "../txtx/crates/txtx-core" }
