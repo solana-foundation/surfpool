@@ -27,11 +27,11 @@ resolver = "2"
 [workspace.dependencies]
 actix-cors = "0.7.0"
 actix-web = { version = "4", default-features = false }
-agave-feature-set = { version = "4.0", default-features = false, features = [
+agave-feature-set = { version = "4.2", default-features = false, features = [
     "agave-unstable-api",
 ] }
-agave-geyser-plugin-interface = { version = "4.0", default-features = false }
-agave-reserved-account-keys = { version = "4.0", default-features = false }
+agave-geyser-plugin-interface = { version = "4.2", default-features = false }
+agave-reserved-account-keys = { version = "4.2", default-features = false }
 anchor-lang-idl = "0.1.2"
 ansi_term = "0.12.1"
 anyhow = { version = "1.0.95", default-features = false }
@@ -110,23 +110,23 @@ strum = { version = "0.26", default-features = false, features = ["derive"] }
 solana-account = { version = "4.3", default-features = false }
 solana-account-decoder = { version = "4.0", default-features = false }
 solana-account-decoder-client-types = { version = "4.0", default-features = false }
-solana-address-lookup-table-interface = { version = "3.0", default-features = false }
+solana-address-lookup-table-interface = { version = "~3.1", default-features = false }
 solana-client = { version = "4.0", default-features = false }
-solana-clock = { version = "3.0", default-features = false }
+solana-clock = { version = "~3.1", default-features = false }
 solana-commitment-config = { version = "3.1", default-features = false }
-solana-compute-budget-interface = { version = "3.0", default-features = false }
+solana-compute-budget-interface = { version = "~3.0", default-features = false }
 solana-epoch-info = { version = "3.1", default-features = false }
-solana-epoch-schedule = { version = "3.0", default-features = false }
+solana-epoch-schedule = { version = "~3.2", default-features = false }
 solana-ed25519-program = { version = "3.0", default-features = false }
 solana-feature-gate-interface = { version = "3.1", default-features = false }
 solana-genesis-config = { version = "4.0", default-features = false }
-solana-hash = { version = "4.2", default-features = false }
+solana-hash = { version = "~4.5", default-features = false }
 solana-inflation = { version = "3.0", default-features = false }
-solana-instruction = { version = "3.2", default-features = false }
+solana-instruction = { version = "~3.4", default-features = false }
 solana-keypair = { version = "3.1", default-features = false }
 solana-loader-v3-interface = { version = "6.1", default-features = false }
 solana-message = { version = "4.3", default-features = false }
-solana-nonce = { version = "3.0", default-features = false }
+solana-nonce = { version = "~3.2", default-features = false }
 solana-packet = { version = "4.0", default-features = false }
 solana-program-option = { version = "3.0", default-features = false }
 solana-program-pack = { version = "3.1", default-features = false }
@@ -134,25 +134,30 @@ solana-pubsub-client = { version = "4.0", default-features = false }
 solana-pubkey = { version = "3.0", default-features = false }
 solana-rpc-client = { version = "4.0", default-features = false }
 solana-rpc-client-api = { version = "4.0", default-features = false }
-solana-runtime = { version = "4.0", default-features = false, features = ["agave-unstable-api"] }
+solana-runtime = { version = "4.2", default-features = false, features = ["agave-unstable-api"] }
 solana-sdk-ids = { version = "3.1", default-features = false }
-solana-signature = { version = "3.3", default-features = false, features = [
+solana-signature = { version = "~3.4", default-features = false, features = [
     "rand",
 ] }
 solana-signer = { version = "3.0", default-features = false }
-solana-slot-hashes = { version = "3.0", default-features = false }
+solana-slot-hashes = { version = "~3.1", default-features = false }
 solana-system-interface = { version = "3.0", default-features = false }
-solana-sysvar = { version = "4.1", default-features = false, features = ["bincode", "wincode"] }
+solana-sysvar = { version = "~4.1", default-features = false, features = ["bincode", "wincode"] }
 solana-sysvar-id = { version = "3.1", default-features = false }
-solana-transaction = { version = "4.1", default-features = false, features = ["serde", "wincode"] }
-solana-transaction-context = { version = "4.0", default-features = false }
-solana-transaction-error = { version = "3.1", default-features = false }
-solana-transaction-status = { version = "4.1", default-features = false, features = ["agave-unstable-api"] }
+solana-transaction = { version = "~4.1", default-features = false, features = ["serde", "wincode"] }
+solana-transaction-context = { version = "4.2", default-features = false }
+solana-transaction-error = { version = "~3.3", default-features = false }
+solana-transaction-status = { version = "4.2", default-features = false, features = ["agave-unstable-api"] }
+solana-transaction-status-client-types = { version = "4.2", default-features = false }
 solana-version = { version = "4.0", default-features = false }
+# spl-token-2022-interface 3.x stopped re-exporting these; the pod types moved
+# out of solana-zk-sdk into solana-zk-sdk-pod, which 3.1.1 depends on directly.
+solana-zk-sdk = { version = "7.0", default-features = false }
+solana-zk-sdk-pod = { version = "0.1.2", default-features = false }
 spl-associated-token-account-interface = { version = "2.0.0", default-features = false }
-spl-token-2022-interface = { version = "2.0.0", default-features = false }
-spl-token-interface = { version = "2.0.0", default-features = false }
-spl-token-metadata-interface = { version = "0.8.0", default-features = false }
+spl-token-2022-interface = { version = "3.1.1", default-features = false }
+spl-token-interface = { version = "3.0.0", default-features = false }
+spl-token-metadata-interface = { version = "1.0.0", default-features = false }
 tempfile = "3.23.0"
 test-case = "^3.3.1"
 ts-rs = { version = "=12.0.1" }

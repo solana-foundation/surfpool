@@ -5100,16 +5100,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_set_confidential_token_account_spendable() {
         use bytemuck::bytes_of;
-        use spl_token_2022_interface::{
-            extension::{
-                BaseStateWithExtensions, StateWithExtensions,
-                confidential_transfer::ConfidentialTransferAccount,
-            },
-            solana_zk_sdk::encryption::{
-                auth_encryption::{AeCiphertext, AeKey},
-                elgamal::ElGamalKeypair,
-                pod::elgamal::PodElGamalPubkey,
-            },
+        use solana_zk_sdk::encryption::{
+            auth_encryption::{AeCiphertext, AeKey},
+            elgamal::ElGamalKeypair,
+        };
+        use solana_zk_sdk_pod::encryption::elgamal::PodElGamalPubkey;
+        use spl_token_2022_interface::extension::{
+            BaseStateWithExtensions, StateWithExtensions,
+            confidential_transfer::ConfidentialTransferAccount,
         };
         use surfpool_types::types::ConfidentialTransferAccountUpdate;
 
@@ -5190,9 +5188,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_set_confidential_token_account_requires_aes_key() {
         use bytemuck::bytes_of;
-        use spl_token_2022_interface::solana_zk_sdk::encryption::{
-            elgamal::ElGamalKeypair, pod::elgamal::PodElGamalPubkey,
-        };
+        use solana_zk_sdk::encryption::elgamal::ElGamalKeypair;
+        use solana_zk_sdk_pod::encryption::elgamal::PodElGamalPubkey;
         use surfpool_types::types::ConfidentialTransferAccountUpdate;
 
         let client = TestSetup::new(SurfnetCheatcodesRpc::empty());
@@ -5235,16 +5232,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_set_confidential_token_account_zero_balance_decrypts_to_zero() {
         use bytemuck::bytes_of;
-        use spl_token_2022_interface::{
-            extension::{
-                BaseStateWithExtensions, StateWithExtensions,
-                confidential_transfer::ConfidentialTransferAccount,
-            },
-            solana_zk_sdk::encryption::{
-                auth_encryption::{AeCiphertext, AeKey},
-                elgamal::ElGamalKeypair,
-                pod::elgamal::PodElGamalPubkey,
-            },
+        use solana_zk_sdk::encryption::{
+            auth_encryption::{AeCiphertext, AeKey},
+            elgamal::ElGamalKeypair,
+        };
+        use solana_zk_sdk_pod::encryption::elgamal::PodElGamalPubkey;
+        use spl_token_2022_interface::extension::{
+            BaseStateWithExtensions, StateWithExtensions,
+            confidential_transfer::ConfidentialTransferAccount,
         };
         use surfpool_types::types::ConfidentialTransferAccountUpdate;
 

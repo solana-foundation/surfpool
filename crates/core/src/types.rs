@@ -39,24 +39,19 @@ use solana_transaction_status::{
     },
     parse_ui_inner_instructions,
 };
-use spl_token_2022_interface::{
-    extension::{
-        BaseStateWithExtensions, BaseStateWithExtensionsMut, ExtensionType, StateWithExtensions,
-        StateWithExtensionsMut,
-        confidential_transfer::{ConfidentialTransferAccount, PENDING_BALANCE_LO_BIT_LENGTH},
-        confidential_transfer_fee::ConfidentialTransferFeeAmount,
-        interest_bearing_mint::InterestBearingConfig,
-        scaled_ui_amount::ScaledUiAmountConfig,
-        transfer_fee::TransferFeeConfig,
-    },
-    solana_zk_sdk::encryption::{
-        auth_encryption::{AeCiphertext, AeKey},
-        elgamal::{ElGamalCiphertext, ElGamalKeypair, ElGamalPubkey, ElGamalSecretKey},
-        pod::{
-            auth_encryption::PodAeCiphertext,
-            elgamal::{PodElGamalCiphertext, PodElGamalPubkey},
-        },
-    },
+use solana_zk_sdk::encryption::{auth_encryption::AeKey, elgamal::ElGamalPubkey};
+use solana_zk_sdk_pod::encryption::{
+    auth_encryption::{AeCiphertext, AeKey, PodAeCiphertext},
+    elgamal::{PodElGamalCiphertext, PodElGamalPubkey},
+};
+use spl_token_2022_interface::extension::{
+    BaseStateWithExtensions, BaseStateWithExtensionsMut, ExtensionType, StateWithExtensions,
+    StateWithExtensionsMut,
+    confidential_transfer::{ConfidentialTransferAccount, PENDING_BALANCE_LO_BIT_LENGTH},
+    confidential_transfer_fee::ConfidentialTransferFeeAmount,
+    interest_bearing_mint::InterestBearingConfig,
+    scaled_ui_amount::ScaledUiAmountConfig,
+    transfer_fee::TransferFeeConfig,
 };
 use surfpool_types::types::{
     ConfidentialBalanceKeys, ConfidentialTransferAccountUpdate, DeriveConfidentialKeysResponse,
