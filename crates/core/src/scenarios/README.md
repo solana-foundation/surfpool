@@ -25,6 +25,7 @@ For custom protocols, an IDL can be registered at runtime using the [`surfnet_re
 Scenarios can be registered at runtime using the [`surfnet_registerScenario`](https://docs.surfpool.run/rpc/cheatcodes#surfnet-registerscenario) RPC cheatcode. 
 This cheatcode takes in a scenario definition in JSON format, which includes the scenario name, description, and a list of overrides to apply to accounts.
 Each override contains a map of the field in the account to override (as indexed in the IDL), and the value to apply for that key.
+Registration validates every enabled override up front: each override's account address must resolve with the provided values, and a scenario containing an unresolvable address (a malformed pubkey, a PDA seed referencing a missing property, a value of the wrong type) is rejected with an error listing each failing override and its cause.
 
 ### Override Templates
 Directly using the `surfnet_registerScenario` endpoint requires building out a map of account keys that are specific to the schema of the account that is being written to.

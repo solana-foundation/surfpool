@@ -58,7 +58,7 @@ use spl_token_2022_interface::extension::{
 };
 use surfpool_types::{
     AccountChange, AccountProfileState, AccountSnapshot, DEFAULT_PROFILING_MAP_CAPACITY,
-    DEFAULT_SLOT_TIME_MS, ExportSnapshotConfig, ExportSnapshotScope, FifoMap, Idl,
+    DEFAULT_SLOT_TIME_MS, ExportSnapshotConfig, ExportSnapshotScope, FifoMap, Idl, OverrideError,
     OverrideInstance, ProfileResult, RpcProfileDepth, RpcProfileResultConfig,
     RunbookExecutionStatusReport, SimnetEvent, SimnetEventsTx, StartupError, SurfnetStartupStatus,
     SurfnetStartupTask, SvmFeatureConfig, TransactionConfirmationStatus, TransactionStatusEvent,
@@ -2619,6 +2619,189 @@ impl SurfnetSvm {
         Ok(())
     }
 
+    /// Apply a single scheduled override. Returns Ok(()) when the override was
+    /// applied or was a no-op by design (no values beyond PDA seed references).
+    pub async fn apply_override(
+        &mut self,
+        remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
+        override_instance: &OverrideInstance,
+    ) -> Result<(), OverrideError> {
+        let account_pubkey = override_instance
+            .account
+            .resolve(Some(&override_instance.values))?;
+
+        debug!(
+            "Processing override {} for account {} (label: {:?})",
+            override_instance.id, account_pubkey, override_instance.label
+        );
+
+        if override_instance.fetch_before_use {
+            if let Some((client, _)) = remote_ctx {
+                debug!(
+                    "Fetching fresh account data for {} from remote",
+                    account_pubkey
+                );
+
+                match client
+                    .get_account(&account_pubkey, CommitmentConfig::confirmed())
+                    .await
+                {
+                    Ok(GetAccountResult::FoundAccount(_pubkey, remote_account, _)) => {
+                        debug!(
+                            "Fetched account {} from remote: {} lamports, {} bytes",
+                            account_pubkey,
+                            remote_account.lamports(),
+                            remote_account.data().len()
+                        );
+
+                        if let Err(e) = self.inner.set_account(account_pubkey, remote_account) {
+                            warn!(
+                                "Failed to set account {} from remote: {}",
+                                account_pubkey, e
+                            );
+                        }
+                    }
+                    Ok(GetAccountResult::None(_)) => {
+                        debug!("Account {} not found on remote", account_pubkey);
+                    }
+                    Ok(_) => {
+                        debug!("Account {} fetched (other variant)", account_pubkey);
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to fetch account {} from remote: {}",
+                            account_pubkey, e
+                        );
+                    }
+                }
+            } else {
+                debug!(
+                    "fetch_before_use enabled but no remote client available for override {}",
+                    override_instance.id
+                );
+            }
+        }
+
+        if !override_instance.values.is_empty() {
+            let pda_refs = override_instance.account.get_pda_seed_references();
+            let account_values: HashMap<String, serde_json::Value> = override_instance
+                .values
+                .iter()
+                .filter(|(key, _)| !pda_refs.contains(key))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+
+            if account_values.is_empty() {
+                debug!(
+                    "Override {} has no account data modifications (all values are PDA seeds)",
+                    override_instance.id
+                );
+                return Ok(());
+            }
+
+            debug!(
+                "Override {} applying {} field modification(s) to account {} (filtered {} PDA seed refs)",
+                override_instance.id,
+                account_values.len(),
+                account_pubkey,
+                pda_refs.len()
+            );
+
+            let Some(account) =
+                self.inner
+                    .get_account(&account_pubkey)
+                    .map_err(|e| OverrideError::Forge {
+                        account: account_pubkey.to_string(),
+                        message: format!("failed to read account from SVM: {}", e),
+                    })?
+            else {
+                return Err(OverrideError::AccountNotFound {
+                    account: account_pubkey.to_string(),
+                });
+            };
+
+            // The 8-byte discriminator requirement is independent of any IDL, so
+            // check it before the IDL lookup to report the more precise cause.
+            if account.data().len() < 8 {
+                return Err(OverrideError::AccountTooSmall {
+                    account: account_pubkey.to_string(),
+                    len: account.data().len(),
+                });
+            }
+
+            let owner_program_id = account.owner();
+
+            let idl_versions = match self.registered_idls.get(&owner_program_id.to_string()) {
+                Ok(Some(versions)) => versions,
+                Ok(None) => {
+                    return Err(OverrideError::NoIdlForOwner {
+                        program_id: owner_program_id.to_string(),
+                        account: account_pubkey.to_string(),
+                    });
+                }
+                Err(e) => {
+                    return Err(OverrideError::Forge {
+                        account: account_pubkey.to_string(),
+                        message: format!("IDL lookup failed: {}", e),
+                    });
+                }
+            };
+
+            let Some(versioned_idl) = idl_versions.first() else {
+                return Err(OverrideError::NoIdlForOwner {
+                    program_id: owner_program_id.to_string(),
+                    account: account_pubkey.to_string(),
+                });
+            };
+
+            let idl = &versioned_idl.1;
+
+            let account_data = account.data();
+
+            let new_account_data = match self.get_forged_account_data(
+                &account_pubkey,
+                account_data,
+                idl,
+                &account_values,
+            ) {
+                Ok(data) => data,
+                Err(e) => {
+                    return Err(OverrideError::Forge {
+                        account: account_pubkey.to_string(),
+                        message: e.to_string(),
+                    });
+                }
+            };
+
+            let modified_account = Account {
+                lamports: account.lamports(),
+                data: new_account_data,
+                owner: *account.owner(),
+                executable: account.executable(),
+                rent_epoch: account.rent_epoch(),
+            };
+
+            match self.inner.set_account(account_pubkey, modified_account) {
+                Ok(_) => {
+                    debug!(
+                        "Successfully applied {} override(s) to account {} (override {})",
+                        override_instance.values.len(),
+                        account_pubkey,
+                        override_instance.id
+                    );
+                }
+                Err(e) => {
+                    return Err(OverrideError::Forge {
+                        account: account_pubkey.to_string(),
+                        message: format!("failed to write account: {}", e),
+                    });
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Materializes scheduled overrides for the current slot
     ///
     /// This function:
@@ -2661,211 +2844,8 @@ impl SurfnetSvm {
                 continue;
             }
 
-            // Resolve account address using the centralized method
-            let account_pubkey = match override_instance
-                .account
-                .resolve(Some(&override_instance.values))
-            {
-                Some(pubkey) => {
-                    if matches!(
-                        &override_instance.account,
-                        surfpool_types::AccountAddress::Pda { .. }
-                    ) {
-                        debug!(
-                            "Derived PDA {} for override {}",
-                            pubkey, override_instance.id
-                        );
-                    }
-                    pubkey
-                }
-                None => {
-                    warn!(
-                        "Failed to resolve account address for override {}",
-                        override_instance.id
-                    );
-                    continue;
-                }
-            };
-
-            debug!(
-                "Processing override {} for account {} (label: {:?})",
-                override_instance.id, account_pubkey, override_instance.label
-            );
-
-            // Fetch fresh account data from remote if requested
-            if override_instance.fetch_before_use {
-                if let Some((client, _)) = remote_ctx {
-                    debug!(
-                        "Fetching fresh account data for {} from remote",
-                        account_pubkey
-                    );
-
-                    match client
-                        .get_account(&account_pubkey, CommitmentConfig::confirmed())
-                        .await
-                    {
-                        Ok(GetAccountResult::FoundAccount(_pubkey, remote_account, _)) => {
-                            debug!(
-                                "Fetched account {} from remote: {} lamports, {} bytes",
-                                account_pubkey,
-                                remote_account.lamports(),
-                                remote_account.data().len()
-                            );
-
-                            // Set the fresh account data in the SVM
-                            if let Err(e) = self.inner.set_account(account_pubkey, remote_account) {
-                                warn!(
-                                    "Failed to set account {} from remote: {}",
-                                    account_pubkey, e
-                                );
-                            }
-                        }
-                        Ok(GetAccountResult::None(_)) => {
-                            debug!("Account {} not found on remote", account_pubkey);
-                        }
-                        Ok(_) => {
-                            debug!("Account {} fetched (other variant)", account_pubkey);
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Failed to fetch account {} from remote: {}",
-                                account_pubkey, e
-                            );
-                        }
-                    }
-                } else {
-                    debug!(
-                        "fetch_before_use enabled but no remote client available for override {}",
-                        override_instance.id
-                    );
-                }
-            }
-
-            // Apply the override values to the account data
-            if !override_instance.values.is_empty() {
-                // Filter out values that are only used for PDA derivation (not account data)
-                let pda_refs = override_instance.account.get_pda_seed_references();
-                let account_values: HashMap<String, serde_json::Value> = override_instance
-                    .values
-                    .iter()
-                    .filter(|(key, _)| !pda_refs.contains(key))
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect();
-
-                if account_values.is_empty() {
-                    debug!(
-                        "Override {} has no account data modifications (all values are PDA seeds)",
-                        override_instance.id
-                    );
-                    continue;
-                }
-
-                debug!(
-                    "Override {} applying {} field modification(s) to account {} (filtered {} PDA seed refs)",
-                    override_instance.id,
-                    account_values.len(),
-                    account_pubkey,
-                    pda_refs.len()
-                );
-
-                // Get the account from the SVM
-                let Some(account) = self.inner.get_account(&account_pubkey)? else {
-                    warn!(
-                        "Account {} not found in SVM for override {}, skipping modifications",
-                        account_pubkey, override_instance.id
-                    );
-                    continue;
-                };
-
-                // Get the account owner (program ID)
-                let owner_program_id = account.owner();
-
-                // Look up the IDL for the owner program
-                let idl_versions = match self.registered_idls.get(&owner_program_id.to_string()) {
-                    Ok(Some(versions)) => versions,
-                    Ok(None) => {
-                        warn!(
-                            "No IDL registered for program {} (owner of account {}), skipping override {}",
-                            owner_program_id, account_pubkey, override_instance.id
-                        );
-                        continue;
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Failed to get IDL for program {}: {}, skipping override {}",
-                            owner_program_id, e, override_instance.id
-                        );
-                        continue;
-                    }
-                };
-
-                // Get the latest IDL version (first in the sorted Vec)
-                let Some(versioned_idl) = idl_versions.first() else {
-                    warn!(
-                        "IDL versions empty for program {}, skipping override {}",
-                        owner_program_id, override_instance.id
-                    );
-                    continue;
-                };
-
-                let idl = &versioned_idl.1;
-
-                // Get account data
-                let account_data = account.data();
-
-                // Check if account data is valid (has at least discriminator)
-                if account_data.len() < 8 {
-                    warn!(
-                        "Account {} has insufficient data ({} bytes) for override {}. \
-                        Enable fetchBeforeUse: true to fetch account data from mainnet first.",
-                        account_pubkey,
-                        account_data.len(),
-                        override_instance.id
-                    );
-                    continue;
-                }
-
-                // Use get_forged_account_data to apply the overrides (with PDA refs filtered out)
-                let new_account_data = match self.get_forged_account_data(
-                    &account_pubkey,
-                    account_data,
-                    idl,
-                    &account_values,
-                ) {
-                    Ok(data) => data,
-                    Err(e) => {
-                        warn!(
-                            "Failed to forge account data for {} (override {}): {}. \
-                            If the account doesn't exist locally, enable fetchBeforeUse: true.",
-                            account_pubkey, override_instance.id, e
-                        );
-                        continue;
-                    }
-                };
-
-                // Create a new account with modified data
-                let modified_account = Account {
-                    lamports: account.lamports(),
-                    data: new_account_data,
-                    owner: *account.owner(),
-                    executable: account.executable(),
-                    rent_epoch: account.rent_epoch(),
-                };
-
-                // Update the account in the SVM
-                if let Err(e) = self.inner.set_account(account_pubkey, modified_account) {
-                    warn!(
-                        "Failed to set modified account {} in SVM: {}",
-                        account_pubkey, e
-                    );
-                } else {
-                    debug!(
-                        "Successfully applied {} override(s) to account {} (override {})",
-                        override_instance.values.len(),
-                        account_pubkey,
-                        override_instance.id
-                    );
-                }
+            if let Err(e) = self.apply_override(remote_ctx, &override_instance).await {
+                warn!("Skipping override {}: {}", override_instance.id, e);
             }
         }
 
@@ -4153,6 +4133,24 @@ impl SurfnetSvm {
             scenario.overrides.len(),
             base_slot
         );
+
+        // Validate enabled overrides before scheduling
+        let mut failures = Vec::new();
+        for override_instance in &scenario.overrides {
+            if !override_instance.enabled {
+                continue;
+            }
+            if let Err(e) = override_instance
+                .account
+                .resolve(Some(&override_instance.values))
+            {
+                failures.push((override_instance.id.clone(), e));
+            }
+        }
+
+        if !failures.is_empty() {
+            return Err(SurfpoolError::invalid_scenario(&scenario.name, &failures));
+        }
 
         // Schedule overrides by adding base slot to their scenario-relative slots
         for override_instance in scenario.overrides {
@@ -6243,7 +6241,7 @@ mod tests {
         };
 
         let result = address.resolve_simple();
-        assert!(result.is_some(), "Should derive PDA with string seed");
+        assert!(result.is_ok(), "Should derive PDA with string seed");
 
         // Verify it matches direct derivation
         let program_pubkey = Pubkey::from_str(program_id).unwrap();
@@ -6263,7 +6261,7 @@ mod tests {
         };
 
         let result = address.resolve_simple();
-        assert!(result.is_some(), "Should derive PDA with pubkey seed");
+        assert!(result.is_ok(), "Should derive PDA with pubkey seed");
 
         // Verify it matches direct derivation
         let program_pubkey = Pubkey::from_str(program_id).unwrap();
@@ -6289,7 +6287,7 @@ mod tests {
         };
 
         let result = address.resolve_simple();
-        assert!(result.is_some(), "Should derive PDA with multiple seeds");
+        assert!(result.is_ok(), "Should derive PDA with multiple seeds");
 
         // Verify it matches direct derivation
         let program_pubkey = Pubkey::from_str(program_id).unwrap();
@@ -6314,7 +6312,7 @@ mod tests {
         };
 
         let result = address.resolve_simple();
-        assert!(result.is_some(), "Should derive PDA with bytes seed");
+        assert!(result.is_ok(), "Should derive PDA with bytes seed");
 
         // Verify it matches direct derivation
         let program_pubkey = Pubkey::from_str(program_id).unwrap();
@@ -6342,10 +6340,7 @@ mod tests {
         );
 
         let result = address.resolve(Some(&values));
-        assert!(
-            result.is_some(),
-            "Should derive PDA with property ref pubkey"
-        );
+        assert!(result.is_ok(), "Should derive PDA with property ref pubkey");
 
         // Verify it matches direct derivation
         let program_pubkey = Pubkey::from_str(program_id).unwrap();
@@ -6374,7 +6369,7 @@ mod tests {
         );
 
         let result = address.resolve(Some(&values));
-        assert!(result.is_some(), "Should derive PDA with property ref u64");
+        assert!(result.is_ok(), "Should derive PDA with property ref u64");
 
         // Verify it matches direct derivation
         let program_pubkey = Pubkey::from_str(program_id).unwrap();
@@ -6392,7 +6387,7 @@ mod tests {
         };
 
         let result = address.resolve_simple();
-        assert!(result.is_none(), "Should fail with invalid program ID");
+        assert!(result.is_err(), "Should fail with invalid program ID");
     }
 
     #[test]
@@ -6407,7 +6402,7 @@ mod tests {
         };
 
         let result = address.resolve_simple();
-        assert!(result.is_none(), "Should fail with invalid pubkey seed");
+        assert!(result.is_err(), "Should fail with invalid pubkey seed");
     }
 
     #[test]
@@ -6422,7 +6417,7 @@ mod tests {
         };
 
         let result = address.resolve_simple(); // No values provided
-        assert!(result.is_none(), "Should fail with missing property ref");
+        assert!(result.is_err(), "Should fail with missing property ref");
     }
 
     #[test]
@@ -6432,7 +6427,7 @@ mod tests {
         let address = surfpool_types::AccountAddress::Pubkey(pubkey_str.to_string());
 
         let result = address.resolve_simple();
-        assert!(result.is_some(), "Should resolve pubkey address");
+        assert!(result.is_ok(), "Should resolve pubkey address");
         assert_eq!(result.unwrap(), Pubkey::from_str(pubkey_str).unwrap());
     }
 
@@ -6458,7 +6453,7 @@ mod tests {
         let result2 = address.resolve_simple();
         let result3 = address.resolve_simple();
 
-        assert!(result1.is_some());
+        assert!(result1.is_ok());
         assert_eq!(result1, result2, "PDA derivation should be deterministic");
         assert_eq!(result2, result3, "PDA derivation should be deterministic");
     }
@@ -6498,7 +6493,7 @@ mod tests {
         };
 
         let result = address.resolve_simple();
-        assert!(result.is_some(), "Should derive Raydium CLMM pool PDA");
+        assert!(result.is_ok(), "Should derive Raydium CLMM pool PDA");
 
         // Verify it matches the known pool address
         let expected_pool =
@@ -6542,10 +6537,7 @@ mod tests {
         );
 
         let result = address.resolve(Some(&values));
-        assert!(
-            result.is_some(),
-            "Should derive pool PDA with property refs"
-        );
+        assert!(result.is_ok(), "Should derive pool PDA with property refs");
 
         let expected_pool =
             Pubkey::from_str("3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv").unwrap();
@@ -6591,7 +6583,7 @@ mod tests {
 
             let result = address.resolve_simple();
             assert!(
-                result.is_some(),
+                result.is_ok(),
                 "Should derive pool for {} fee tier",
                 tier_name
             );
@@ -6714,7 +6706,7 @@ mod tests {
 
             let result = address.resolve_simple();
             assert!(
-                result.is_some(),
+                result.is_ok(),
                 "Should derive AMM config for index {}",
                 index
             );
@@ -6760,7 +6752,7 @@ mod tests {
         };
 
         let result = address.resolve_simple();
-        assert!(result.is_some(), "Should derive pool with nested PDA");
+        assert!(result.is_ok(), "Should derive pool with nested PDA");
 
         // Should match the known SOL/USDC pool
         let expected_pool =
@@ -6810,7 +6802,7 @@ mod tests {
         );
 
         let result = address.resolve(Some(&values));
-        assert!(result.is_some(), "Should derive pool with property refs");
+        assert!(result.is_ok(), "Should derive pool with property refs");
 
         let expected_pool =
             Pubkey::from_str("3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv").unwrap();
@@ -6818,6 +6810,204 @@ mod tests {
             result.unwrap(),
             expected_pool,
             "Property ref dynamic derivation should match known SOL/USDC pool"
+        );
+    }
+
+    /// An enabled override targeting the given address, with a single value
+    /// under the given field name.
+    fn override_with_value(
+        address: surfpool_types::AccountAddress,
+        field: &str,
+    ) -> surfpool_types::OverrideInstance {
+        let mut instance =
+            surfpool_types::OverrideInstance::new("test-template".to_string(), 0, address);
+        instance.values = HashMap::from([(
+            field.to_string(),
+            serde_json::Value::String("test_value".to_string()),
+        )]);
+        instance.enabled = true;
+        instance
+    }
+
+    /// A rent-holding account with zeroed data of the given length.
+    fn seed_account(svm: &mut SurfnetSvm, pubkey: &Pubkey, data_len: usize, owner: Pubkey) {
+        let account = Account {
+            lamports: 1_000_000,
+            data: vec![0u8; data_len],
+            owner,
+            executable: false,
+            rent_epoch: 0,
+        };
+        svm.set_account(pubkey, account).unwrap();
+    }
+
+    #[tokio::test]
+    async fn apply_override_reports_missing_account() {
+        let (mut svm, _events_rx, _geyser_rx) =
+            SurfnetSvm::new(SurfnetSvmConfig::default()).unwrap();
+        let account_pubkey = Pubkey::new_unique();
+        let override_instance = override_with_value(
+            surfpool_types::AccountAddress::Pubkey(account_pubkey.to_string()),
+            "dummy_field",
+        );
+
+        let result = svm.apply_override(&None, &override_instance).await;
+
+        assert_eq!(
+            result,
+            Err(surfpool_types::OverrideError::AccountNotFound {
+                account: account_pubkey.to_string()
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_override_reports_account_too_small() {
+        let (mut svm, _events_rx, _geyser_rx) =
+            SurfnetSvm::new(SurfnetSvmConfig::default()).unwrap();
+        let account_pubkey = Pubkey::new_unique();
+        seed_account(&mut svm, &account_pubkey, 4, Pubkey::new_unique());
+        let override_instance = override_with_value(
+            surfpool_types::AccountAddress::Pubkey(account_pubkey.to_string()),
+            "dummy_field",
+        );
+
+        let result = svm.apply_override(&None, &override_instance).await;
+
+        assert_eq!(
+            result,
+            Err(surfpool_types::OverrideError::AccountTooSmall {
+                account: account_pubkey.to_string(),
+                len: 4
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_override_reports_missing_idl() {
+        let (mut svm, _events_rx, _geyser_rx) =
+            SurfnetSvm::new(SurfnetSvmConfig::default()).unwrap();
+        let account_pubkey = Pubkey::new_unique();
+        let owner_program_id = Pubkey::new_unique();
+        seed_account(&mut svm, &account_pubkey, 16, owner_program_id);
+        let override_instance = override_with_value(
+            surfpool_types::AccountAddress::Pubkey(account_pubkey.to_string()),
+            "dummy_field",
+        );
+
+        let result = svm.apply_override(&None, &override_instance).await;
+
+        assert_eq!(
+            result,
+            Err(surfpool_types::OverrideError::NoIdlForOwner {
+                program_id: owner_program_id.to_string(),
+                account: account_pubkey.to_string()
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_override_resolve_failure_is_typed() {
+        let (mut svm, _events_rx, _geyser_rx) =
+            SurfnetSvm::new(SurfnetSvmConfig::default()).unwrap();
+        let override_instance = surfpool_types::OverrideInstance::new(
+            "test-template".to_string(),
+            0,
+            surfpool_types::AccountAddress::Pubkey("garbage".to_string()),
+        );
+
+        let result = svm.apply_override(&None, &override_instance).await;
+
+        assert!(
+            matches!(result, Err(surfpool_types::OverrideError::Resolve(_))),
+            "Expected OverrideError::Resolve, got {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_override_pda_seed_only_values_is_ok() {
+        let (mut svm, _events_rx, _geyser_rx) =
+            SurfnetSvm::new(SurfnetSvmConfig::default()).unwrap();
+        let pda_account = surfpool_types::AccountAddress::Pda {
+            program_id: Pubkey::new_unique().to_string(),
+            seeds: vec![surfpool_types::PdaSeed::PropertyRef(
+                "seed_value".to_string(),
+            )],
+        };
+        let override_instance = override_with_value(pda_account, "seed_value");
+
+        let result = svm.apply_override(&None, &override_instance).await;
+
+        assert!(
+            result.is_ok(),
+            "PDA with seed-only values should be ok (no-op): {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn register_scenario_rejects_unresolvable_override() {
+        // Test that register_scenario rejects scenarios with unresolvable override addresses
+        let (mut svm, _events_rx, _geyser_rx) =
+            SurfnetSvm::new(SurfnetSvmConfig::default()).unwrap();
+
+        let mut scenario = surfpool_types::Scenario::new(
+            "test_unresolvable".to_string(),
+            "Test scenario with invalid pubkey".to_string(),
+        );
+
+        let override_instance = surfpool_types::OverrideInstance::new(
+            "test-template".to_string(),
+            0,
+            surfpool_types::AccountAddress::Pubkey("not-a-pubkey".to_string()),
+        );
+
+        scenario.add_override(override_instance.clone());
+
+        let result = svm.register_scenario(scenario.clone(), Some(0));
+
+        assert!(
+            result.is_err(),
+            "Should reject scenario with invalid pubkey address"
+        );
+        let error_msg = format!("{}", result.unwrap_err());
+        assert!(
+            error_msg.contains(&override_instance.id),
+            "Error message should contain the override ID"
+        );
+        assert!(
+            error_msg.contains("not a valid pubkey") || error_msg.contains("invalid"),
+            "Error message should indicate invalid pubkey"
+        );
+    }
+
+    #[test]
+    fn register_scenario_accepts_resolvable_override() {
+        // Test that register_scenario accepts scenarios with resolvable override addresses
+        let (mut svm, _events_rx, _geyser_rx) =
+            SurfnetSvm::new(SurfnetSvmConfig::default()).unwrap();
+
+        let mut scenario = surfpool_types::Scenario::new(
+            "test_resolvable".to_string(),
+            "Test scenario with valid pubkey".to_string(),
+        );
+
+        // Use a valid base58 pubkey
+        let valid_pubkey = solana_pubkey::Pubkey::new_unique().to_string();
+        let override_instance = surfpool_types::OverrideInstance::new(
+            "test-template".to_string(),
+            0,
+            surfpool_types::AccountAddress::Pubkey(valid_pubkey.clone()),
+        );
+
+        scenario.add_override(override_instance);
+
+        let result = svm.register_scenario(scenario, Some(0));
+
+        assert!(
+            result.is_ok(),
+            "Should accept scenario with valid pubkey address"
         );
     }
 

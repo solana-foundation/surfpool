@@ -60,6 +60,70 @@ impl ConstantDefinition {
 // Core Scenarios Types
 // ========================================
 
+/// Why a single PDA seed could not be converted to bytes.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum SeedError {
+    #[error("'{0}' is not a valid pubkey")]
+    InvalidPubkey(String),
+    #[error("seed references property '{0}' but no values were provided")]
+    NoValues(String),
+    #[error("property '{0}' not found in values")]
+    UnknownProperty(String),
+    #[error("property '{name}' is {found}, expected {expected}")]
+    WrongType {
+        name: String,
+        expected: &'static str,
+        found: &'static str,
+    },
+    #[error("property '{name}' value {value} does not fit in u16")]
+    U16OutOfRange { name: String, value: u64 },
+    #[error("'{0}' is not a 32-byte hex string")]
+    InvalidBytes32(String),
+    #[error("seed {index} of derived PDA for program {program_id}: {source}")]
+    DerivedSeed {
+        program_id: String,
+        index: usize,
+        source: Box<SeedError>,
+    },
+}
+
+/// Why an account address could not be resolved to a pubkey.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum ScenarioError {
+    #[error("invalid account address: {0}")]
+    InvalidAddress(#[from] SeedError),
+    #[error("invalid program id '{0}'")]
+    InvalidProgramId(String),
+    #[error("PDA for program {program_id}, seed {index}: {source}")]
+    Seed {
+        program_id: String,
+        index: usize,
+        source: SeedError,
+    },
+    #[error("template '{template_id}': {source}")]
+    Template {
+        template_id: String,
+        source: Box<ScenarioError>,
+    },
+}
+
+/// Why a scheduled override could not be applied at its slot.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum OverrideError {
+    #[error("{0}")]
+    Resolve(#[from] ScenarioError),
+    #[error(
+        "account {account} does not exist locally; overrides patch existing accounts (enable fetchBeforeUse or create the account first)"
+    )]
+    AccountNotFound { account: String },
+    #[error("account {account} has {len} byte(s), too small for an 8-byte discriminator")]
+    AccountTooSmall { account: String, len: usize },
+    #[error("no IDL registered for program {program_id} (owner of account {account})")]
+    NoIdlForOwner { program_id: String, account: String },
+    #[error("failed to forge account data for {account}: {message}")]
+    Forge { account: String, message: String },
+}
+
 /// Defines how an account address should be determined
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -105,77 +169,160 @@ pub enum PdaSeed {
     },
 }
 
+/// Look up a property referenced by a seed, distinguishing a missing values
+/// map from a missing key.
+fn property_value<'a>(
+    values: Option<&'a HashMap<String, serde_json::Value>>,
+    prop: &str,
+) -> Result<&'a serde_json::Value, SeedError> {
+    values
+        .ok_or_else(|| SeedError::NoValues(prop.to_string()))?
+        .get(prop)
+        .ok_or_else(|| SeedError::UnknownProperty(prop.to_string()))
+}
+
+fn json_type_name(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
 impl PdaSeed {
+    /// Check that literal pubkey content parses. Reference seeds are not
+    /// validated here; they depend on instance values.
+    pub(crate) fn validate_literals(&self) -> Result<(), SeedError> {
+        match self {
+            PdaSeed::Pubkey(s) => Pubkey::from_str(s)
+                .map(|_| ())
+                .map_err(|_| SeedError::InvalidPubkey(s.clone())),
+            PdaSeed::DerivedPda { program_id, seeds } => {
+                Pubkey::from_str(program_id)
+                    .map_err(|_| SeedError::InvalidPubkey(program_id.clone()))?;
+                for (i, seed) in seeds.iter().enumerate() {
+                    seed.validate_literals()
+                        .map_err(|e| SeedError::DerivedSeed {
+                            program_id: program_id.clone(),
+                            index: i,
+                            source: Box::new(e),
+                        })?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Convert a seed to bytes, optionally using values for PropertyRef resolution
-    pub fn to_bytes(&self, values: Option<&HashMap<String, serde_json::Value>>) -> Option<Vec<u8>> {
+    pub fn to_bytes(
+        &self,
+        values: Option<&HashMap<String, serde_json::Value>>,
+    ) -> Result<Vec<u8>, SeedError> {
         match self {
             PdaSeed::Pubkey(pk_str) => Pubkey::from_str(pk_str)
-                .ok()
-                .map(|pk| pk.to_bytes().to_vec()),
-            PdaSeed::String(s) => Some(s.as_bytes().to_vec()),
-            PdaSeed::Bytes(b) => Some(b.clone()),
+                .map(|pk| pk.to_bytes().to_vec())
+                .map_err(|_| SeedError::InvalidPubkey(pk_str.clone())),
+            PdaSeed::String(s) => Ok(s.as_bytes().to_vec()),
+            PdaSeed::Bytes(b) => Ok(b.clone()),
             PdaSeed::PropertyRef(prop) => {
-                values?.get(prop).and_then(|v| {
-                    // Handle string values (could be pubkey or raw string)
-                    if let Some(s) = v.as_str() {
-                        if let Ok(pk) = Pubkey::from_str(s) {
-                            return Some(pk.to_bytes().to_vec());
-                        }
-                        return Some(s.as_bytes().to_vec());
+                let v = property_value(values, prop)?;
+
+                // Handle string values (could be pubkey or raw string)
+                if let Some(s) = v.as_str() {
+                    if let Ok(pk) = Pubkey::from_str(s) {
+                        return Ok(pk.to_bytes().to_vec());
                     }
-                    // Handle numeric values (u64)
-                    if let Some(n) = v.as_u64() {
-                        return Some(n.to_le_bytes().to_vec());
-                    }
-                    None
+                    return Ok(s.as_bytes().to_vec());
+                }
+                // Handle numeric values (u64)
+                if let Some(n) = v.as_u64() {
+                    return Ok(n.to_le_bytes().to_vec());
+                }
+                Err(SeedError::WrongType {
+                    name: prop.clone(),
+                    expected: "string or u64",
+                    found: json_type_name(v),
                 })
             }
-            PdaSeed::U16Be(n) => Some(n.to_be_bytes().to_vec()),
-            PdaSeed::U16BeRef(prop) => values?.get(prop).and_then(|v| {
-                let index = match v {
-                    serde_json::Value::String(s) => s.parse::<u16>().ok()?,
-                    _ => u16::try_from(v.as_u64()?).ok()?,
-                };
-                Some(index.to_be_bytes().to_vec())
-            }),
-            PdaSeed::U16Le(n) => Some(n.to_le_bytes().to_vec()),
+            PdaSeed::U16Be(n) => Ok(n.to_be_bytes().to_vec()),
+            PdaSeed::U16BeRef(prop) => {
+                let v = property_value(values, prop)?;
+
+                // A scenario file may carry the index as a JSON number or as a
+                // decimal string; both mean the same two big-endian bytes.
+                if let serde_json::Value::String(s) = v {
+                    let index = s.parse::<u16>().map_err(|_| SeedError::WrongType {
+                        name: prop.clone(),
+                        expected: "u16",
+                        found: json_type_name(v),
+                    })?;
+                    return Ok(index.to_be_bytes().to_vec());
+                }
+
+                // Handle numeric values - convert to u16 big-endian
+                if let Some(n) = v.as_u64() {
+                    let n16 = u16::try_from(n).map_err(|_| SeedError::U16OutOfRange {
+                        name: prop.clone(),
+                        value: n,
+                    })?;
+                    return Ok(n16.to_be_bytes().to_vec());
+                }
+                Err(SeedError::WrongType {
+                    name: prop.clone(),
+                    expected: "u64",
+                    found: json_type_name(v),
+                })
+            }
+            PdaSeed::U16Le(n) => Ok(n.to_le_bytes().to_vec()),
             PdaSeed::Bytes32Ref(prop) => {
-                values?.get(prop).and_then(|v| {
-                    // Handle hex string values (e.g., "0xef0d8b6f..." for Pyth feed IDs)
-                    if let Some(s) = v.as_str() {
-                        // Remove 0x prefix if present
-                        let hex_str = s.strip_prefix("0x").unwrap_or(s);
-                        // Parse as 32-byte hex
-                        if let Ok(bytes) = hex::decode(hex_str) {
-                            if bytes.len() == 32 {
-                                return Some(bytes);
-                            }
+                let v = property_value(values, prop)?;
+
+                // Handle hex string values (e.g., "0xef0d8b6f..." for Pyth feed IDs)
+                if let Some(s) = v.as_str() {
+                    // Remove 0x prefix if present
+                    let hex_str = s.strip_prefix("0x").unwrap_or(s);
+                    // Parse as 32-byte hex
+                    match hex::decode(hex_str) {
+                        Ok(bytes) if bytes.len() == 32 => return Ok(bytes),
+                        _ => {
+                            return Err(SeedError::InvalidBytes32(hex_str.to_string()));
                         }
                     }
-                    None
+                }
+                Err(SeedError::WrongType {
+                    name: prop.clone(),
+                    expected: "hex string",
+                    found: json_type_name(v),
                 })
             }
             PdaSeed::DerivedPda { program_id, seeds } => {
                 // Derive a nested PDA and use its pubkey as the seed
-                let program_pubkey = Pubkey::from_str(program_id).ok()?;
+                let program_pubkey = Pubkey::from_str(program_id)
+                    .map_err(|_| SeedError::InvalidPubkey(program_id.clone()))?;
 
                 // Convert inner seeds to bytes
                 let seed_bytes: Vec<Vec<u8>> = seeds
                     .iter()
-                    .filter_map(|seed| seed.to_bytes(values))
-                    .collect();
-
-                // Ensure all seeds were converted successfully
-                if seed_bytes.len() != seeds.len() {
-                    return None;
-                }
+                    .enumerate()
+                    .map(|(i, seed)| {
+                        seed.to_bytes(values).map_err(|e| SeedError::DerivedSeed {
+                            program_id: program_id.clone(),
+                            index: i,
+                            source: Box::new(e),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
 
                 // Create seed slices for find_program_address
                 let seed_slices: Vec<&[u8]> = seed_bytes.iter().map(|s| s.as_slice()).collect();
 
                 // Derive the nested PDA
                 let (pda, _bump) = Pubkey::find_program_address(&seed_slices, &program_pubkey);
-                Some(pda.to_bytes().to_vec())
+                Ok(pda.to_bytes().to_vec())
             }
         }
     }
@@ -185,36 +332,44 @@ impl AccountAddress {
     /// Resolve the account address to a Pubkey
     /// For PDA addresses, this derives the address from the program_id and seeds
     /// For PropertyRef seeds, values map is used to resolve the reference
-    pub fn resolve(&self, values: Option<&HashMap<String, serde_json::Value>>) -> Option<Pubkey> {
+    pub fn resolve(
+        &self,
+        values: Option<&HashMap<String, serde_json::Value>>,
+    ) -> Result<Pubkey, ScenarioError> {
         match self {
-            AccountAddress::Pubkey(pubkey_str) => Pubkey::from_str(pubkey_str).ok(),
+            AccountAddress::Pubkey(pubkey_str) => Pubkey::from_str(pubkey_str).map_err(|_| {
+                ScenarioError::InvalidAddress(SeedError::InvalidPubkey(pubkey_str.clone()))
+            }),
             AccountAddress::Pda { program_id, seeds } => {
-                let program_pubkey = Pubkey::from_str(program_id).ok()?;
+                let program_pubkey = Pubkey::from_str(program_id)
+                    .map_err(|_| ScenarioError::InvalidProgramId(program_id.clone()))?;
 
                 // Convert all seeds to bytes
                 let seed_bytes: Vec<Vec<u8>> = seeds
                     .iter()
-                    .filter_map(|seed| seed.to_bytes(values))
-                    .collect();
-
-                // Ensure all seeds were converted successfully
-                if seed_bytes.len() != seeds.len() {
-                    return None;
-                }
+                    .enumerate()
+                    .map(|(i, seed)| {
+                        seed.to_bytes(values).map_err(|e| ScenarioError::Seed {
+                            program_id: program_id.clone(),
+                            index: i,
+                            source: e,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
 
                 // Create seed slices for find_program_address
                 let seed_slices: Vec<&[u8]> = seed_bytes.iter().map(|s| s.as_slice()).collect();
 
                 // Derive the PDA
                 let (pda, _bump) = Pubkey::find_program_address(&seed_slices, &program_pubkey);
-                Some(pda)
+                Ok(pda)
             }
         }
     }
 
     /// Resolve the account address to a Pubkey without any values for PropertyRef
     /// This is a convenience method when no PropertyRef seeds are expected
-    pub fn resolve_simple(&self) -> Option<Pubkey> {
+    pub fn resolve_simple(&self) -> Result<Pubkey, ScenarioError> {
         self.resolve(None)
     }
 
@@ -638,16 +793,29 @@ pub struct YamlOverrideTemplateFile {
     pub llm_context: Option<String>,
 }
 
+/// Convert a template's YAML address, attaching the template id to any failure.
+fn template_address(
+    template_id: &str,
+    address: YamlAccountAddress,
+) -> Result<AccountAddress, ScenarioError> {
+    AccountAddress::try_from(address).map_err(|e| ScenarioError::Template {
+        template_id: template_id.to_string(),
+        source: Box::new(e),
+    })
+}
+
 impl YamlOverrideTemplateFile {
     /// Convert file-based template to runtime OverrideTemplate with loaded IDL
-    pub fn to_override_template(self, idl: Idl) -> OverrideTemplate {
-        OverrideTemplate {
+    pub fn to_override_template(self, idl: Idl) -> Result<OverrideTemplate, ScenarioError> {
+        let address = template_address(&self.id, self.address)?;
+
+        Ok(OverrideTemplate {
             id: self.id,
             name: self.name,
             description: self.description,
             protocol: self.protocol,
             idl,
-            address: self.address.into(),
+            address,
             account_type: self.account_type,
             properties: self.properties.into_iter().map(Into::into).collect(),
             constants: self
@@ -657,7 +825,7 @@ impl YamlOverrideTemplateFile {
                 .collect(),
             tags: self.tags,
             llm_context: self.llm_context,
-        }
+        })
     }
 }
 
@@ -932,8 +1100,8 @@ pub struct YamlOverrideTemplateEntry {
 }
 
 impl YamlOverrideTemplateCollection {
-    /// Convert collection to runtime OverrideTemplates with loaded IDL
-    pub fn to_override_templates(self, idl: Idl) -> Vec<OverrideTemplate> {
+    /// Convert collection to runtime OverrideTemplates with loaded IDL, validating addresses
+    pub fn to_override_templates(self, idl: Idl) -> Result<Vec<OverrideTemplate>, ScenarioError> {
         // Convert constants once for sharing
         let constants: HashMap<String, ConstantDefinition> = self
             .constants
@@ -943,15 +1111,17 @@ impl YamlOverrideTemplateCollection {
 
         let default_account_type = self.account_type.clone().unwrap_or_default();
 
-        self.templates
-            .into_iter()
-            .map(|entry| OverrideTemplate {
+        let mut templates = Vec::new();
+        for entry in self.templates {
+            let address = template_address(&entry.id, entry.address)?;
+
+            templates.push(OverrideTemplate {
                 id: entry.id,
                 name: entry.name,
                 description: entry.description,
                 protocol: self.protocol.clone(),
                 idl: idl.clone(),
-                address: entry.address.into(),
+                address,
                 account_type: entry
                     .idl_account_name
                     .unwrap_or_else(|| default_account_type.clone()),
@@ -959,8 +1129,10 @@ impl YamlOverrideTemplateCollection {
                 constants: constants.clone(),
                 tags: self.tags.clone(),
                 llm_context: entry.llm_context,
-            })
-            .collect()
+            });
+        }
+
+        Ok(templates)
     }
 }
 
@@ -989,14 +1161,16 @@ pub struct YamlOverrideTemplate {
 
 impl YamlOverrideTemplate {
     /// Convert to runtime OverrideTemplate
-    pub fn to_override_template(self) -> OverrideTemplate {
-        OverrideTemplate {
+    pub fn to_override_template(self) -> Result<OverrideTemplate, ScenarioError> {
+        let address = template_address(&self.id, self.address)?;
+
+        Ok(OverrideTemplate {
             id: self.id,
             name: self.name,
             description: self.description,
             protocol: self.protocol,
             idl: self.idl,
-            address: self.address.into(),
+            address,
             account_type: self.account_type,
             properties: self.properties.into_iter().map(Into::into).collect(),
             constants: self
@@ -1006,7 +1180,7 @@ impl YamlOverrideTemplate {
                 .collect(),
             tags: self.tags,
             llm_context: self.llm_context,
-        }
+        })
     }
 }
 
@@ -1024,16 +1198,41 @@ pub enum YamlAccountAddress {
     },
 }
 
-impl From<YamlAccountAddress> for AccountAddress {
-    fn from(yaml: YamlAccountAddress) -> Self {
+impl std::convert::TryFrom<YamlAccountAddress> for AccountAddress {
+    type Error = ScenarioError;
+
+    fn try_from(yaml: YamlAccountAddress) -> Result<Self, Self::Error> {
         match yaml {
-            YamlAccountAddress::Pubkey { value } => {
-                AccountAddress::Pubkey(value.unwrap_or_default())
+            // The empty string is the established wire placeholder for "address
+            // supplied per override instance" (the spl-token templates rely on
+            // it), so it stays until templates model the absent address
+            // explicitly.
+            YamlAccountAddress::Pubkey { value: None } => Ok(AccountAddress::Pubkey(String::new())),
+            YamlAccountAddress::Pubkey { value: Some(s) } => {
+                if Pubkey::from_str(&s).is_err() {
+                    return Err(ScenarioError::InvalidAddress(SeedError::InvalidPubkey(s)));
+                }
+                Ok(AccountAddress::Pubkey(s))
             }
-            YamlAccountAddress::Pda { program_id, seeds } => AccountAddress::Pda {
-                program_id,
-                seeds: seeds.into_iter().map(|s| s.into()).collect(),
-            },
+            YamlAccountAddress::Pda { program_id, seeds } => {
+                Pubkey::from_str(&program_id)
+                    .map_err(|_| ScenarioError::InvalidProgramId(program_id.clone()))?;
+
+                let converted_seeds: Vec<PdaSeed> = seeds.into_iter().map(|s| s.into()).collect();
+
+                for (i, seed) in converted_seeds.iter().enumerate() {
+                    seed.validate_literals().map_err(|e| ScenarioError::Seed {
+                        program_id: program_id.clone(),
+                        index: i,
+                        source: e,
+                    })?;
+                }
+
+                Ok(AccountAddress::Pda {
+                    program_id,
+                    seeds: converted_seeds,
+                })
+            }
         }
     }
 }
@@ -1098,18 +1297,150 @@ impl From<YamlPdaSeed> for PdaSeed {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::{collections::HashMap, str::FromStr};
 
     use serde_json::json;
+    use solana_pubkey::Pubkey;
 
-    use super::PdaSeed;
+    use super::{
+        AccountAddress, Idl, OverrideError, PdaSeed, ScenarioError, SeedError, YamlAccountAddress,
+        YamlOverrideTemplateCollection, YamlOverrideTemplateEntry, YamlPdaSeed,
+    };
+
+    /// Pin the rendered message of every error variant. Run with
+    /// `--nocapture` to view them.
+    #[test]
+    fn error_messages_render_with_full_context() {
+        let program = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
+        let account = "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM";
+        let cases: Vec<(String, String)> = vec![
+            (
+                SeedError::InvalidPubkey("garbage".to_string()).to_string(),
+                "'garbage' is not a valid pubkey".to_string(),
+            ),
+            (
+                SeedError::NoValues("owner".to_string()).to_string(),
+                "seed references property 'owner' but no values were provided".to_string(),
+            ),
+            (
+                SeedError::UnknownProperty("owner".to_string()).to_string(),
+                "property 'owner' not found in values".to_string(),
+            ),
+            (
+                SeedError::WrongType {
+                    name: "owner".to_string(),
+                    expected: "string",
+                    found: "bool",
+                }
+                .to_string(),
+                "property 'owner' is bool, expected string".to_string(),
+            ),
+            (
+                SeedError::U16OutOfRange {
+                    name: "index".to_string(),
+                    value: 70_000,
+                }
+                .to_string(),
+                "property 'index' value 70000 does not fit in u16".to_string(),
+            ),
+            (
+                SeedError::InvalidBytes32("zz".to_string()).to_string(),
+                "'zz' is not a 32-byte hex string".to_string(),
+            ),
+            (
+                SeedError::DerivedSeed {
+                    program_id: program.to_string(),
+                    index: 1,
+                    source: Box::new(SeedError::InvalidPubkey("garbage".to_string())),
+                }
+                .to_string(),
+                format!(
+                    "seed 1 of derived PDA for program {program}: 'garbage' is not a valid pubkey"
+                ),
+            ),
+            (
+                ScenarioError::InvalidAddress(SeedError::InvalidPubkey("garbage".to_string()))
+                    .to_string(),
+                "invalid account address: 'garbage' is not a valid pubkey".to_string(),
+            ),
+            (
+                ScenarioError::InvalidProgramId("garbage".to_string()).to_string(),
+                "invalid program id 'garbage'".to_string(),
+            ),
+            (
+                ScenarioError::Seed {
+                    program_id: program.to_string(),
+                    index: 2,
+                    source: SeedError::UnknownProperty("owner".to_string()),
+                }
+                .to_string(),
+                format!("PDA for program {program}, seed 2: property 'owner' not found in values"),
+            ),
+            (
+                ScenarioError::Template {
+                    template_id: "spl-token".to_string(),
+                    source: Box::new(ScenarioError::InvalidProgramId("garbage".to_string())),
+                }
+                .to_string(),
+                "template 'spl-token': invalid program id 'garbage'".to_string(),
+            ),
+            (
+                OverrideError::Resolve(ScenarioError::InvalidProgramId("garbage".to_string()))
+                    .to_string(),
+                "invalid program id 'garbage'".to_string(),
+            ),
+            (
+                OverrideError::AccountNotFound {
+                    account: account.to_string(),
+                }
+                .to_string(),
+                format!(
+                    "account {account} does not exist locally; overrides patch existing accounts (enable fetchBeforeUse or create the account first)"
+                ),
+            ),
+            (
+                OverrideError::AccountTooSmall {
+                    account: account.to_string(),
+                    len: 4,
+                }
+                .to_string(),
+                format!("account {account} has 4 byte(s), too small for an 8-byte discriminator"),
+            ),
+            (
+                OverrideError::NoIdlForOwner {
+                    program_id: program.to_string(),
+                    account: account.to_string(),
+                }
+                .to_string(),
+                format!("no IDL registered for program {program} (owner of account {account})"),
+            ),
+            (
+                OverrideError::Forge {
+                    account: account.to_string(),
+                    message: "borsh decode failed".to_string(),
+                }
+                .to_string(),
+                format!("failed to forge account data for {account}: borsh decode failed"),
+            ),
+        ];
+        for (rendered, expected) in cases {
+            println!("{rendered}");
+            assert_eq!(rendered, expected);
+        }
+    }
 
     #[test]
     fn u16_be_ref_rejects_out_of_range_values() {
         let seed = PdaSeed::U16BeRef("index".to_string());
         let values = HashMap::from([("index".to_string(), json!(70_000))]);
 
-        assert_eq!(seed.to_bytes(Some(&values)), None);
+        assert_eq!(
+            seed.to_bytes(Some(&values)),
+            Err(SeedError::U16OutOfRange {
+                name: "index".to_string(),
+                value: 70_000,
+            })
+        );
     }
 
     #[test]
@@ -1117,7 +1448,156 @@ mod tests {
         let seed = PdaSeed::U16BeRef("index".to_string());
         let values = HashMap::from([("index".to_string(), json!(513))]);
 
-        assert_eq!(seed.to_bytes(Some(&values)), Some(vec![2, 1]));
+        assert_eq!(seed.to_bytes(Some(&values)), Ok(vec![2, 1]));
+    }
+
+    #[test]
+    fn pubkey_seed_with_garbage_string() {
+        let seed = PdaSeed::Pubkey("not-a-pubkey".to_string());
+        assert_eq!(
+            seed.to_bytes(None),
+            Err(SeedError::InvalidPubkey("not-a-pubkey".to_string()))
+        );
+    }
+
+    #[test]
+    fn property_ref_with_no_values() {
+        let seed = PdaSeed::PropertyRef("some_prop".to_string());
+        assert_eq!(
+            seed.to_bytes(None),
+            Err(SeedError::NoValues("some_prop".to_string()))
+        );
+    }
+
+    #[test]
+    fn property_ref_with_missing_key() {
+        let seed = PdaSeed::PropertyRef("missing_key".to_string());
+        let values = HashMap::from([("other_key".to_string(), json!("value"))]);
+        assert_eq!(
+            seed.to_bytes(Some(&values)),
+            Err(SeedError::UnknownProperty("missing_key".to_string()))
+        );
+    }
+
+    #[test]
+    fn property_ref_with_wrong_type() {
+        let seed = PdaSeed::PropertyRef("my_prop".to_string());
+        let values = HashMap::from([("my_prop".to_string(), json!(true))]);
+        assert_eq!(
+            seed.to_bytes(Some(&values)),
+            Err(SeedError::WrongType {
+                name: "my_prop".to_string(),
+                expected: "string or u64",
+                found: "bool",
+            })
+        );
+    }
+
+    #[test]
+    fn bytes32_ref_with_invalid_hex() {
+        let seed = PdaSeed::Bytes32Ref("feed_id".to_string());
+        let values = HashMap::from([("feed_id".to_string(), json!("0xzz"))]);
+        assert_eq!(
+            seed.to_bytes(Some(&values)),
+            Err(SeedError::InvalidBytes32("zz".to_string()))
+        );
+    }
+
+    #[test]
+    fn derived_pda_with_bad_inner_seed() {
+        let seed = PdaSeed::DerivedPda {
+            program_id: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_string(),
+            seeds: vec![
+                PdaSeed::String("valid_string".to_string()),
+                PdaSeed::Pubkey("not-a-pubkey".to_string()),
+            ],
+        };
+
+        match seed.to_bytes(None) {
+            Ok(_) => panic!("expected error"),
+            Err(SeedError::DerivedSeed {
+                program_id,
+                index,
+                source,
+            }) => {
+                assert_eq!(program_id, "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+                assert_eq!(index, 1);
+                assert_eq!(
+                    *source,
+                    SeedError::InvalidPubkey("not-a-pubkey".to_string())
+                );
+            }
+            Err(e) => panic!("wrong error: {:?}", e),
+        }
+    }
+
+    #[test]
+    fn account_address_pubkey_with_garbage_resolve_simple() {
+        let addr = AccountAddress::Pubkey("garbage".to_string());
+        assert_eq!(
+            addr.resolve_simple(),
+            Err(ScenarioError::InvalidAddress(SeedError::InvalidPubkey(
+                "garbage".to_string()
+            )))
+        );
+    }
+
+    #[test]
+    fn account_address_pda_with_invalid_program_id() {
+        let addr = AccountAddress::Pda {
+            program_id: "invalid-program".to_string(),
+            seeds: vec![PdaSeed::String("test".to_string())],
+        };
+
+        match addr.resolve_simple() {
+            Ok(_) => panic!("expected error"),
+            Err(ScenarioError::InvalidProgramId(id)) => {
+                assert_eq!(id, "invalid-program");
+            }
+            Err(e) => panic!("wrong error: {:?}", e),
+        }
+    }
+
+    #[test]
+    fn account_address_pda_with_property_ref_no_values() {
+        let addr = AccountAddress::Pda {
+            program_id: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_string(),
+            seeds: vec![PdaSeed::PropertyRef("owner".to_string())],
+        };
+
+        match addr.resolve_simple() {
+            Ok(_) => panic!("expected error"),
+            Err(ScenarioError::Seed {
+                program_id,
+                index,
+                source,
+            }) => {
+                assert_eq!(program_id, "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+                assert_eq!(index, 0);
+                assert_eq!(source, SeedError::NoValues("owner".to_string()));
+            }
+            Err(e) => panic!("wrong error: {:?}", e),
+        }
+    }
+
+    #[test]
+    fn account_address_pda_success() {
+        let seed_str = "test_seed";
+        let addr = AccountAddress::Pda {
+            program_id: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_string(),
+            seeds: vec![PdaSeed::String(seed_str.to_string())],
+        };
+
+        let resolved = addr.resolve_simple();
+        assert!(resolved.is_ok());
+
+        // Verify it matches the expected PDA computed via find_program_address
+        let expected_program =
+            Pubkey::from_str("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap();
+        let (expected_pda, _) =
+            Pubkey::find_program_address(&[seed_str.as_bytes()], &expected_program);
+
+        assert_eq!(resolved.ok(), Some(expected_pda));
     }
 
     #[test]
@@ -1125,16 +1605,32 @@ mod tests {
         let seed = PdaSeed::U16BeRef("index".to_string());
         let values = HashMap::from([("index".to_string(), json!("513"))]);
 
-        assert_eq!(seed.to_bytes(Some(&values)), Some(vec![2, 1]));
+        assert_eq!(seed.to_bytes(Some(&values)), Ok(vec![2, 1]));
     }
 
+    /// Every non-u16 string reports `WrongType`, including "65536": the
+    /// string path rejects at the parse, so an overflowing decimal string
+    /// reports the type, not the range. Only JSON numbers get
+    /// `U16OutOfRange`.
     #[test]
     fn u16_be_ref_rejects_strings_that_are_not_a_u16() {
         let seed = PdaSeed::U16BeRef("index".to_string());
 
         for value in [json!("65536"), json!("abc"), json!("-1"), json!("")] {
             let values = HashMap::from([("index".to_string(), value.clone())]);
-            assert_eq!(seed.to_bytes(Some(&values)), None, "value {value}");
+            let err = seed
+                .to_bytes(Some(&values))
+                .expect_err(&format!("value {value}"));
+            assert_eq!(
+                err,
+                SeedError::WrongType {
+                    name: "index".to_string(),
+                    expected: "u16",
+                    found: "string",
+                },
+                "value {value}"
+            );
+            assert_eq!(err.to_string(), "property 'index' is string, expected u16");
         }
     }
 
@@ -1144,7 +1640,168 @@ mod tests {
 
         for value in [json!(1.5), json!(true), json!(null), json!([1]), json!({})] {
             let values = HashMap::from([("index".to_string(), value.clone())]);
-            assert_eq!(seed.to_bytes(Some(&values)), None, "value {value}");
+            assert!(seed.to_bytes(Some(&values)).is_err(), "value {value}");
+        }
+    }
+
+    #[test]
+    fn yaml_account_address_pubkey_valid_base58_converts() {
+        let yaml_addr = YamlAccountAddress::Pubkey {
+            value: Some("So11111111111111111111111111111111111111112".to_string()),
+        };
+
+        let result = AccountAddress::try_from(yaml_addr);
+        assert!(result.is_ok());
+
+        if let Ok(AccountAddress::Pubkey(s)) = result {
+            assert_eq!(s, "So11111111111111111111111111111111111111112");
+        } else {
+            panic!("Expected Pubkey variant");
+        }
+    }
+
+    #[test]
+    fn yaml_account_address_pubkey_invalid_string_errors() {
+        let yaml_addr = YamlAccountAddress::Pubkey {
+            value: Some("not-a-pubkey".to_string()),
+        };
+
+        let result = AccountAddress::try_from(yaml_addr);
+        assert!(result.is_err());
+
+        if let Err(ScenarioError::InvalidAddress(SeedError::InvalidPubkey(s))) = result {
+            assert_eq!(s, "not-a-pubkey");
+        } else {
+            panic!("Expected InvalidAddress error with InvalidPubkey");
+        }
+    }
+
+    #[test]
+    fn yaml_account_address_pubkey_none_stays_empty_string() {
+        let yaml_addr = YamlAccountAddress::Pubkey { value: None };
+
+        let result = AccountAddress::try_from(yaml_addr);
+        assert!(result.is_ok());
+
+        if let Ok(AccountAddress::Pubkey(s)) = result {
+            assert_eq!(s, "");
+        } else {
+            panic!("Expected Pubkey variant with empty string");
+        }
+    }
+
+    #[test]
+    fn yaml_account_address_pda_bad_program_id_errors() {
+        let yaml_addr = YamlAccountAddress::Pda {
+            program_id: "not-a-pubkey".to_string(),
+            seeds: vec![],
+        };
+
+        let result = AccountAddress::try_from(yaml_addr);
+        assert!(result.is_err());
+
+        if let Err(ScenarioError::InvalidProgramId(id)) = result {
+            assert_eq!(id, "not-a-pubkey");
+        } else {
+            panic!("Expected InvalidProgramId error");
+        }
+    }
+
+    #[test]
+    fn yaml_account_address_pda_bad_literal_pubkey_seed_errors() {
+        let yaml_addr = YamlAccountAddress::Pda {
+            program_id: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_string(),
+            seeds: vec![
+                YamlPdaSeed::String {
+                    value: "seed0".to_string(),
+                },
+                YamlPdaSeed::Pubkey {
+                    value: "oops".to_string(),
+                },
+            ],
+        };
+
+        let result = AccountAddress::try_from(yaml_addr);
+        assert!(result.is_err());
+
+        if let Err(ScenarioError::Seed {
+            program_id,
+            index,
+            source,
+        }) = result
+        {
+            assert_eq!(program_id, "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+            assert_eq!(index, 1);
+            assert_eq!(source, SeedError::InvalidPubkey("oops".to_string()));
+        } else {
+            panic!("Expected Seed error at index 1");
+        }
+    }
+
+    #[test]
+    fn yaml_account_address_pda_property_ref_seed_not_validated() {
+        use std::convert::TryFrom;
+
+        let yaml_addr = YamlAccountAddress::Pda {
+            program_id: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_string(),
+            seeds: vec![YamlPdaSeed::PropertyRef {
+                value: "some_property".to_string(),
+            }],
+        };
+
+        let result = AccountAddress::try_from(yaml_addr);
+        assert!(
+            result.is_ok(),
+            "PropertyRef seeds should not be validated at load time"
+        );
+    }
+
+    #[test]
+    fn yaml_override_template_collection_with_bad_address_wraps_error() {
+        let entry = YamlOverrideTemplateEntry {
+            id: "test-template".to_string(),
+            name: "Test".to_string(),
+            description: "Test template".to_string(),
+            idl_account_name: None,
+            properties: vec![],
+            address: YamlAccountAddress::Pubkey {
+                value: Some("invalid-pubkey".to_string()),
+            },
+            llm_context: None,
+        };
+
+        let collection = YamlOverrideTemplateCollection {
+            protocol: "Test".to_string(),
+            version: "1.0".to_string(),
+            account_type: None,
+            idl_file_path: "test.json".to_string(),
+            tags: vec![],
+            constants: HashMap::new(),
+            templates: vec![entry],
+        };
+
+        let idl_json = r#"{
+            "address": "11111111111111111111111111111111",
+            "instructions": [],
+            "accounts": [],
+            "types": [],
+            "errors": [],
+            "metadata": {"name": "test", "version": "0.1.0", "spec": "0.1.0"}
+        }"#;
+
+        let idl: Idl = serde_json::from_str(idl_json).expect("Valid minimal IDL");
+
+        let result = collection.to_override_templates(idl);
+        assert!(result.is_err());
+
+        if let Err(ScenarioError::Template {
+            template_id,
+            source: _,
+        }) = result
+        {
+            assert_eq!(template_id, "test-template");
+        } else {
+            panic!("Expected Template error wrapper");
         }
     }
 }

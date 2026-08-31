@@ -11,6 +11,7 @@ use solana_pubkey::Pubkey;
 use solana_signature::Signature;
 use solana_transaction::TransactionError;
 use solana_transaction_status::EncodeError;
+use surfpool_types::ScenarioError;
 
 use crate::storage::StorageError;
 
@@ -483,6 +484,21 @@ impl SurfpoolError {
         error.message = format!("Expected profile not found for key {key}");
         Self(error)
     }
+
+    pub fn invalid_scenario(scenario_name: &str, failures: &[(String, ScenarioError)]) -> Self {
+        let mut error = Error::invalid_request();
+        let failure_messages = failures
+            .iter()
+            .map(|(id, err)| format!("override '{}': {}", id, err))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let message = format!(
+            "Cannot register scenario '{}': {}",
+            scenario_name, failure_messages
+        );
+        error.message = message;
+        Self(error)
+    }
 }
 
 impl From<StorageError> for SurfpoolError {
@@ -506,6 +522,14 @@ impl From<TransactionError> for SurfpoolError {
         let mut error = Error::internal_error();
         error.data = Some(json!(format!("Transaction error: {}", e.to_string())));
         SurfpoolError(error)
+    }
+}
+
+impl From<ScenarioError> for SurfpoolError {
+    fn from(e: ScenarioError) -> Self {
+        let mut error = Error::invalid_request();
+        error.data = Some(json!(format!("Scenario error: {}", e)));
+        Self(error)
     }
 }
 
