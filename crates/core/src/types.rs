@@ -39,9 +39,13 @@ use solana_transaction_status::{
     },
     parse_ui_inner_instructions,
 };
-use solana_zk_sdk::encryption::{auth_encryption::AeKey, elgamal::ElGamalPubkey};
+use solana_zk_sdk::encryption::{
+    auth_encryption::{AeCiphertext, AeKey},
+    derivation::derive_confidential_keys_from_signature,
+    elgamal::{ElGamalCiphertext, ElGamalPubkey, ElGamalSecretKey},
+};
 use solana_zk_sdk_pod::encryption::{
-    auth_encryption::{AeCiphertext, AeKey, PodAeCiphertext},
+    auth_encryption::PodAeCiphertext,
     elgamal::{PodElGamalCiphertext, PodElGamalPubkey},
 };
 use spl_token_2022_interface::extension::{
@@ -1429,30 +1433,22 @@ fn decrypt_pending_balance(
     })
 }
 
-/// Derive an owner's confidential-transfer keys from the owner's signatures.
+/// Derive an owner's confidential-transfer keys from the owner's signature.
 ///
-/// Backs the `surfnet_deriveConfidentialKeys` cheatcode: the caller signs the two seed
-/// messages and gets back keys ready to pass to the other confidential cheatcodes.
+/// Backs the `surfnet_deriveConfidentialKeys` cheatcode: the caller signs the
+/// canonical confidential-balance derivation message and gets back keys ready to
+/// pass to the other confidential cheatcodes.
 ///
-/// The derivation semantics — domain separation, the `new_from_signer` equivalence, and
-/// what does and does not cross the wire — are documented on `surfnet_deriveConfidentialKeys`
-/// in [`crate::rpc::surfnet_cheatcodes::SurfnetCheatcodes`].
+/// The SDK's domain separation and what does and does not cross the wire are documented on
+/// `surfnet_deriveConfidentialKeys` in [`crate::rpc::surfnet_cheatcodes::SurfnetCheatcodes`].
 ///
 /// `derive_confidential_keys` itself imposes no seed: the caller owns what the keys are
 /// scoped to, because the caller owns what it signed.
-pub fn derive_confidential_keys(
-    elgamal_signature: &str,
-    ae_signature: &str,
-) -> Result<DeriveConfidentialKeysResponse, String> {
-    let elgamal_signature = parse_confidential_key_signature(elgamal_signature)
-        .map_err(|e| format!("elgamalSignature: {e}"))?;
-    let ae_signature =
-        parse_confidential_key_signature(ae_signature).map_err(|e| format!("aeSignature: {e}"))?;
-
-    let elgamal = ElGamalKeypair::new_from_signature(&elgamal_signature)
-        .map_err(|e| format!("failed to derive ElGamal keypair: {e}"))?;
-    let aes_key = AeKey::new_from_signature(&ae_signature)
-        .map_err(|e| format!("failed to derive AES key: {e}"))?;
+pub fn derive_confidential_keys(signature: &str) -> Result<DeriveConfidentialKeysResponse, String> {
+    let signature =
+        parse_confidential_key_signature(signature).map_err(|e| format!("signature: {e}"))?;
+    let (elgamal, aes_key) = derive_confidential_keys_from_signature(&signature)
+        .map_err(|e| format!("failed to derive confidential keys: {e}"))?;
 
     let elgamal_secret_key: [u8; 32] = elgamal.secret().into();
     let aes_key: [u8; 16] = aes_key.into();
@@ -1464,24 +1460,25 @@ pub fn derive_confidential_keys(
     })
 }
 
-/// Sign the two seed messages `derive_confidential_keys` expects, scoping the keys
+/// Sign the canonical confidential-balance derivation message, scoping the keys
 /// to `token_account`.
 ///
-/// This is the client-side half of the cheatcode: it mirrors, in the open, what
-/// `ElGamalKeypair::new_from_signer` and `AeKey::new_from_signer` sign internally.
+/// This is the client-side half of the cheatcode and mirrors
+/// `solana_zk_sdk::encryption::derivation::derive_confidential_keys`.
 #[cfg(test)]
-pub(crate) fn confidential_key_signatures(
+pub(crate) fn confidential_key_signature(
     owner: &solana_keypair::Keypair,
     token_account: &Pubkey,
-) -> (String, String) {
+) -> String {
     use solana_signer::Signer;
 
-    let sign = |domain: &[u8]| {
-        owner
-            .sign_message(&[domain, token_account.as_ref()].concat())
-            .to_string()
-    };
-    (sign(b"ElGamalSecretKey"), sign(b"AeKey"))
+    owner
+        .sign_message(
+            &solana_zk_sdk::encryption::derivation::confidential_derivation_message(
+                token_account.as_ref(),
+            ),
+        )
+        .to_string()
 }
 
 #[cfg(test)]
@@ -1490,79 +1487,69 @@ mod confidential_key_derivation_tests {
 
     use super::*;
 
-    /// The whole point of moving from a keypair to signatures is that the keys do
-    /// not change. Derive both ways over the same owner and token account and
-    /// compare: `new_from_signer` signs `"ElGamalSecretKey" || seed` and
-    /// `"AeKey" || seed` itself and then calls the very `new_from_signature`
-    /// functions the cheatcode now calls, so the two paths must agree byte for byte.
+    /// The canonical signer and precomputed-signature paths must produce the same
+    /// HKDF-derived key material.
     #[test]
     fn signatures_reproduce_the_keys_the_signer_path_derived() {
         let owner = Keypair::new();
         let token_account = Pubkey::new_unique();
 
-        let (elgamal_signature, ae_signature) = confidential_key_signatures(&owner, &token_account);
-        let from_signatures = derive_confidential_keys(&elgamal_signature, &ae_signature)
-            .expect("deriving from signatures should succeed");
+        let signature = confidential_key_signature(&owner, &token_account);
+        let from_signature =
+            derive_confidential_keys(&signature).expect("deriving from signatures should succeed");
 
-        // The reference path, with the standard per-account seed and no prefix.
-        let seed = token_account.as_ref();
-        let elgamal = ElGamalKeypair::new_from_signer(&owner, seed).unwrap();
-        let aes_key = AeKey::new_from_signer(&owner, seed).unwrap();
+        let (elgamal, aes_key) = solana_zk_sdk::encryption::derivation::derive_confidential_keys(
+            &owner,
+            token_account.as_ref(),
+        )
+        .unwrap();
         let elgamal_secret: [u8; 32] = elgamal.secret().into();
         let aes_key_bytes: [u8; 16] = aes_key.into();
 
         assert_eq!(
-            from_signatures.elgamal_pubkey,
+            from_signature.elgamal_pubkey,
             bs58::encode(bytes_of(&PodElGamalPubkey::from(elgamal.pubkey_owned()))).into_string(),
         );
         assert_eq!(
-            from_signatures.elgamal_secret_key,
+            from_signature.elgamal_secret_key,
             bs58::encode(elgamal_secret).into_string(),
         );
         assert_eq!(
-            from_signatures.aes_key,
+            from_signature.aes_key,
             bs58::encode(aes_key_bytes).into_string(),
         );
     }
 
-    /// The two seed messages are domain-separated, so reusing one signature for
-    /// both keys does not reproduce the signer path. This is why the cheatcode
-    /// takes two signatures rather than one.
+    /// The account seed is part of the canonical signed message, so changing it
+    /// changes both keys.
     #[test]
-    fn one_signature_cannot_stand_in_for_both() {
+    fn different_seed_produces_different_keys() {
         let owner = Keypair::new();
         let token_account = Pubkey::new_unique();
 
-        let (elgamal_signature, ae_signature) = confidential_key_signatures(&owner, &token_account);
-        assert_ne!(elgamal_signature, ae_signature);
+        let current =
+            derive_confidential_keys(&confidential_key_signature(&owner, &token_account)).unwrap();
+        let other =
+            derive_confidential_keys(&confidential_key_signature(&owner, &Pubkey::new_unique()))
+                .unwrap();
 
-        let reused = derive_confidential_keys(&elgamal_signature, &elgamal_signature).unwrap();
-        let correct = derive_confidential_keys(&elgamal_signature, &ae_signature).unwrap();
-
-        assert_eq!(reused.elgamal_pubkey, correct.elgamal_pubkey);
-        assert_ne!(reused.aes_key, correct.aes_key);
+        assert_ne!(current.elgamal_pubkey, other.elgamal_pubkey);
+        assert_ne!(current.aes_key, other.aes_key);
     }
 
-    /// `new_from_signature` hashes the all-zero default signature happily, so
-    /// without an explicit check the cheatcode would hand back a fixed key pair
-    /// anyone can compute. `new_from_signer`, the path this replaced, rejects it.
-    /// Assert the rejection on both parameters and that the error names which one.
+    /// The SDK rejects the all-zero signature so the cheatcode cannot hand back a
+    /// fixed, publicly computable key pair.
     #[test]
-    fn the_default_signature_is_rejected_on_both_parameters() {
+    fn the_default_signature_is_rejected() {
         let owner = Keypair::new();
         let token_account = Pubkey::new_unique();
-        let (elgamal_signature, ae_signature) = confidential_key_signatures(&owner, &token_account);
+        let signature = confidential_key_signature(&owner, &token_account);
         let default_signature = Signature::default().to_string();
 
-        // Why the check has to live here: the SDK functions this calls accept it.
-        assert!(ElGamalKeypair::new_from_signature(&Signature::default()).is_ok());
-        assert!(AeKey::new_from_signature(&Signature::default()).is_ok());
+        let error = derive_confidential_keys(&default_signature).unwrap_err();
+        assert!(error.starts_with("signature:"), "got: {error}");
 
-        let error = derive_confidential_keys(&default_signature, &ae_signature).unwrap_err();
-        assert!(error.starts_with("elgamalSignature:"), "got: {error}");
-
-        let error = derive_confidential_keys(&elgamal_signature, &default_signature).unwrap_err();
-        assert!(error.starts_with("aeSignature:"), "got: {error}");
+        assert!(derive_confidential_keys(&signature).is_ok());
     }
 
     /// A 32-byte pubkey is valid base58 but is not a signature, and the error has
@@ -1571,14 +1558,13 @@ mod confidential_key_derivation_tests {
     fn a_malformed_signature_names_its_parameter() {
         let owner = Keypair::new();
         let token_account = Pubkey::new_unique();
-        let (elgamal_signature, ae_signature) = confidential_key_signatures(&owner, &token_account);
+        let signature = confidential_key_signature(&owner, &token_account);
         let not_a_signature = token_account.to_string();
 
-        let error = derive_confidential_keys(&not_a_signature, &ae_signature).unwrap_err();
-        assert!(error.starts_with("elgamalSignature:"), "got: {error}");
+        let error = derive_confidential_keys(&not_a_signature).unwrap_err();
+        assert!(error.starts_with("signature:"), "got: {error}");
 
-        let error = derive_confidential_keys(&elgamal_signature, &not_a_signature).unwrap_err();
-        assert!(error.starts_with("aeSignature:"), "got: {error}");
+        assert!(derive_confidential_keys(&signature).is_ok());
     }
 }
 

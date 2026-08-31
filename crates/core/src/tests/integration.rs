@@ -10776,18 +10776,16 @@ async fn test_token2022_metadata_realloc(test_type: TestType) {
 #[cfg_attr(feature = "postgres", test_case(TestType::postgres(); "with postgres db"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_confidential_balance_deposit_round_trip(test_type: TestType) {
+    use solana_zk_sdk::encryption::{
+        auth_encryption::AeKey,
+        elgamal::{ElGamalKeypair, ElGamalPubkey},
+    };
+    use solana_zk_sdk_pod::encryption::auth_encryption::PodAeCiphertext;
     use spl_associated_token_account_interface::address::get_associated_token_address_with_program_id;
-    use spl_token_2022_interface::{
-        extension::{
-            BaseStateWithExtensionsMut, StateWithExtensionsMut,
-            confidential_transfer::{
-                ConfidentialTransferAccount, instruction as confidential_instruction,
-            },
-        },
-        solana_zk_sdk::encryption::{
-            auth_encryption::AeKey,
-            elgamal::{ElGamalKeypair, ElGamalPubkey},
-            pod::auth_encryption::PodAeCiphertext,
+    use spl_token_2022_interface::extension::{
+        BaseStateWithExtensionsMut, StateWithExtensionsMut,
+        confidential_transfer::{
+            ConfidentialTransferAccount, instruction as confidential_instruction,
         },
     };
     use surfpool_types::types::{
@@ -10825,16 +10823,11 @@ async fn test_confidential_balance_deposit_round_trip(test_type: TestType) {
         &token_program,
     );
 
-    // Leg 1: derive the owner's confidential keys from signatures scoped to this
-    // token account, which are the two messages a confidential client signs.
-    let (elgamal_signature, ae_signature) =
-        crate::types::confidential_key_signatures(&owner, &token_account);
+    // Leg 1: derive the owner's confidential keys from a signature scoped to
+    // this token account, using the SDK's canonical derivation message.
+    let signature = crate::types::confidential_key_signature(&owner, &token_account);
     let keys = rpc_server
-        .derive_confidential_keys(
-            Some(runloop_context.clone()),
-            elgamal_signature,
-            ae_signature,
-        )
+        .derive_confidential_keys(Some(runloop_context.clone()), signature)
         .expect("deriveConfidentialKeys should succeed")
         .value;
 

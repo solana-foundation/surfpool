@@ -1285,23 +1285,19 @@ pub trait SurfnetCheatcodes {
         keys: ConfidentialBalanceKeys,
     ) -> BoxFuture<Result<RpcResponse<GetConfidentialBalanceResponse>>>;
 
-    /// A cheat code to derive an owner's confidential-transfer keys from the owner's signatures.
+    /// A cheat code to derive an owner's confidential-transfer keys from the owner's signature.
     ///
     /// The confidential cheatcodes take an `elgamalPubkey` and an `aesKey`, which a client would
     /// normally derive with an external confidential-transfer SDK. Deriving them here lets a test
     /// drive the whole confidential suite with no client-side crypto dependency.
     ///
     /// ## Parameters
-    /// - `elgamal_signature`: The owner's 64-byte signature over the bytes `"ElGamalSecretKey"`
-    ///   followed by the token account address, base58 or base64 encoded.
-    /// - `ae_signature`: The owner's 64-byte signature over the bytes `"AeKey"` followed by the token
-    ///   account address, base58 or base64 encoded.
+    /// - `signature`: The owner's 64-byte signature over `"solana-conf-bal/v1"` followed by the
+    ///   desired public seed (normally the token account address), base58 or base64 encoded.
     ///
-    /// `solana_zk_sdk` derives the two keys from signatures over two different domain-separated
-    /// messages, so one signature cannot reproduce both: passing the same signature twice still
-    /// returns a well-formed pair, just not the pair the signer path derives. Signing those two
-    /// messages over the token account address is what scopes the keys to that account; the caller
-    /// picks the seed, so per-wallet keying is the same call with a different message signed.
+    /// `solana_zk_sdk` derives both keys from this single signature using its canonical HKDF-SHA512
+    /// derivation. Signing the message with the token account address as its seed scopes the keys
+    /// to that account; the caller can use a different seed for per-wallet keying.
     ///
     /// ## Returns
     /// A `RpcResponse<DeriveConfidentialKeysResponse>` with base58 `elgamalPubkey` (for
@@ -1315,8 +1311,7 @@ pub trait SurfnetCheatcodes {
     ///   "id": 1,
     ///   "method": "surfnet_deriveConfidentialKeys",
     ///   "params": [
-    ///     "<base58, 64-byte signature over \"ElGamalSecretKey\" || token account>",
-    ///     "<base58, 64-byte signature over \"AeKey\" || token account>"
+    ///     "<base58, 64-byte signature over \"solana-conf-bal/v1\" || token account>"
     ///   ]
     /// }
     /// ```
@@ -1341,13 +1336,13 @@ pub trait SurfnetCheatcodes {
     /// ```
     ///
     /// # Notes
-    /// The owner's *signing* key never crosses the wire: the caller signs the two seed messages
-    /// locally and sends only the signatures, so a hardware signer, which never exposes its signing
-    /// key, can drive this. The signatures are used only as key material and are not stored.
+    /// The owner's *signing* key never crosses the wire: the caller signs the canonical seed message
+    /// locally and sends only the signature, so a hardware signer, which never exposes its signing
+    /// key, can drive this. The signature is used only as key material and is not stored.
     ///
     /// What that does and does not buy is worth stating plainly. Because the ElGamal secret is a
-    /// hash of the signature, `elgamalSignature` is exactly as sensitive as the `elgamalSecretKey`
-    /// it derives: anyone who sees it recomputes that key offline.
+    /// HKDF input, `signature` is exactly as sensitive as the derived confidential keys: anyone who
+    /// sees it recomputes them offline.
     ///
     /// The derived `elgamalSecretKey` and `aesKey` do travel back in the response, and
     /// `surfnet_getConfidentialBalance` takes them back as inputs. That is the point of the
@@ -1358,8 +1353,7 @@ pub trait SurfnetCheatcodes {
     fn derive_confidential_keys(
         &self,
         meta: Self::Metadata,
-        elgamal_signature: String,
-        ae_signature: String,
+        signature: String,
     ) -> Result<RpcResponse<DeriveConfidentialKeysResponse>>;
 
     /// A "cheat code" method for developers to write program data at a specified offset in Surfpool.
@@ -2438,12 +2432,10 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
     fn derive_confidential_keys(
         &self,
         meta: Self::Metadata,
-        elgamal_signature: String,
-        ae_signature: String,
+        signature: String,
     ) -> Result<RpcResponse<DeriveConfidentialKeysResponse>> {
         let svm_locker = meta.get_svm_locker()?;
-        let keys = derive_confidential_keys(&elgamal_signature, &ae_signature)
-            .map_err(Error::invalid_params)?;
+        let keys = derive_confidential_keys(&signature).map_err(Error::invalid_params)?;
         Ok(RpcResponse {
             context: RpcResponseContext::new(svm_locker.get_latest_absolute_slot()),
             value: keys,
@@ -2599,7 +2591,7 @@ mod tests {
     use super::*;
     use crate::{
         rpc::surfnet_cheatcodes::SurfnetCheatcodesRpc, tests::helpers::TestSetup,
-        types::confidential_key_signatures,
+        types::confidential_key_signature,
     };
 
     /// Guards the canonical cheatcode method manifest in `surfpool-types`
@@ -5323,14 +5315,10 @@ mod tests {
             &token_program,
         );
 
-        let (elgamal_signature, ae_signature) = confidential_key_signatures(&owner, &token_account);
+        let signature = confidential_key_signature(&owner, &token_account);
         let keys = client
             .rpc
-            .derive_confidential_keys(
-                Some(client.context.clone()),
-                elgamal_signature,
-                ae_signature,
-            )
+            .derive_confidential_keys(Some(client.context.clone()), signature)
             .expect("key derivation should succeed")
             .value;
 
@@ -5387,12 +5375,11 @@ mod tests {
     #[test]
     fn test_confidential_pending_balance_recombines_lo_and_hi() {
         use bytemuck::bytes_of;
-        use spl_token_2022_interface::{
-            extension::{
-                BaseStateWithExtensionsMut, StateWithExtensionsMut,
-                confidential_transfer::ConfidentialTransferAccount,
-            },
-            solana_zk_sdk::encryption::{elgamal::ElGamalKeypair, pod::elgamal::PodElGamalPubkey},
+        use solana_zk_sdk::encryption::elgamal::ElGamalKeypair;
+        use solana_zk_sdk_pod::encryption::elgamal::PodElGamalPubkey;
+        use spl_token_2022_interface::extension::{
+            BaseStateWithExtensionsMut, StateWithExtensionsMut,
+            confidential_transfer::ConfidentialTransferAccount,
         };
         use surfpool_types::types::ConfidentialTransferAccountUpdate;
 
@@ -5474,15 +5461,10 @@ mod tests {
         let token_account = Pubkey::new_unique();
 
         let derive = |token_account: Pubkey| {
-            let (elgamal_signature, ae_signature) =
-                confidential_key_signatures(&owner, &token_account);
+            let signature = confidential_key_signature(&owner, &token_account);
             client
                 .rpc
-                .derive_confidential_keys(
-                    Some(client.context.clone()),
-                    elgamal_signature,
-                    ae_signature,
-                )
+                .derive_confidential_keys(Some(client.context.clone()), signature)
                 .expect("key derivation should succeed")
                 .value
         };
@@ -5505,14 +5487,10 @@ mod tests {
             &token_program,
         );
 
-        let (elgamal_signature, ae_signature) = confidential_key_signatures(&owner, &token_account);
+        let signature = confidential_key_signature(&owner, &token_account);
         let keys = client
             .rpc
-            .derive_confidential_keys(
-                Some(client.context.clone()),
-                elgamal_signature,
-                ae_signature,
-            )
+            .derive_confidential_keys(Some(client.context.clone()), signature)
             .expect("key derivation should succeed")
             .value;
 
@@ -5551,15 +5529,10 @@ mod tests {
 
         // A wrong AES key must fail the ciphertext's authentication tag rather than
         // silently decrypt to some other number.
-        let (foreign_elgamal_signature, foreign_ae_signature) =
-            confidential_key_signatures(&Keypair::new(), &token_account);
+        let foreign_signature = confidential_key_signature(&Keypair::new(), &token_account);
         let wrong_keys = client
             .rpc
-            .derive_confidential_keys(
-                Some(client.context.clone()),
-                foreign_elgamal_signature,
-                foreign_ae_signature,
-            )
+            .derive_confidential_keys(Some(client.context.clone()), foreign_signature)
             .expect("key derivation should succeed")
             .value;
         assert!(
