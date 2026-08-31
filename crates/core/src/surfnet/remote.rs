@@ -33,13 +33,16 @@ use solana_rpc_client_api::client_error::{
     Error as ClientError, ErrorKind as ClientErrorKind, Result as ClientResult,
 };
 use solana_signature::Signature;
-use solana_transaction_status::{EncodedConfirmedTransactionWithStatusMeta, UiConfirmedBlock};
+use solana_transaction::versioned::VersionedTransaction;
+use solana_transaction_status::{
+    EncodedConfirmedTransactionWithStatusMeta, UiConfirmedBlock, UiTransactionEncoding,
+};
 use surfpool_types::sanitized_datasource_url;
 
 use super::GetTransactionResult;
 use crate::{
     error::{SurfpoolError, SurfpoolResult},
-    rpc::utils::is_method_not_supported_error,
+    rpc::utils::{MAX_SUPPORTED_TRANSACTION_VERSION, is_method_not_supported_error},
     surfnet::{
         AccountSource, CoupledAccount, GetAccountResult, locker::is_supported_token_program,
     },
@@ -194,6 +197,16 @@ impl SurfpoolRpcClient {
         let client = RpcClient::new_sender(sender, RpcClientConfig::default());
         Some(SurfpoolRpcClient { client })
     }
+}
+
+/// A transaction fetched from a remote, with what the remote reports about running it
+#[derive(Debug)]
+pub struct RemoteTransaction {
+    pub transaction: VersionedTransaction,
+    pub slot: Slot,
+    pub block_time: Option<i64>,
+    pub error: Option<String>,
+    pub compute_units_consumed: Option<u64>,
 }
 
 pub struct SurfnetRemoteClient {
@@ -484,6 +497,61 @@ impl SurfnetRemoteClient {
                 GetTransactionResult::found_transaction(signature, tx, latest_absolute_slot)
             }
             None => GetTransactionResult::None(signature),
+        })
+    }
+
+    /// Gets a confirmed transaction from the remote, with its slot and block time.
+    ///
+    /// A `null` result means the transaction is missing. Any other failure is returned as an
+    /// error.
+    pub async fn get_versioned_transaction(
+        &self,
+        signature: Signature,
+    ) -> SurfpoolResult<RemoteTransaction> {
+        let config = RpcTransactionConfig {
+            encoding: Some(UiTransactionEncoding::Base64),
+            commitment: Some(CommitmentConfig::confirmed()),
+            max_supported_transaction_version: Some(MAX_SUPPORTED_TRANSACTION_VERSION),
+        };
+
+        // Clean up the client error first. The raw one can contain the secret in the
+        // datasource URL, and this message is shown to the user.
+        let encoded = self
+            .client
+            .send::<Option<EncodedConfirmedTransactionWithStatusMeta>>(
+                RpcRequest::GetTransaction,
+                json!([signature.to_string(), config]),
+            )
+            .await
+            .map_err(|error| {
+                SurfpoolError::get_transaction(
+                    signature,
+                    sanitized_client_error(&error, &self.client.url()),
+                )
+            })?;
+        let encoded = encoded.ok_or_else(|| SurfpoolError::transaction_not_found(signature))?;
+
+        let slot = encoded.slot;
+        let block_time = encoded.block_time;
+        let meta = encoded.transaction.meta;
+        let error = meta
+            .as_ref()
+            .and_then(|meta| meta.err.as_ref().map(|e| e.to_string()));
+        let compute_units_consumed =
+            meta.and_then(|meta| Option::<u64>::from(meta.compute_units_consumed));
+        let transaction = encoded.transaction.transaction.decode().ok_or_else(|| {
+            SurfpoolError::internal(format!(
+                "Transaction {} could not be decoded from the datasource response",
+                signature
+            ))
+        })?;
+
+        Ok(RemoteTransaction {
+            transaction,
+            slot,
+            block_time,
+            error,
+            compute_units_consumed,
         })
     }
 
@@ -968,6 +1036,150 @@ mod tests {
                 "the failure should still name the host: {message}"
             );
         }
+    }
+
+    /// Answers every request with one fixed value.
+    struct Answers(serde_json::Value);
+
+    #[async_trait]
+    impl RpcSender for Answers {
+        async fn send(
+            &self,
+            _request: RpcRequest,
+            _params: serde_json::Value,
+        ) -> ClientResult<serde_json::Value> {
+            Ok(self.0.clone())
+        }
+
+        fn get_transport_stats(&self) -> RpcTransportStats {
+            RpcTransportStats::default()
+        }
+
+        fn url(&self) -> String {
+            "http://test.example".to_string()
+        }
+    }
+
+    /// Answers every request with one fixed value, and keeps the params it was called with.
+    struct RecordsParams {
+        answer: serde_json::Value,
+        params: std::sync::Arc<std::sync::Mutex<Option<serde_json::Value>>>,
+    }
+
+    #[async_trait]
+    impl RpcSender for RecordsParams {
+        async fn send(
+            &self,
+            _request: RpcRequest,
+            params: serde_json::Value,
+        ) -> ClientResult<serde_json::Value> {
+            *self.params.lock().unwrap() = Some(params);
+            Ok(self.answer.clone())
+        }
+
+        fn get_transport_stats(&self) -> RpcTransportStats {
+            RpcTransportStats::default()
+        }
+
+        fn url(&self) -> String {
+            "http://test.example".to_string()
+        }
+    }
+
+    /// Fails every request, like a datasource cannot be reached.
+    struct Fails(String);
+
+    #[async_trait]
+    impl RpcSender for Fails {
+        async fn send(
+            &self,
+            _request: RpcRequest,
+            _params: serde_json::Value,
+        ) -> ClientResult<serde_json::Value> {
+            Err(ClientErrorKind::Custom(self.0.clone()).into())
+        }
+
+        fn get_transport_stats(&self) -> RpcTransportStats {
+            RpcTransportStats::default()
+        }
+
+        fn url(&self) -> String {
+            "http://test.example".to_string()
+        }
+    }
+
+    fn client_from(sender: impl RpcSender + Send + Sync + 'static) -> SurfnetRemoteClient {
+        SurfnetRemoteClient {
+            client: RpcClient::new_sender(sender, RpcClientConfig::default()),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_null_result_is_a_missing_transaction() {
+        let client = client_from(Answers(serde_json::Value::Null));
+
+        let message = client
+            .get_versioned_transaction(Signature::default())
+            .await
+            .expect_err("a datasource holding no such transaction should not succeed")
+            .to_string();
+
+        assert!(
+            message.contains("not found"),
+            "a null result should read as a missing transaction: {message}"
+        );
+    }
+
+    /// A transaction is finalized about half a minute after it is confirmed. Asking for a
+    /// finalized one would return `null` for a transaction the caller just sent, which looks
+    /// like the transaction does not exist.
+    #[tokio::test]
+    async fn a_transaction_is_fetched_at_confirmed_commitment() {
+        let params = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let client = client_from(RecordsParams {
+            answer: serde_json::Value::Null,
+            params: params.clone(),
+        });
+
+        let _ = client.get_versioned_transaction(Signature::default()).await;
+
+        let params = params.lock().unwrap().clone().expect("a request was sent");
+        assert_eq!(
+            params[1]["commitment"], "confirmed",
+            "the transaction should be fetched at confirmed commitment, got {params}"
+        );
+    }
+
+    /// The caller has to know the difference between a datasource that turned the request
+    /// away and a transaction that does not exist. The first one is fixed by using another
+    /// endpoint, the second one is not. The reason has to reach the caller without the raw
+    /// client error, which can contain the secret in the datasource URL.
+    #[tokio::test]
+    async fn a_datasource_failure_is_not_a_missing_transaction() {
+        let client = client_from(Fails("429 Too Many Requests".to_string()));
+
+        let message = client
+            .get_versioned_transaction(Signature::default())
+            .await
+            .expect_err("a datasource that refuses the request should not succeed")
+            .to_string();
+
+        assert!(
+            message.contains("datasource client error"),
+            "the failure should say the datasource refused: {message}"
+        );
+        assert!(
+            message.contains("http://test.example"),
+            "the failure should still name the endpoint: {message}"
+        );
+        assert!(
+            !message.contains("not found"),
+            "a refused request should not read as a missing transaction: {message}"
+        );
+        assert!(
+            !message.contains("429"),
+            "the raw client error should not be passed through: {message}"
+        );
     }
 
     #[tokio::test]

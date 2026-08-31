@@ -396,6 +396,21 @@ impl SurfpoolError {
         Self(error)
     }
 
+    /// A lookup table that exists but is deactivated as of the slot being executed.
+    ///
+    /// Different from [`SurfpoolError::invalid_lookup_index`]. Here the indices are correct and
+    /// the table itself cannot be used at this slot, so reporting an invalid index would send
+    /// the caller looking in the wrong place.
+    pub fn inactive_lookup_table<P>(pubkey: P, slot: u64) -> Self
+    where
+        P: Display,
+    {
+        let error = Error::invalid_params(format!(
+            "Address lookup table {pubkey} is deactivated as of slot {slot}"
+        ));
+        Self(error)
+    }
+
     pub fn invalid_base64_data<D>(typing: &str, data: D) -> Self
     where
         D: Display,
