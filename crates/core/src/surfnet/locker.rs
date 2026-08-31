@@ -260,16 +260,16 @@ impl SurfnetSvmLocker {
             return Ok(());
         };
 
-        let (mut epoch_info, epoch_schedule, genesis_hash) = {
+        let (mut epoch_info, epoch_schedule, some_genesis_hash) = {
             let epoch_info = remote_client.get_epoch_info().await?;
             let epoch_schedule = remote_client.get_epoch_schedule().await?;
-            let genesis_hash = remote_client.get_genesis_hash().await?;
-            (epoch_info, epoch_schedule, genesis_hash)
+            let some_genesis_hash = remote_client.get_genesis_hash().await.ok();
+            (epoch_info, epoch_schedule, some_genesis_hash)
         };
         epoch_info.transaction_count = None;
 
         self.with_svm_writer(move |svm_writer| {
-            svm_writer.cached_genesis_hash = Some(genesis_hash);
+            svm_writer.cached_genesis_hash = some_genesis_hash;
             svm_writer.initialize(epoch_info, epoch_schedule);
         });
         Ok(())
