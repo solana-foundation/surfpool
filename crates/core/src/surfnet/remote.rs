@@ -687,7 +687,8 @@ mod tests {
                     requests: Arc::clone(&requests),
                 },
                 RpcClientConfig::default(),
-            ),
+            )
+            .into(),
         };
         let signature = Signature::new_unique();
         let config = RpcTransactionConfig {
@@ -719,7 +720,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_remote_transaction_provider_failure_reaches_the_locker_caller() {
         let client = SurfnetRemoteClient {
-            client: RpcClient::new_sender(ReturnsError, RpcClientConfig::default()),
+            client: RpcClient::new_sender(ReturnsError, RpcClientConfig::default()).into(),
         };
         let signature = Signature::new_unique();
         let (svm, _, _) = SurfnetSvm::default();
@@ -864,7 +865,8 @@ mod tests {
                     requests: Arc::clone(&requests),
                 },
                 RpcClientConfig::default(),
-            ),
+            )
+            .into(),
         };
 
         let pubkey = Pubkey::new_unique();
