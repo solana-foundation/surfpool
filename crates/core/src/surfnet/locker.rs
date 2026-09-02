@@ -4716,7 +4716,8 @@ mod tests {
                     requests: Arc::clone(&requests),
                 },
                 RpcClientConfig::default(),
-            ),
+            )
+            .into(),
         };
         let remote_ctx = Some(remote_client);
 
