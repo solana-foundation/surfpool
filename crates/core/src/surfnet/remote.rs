@@ -99,12 +99,16 @@ fn sanitized_client_error(error: &ClientError, datasource_url: &str) -> String {
     }
 }
 
-/// JSON-RPC `-32602`: the datasource understood the request and rejected its params.
-fn is_invalid_params(error: &ClientError) -> bool {
-    matches!(
-        error.kind(),
-        ClientErrorKind::RpcError(RpcError::RpcResponseError { code: -32602, .. })
-    )
+/// The datasource's answer for a `Mint` filter it cannot resolve: JSON-RPC `-32602` with
+/// `could not find mint`. Any other `-32602` (bad encoding, bad program filter) is a request
+/// error the caller must see.
+fn is_unknown_mint(filter: &TokenAccountsFilter, error: &ClientError) -> bool {
+    matches!(filter, TokenAccountsFilter::Mint(_))
+        && matches!(
+            error.kind(),
+            ClientErrorKind::RpcError(RpcError::RpcResponseError { code: -32602, message, .. })
+                if message.contains("could not find mint")
+        )
 }
 
 /// Bounds how long the sender it wraps may take, so a datasource that stops
@@ -487,12 +491,12 @@ impl SurfnetRemoteClient {
             .await;
         match res {
             Ok(res) => Ok(res.value),
-            // The datasource rejected the filter itself: a mint that exists only on this surfnet
-            // is `could not find mint` upstream. That is a definite "no remote accounts", not a
-            // failed lookup, and must not discard the local accounts the caller merges with.
-            Err(e) if is_invalid_params(&e) => {
+            // A mint that exists only on this surfnet is `could not find mint` upstream. That is
+            // a definite "no remote accounts", not a failed lookup, and must not discard the
+            // local accounts the caller merges with.
+            Err(e) if is_unknown_mint(filter, &e) => {
                 log::debug!(
-                    "datasource rejected getTokenAccountsByOwner filter for {owner}; \
+                    "datasource does not know the mint in getTokenAccountsByOwner for {owner}; \
                      answering from local accounts only"
                 );
                 Ok(vec![])
@@ -1037,6 +1041,68 @@ mod tests {
             .expect("a rejected filter is an empty remote answer, not a failure");
 
         assert!(accounts.is_empty());
+    }
+
+    struct RejectsParams;
+
+    #[async_trait]
+    impl RpcSender for RejectsParams {
+        async fn send(
+            &self,
+            _request: RpcRequest,
+            _params: serde_json::Value,
+        ) -> ClientResult<serde_json::Value> {
+            Err(ClientErrorKind::RpcError(RpcError::RpcResponseError {
+                code: -32602,
+                message: "Invalid param: unsupported encoding".to_string(),
+                data: RpcResponseErrorData::Empty,
+            })
+            .into())
+        }
+
+        fn get_transport_stats(&self) -> RpcTransportStats {
+            RpcTransportStats::default()
+        }
+
+        fn url(&self) -> String {
+            "http://rejects-params.example".to_string()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn any_other_invalid_params_rejection_is_still_an_error() {
+        let client = SurfnetRemoteClient {
+            client: RpcClient::new_sender(RejectsParams, RpcClientConfig::default()).into(),
+        };
+
+        let error = client
+            .get_token_accounts_by_owner(
+                Pubkey::new_unique(),
+                &TokenAccountsFilter::Mint(Pubkey::new_unique()),
+                &RpcAccountInfoConfig::default(),
+            )
+            .await
+            .expect_err("a rejected encoding is a request error, not an empty answer");
+
+        assert!(error.to_string().contains("unsupported encoding"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unknown_mint_answer_on_a_program_filter_is_still_an_error() {
+        let client = SurfnetRemoteClient {
+            client: RpcClient::new_sender(RejectsUnknownMint, RpcClientConfig::default()).into(),
+        };
+
+        let error = client
+            .get_token_accounts_by_owner(
+                Pubkey::new_unique(),
+                &TokenAccountsFilter::ProgramId(Pubkey::new_unique()),
+                &RpcAccountInfoConfig::default(),
+            )
+            .await
+            .expect_err("only a Mint filter can be answered by an unknown mint");
+
+        assert!(error.to_string().contains("could not find mint"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
