@@ -1010,7 +1010,9 @@ mod tests {
         ) -> ClientResult<serde_json::Value> {
             Err(ClientErrorKind::RpcError(RpcError::RpcResponseError {
                 code: -32602,
-                message: "Invalid param: could not find mint".to_string(),
+                message:
+                    "Error getting token program id and mint: Invalid param: could not find mint"
+                        .to_string(),
                 data: RpcResponseErrorData::Empty,
             })
             .into())
