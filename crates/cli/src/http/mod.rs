@@ -75,6 +75,41 @@ pub async fn start_studio_and_scenario_server(
         .sse_keep_alive(Duration::from_secs(30))
         .build();
 
+    let default_port = network_binding
+        .rsplit_once(':')
+        .map(|(_, port)| port)
+        .unwrap_or("18488");
+
+    let final_bind_addr = match std::env::var("SURFPOOL_STUDIO_HOST") {
+        Ok(host) => {
+            let resolved = if host.contains(']') {
+                if host.rfind(':') > host.rfind(']') {
+                    host
+                } else {
+                    format!("{}:{}", host, default_port)
+                }
+            } else {
+                match host.matches(':').count() {
+                    0 => format!("{}:{}", host, default_port),
+                    1 => {
+                        if host.rsplit_once(':').map_or(false, |(_, p)| !p.is_empty()) {
+                            host
+                        } else {
+                            format!("{}:{}", host.trim_end_matches(':'), default_port)
+                        }
+                    }
+                    _ => format!("[{}]:{}", host, default_port),
+                }
+            };
+            info!(
+                "Binding studio server to {} (from SURFPOOL_STUDIO_HOST)",
+                resolved
+            );
+            resolved
+        }
+        Err(_) => network_binding,
+    };
+    info!("Binding studio server to {}", final_bind_addr);
     let server = HttpServer::new(move || {
         let mut app = App::new()
             .app_data(config_wrapped.clone())
@@ -102,7 +137,7 @@ pub async fn start_studio_and_scenario_server(
         app
     })
     .workers(5)
-    .bind(network_binding)?
+    .bind(final_bind_addr)?
     .run();
     let handle = server.handle();
     tokio::spawn(server);
