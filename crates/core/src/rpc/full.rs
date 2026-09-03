@@ -27,7 +27,6 @@ use solana_pubkey::Pubkey;
 use solana_rpc_client_api::response::Response as RpcResponse;
 use solana_sdk_ids::compute_budget;
 use solana_signature::Signature;
-use solana_system_interface::program as system_program;
 use solana_transaction_error::TransactionError;
 use solana_transaction_status::{
     EncodedConfirmedTransactionWithStatusMeta, EncodedTransactionWithStatusMeta,
@@ -2722,9 +2721,7 @@ fn get_simulate_transaction_result(
         },
         logs: Some(metadata.logs.clone()),
         replacement_blockhash,
-        return_data: if metadata.return_data.program_id == system_program::id()
-            && metadata.return_data.data.is_empty()
-        {
+        return_data: if metadata.return_data.data.is_empty() {
             None
         } else {
             Some(metadata.return_data.clone().into())
@@ -2832,6 +2829,28 @@ mod tests {
             recent_blockhash,
         ));
         VersionedTransaction::try_new(msg, signers).unwrap()
+    }
+
+    #[test]
+    fn simulate_transaction_omits_only_empty_return_data() {
+        let mut metadata = TransactionMetadata::default();
+        metadata.return_data.program_id = Pubkey::new_unique();
+        let message = VersionedMessage::Legacy(LegacyMessage::default());
+
+        let result = get_simulate_transaction_result(
+            metadata, None, None, None, false, &message, None, None,
+        );
+
+        assert!(result.return_data.is_none());
+
+        let mut metadata = TransactionMetadata::default();
+        metadata.return_data.program_id = Pubkey::new_unique();
+        metadata.return_data.data = vec![1];
+        let result = get_simulate_transaction_result(
+            metadata, None, None, None, false, &message, None, None,
+        );
+
+        assert!(result.return_data.is_some());
     }
 
     async fn send_and_await_transaction(
