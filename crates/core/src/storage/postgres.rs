@@ -135,17 +135,8 @@ where
         debug!("Getting connection from pool for table creation");
         let mut conn = self.pool.get().map_err(|_| StorageError::LockError)?;
 
-        // IF NOT EXISTS is a catalog lookup then a create, atomic only
-        // against itself: two sessions can both pass the lookup, and the
-        // loser fails on a duplicate key in pg_type. An advisory lock keyed
-        // by table name serializes the two halves across sessions. The lock
-        // must be transaction-scoped: a session-scoped lock survives an
-        // error between lock and unlock, rides its pooled connection back
-        // into the pool, and parks every later constructor forever. Per
-        // the PostgreSQL docs, an xact lock "is automatically released at
-        // the end of the current transaction and cannot be released
-        // explicitly": release is the database's job alone, on commit and
-        // rollback alike, so no error path can leak it.
+        // pg_advisory_xact_lock serializes this transaction, at the server,
+        // against every other session taking the same key, preventing a race.
         conn.transaction(|conn| {
             sql_query("SELECT pg_advisory_xact_lock(hashtext('surfpool:ddl:' || $1))")
                 .bind::<Text, _>(&self.table_name)
