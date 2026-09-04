@@ -48,10 +48,7 @@ use solana_slot_hashes::MAX_ENTRIES as MAX_SLOT_HASHES_ENTRIES;
 use solana_system_interface::instruction as system_instruction;
 use solana_transaction::versioned::VersionedTransaction;
 use solana_transaction_error::TransactionError;
-use solana_transaction_status::{
-    TransactionConfirmationStatus as RpcTransactionConfirmationStatus, TransactionDetails,
-    TransactionStatusMeta, UiConfirmedBlock,
-};
+use solana_transaction_status::{TransactionDetails, TransactionStatusMeta, UiConfirmedBlock};
 use spl_token_2022_interface::extension::{
     BaseStateWithExtensions, StateWithExtensions, interest_bearing_mint::InterestBearingConfig,
     scaled_ui_amount::ScaledUiAmountConfig,
@@ -81,9 +78,10 @@ use uuid::Uuid;
 use super::{
     AccountSource, AccountSubscriptionData, BlockHeader, BlockIdentifier, CoupledAccount,
     FINALIZATION_SLOT_THRESHOLD, GetAccountResult, GeyserBlockMetadata, GeyserEntryInfo,
-    GeyserEvent, GeyserSlotStatus, LocalSignatureStatus, LocalSignatureStatusOrSubscription,
-    ProgramSubscriptionData, SignatureSubscriptionData, SignatureSubscriptionType,
-    SlotsUpdatesSubscriptionData, remote::SurfnetRemoteClient,
+    GeyserEvent, GeyserSlotStatus, ProgramSubscriptionData, SignatureSubscriptionType,
+    SlotsUpdatesSubscriptionData,
+    remote::SurfnetRemoteClient,
+    signature_subscriptions::{SignatureSubscribeOutcome, SignatureSubscriptions, TxStage},
 };
 use crate::{
     error::{AirdropError, SurfpoolError, SurfpoolResult},
@@ -304,7 +302,6 @@ impl Default for SurfnetSvmConfig {
 /// remote RPC connections, transaction processing, and account management.
 ///
 /// It also exposes channels to listen for simulation events (`SimnetEvent`) and Geyser plugin events (`GeyserEvent`).
-#[derive(Clone)]
 pub struct SurfnetSvm {
     pub inner: SurfnetLiteSvm,
     pub remote_rpc_url: Option<String>,
@@ -334,7 +331,7 @@ pub struct SurfnetSvm {
     pub latest_epoch_info: EpochInfo,
     pub simnet_events_tx: SimnetEventsTx,
     pub geyser_events_tx: Sender<GeyserEvent>,
-    pub signature_subscriptions: HashMap<Signature, Vec<SignatureSubscriptionData>>,
+    pub signature_subscriptions: SignatureSubscriptions,
     pub account_subscriptions: AccountSubscriptionData,
     pub program_subscriptions: ProgramSubscriptionData,
     pub slot_subscriptions: Vec<Sender<SlotInfo>>,
@@ -636,7 +633,7 @@ impl SurfnetSvm {
             simnet_events_tx: dummy_simnet_tx,
             geyser_events_tx: dummy_geyser_tx,
 
-            signature_subscriptions: HashMap::new(),
+            signature_subscriptions: SignatureSubscriptions::default(),
             account_subscriptions: HashMap::new(),
             program_subscriptions: HashMap::new(),
             // All subscription containers are emptied on the sandbox so that no notification
@@ -888,11 +885,12 @@ impl SurfnetSvm {
                 }
                 _ => (None, Vec::new()),
             };
-            self.notify_signature_subscribers(
-                SignatureSubscriptionType::processed(),
+            self.record_signature_stage(
                 sig,
-                slot,
-                err.clone(),
+                TxStage::Executed {
+                    slot,
+                    err: err.clone(),
+                },
             );
             self.notify_logs_subscribers(sig, err, logs, CommitmentLevel::Processed);
             let _ = bundle_status_tx.try_send(TransactionStatusEvent::Success(
@@ -1092,7 +1090,7 @@ impl SurfnetSvm {
             latest_epoch_info: epoch_info.clone(),
             transactions_queued_for_confirmation: VecDeque::new(),
             transactions_queued_for_finalization: VecDeque::new(),
-            signature_subscriptions: HashMap::new(),
+            signature_subscriptions: SignatureSubscriptions::default(),
             account_subscriptions: HashMap::new(),
             program_subscriptions: HashMap::new(),
             slot_subscriptions: Vec::new(),
@@ -1282,12 +1280,7 @@ impl SurfnetSvm {
                     HashSet::from([*pubkey]),
                 ),
             )?;
-            self.notify_signature_subscribers(
-                SignatureSubscriptionType::processed(),
-                tx.get_signature(),
-                slot,
-                None,
-            );
+            self.record_signature_stage(tx.get_signature(), TxStage::Executed { slot, err: None });
             self.notify_logs_subscribers(
                 tx.get_signature(),
                 None,
@@ -1948,6 +1941,11 @@ impl SurfnetSvm {
         self.runbook_executions.clear();
         self.streamed_accounts.clear()?;
         self.scheduled_overrides.clear()?;
+        // Recorded stages describe transactions the reset just wiped,
+        // and the rewound clock would misjudge them; dropping the
+        // senders resolves every open subscription as
+        // unable-to-complete instead.
+        self.signature_subscriptions = SignatureSubscriptions::default();
 
         let current_time = chrono::Utc::now().timestamp_millis() as u64;
         self.updated_at = current_time;
@@ -2226,7 +2224,6 @@ impl SurfnetSvm {
     fn confirm_transactions(&mut self) -> Result<(Vec<Signature>, u64), SurfpoolError> {
         let mut confirmed_transactions = vec![];
         let mut num_failed: u64 = 0;
-        let slot = self.latest_epoch_info.slot_index;
         let current_slot = self.latest_epoch_info.absolute_slot;
 
         while let Some((tx, status_tx, error)) =
@@ -2246,13 +2243,6 @@ impl SurfnetSvm {
                 status_tx,
                 error.clone(),
             ));
-
-            self.notify_signature_subscribers(
-                SignatureSubscriptionType::confirmed(),
-                &signature,
-                slot,
-                error,
-            );
 
             let Some(SurfnetTransactionStatus::Processed(tx_data)) =
                 self.transactions.get(&signature.to_string()).ok().flatten()
@@ -2296,12 +2286,6 @@ impl SurfnetSvm {
                     TransactionConfirmationStatus::Finalized,
                 ));
                 let signature = &tx.signatures[0];
-                self.notify_signature_subscribers(
-                    SignatureSubscriptionType::finalized(),
-                    signature,
-                    self.latest_epoch_info.absolute_slot,
-                    error,
-                );
                 let Some(SurfnetTransactionStatus::Processed(tx_data)) =
                     self.transactions.get(&signature.to_string()).ok().flatten()
                 else {
@@ -2642,6 +2626,10 @@ impl SurfnetSvm {
         self.inner.set_sysvar(&clock);
 
         self.finalize_transactions()?;
+        // One tick per produced block: this is where executed stages
+        // cross the confirmed and finalized boundaries for signature
+        // waiters (the clock advanced above, so current is now N+1).
+        self.evaluate_signature_waiters();
 
         // Notify geyser plugins of newly rooted (finalized) slot
         // Only emit if root is a valid slot (greater than genesis)
@@ -3109,65 +3097,46 @@ impl SurfnetSvm {
         Ok(new_account_data)
     }
 
-    /// Subscribes for updates on a transaction signature for a given subscription type.
+    /// Atomically resolves a signature subscription against local state or registers a waiter,
+    /// all under the SVM writer borrow.
     ///
-    /// # Arguments
-    /// * `signature` - The transaction signature to subscribe to.
-    /// * `subscription_type` - The type of subscription (confirmed/finalized).
-    ///
-    /// # Returns
-    /// A receiver for slot and transaction error updates.
-    pub fn subscribe_for_signature_updates(
+    /// The persistent transaction store answers for executed transactions; the registry answers
+    /// for received and failed stages and holds the waiter otherwise. Registration and stage
+    /// transitions mutate the same registry under the same lock, so a transaction cannot be
+    /// committed between the status check and the waiter installation.
+    pub fn subscribe_signature(
         &mut self,
         signature: &Signature,
-        subscription_type: SignatureSubscriptionType,
-    ) -> Receiver<(Slot, Option<TransactionError>)> {
-        let (tx, rx) = unbounded();
-        self.signature_subscriptions
-            .entry(*signature)
-            .or_default()
-            .push((subscription_type, tx));
-        rx
+        target: SignatureSubscriptionType,
+    ) -> SurfpoolResult<SignatureSubscribeOutcome> {
+        let current_slot = self.get_latest_absolute_slot();
+        let known_stage = match self.transactions.get(&signature.to_string())? {
+            Some(SurfnetTransactionStatus::Processed(transaction)) => {
+                let (transaction, _) = transaction.as_ref();
+                Some(TxStage::Executed {
+                    slot: transaction.slot,
+                    err: transaction.meta.status.clone().err(),
+                })
+            }
+            _ => None,
+        };
+        Ok(self
+            .signature_subscriptions
+            .subscribe(signature, target, known_stage, current_slot))
     }
 
-    /// Atomically returns a local signature status that already satisfies a subscription, or
-    /// registers the subscription before releasing the SVM write lock.
-    ///
-    /// This closes the check-then-subscribe race for WebSocket clients: a transaction cannot be
-    /// committed between the local status check and receiver registration. The compact status is
-    /// derived directly from the stored transaction metadata, avoiding transaction encoding.
-    pub fn get_local_signature_status_or_subscribe(
-        &mut self,
-        signature: &Signature,
-        subscription_type: SignatureSubscriptionType,
-    ) -> SurfpoolResult<LocalSignatureStatusOrSubscription> {
+    /// Records a signature lifecycle transition, completing the waiters it satisfies.
+    pub fn record_signature_stage(&mut self, signature: &Signature, stage: TxStage) {
         let current_slot = self.get_latest_absolute_slot();
-        if let Some(SurfnetTransactionStatus::Processed(transaction)) =
-            self.transactions.get(&signature.to_string())?
-        {
-            let (transaction, _) = transaction.as_ref();
-            let confirmation_status =
-                if current_slot >= transaction.slot + FINALIZATION_SLOT_THRESHOLD {
-                    RpcTransactionConfirmationStatus::Finalized
-                } else if current_slot > transaction.slot {
-                    RpcTransactionConfirmationStatus::Confirmed
-                } else {
-                    RpcTransactionConfirmationStatus::Processed
-                };
+        self.signature_subscriptions
+            .record(signature, stage, current_slot);
+    }
 
-            if subscription_type.is_satisfied_by(confirmation_status) {
-                return Ok(LocalSignatureStatusOrSubscription::Status(
-                    LocalSignatureStatus {
-                        slot: transaction.slot,
-                        err: transaction.meta.status.clone().err(),
-                    },
-                ));
-            }
-        }
-
-        Ok(LocalSignatureStatusOrSubscription::Subscription(
-            self.subscribe_for_signature_updates(signature, subscription_type),
-        ))
+    /// Re-evaluates signature waiters against the advanced clock; called once per produced
+    /// block, where executed stages cross the confirmed and finalized boundaries.
+    pub fn evaluate_signature_waiters(&mut self) {
+        let current_slot = self.get_latest_absolute_slot();
+        self.signature_subscriptions.tick(current_slot);
     }
 
     pub fn subscribe_for_account_updates(
@@ -3195,38 +3164,6 @@ impl SurfnetSvm {
             .or_default()
             .push((encoding, filters, tx));
         rx
-    }
-
-    /// Notifies signature subscribers of a status update, sending slot and error info.
-    ///
-    /// # Arguments
-    /// * `status` - The subscription type (confirmed/finalized).
-    /// * `signature` - The transaction signature.
-    /// * `slot` - The slot number.
-    /// * `err` - Optional transaction error.
-    pub fn notify_signature_subscribers(
-        &mut self,
-        status: SignatureSubscriptionType,
-        signature: &Signature,
-        slot: Slot,
-        err: Option<TransactionError>,
-    ) {
-        let mut remaining = vec![];
-        if let Some(subscriptions) = self.signature_subscriptions.remove(signature) {
-            for (subscription_type, tx) in subscriptions {
-                if status.eq(&subscription_type) {
-                    if tx.send((slot, err.clone())).is_err() {
-                        // The receiver has been dropped, so we can skip notifying
-                        continue;
-                    }
-                } else {
-                    remaining.push((subscription_type, tx));
-                }
-            }
-            if !remaining.is_empty() {
-                self.signature_subscriptions.insert(*signature, remaining);
-            }
-        }
     }
 
     pub fn notify_account_subscribers(

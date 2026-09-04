@@ -1,6 +1,6 @@
 use std::{collections::HashMap, fmt::Display, sync::Arc};
 
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::Sender;
 use jsonrpc_core::Result as RpcError;
 use locker::SurfnetSvmLocker;
 use solana_account::Account;
@@ -17,7 +17,6 @@ use solana_pubkey::Pubkey;
 use solana_rpc_client_api::response::SlotUpdate;
 use solana_signature::Signature;
 use solana_transaction::versioned::VersionedTransaction;
-use solana_transaction_error::TransactionError;
 use solana_transaction_status::{
     EncodedConfirmedTransactionWithStatusMeta, TransactionConfirmationStatus, TransactionStatus,
 };
@@ -32,11 +31,31 @@ use crate::{
 pub mod locker;
 pub mod noop_program;
 pub mod remote;
+pub mod signature_subscriptions;
 pub mod surfnet_lite_svm;
 pub mod svm;
 
+pub use signature_subscriptions::{SignatureNotification, SignatureSubscribeOutcome, TxStage};
+
 pub const FINALIZATION_SLOT_THRESHOLD: u64 = 31;
 pub const SLOTS_PER_EPOCH: u64 = 432000;
+
+/// The confirmation status a transaction executed at `tx_slot` has
+/// reached by `current_slot`: processed in its execution slot,
+/// confirmed one block later, finalized `FINALIZATION_SLOT_THRESHOLD`
+/// slots after execution. The single home of the slot-distance ladder.
+/// A current slot behind the execution slot reports processed; that
+/// domain is unreachable locally and covers remote transactions ahead
+/// of the local clock.
+pub fn confirmation_status_at(tx_slot: Slot, current_slot: Slot) -> TransactionConfirmationStatus {
+    if current_slot >= tx_slot.saturating_add(FINALIZATION_SLOT_THRESHOLD) {
+        TransactionConfirmationStatus::Finalized
+    } else if current_slot > tx_slot {
+        TransactionConfirmationStatus::Confirmed
+    } else {
+        TransactionConfirmationStatus::Processed
+    }
+}
 
 pub type AccountFactory = Box<dyn Fn(SurfnetSvmLocker) -> GetAccountResult + Send + Sync>;
 
@@ -154,27 +173,6 @@ pub struct BlockHeader {
 pub enum SurfnetDataConnection {
     Offline,
     Connected(String, EpochInfo),
-}
-
-pub type SignatureSubscriptionData = (
-    SignatureSubscriptionType,
-    Sender<(Slot, Option<TransactionError>)>,
-);
-
-/// The status returned by an atomic signature lookup.
-///
-/// This deliberately contains only the fields needed to produce a
-/// `signatureNotification`; serializing the transaction is both unnecessary and would make the
-/// registration path needlessly expensive.
-pub struct LocalSignatureStatus {
-    pub slot: Slot,
-    pub err: Option<TransactionError>,
-}
-
-/// The outcome of atomically checking a local signature and registering for updates.
-pub enum LocalSignatureStatusOrSubscription {
-    Status(LocalSignatureStatus),
-    Subscription(Receiver<(Slot, Option<TransactionError>)>),
 }
 
 pub type AccountSubscriptionData =
@@ -411,24 +409,14 @@ impl GetTransactionResult {
         tx: EncodedConfirmedTransactionWithStatusMeta,
         latest_absolute_slot: u64,
     ) -> Self {
-        let is_finalized = latest_absolute_slot >= tx.slot + FINALIZATION_SLOT_THRESHOLD;
-        let is_confirmed = latest_absolute_slot >= tx.slot + 1;
-        let (confirmation_status, confirmations) = if is_finalized {
-            (
-                Some(solana_transaction_status::TransactionConfirmationStatus::Finalized),
-                None,
-            )
-        } else if is_confirmed {
-            (
-                Some(solana_transaction_status::TransactionConfirmationStatus::Confirmed),
-                Some((latest_absolute_slot - tx.slot) as usize),
-            )
-        } else {
-            (
-                Some(solana_transaction_status::TransactionConfirmationStatus::Processed),
-                Some((latest_absolute_slot - tx.slot) as usize),
-            )
+        let confirmation_status = confirmation_status_at(tx.slot, latest_absolute_slot);
+        let confirmations = match confirmation_status {
+            TransactionConfirmationStatus::Finalized => None,
+            // Saturating: a remote transaction ahead of the local clock
+            // reports zero confirmations rather than underflowing.
+            _ => Some(latest_absolute_slot.saturating_sub(tx.slot) as usize),
         };
+        let confirmation_status = Some(confirmation_status);
         let status = TransactionStatus {
             slot: tx.slot,
             confirmations,

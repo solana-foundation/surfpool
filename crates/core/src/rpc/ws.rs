@@ -4,7 +4,6 @@ use std::{
     sync::{Arc, RwLock, atomic},
 };
 
-use crossbeam_channel::TryRecvError;
 use jsonrpc_core::{Error, ErrorCode, Result};
 use jsonrpc_derive::rpc;
 use jsonrpc_pubsub::{
@@ -25,12 +24,14 @@ use solana_pubkey::Pubkey;
 use solana_rpc_client_api::response::{Response as RpcResponse, SlotInfo, SlotUpdate};
 use solana_signature::Signature;
 use solana_transaction_status::UiTransactionEncoding;
+use tokio::sync::oneshot;
 
 use super::{State, SurfnetRpcContext, SurfpoolWebsocketMeta};
 use crate::{
     rpc::utils::MAX_SUPPORTED_TRANSACTION_VERSION,
     surfnet::{
-        GetTransactionResult, LocalSignatureStatusOrSubscription, SignatureSubscriptionType,
+        GetTransactionResult, SignatureNotification, SignatureSubscribeOutcome,
+        SignatureSubscriptionType, signature_subscriptions::notification_for,
     },
 };
 
@@ -1088,7 +1089,7 @@ pub trait Rpc {
 pub struct SurfpoolWsRpc {
     pub uid: atomic::AtomicUsize,
     pub signature_subscription_map:
-        Arc<RwLock<HashMap<SubscriptionId, Sink<RpcResponse<RpcSignatureResult>>>>>,
+        Arc<RwLock<HashMap<SubscriptionId, SignatureSubscriptionEntry>>>,
     pub account_subscription_map:
         Arc<RwLock<HashMap<SubscriptionId, Sink<RpcResponse<UiAccount>>>>>,
     pub program_subscription_map:
@@ -1102,47 +1103,65 @@ pub struct SurfpoolWsRpc {
     pub tokio_handle: tokio::runtime::Handle,
 }
 
+/// A live signature subscription: the client sink and the cancellation
+/// handle for its delivery task. Removing the entry (delivery or
+/// unsubscribe) drops the cancel sender, which wakes and ends the task;
+/// the task's dropped receiver is then swept from the SVM-side registry
+/// on the next transition or tick.
+pub struct SignatureSubscriptionEntry {
+    sink: Sink<RpcResponse<RpcSignatureResult>>,
+    _cancel: oneshot::Sender<()>,
+}
+
 impl SurfpoolWsRpc {
-    /// Send the one notification a signature subscription is allowed to produce and remove its
-    /// sink from the active subscription map.
+    /// Sends the one notification a signature subscription may produce and removes its entry
+    /// from the active subscription map. The payload variant is carried by the notification,
+    /// so every delivery path renders identically.
     fn notify_signature_subscriber(
-        active: &Arc<RwLock<HashMap<SubscriptionId, Sink<RpcResponse<RpcSignatureResult>>>>>,
+        active: &Arc<RwLock<HashMap<SubscriptionId, SignatureSubscriptionEntry>>>,
         sub_id: &SubscriptionId,
-        subscription_type: &SignatureSubscriptionType,
-        slot: u64,
-        err: Option<solana_transaction_error::TransactionError>,
-        is_received_event: bool,
-    ) -> bool {
+        notification: SignatureNotification,
+    ) {
         let Ok(mut guard) = active.write() else {
             log::error!("Failed to acquire write lock on signature_subscription_map");
-            return false;
+            return;
         };
 
-        let Some(sink) = guard.remove(sub_id) else {
-            return false;
+        let Some(entry) = guard.remove(sub_id) else {
+            return;
         };
 
-        let result = match (subscription_type, is_received_event) {
-            (SignatureSubscriptionType::Received, true) => sink.notify(Ok(RpcResponse {
+        let response = match notification {
+            SignatureNotification::Received { slot } => RpcResponse {
                 context: RpcResponseContext::new(slot),
                 value: RpcSignatureResult::ReceivedSignature(
                     ReceivedSignatureResult::ReceivedSignature,
                 ),
-            })),
-            _ => sink.notify(Ok(RpcResponse {
+            },
+            SignatureNotification::Processed { slot, err } => RpcResponse {
                 context: RpcResponseContext::new(slot),
                 value: RpcSignatureResult::ProcessedSignature(ProcessedSignatureResult {
                     err: err.map(Into::into),
                 }),
-            })),
+            },
         };
 
-        if let Err(error) = result {
+        if let Err(error) = entry.sink.notify(Ok(response)) {
             log::error!("Failed to notify client about signature update: {error}");
-            return false;
         }
+    }
 
-        true
+    /// Fails a signature subscription: removes its entry and forwards the error to the client.
+    fn fail_signature_subscriber(
+        active: &Arc<RwLock<HashMap<SubscriptionId, SignatureSubscriptionEntry>>>,
+        sub_id: &SubscriptionId,
+        error: Error,
+    ) {
+        if let Ok(mut guard) = active.write()
+            && let Some(entry) = guard.remove(sub_id)
+        {
+            let _ = entry.sink.notify(Err(error));
+        }
     }
 }
 
@@ -1217,8 +1236,15 @@ impl Rpc for SurfpoolWsRpc {
         let active = Arc::clone(&self.signature_subscription_map);
         let meta = meta.clone();
         self.tokio_handle.spawn(async move {
+            let (cancel_tx, cancel_rx) = oneshot::channel();
             if let Ok(mut guard) = active.write() {
-                guard.insert(sub_id.clone(), sink);
+                guard.insert(
+                    sub_id.clone(),
+                    SignatureSubscriptionEntry {
+                        sink,
+                        _cancel: cancel_tx,
+                    },
+                );
             } else {
                 log::error!("Failed to acquire write lock on signature_subscription_map");
                 return;
@@ -1231,125 +1257,75 @@ impl Rpc for SurfpoolWsRpc {
                 Ok(res) => res,
                 Err(e) => {
                     log::error!("Failed to get RPC context: {:?}", e);
-                    if let Ok(mut guard) = active.write() {
-                        if let Some(sink) = guard.remove(&sub_id) {
-                            if let Err(e) = sink.notify(Err(e.into())) {
-                                log::error!("Failed to notify client about RPC context error: {e}");
-                            }
-                        }
-                    }
+                    Self::fail_signature_subscriber(&active, &sub_id, e.into());
                     return;
                 }
             };
-            // Check local history first. A remote miss can take arbitrarily long, so it must not
-            // be part of the window between the final local check and receiver registration.
-            let local_tx_result =
-                match svm_locker.get_transaction_local(&signature, &rpc_transaction_config) {
-                    Ok(res) => res,
-                    Err(e) => {
-                        if let Ok(mut guard) = active.write() {
-                            if let Some(sink) = guard.remove(&sub_id) {
-                                let _ = sink.notify(Err(e.into()));
-                            }
-                        }
-                        return;
-                    }
-                };
 
-            // Preserve the historical remote lookup for signatures that were not executed
-            // locally. Its result is intentionally not inserted into the SVM.
-            let tx_result = if local_tx_result.is_none() {
-                match remote_ctx.as_ref() {
-                    Some((remote_client, _)) => {
-                        remote_client
-                            .get_transaction(
-                                signature,
-                                rpc_transaction_config.clone(),
-                                svm_locker.get_latest_absolute_slot(),
-                            )
-                            .await
-                    }
-                    None => local_tx_result,
+            // Resolve against local state or install the waiter, atomically: a transaction
+            // cannot be committed between the status check and the waiter installation.
+            let (rx, known_locally) = match svm_locker
+                .subscribe_signature(&signature, subscription_type.clone())
+            {
+                Ok(SignatureSubscribeOutcome::Now(notification)) => {
+                    Self::notify_signature_subscriber(&active, &sub_id, notification);
+                    return;
                 }
-            } else {
-                local_tx_result
+                Ok(SignatureSubscribeOutcome::Wait { rx, known_locally }) => (rx, known_locally),
+                Err(error) => {
+                    Self::fail_signature_subscriber(&active, &sub_id, error.into());
+                    return;
+                }
             };
 
-            if let GetTransactionResult::FoundTransaction(_, _, tx) = tx_result {
-                if tx
-                    .confirmation_status
-                    .is_some_and(|status| subscription_type.is_satisfied_by(status))
+            // Preserve the historical remote lookup for signatures this surfnet has never
+            // seen. The waiter is already installed, so a transaction landing during the
+            // lookup is delivered through it; the remote result is intentionally not
+            // inserted into the SVM.
+            if !known_locally && let Some((remote_client, _)) = remote_ctx.as_ref() {
+                let tx_result = remote_client
+                    .get_transaction(
+                        signature,
+                        rpc_transaction_config,
+                        svm_locker.get_latest_absolute_slot(),
+                    )
+                    .await;
+                if let GetTransactionResult::FoundTransaction(_, _, tx) = tx_result
+                    && tx
+                        .confirmation_status
+                        .is_some_and(|status| subscription_type.is_satisfied_by(status))
                 {
+                    // Satisfaction is judged by the remote's own confirmation status;
+                    // only the payload rule is shared with the registry.
                     Self::notify_signature_subscriber(
                         &active,
                         &sub_id,
-                        &subscription_type,
-                        tx.slot,
-                        tx.err,
-                        false,
+                        notification_for(&subscription_type, tx.slot, tx.err),
                     );
                     return;
                 }
             }
 
-            // Check local status and install the receiver while holding one SVM write lock. A
-            // locally committed transaction therefore cannot be missed after a remote miss.
-            let rx = match svm_locker
-                .get_local_signature_status_or_subscribe(&signature, subscription_type.clone())
-            {
-                Ok(LocalSignatureStatusOrSubscription::Status(status)) => {
-                    Self::notify_signature_subscriber(
-                        &active,
-                        &sub_id,
-                        &subscription_type,
-                        status.slot,
-                        status.err,
-                        false,
-                    );
-                    return;
-                }
-                Ok(LocalSignatureStatusOrSubscription::Subscription(rx)) => rx,
-                Err(error) => {
-                    if let Ok(mut guard) = active.write() {
-                        if let Some(sink) = guard.remove(&sub_id) {
-                            let _ = sink.notify(Err(error.into()));
+            tokio::select! {
+                notification = rx => {
+                    match notification {
+                        Ok(notification) => {
+                            Self::notify_signature_subscriber(&active, &sub_id, notification);
                         }
-                    }
-                    return;
-                }
-            };
-
-            loop {
-                let (slot, some_err) = match rx.try_recv() {
-                    Ok(msg) => msg,
-                    Err(e) => {
-                        match e {
-                            TryRecvError::Empty => {
-                                // no update yet, continue
-                                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-                                continue;
-                            }
-                            TryRecvError::Disconnected => {
-                                warn!(
-                                    "Signature subscription channel closed for sub id {:?}",
-                                    sub_id
-                                );
-                                // channel closed, exit loop
-                                break;
+                        // The registry dropped the sender (a network reset, or a swept
+                        // waiter): this subscription can no longer resolve, so drop the
+                        // entry rather than let the sink outlive it.
+                        Err(_) => {
+                            if let Ok(mut guard) = active.write() {
+                                guard.remove(&sub_id);
                             }
                         }
                     }
-                };
-
-                Self::notify_signature_subscriber(
-                    &active,
-                    &sub_id,
-                    &subscription_type,
-                    slot,
-                    some_err,
-                    true,
-                );
-                break;
+                }
+                // Unsubscribe removed the entry and dropped the cancel sender: end the task.
+                // The receiver dropped with this task is swept from the registry on the next
+                // transition or tick.
+                _ = cancel_rx => {}
             }
         });
     }

@@ -472,6 +472,10 @@ pub async fn start_block_production_runloop(
                             svm_writer.latest_epoch_info.slot_index = clock.slot;
                             svm_writer.latest_epoch_info.epoch = clock.epoch;
                             svm_writer.latest_epoch_info.absolute_slot = clock.slot + clock.epoch * svm_writer.latest_epoch_info.slots_in_epoch;
+                            // The warp is a clock advance without a produced block, so run
+                            // the block tick's waiter evaluation here or finalized waiters
+                            // stall until the next block (forever, in Manual mode).
+                            svm_writer.evaluate_signature_waiters();
                             svm_writer.simnet_events_tx.system_clock_updated(clock);
                         });
                     }
@@ -491,6 +495,8 @@ pub async fn start_block_production_runloop(
                             svm_writer.latest_epoch_info.slot_index = clock.slot;
                             svm_writer.latest_epoch_info.epoch = clock.epoch;
                             svm_writer.latest_epoch_info.absolute_slot = clock.slot + clock.epoch * svm_writer.latest_epoch_info.slots_in_epoch;
+                            // Same tick as the fire-and-forget warp above.
+                            svm_writer.evaluate_signature_waiters();
                             svm_writer.simnet_events_tx.system_clock_updated(clock);
                             svm_writer.latest_epoch_info.clone()
                         });

@@ -65,8 +65,10 @@ use uuid::Uuid;
 
 use super::{
     AccountFactory, AccountSource, CoupledAccount, GetAccountResult, GetTransactionResult,
-    GeyserEvent, LocalSignatureStatusOrSubscription, SignatureSubscriptionType, SurfnetSvm,
-    remote::SurfnetRemoteClient, svm::AccountUpdatePolicy,
+    GeyserEvent, SignatureSubscriptionType, SurfnetSvm,
+    remote::SurfnetRemoteClient,
+    signature_subscriptions::{SignatureSubscribeOutcome, TxStage},
+    svm::AccountUpdatePolicy,
 };
 use crate::{
     error::{AirdropError, SurfpoolError, SurfpoolResult},
@@ -81,7 +83,7 @@ use crate::{
         utils::{convert_transaction_metadata_from_canonical, verify_pubkey},
     },
     storage::StorageResult,
-    surfnet::FINALIZATION_SLOT_THRESHOLD,
+    surfnet::{FINALIZATION_SLOT_THRESHOLD, confirmation_status_at},
     types::{
         GeyserAccountUpdate, OfflineAccountConfig, RemoteRpcResult, SurfnetTransactionStatus,
         TimeTravelConfig, TokenAccount, TransactionLoadedAddresses, TransactionWithStatusMeta,
@@ -1268,13 +1270,7 @@ impl SurfnetSvmLocker {
                             meta: tx_with_meta.meta.clone(),
                         });
 
-                        let confirmation_status = match current_slot {
-                            cs if cs == slot => SolanaTransactionConfirmationStatus::Processed,
-                            cs if cs < slot + FINALIZATION_SLOT_THRESHOLD => {
-                                SolanaTransactionConfirmationStatus::Confirmed
-                            }
-                            _ => SolanaTransactionConfirmationStatus::Finalized,
-                        };
+                        let confirmation_status = confirmation_status_at(slot, current_slot);
 
                         Some(Record {
                             signature: sig,
@@ -1444,13 +1440,7 @@ impl SurfnetSvmLocker {
                         }
 
                         // Determine confirmation status
-                        let confirmation_status = match current_slot {
-                            cs if cs == slot => SolanaTransactionConfirmationStatus::Processed,
-                            cs if cs < slot + FINALIZATION_SLOT_THRESHOLD => {
-                                SolanaTransactionConfirmationStatus::Confirmed
-                            }
-                            _ => SolanaTransactionConfirmationStatus::Finalized,
-                        };
+                        let confirmation_status = confirmation_status_at(slot, current_slot);
 
                         // Reconstruct the memo summary the same way a full Agave validator
                         // does, reusing its canonical extractor. `account_keys()` on the
@@ -1866,11 +1856,15 @@ impl SurfnetSvmLocker {
 
         let latest_absolute_slot = self.with_svm_writer(|svm_writer| {
             let latest_absolute_slot = svm_writer.get_latest_absolute_slot();
-            svm_writer.notify_signature_subscribers(
-                SignatureSubscriptionType::received(),
+            // Recording the stage (rather than firing a notification at
+            // whoever is registered right now) is what lets a subscriber
+            // arriving after this point, but before the transaction
+            // stores, still resolve its Received target.
+            svm_writer.record_signature_stage(
                 &signature,
-                latest_absolute_slot,
-                None,
+                TxStage::Received {
+                    slot: latest_absolute_slot,
+                },
             );
 
             latest_absolute_slot
@@ -2179,11 +2173,15 @@ impl SurfnetSvmLocker {
             simnet_events_tx.error(format!("Transaction simulation failed: {}", err));
 
             self.with_svm_writer(|svm_writer| {
-                svm_writer.notify_signature_subscribers(
-                    SignatureSubscriptionType::processed(),
+                // Failed, not Executed: this transaction was rejected
+                // before commitment and will never confirm, so only
+                // processed-level waiters may resolve from it.
+                svm_writer.record_signature_stage(
                     &signature,
-                    simulated_slot,
-                    Some(err.clone()),
+                    TxStage::Failed {
+                        slot: simulated_slot,
+                        err: err.clone(),
+                    },
                 );
                 svm_writer.notify_logs_subscribers(
                     &signature,
@@ -2309,11 +2307,12 @@ impl SurfnetSvmLocker {
                     Some(err.clone()),
                 ));
 
-                svm_writer.notify_signature_subscribers(
-                    SignatureSubscriptionType::processed(),
+                svm_writer.record_signature_stage(
                     &signature,
-                    simulated_slot,
-                    Some(err.clone()),
+                    TxStage::Executed {
+                        slot: simulated_slot,
+                        err: Some(err.clone()),
+                    },
                 );
                 svm_writer.notify_logs_subscribers(
                     &signature,
@@ -2503,11 +2502,12 @@ impl SurfnetSvmLocker {
                     None,
                 ));
 
-                svm_writer.notify_signature_subscribers(
-                    SignatureSubscriptionType::processed(),
+                svm_writer.record_signature_stage(
                     &signature,
-                    simulated_slot,
-                    None,
+                    TxStage::Executed {
+                        slot: simulated_slot,
+                        err: None,
+                    },
                 );
                 svm_writer.notify_logs_subscribers(
                     &signature,
@@ -3996,27 +3996,14 @@ impl SurfnetSvmLocker {
         svm_writer.materialize_overrides(remote_ctx).await
     }
 
-    /// Subscribes for signature updates (confirmed/finalized) and returns a receiver of events.
-    pub fn subscribe_for_signature_updates(
+    /// Atomically resolves a signature subscription against local state or registers a
+    /// waiter, under the SVM write lock.
+    pub fn subscribe_signature(
         &self,
         signature: &Signature,
-        subscription_type: SignatureSubscriptionType,
-    ) -> Receiver<(Slot, Option<TransactionError>)> {
-        self.with_svm_writer(|svm_writer| {
-            svm_writer.subscribe_for_signature_updates(signature, subscription_type.clone())
-        })
-    }
-
-    /// Atomically checks whether a local transaction already satisfies a signature
-    /// subscription, otherwise registers its receiver under the SVM write lock.
-    pub fn get_local_signature_status_or_subscribe(
-        &self,
-        signature: &Signature,
-        subscription_type: SignatureSubscriptionType,
-    ) -> SurfpoolResult<LocalSignatureStatusOrSubscription> {
-        self.with_svm_writer(|svm_writer| {
-            svm_writer.get_local_signature_status_or_subscribe(signature, subscription_type)
-        })
+        target: SignatureSubscriptionType,
+    ) -> SurfpoolResult<SignatureSubscribeOutcome> {
+        self.with_svm_writer(|svm_writer| svm_writer.subscribe_signature(signature, target))
     }
 
     /// Subscribes for account updates and returns a receiver of account updates.
