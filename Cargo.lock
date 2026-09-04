@@ -12284,6 +12284,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "surfpool-spec-harness"
+version = "1.5.0"
+
+[[package]]
 name = "surfpool-studio-ui"
 version = "0.1.1"
 dependencies = [
@@ -12336,6 +12340,7 @@ dependencies = [
  "solana-transaction-context",
  "solana-transaction-error 3.3.1",
  "solana-transaction-status",
+ "surfpool-spec-harness",
  "test-case",
  "thiserror 2.0.20",
  "ts-rs",

@@ -8,3 +8,5 @@ surfpool-install-minimal = "install --path crates/cli --locked --force"
 surfpool-update-startup-spec = "test -p surfpool-types regenerate_the_startup_spec_tables -- --ignored --nocapture"
 # re-render the spec's mermaid diagrams to crates/types/src/diagrams/ (needs mmdc)
 surfpool-render-startup-diagrams = "test -p surfpool-types render_the_startup_diagrams -- --ignored --nocapture"
+# regenerate the Promela cells in crates/types/models/startup/ from the spec tables
+surfpool-update-startup-pml = "test -p surfpool-types regenerate_the_startup_pml_cells -- --ignored --nocapture"

@@ -17,6 +17,7 @@ members = [
     "crates/mcp",
     "crates/sdk",
     "crates/sdk-node",
+    "crates/spec-harness",
     "crates/studio",
     "crates/types",
 ]
@@ -177,6 +178,9 @@ surfpool-sdk = { path = "crates/sdk", default-features = false, version = "1.5.0
 surfpool-db = { path = "crates/db", version = "1.5.0" }
 surfpool-mcp = { path = "crates/mcp", default-features = false, version = "1.5.0" }
 surfpool-types = { path = "crates/types", default-features = false, version = "1.5.0" }
+# path-only and versionless on purpose: cargo strips it from published
+# manifests, so the harness itself never has to be published
+surfpool-spec-harness = { path = "crates/spec-harness" }
 surfpool-studio-ui = { path = "crates/studio", default-features = false, version = "0.1.1" }
 
 txtx-addon-kit = "0.4.15"
