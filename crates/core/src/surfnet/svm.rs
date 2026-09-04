@@ -721,6 +721,9 @@ impl SurfnetSvm {
         let (simnet_tx, simnet_rx) = SimnetEventsTx::unbounded();
         svm.geyser_events_tx = geyser_tx;
         svm.simnet_events_tx = simnet_tx;
+        // The sandbox promotes nothing itself; draining an inherited queue back at commit would confirm every pending tx twice.
+        svm.transactions_queued_for_confirmation.clear();
+        svm.transactions_queued_for_finalization.clear();
         BundleSandbox {
             svm,
             geyser_rx,

@@ -2816,4 +2816,78 @@ mod tests {
         });
         assert_eq!(stored.expect_processed().0.slot, commit_slot);
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_commit_sandbox_does_not_requeue_pending_transactions() {
+        let (svm, _simnet_rx, _geyser_rx) = SurfnetSvm::default();
+        let locker = SurfnetSvmLocker::new(svm);
+        let payer = Keypair::new();
+        let _ = locker
+            .0
+            .write()
+            .await
+            .airdrop(&payer.pubkey(), 4 * LAMPORTS_PER_SOL);
+        locker.with_svm_writer(|svm| svm.confirm_current_block().unwrap());
+        let recent_blockhash = locker.with_svm_reader(|svm| svm.latest_blockhash());
+        let build = |recipient: Pubkey| {
+            build_v0_transaction(
+                &payer.pubkey(),
+                &[&payer],
+                &[system_instruction::transfer(
+                    &payer.pubkey(),
+                    &recipient,
+                    LAMPORTS_PER_SOL,
+                )],
+                &recent_blockhash,
+            )
+        };
+
+        // A transaction from the regular path, still pending confirmation when the bundle is cloned.
+        let pending_tx = build(Pubkey::new_unique());
+        let pending_sig = pending_tx.signatures[0];
+        let (status_tx, _status_rx) = crossbeam_channel::bounded(1);
+        locker
+            .process_transaction(&None, pending_tx, status_tx, true, true)
+            .await
+            .unwrap();
+        let queued_before =
+            locker.with_svm_reader(|svm| svm.transactions_queued_for_confirmation.len());
+        assert_eq!(queued_before, 1);
+
+        let BundleSandbox {
+            svm: sandbox_svm,
+            geyser_rx,
+            simnet_rx,
+        } = locker.with_svm_reader(|svm| svm.clone_for_bundle_sandbox());
+        let sandbox_locker = SurfnetSvmLocker::new(sandbox_svm);
+        let bundle_tx = build(Pubkey::new_unique());
+        let bundle_sig = bundle_tx.signatures[0];
+        let (status_tx, _status_rx) = crossbeam_channel::bounded(1);
+        sandbox_locker
+            .process_transaction(&None, bundle_tx, status_tx, true, true)
+            .await
+            .unwrap();
+        let sandbox_svm = Arc::try_unwrap(sandbox_locker.0).ok().unwrap().into_inner();
+        let (bundle_status_tx, _bundle_status_rx) = crossbeam_channel::unbounded();
+        locker
+            .with_svm_writer(|original| {
+                original.commit_sandbox(
+                    BundleSandbox {
+                        svm: sandbox_svm,
+                        geyser_rx,
+                        simnet_rx,
+                    },
+                    bundle_status_tx,
+                )
+            })
+            .unwrap();
+
+        let queued: Vec<Signature> = locker.with_svm_reader(|svm| {
+            svm.transactions_queued_for_confirmation
+                .iter()
+                .map(|(tx, _, _)| tx.signatures[0])
+                .collect()
+        });
+        assert_eq!(queued, vec![pending_sig, bundle_sig]);
+    }
 }
