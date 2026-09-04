@@ -238,6 +238,12 @@ pub async fn start_local_surfnet_runloop(
 
     let (plugin_commands_tx, plugin_commands_rx) = unbounded::<PluginCommand>();
 
+    // Startup before traffic: plugins observe startup completion and the open slot
+    // before the RPC listeners bind, so external traffic can't emit block data for
+    // a slot that a plugin is not tracking yet.
+    let _ = svm_locker.with_svm_reader(|svm| svm.geyser_events_tx.send(GeyserEvent::EndOfStartup));
+    svm_locker.with_svm_writer(|svm_writer| svm_writer.announce_open_slot());
+
     let (_rpc_handle, _ws_handle, shutdown_rpc_servers) = start_rpc_servers_runloop(
         &config,
         &simnet_commands_tx,
@@ -329,9 +335,6 @@ pub async fn start_local_surfnet_runloop(
         }
     }
     simnet_events_tx_cc.core_started(initial_transaction_count);
-
-    // Notify geyser plugins that startup is complete
-    let _ = svm_locker.with_svm_reader(|svm| svm.geyser_events_tx.send(GeyserEvent::EndOfStartup));
 
     start_block_production_runloop(
         clock_event_rx,
@@ -465,14 +468,7 @@ pub async fn start_block_production_runloop(
                         }
 
                         svm_locker.with_svm_writer(|svm_writer| {
-                            svm_writer.inner.set_sysvar(&clock);
-                            svm_writer.updated_at = clock.unix_timestamp as u64 * 1_000;
-                            svm_writer.latest_epoch_info.absolute_slot = clock.slot;
-                            svm_writer.latest_epoch_info.epoch = clock.epoch;
-                            svm_writer.latest_epoch_info.slot_index = clock.slot;
-                            svm_writer.latest_epoch_info.epoch = clock.epoch;
-                            svm_writer.latest_epoch_info.absolute_slot = clock.slot + clock.epoch * svm_writer.latest_epoch_info.slots_in_epoch;
-                            svm_writer.simnet_events_tx.system_clock_updated(clock);
+                            svm_writer.warp_clock(clock);
                         });
                     }
                     SimnetCommand::UpdateInternalClockWithConfirmation(_, clock, response_tx) => {
@@ -483,17 +479,8 @@ pub async fn start_block_production_runloop(
                             ));
                         }
 
-                        let epoch_info = svm_locker.with_svm_writer(|svm_writer| {
-                            svm_writer.inner.set_sysvar(&clock);
-                            svm_writer.updated_at = clock.unix_timestamp as u64 * 1_000;
-                            svm_writer.latest_epoch_info.absolute_slot = clock.slot;
-                            svm_writer.latest_epoch_info.epoch = clock.epoch;
-                            svm_writer.latest_epoch_info.slot_index = clock.slot;
-                            svm_writer.latest_epoch_info.epoch = clock.epoch;
-                            svm_writer.latest_epoch_info.absolute_slot = clock.slot + clock.epoch * svm_writer.latest_epoch_info.slots_in_epoch;
-                            svm_writer.simnet_events_tx.system_clock_updated(clock);
-                            svm_writer.latest_epoch_info.clone()
-                        });
+                        let epoch_info = svm_locker
+                            .with_svm_writer(|svm_writer| svm_writer.warp_clock(clock));
 
                         // Send confirmation back
                         let _ = response_tx.send(epoch_info);
@@ -828,14 +815,8 @@ fn start_geyser_runloop(
                         }
                     }
                     Ok(GeyserEvent::UpdateSlotStatus { slot, parent, status }) => {
-                        let slot_status = match status {
-                            crate::surfnet::GeyserSlotStatus::Processed => SlotStatus::Processed,
-                            crate::surfnet::GeyserSlotStatus::Confirmed => SlotStatus::Confirmed,
-                            crate::surfnet::GeyserSlotStatus::Rooted => SlotStatus::Rooted,
-                        };
-
                         for plugin in managed_plugins.iter().map(|p| &*p.plugin) {
-                            if let Err(e) = plugin.update_slot_status(slot, parent, &slot_status) {
+                            if let Err(e) = plugin.update_slot_status(slot, parent, &status) {
                                 simnet_events_tx.error(format!("Failed to update slot status in Geyser plugin: {:?}", e));
                             }
                         }

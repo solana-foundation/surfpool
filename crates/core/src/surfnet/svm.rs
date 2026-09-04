@@ -7,6 +7,7 @@ use std::{
 };
 
 use agave_feature_set::FeatureSet;
+use agave_geyser_plugin_interface::geyser_plugin_interface::SlotStatus;
 use base64::{Engine, prelude::BASE64_STANDARD};
 use chrono::Utc;
 use convert_case::Casing;
@@ -81,9 +82,10 @@ use uuid::Uuid;
 use super::{
     AccountSource, AccountSubscriptionData, BlockHeader, BlockIdentifier, CoupledAccount,
     FINALIZATION_SLOT_THRESHOLD, GetAccountResult, GeyserBlockMetadata, GeyserEntryInfo,
-    GeyserEvent, GeyserSlotStatus, LocalSignatureStatus, LocalSignatureStatusOrSubscription,
-    ProgramSubscriptionData, SignatureSubscriptionData, SignatureSubscriptionType,
-    SlotsUpdatesSubscriptionData, remote::SurfnetRemoteClient,
+    GeyserEvent, LocalSignatureStatus, LocalSignatureStatusOrSubscription, ProgramSubscriptionData,
+    SignatureSubscriptionData, SignatureSubscriptionType, SlotsUpdatesSubscriptionData,
+    remote::SurfnetRemoteClient,
+    slot_lifecycle::{SlotEmission, SlotLifecycle},
 };
 use crate::{
     error::{AirdropError, SurfpoolError, SurfpoolResult},
@@ -387,6 +389,8 @@ pub struct SurfnetSvm {
     pub streamed_accounts: Box<dyn Storage<String, bool>>,
     pub recent_blockhashes: VecDeque<(SyntheticBlockhash, i64)>,
     pub scheduled_overrides: Box<dyn Storage<u64, Vec<OverrideInstance>>>,
+    /// The per-slot lifecycle every geyser slot-status emission derives from.
+    pub slot_lifecycle: SlotLifecycle,
     /// Tracks accounts that should not be downloaded from the remote RPC.
     /// This includes accounts explicitly closed locally and accounts marked offline via cheatcodes.
     /// The key is the account pubkey as a string. If `include_owned_accounts` is true,
@@ -624,6 +628,7 @@ impl SurfnetSvm {
             registered_idls: OverlayStorage::wrap(self.registered_idls.clone_box()),
             streamed_accounts: OverlayStorage::wrap(self.streamed_accounts.clone_box()),
             scheduled_overrides: OverlayStorage::wrap(self.scheduled_overrides.clone_box()),
+            slot_lifecycle: self.slot_lifecycle.clone(),
 
             // Clone non-storage fields normally
             transactions_queued_for_confirmation: self.transactions_queued_for_confirmation.clone(),
@@ -1132,6 +1137,7 @@ impl SurfnetSvm {
             streamed_accounts: streamed_accounts_db,
             recent_blockhashes: VecDeque::new(),
             scheduled_overrides: scheduled_overrides_db,
+            slot_lifecycle: SlotLifecycle::default(),
             offline_accounts: offline_accounts_db,
             genesis_slot: default_genesis_slot,
             genesis_updated_at: updated_at,
@@ -1955,6 +1961,12 @@ impl SurfnetSvm {
         self.latest_epoch_info = epoch_info.clone();
         // Set genesis_slot to the current slot when resetting (similar to initialize)
         self.genesis_slot = epoch_info.absolute_slot;
+        // A reset erases the world rather than reorging it: live slots
+        // are forgotten with no terminal status, and only the new
+        // genesis is announced. A warp, by contrast, kills what it
+        // abandons with `Dead`.
+        self.slot_lifecycle.clear();
+        self.announce_open_slot();
         let chain_tip_hash = SyntheticBlockhash::new(epoch_info.block_height).to_string();
         self.chain_tip = BlockIdentifier::new(epoch_info.block_height, chain_tip_hash.as_str());
         self.inner.set_sysvar(&epoch_schedule);
@@ -2576,28 +2588,7 @@ impl SurfnetSvm {
                 max_transactions_per_entry: num_transactions,
             },
         });
-        self.notify_slots_updates_subscribers(SlotUpdate::CreatedBank {
-            slot: new_slot,
-            parent: parent_slot,
-            timestamp: slots_update_ts,
-        });
-
         let geyser_parent_slot = slot.saturating_sub(1);
-
-        // Emit confirmation for the same slot used by processed account/transaction updates.
-        self.geyser_events_tx
-            .send(GeyserEvent::UpdateSlotStatus {
-                slot,
-                parent: slot.checked_sub(1),
-                status: GeyserSlotStatus::Confirmed,
-            })
-            .ok();
-        // Mirror the Confirmed Geyser event as an `OptimisticConfirmation`
-        // notification for `slotsUpdatesSubscribe` clients.
-        self.notify_slots_updates_subscribers(SlotUpdate::OptimisticConfirmation {
-            slot,
-            timestamp: slots_update_ts,
-        });
 
         // Notify geyser plugins of block metadata
         let block_metadata = GeyserBlockMetadata {
@@ -2630,6 +2621,13 @@ impl SurfnetSvm {
             .send(GeyserEvent::NotifyEntry(entry_info))
             .ok();
 
+        // Slot statuses derive from the lifecycle after the slot's block data (data
+        // before confirmation); the next slot is announced last, so its data
+        // can never precede its announcement.
+        let mut emissions = self.slot_lifecycle.produce(slot);
+        emissions.extend(self.slot_lifecycle.confirm(slot));
+        self.emit_slot_statuses(emissions, slots_update_ts);
+
         let clock: Clock = Clock {
             slot: self.latest_epoch_info.absolute_slot,
             epoch: self.latest_epoch_info.epoch,
@@ -2643,23 +2641,14 @@ impl SurfnetSvm {
 
         self.finalize_transactions()?;
 
-        // Notify geyser plugins of newly rooted (finalized) slot
-        // Only emit if root is a valid slot (greater than genesis)
-        if root >= self.genesis_slot {
-            self.geyser_events_tx
-                .send(GeyserEvent::UpdateSlotStatus {
-                    slot: root,
-                    parent: root.checked_sub(1),
-                    status: GeyserSlotStatus::Rooted,
-                })
-                .ok();
-            // Mirror the Rooted Geyser event as a `Root` notification for
-            // `slotsUpdatesSubscribe` clients.
-            self.notify_slots_updates_subscribers(SlotUpdate::Root {
-                slot: root,
-                timestamp: slots_update_ts,
-            });
-        }
+        // The registry decides which slots are due from its own record,
+        // so a history with gaps (a clock warp) roots exactly what it
+        // confirmed, and a slot below what the registry holds (an early
+        // block, a restart) roots nothing.
+        let emissions = self.slot_lifecycle.root_through(root);
+        self.emit_slot_statuses(emissions, slots_update_ts);
+        let emissions = self.slot_lifecycle.announce(new_slot);
+        self.emit_slot_statuses(emissions, slots_update_ts);
 
         // Evict the accounts marked as streamed from cache to enforce them to be fetched again
         let accounts_to_reset: Vec<_> = self.streamed_accounts.into_iter()?.collect();
@@ -3168,6 +3157,115 @@ impl SurfnetSvm {
         Ok(LocalSignatureStatusOrSubscription::Subscription(
             self.subscribe_for_signature_updates(signature, subscription_type),
         ))
+    }
+
+    /// Sends the slot statuses a lifecycle transition produced, in
+    /// order: each status to geyser plugins, and a mirror of
+    /// `CreatedBank`, `Confirmed`, `Rooted`, and `Dead` to
+    /// `slotsUpdatesSubscribe` clients, so the two streams cannot
+    /// diverge on lifecycle events. `Frozen` has no lifecycle emission
+    /// to mirror: block production sends it directly, since only it
+    /// knows the block's transaction stats. `ws_timestamp` is the
+    /// millisecond wall-clock sample the ws variants carry; a caller
+    /// emitting several batches for one block passes the same sample to
+    /// all of them.
+    fn emit_slot_statuses(&mut self, emissions: Vec<SlotEmission>, ws_timestamp: u64) {
+        for SlotEmission {
+            slot,
+            parent,
+            status,
+        } in emissions
+        {
+            let mirror = match &status {
+                SlotStatus::CreatedBank => Some(SlotUpdate::CreatedBank {
+                    slot,
+                    parent: parent.unwrap_or_else(|| slot.saturating_sub(1)),
+                    timestamp: ws_timestamp,
+                }),
+                SlotStatus::Confirmed => Some(SlotUpdate::OptimisticConfirmation {
+                    slot,
+                    timestamp: ws_timestamp,
+                }),
+                SlotStatus::Rooted => Some(SlotUpdate::Root {
+                    slot,
+                    timestamp: ws_timestamp,
+                }),
+                SlotStatus::Dead(reason) => Some(SlotUpdate::Dead {
+                    slot,
+                    timestamp: ws_timestamp,
+                    err: reason.clone(),
+                }),
+                _ => None,
+            };
+            self.geyser_events_tx
+                .send(GeyserEvent::UpdateSlotStatus {
+                    slot,
+                    parent,
+                    status,
+                })
+                .ok();
+            if let Some(update) = mirror {
+                self.notify_slots_updates_subscribers(update);
+            }
+        }
+    }
+
+    /// Announces the slot currently open for block production. Startup calls this for
+    /// genesis and a reset for its new genesis; block production announces N+1 itself.
+    pub fn announce_open_slot(&mut self) {
+        let slot = self.get_latest_absolute_slot();
+        let emissions = self.slot_lifecycle.announce(slot);
+        let ws_timestamp = Utc::now().timestamp_millis().max(0) as u64;
+        self.emit_slot_statuses(emissions, ws_timestamp);
+    }
+
+    /// Applies a time-travel clock: writes the sysvar and epoch info,
+    /// reports the jump on the simnet events channel, and resolves the
+    /// slot lifecycle across it. Returns the resulting epoch info.
+    ///
+    /// The open slot is captured before any clock write, and the
+    /// lifecycle resolves after all of them, since
+    /// [`Self::warp_slot_lifecycle`] reads the destination from the
+    /// epoch info this method just wrote; keeping both sides here is
+    /// what stops a caller from getting that order wrong.
+    ///
+    /// `clock.slot` is the epoch-relative slot index, as the
+    /// `helpers::time_travel` calculators produce it; the absolute slot
+    /// is reconstructed from it and `clock.epoch`.
+    ///
+    /// A destination at or below the just-confirmed slot is a reorg:
+    /// the rewritten slots die (`Dead`) and the destination is
+    /// re-announced, to be replayed by the new timeline. Time travel to
+    /// the current slot lands there, because the command handlers
+    /// confirm a block before applying the clock.
+    ///
+    /// A destination at or below the root line goes further: rooted
+    /// slots are no longer on record, so they die without a `Dead`, and
+    /// the landing `CreatedBank` (parentless when nothing below it is
+    /// on record) is the consumer's signal to drop everything at or
+    /// above it and resync. The module documentation for
+    /// [`super::slot_lifecycle`] states that contract.
+    pub fn warp_clock(&mut self, clock: Clock) -> EpochInfo {
+        let open_slot = self.get_latest_absolute_slot();
+        self.inner.set_sysvar(&clock);
+        self.updated_at = clock.unix_timestamp as u64 * 1_000;
+        self.latest_epoch_info.slot_index = clock.slot;
+        self.latest_epoch_info.epoch = clock.epoch;
+        self.latest_epoch_info.absolute_slot =
+            clock.slot + clock.epoch * self.latest_epoch_info.slots_in_epoch;
+        let _ = self.simnet_events_tx.system_clock_updated(clock);
+        self.warp_slot_lifecycle(open_slot);
+        self.latest_epoch_info.clone()
+    }
+
+    /// Resolves the slot lifecycle across a clock warp: the slot that was open before
+    /// (`from`) dies unless the warp landed on it, and the new open slot is announced if
+    /// it is not already.
+    fn warp_slot_lifecycle(&mut self, from: Slot) {
+        let to = self.get_latest_absolute_slot();
+        let emissions = self.slot_lifecycle.warp(from, to);
+        let ws_timestamp = Utc::now().timestamp_millis().max(0) as u64;
+        self.emit_slot_statuses(emissions, ws_timestamp);
     }
 
     pub fn subscribe_for_account_updates(
@@ -7347,5 +7445,156 @@ mod tests {
             .expect("get_account should not error")
             .expect("Valid account should be restored");
         assert_eq!(restored_account.lamports, 1_000_000);
+    }
+
+    /// Drains the geyser stream into (slot, tag) pairs, in emission order.
+    fn geyser_slot_events(rx: &crossbeam_channel::Receiver<GeyserEvent>) -> Vec<(u64, String)> {
+        use agave_geyser_plugin_interface::geyser_plugin_interface::SlotStatus;
+        let mut out = vec![];
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                GeyserEvent::UpdateSlotStatus { slot, status, .. } => {
+                    let tag = match status {
+                        SlotStatus::CreatedBank => "created",
+                        SlotStatus::Processed => "processed",
+                        SlotStatus::Confirmed => "confirmed",
+                        SlotStatus::Rooted => "rooted",
+                        SlotStatus::Dead(_) => "dead",
+                        _ => "other",
+                    };
+                    out.push((slot, tag.to_string()));
+                }
+                GeyserEvent::NotifyBlockMetadata(m) => out.push((m.slot, "block_meta".to_string())),
+                GeyserEvent::NotifyEntry(e) => out.push((e.slot, "entry".to_string())),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn warp_clock_moves_the_clock_and_resolves_the_lifecycle() {
+        let (mut svm, _events_rx, geyser_rx) = SurfnetSvm::default();
+        svm.announce_open_slot();
+        svm.confirm_current_block().unwrap();
+        let open_slot = svm.get_latest_absolute_slot();
+        let _ = geyser_slot_events(&geyser_rx);
+
+        let slots_in_epoch = svm.latest_epoch_info.slots_in_epoch;
+        let target = open_slot + 40;
+        let clock = Clock {
+            slot: target % slots_in_epoch,
+            epoch: target / slots_in_epoch,
+            unix_timestamp: 1_700_000_000,
+            epoch_start_timestamp: 1_700_000_000,
+            leader_schedule_epoch: 0,
+        };
+        let epoch_info = svm.warp_clock(clock);
+
+        assert_eq!(epoch_info.absolute_slot, target);
+        assert_eq!(svm.latest_epoch_info.slot_index, target % slots_in_epoch);
+        assert_eq!(svm.updated_at, 1_700_000_000_000);
+        assert_eq!(
+            geyser_slot_events(&geyser_rx),
+            vec![
+                (open_slot, "dead".to_string()),
+                (target, "created".to_string())
+            ],
+            "the abandoned slot dies and the destination is announced"
+        );
+    }
+
+    #[test]
+    fn warp_emissions_reach_slots_updates_subscribers_too() {
+        let (mut svm, _events_rx, geyser_rx) = SurfnetSvm::default();
+        svm.announce_open_slot();
+        svm.confirm_current_block().unwrap();
+        svm.confirm_current_block().unwrap();
+        let ws_rx = svm.subscribe_for_slots_updates();
+        let open_slot = svm.get_latest_absolute_slot();
+        let chain_tip = open_slot - 1;
+        let _ = geyser_slot_events(&geyser_rx);
+
+        svm.latest_epoch_info.absolute_slot = open_slot + 40;
+        svm.warp_slot_lifecycle(open_slot);
+
+        let updates: Vec<_> = ws_rx.try_iter().collect();
+        assert!(
+            matches!(*updates[0], SlotUpdate::Dead { slot, .. } if slot == open_slot),
+            "the abandoned slot's death reaches ws clients"
+        );
+        assert!(
+            matches!(*updates[1], SlotUpdate::CreatedBank { slot, parent, .. }
+                if slot == open_slot + 40 && parent == chain_tip),
+            "the destination's bank reaches ws clients with the chain-tip parent"
+        );
+        assert_eq!(updates.len(), 2, "the warp mirrors exactly its emissions");
+    }
+
+    #[test]
+    fn every_slot_is_announced_once_before_its_data_and_confirmed_after_it() {
+        let (mut svm, _events_rx, geyser_rx) = SurfnetSvm::default();
+        svm.announce_open_slot();
+        for _ in 0..5 {
+            svm.confirm_current_block().unwrap();
+        }
+        let events = geyser_slot_events(&geyser_rx);
+        let mut announced = std::collections::HashSet::new();
+        let mut confirmed = std::collections::HashSet::new();
+        let mut processed = std::collections::HashSet::new();
+        for (slot, tag) in &events {
+            match tag.as_str() {
+                "created" => assert!(announced.insert(*slot), "slot {slot} announced twice"),
+                "block_meta" | "entry" => {
+                    assert!(announced.contains(slot), "data for unannounced slot {slot}");
+                    assert!(
+                        !confirmed.contains(slot),
+                        "data for slot {slot} after its confirmation"
+                    );
+                }
+                "processed" => {
+                    assert!(
+                        announced.contains(slot),
+                        "processed before announced: {slot}"
+                    );
+                    assert!(processed.insert(*slot), "slot {slot} processed twice");
+                }
+                "confirmed" => {
+                    assert!(
+                        processed.contains(slot),
+                        "confirmed before processed: {slot}"
+                    );
+                    assert!(confirmed.insert(*slot), "slot {slot} confirmed twice");
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(confirmed.len(), 5, "five slots confirmed");
+    }
+
+    #[test]
+    fn a_warp_kills_the_open_slot_and_announces_the_destination() {
+        // Against the real SVM: after two blocks the open slot is
+        // genesis + 2, announced and unproduced; the clock jumps to +40.
+        let (mut svm, _events_rx, geyser_rx) = SurfnetSvm::default();
+        svm.announce_open_slot();
+        svm.confirm_current_block().unwrap();
+        svm.confirm_current_block().unwrap();
+        let open_slot = svm.get_latest_absolute_slot();
+        let _ = geyser_slot_events(&geyser_rx);
+
+        svm.latest_epoch_info.absolute_slot = open_slot + 40;
+        svm.warp_slot_lifecycle(open_slot);
+
+        assert_eq!(
+            geyser_slot_events(&geyser_rx),
+            vec![
+                (open_slot, "dead".to_string()),
+                (open_slot + 40, "created".to_string())
+            ]
+        );
+        // Landing on the slot already open announces nothing.
+        svm.warp_slot_lifecycle(open_slot + 40);
+        assert!(geyser_slot_events(&geyser_rx).is_empty());
     }
 }
