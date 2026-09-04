@@ -1,0 +1,114 @@
+protocol: kamino-swap
+version: v0.1.0
+account_type: Order
+idl_file_path: idl.json
+
+tags:
+  - swap
+  - limit-orders
+  - defi
+
+templates:
+  - id: kamino-swap-order
+    name: Override Limit Order
+    description: Override a Kamino limit order's amounts and fill progress
+    idl_account_name: Order
+    properties:
+      - path: maker
+        label: Maker
+        description: "Wallet that placed the order and deposited the input tokens. Example: your test wallet"
+      - path: input_mint
+        label: Input token
+        description: >-
+          Token the maker is giving away. Example: So11111111111111111111111111111111111111112 (wSOL)
+      - path: output_mint
+        label: Output token
+        description: >-
+          Token the maker wants to receive. Example: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v (USDC)
+      - "initial_input_amount"
+      - "expected_output_amount"
+      - "remaining_input_amount"
+      - "filled_output_amount"
+      - "tip_amount"
+      - "number_of_fills"
+      - path: order_type
+        label: Order type
+        description: Order behaviour; unlabelled in the IDL, keep as found
+      - path: status
+        label: Order status
+        description: Strategy lifecycle state; unlabelled in the IDL, keep as found
+      - path: permissionless
+        label: Anyone can fill
+        description: "1 lets any taker fill the order, 0 restricts it to `counterparty`. Example: 1"
+      - path: counterparty
+        label: Allowed taker
+        description: >-
+          The only wallet permitted to fill when `permissionless` is 0. Example: the taker's wallet
+      - path: last_updated_timestamp
+        label: Last updated
+        description: "When the order last changed (unix seconds). Example: 1800000000"
+    address:
+      type: pubkey
+    llm_context: |
+      Kamino's Swap tab is powered by LIMO, an on-chain limit order book.
+
+      HOW TO USE THIS TEMPLATE:
+      1. Set remaining_input_amount to a fraction of initial_input_amount to simulate a PARTIALLY
+         filled order, or 0 to make it fully consumed
+      2. The implied limit price is expected_output_amount / initial_input_amount - lower the
+         expected output to make the order fillable at a worse market price
+      3. Raise tip_amount to make filling attractive to a bot
+      4. Amounts are in each mint's smallest unit, so check the mint's decimals first
+
+      EXAMPLE - "1 SOL order, half filled, cheap for the taker":
+      initial_input_amount: 1000000000
+      remaining_input_amount: 500000000
+      expected_output_amount: 100000000
+
+      DO NOT set persist: true here - transactions write these fields, and re-applying the
+      override reverts their writes at the start of every following slot.
+
+  - id: kamino-swap-global-config
+    name: Override Swap Global Config
+    description: Override Kamino limit order global switches and fees
+    idl_account_name: GlobalConfig
+    properties:
+      - path: emergency_mode
+        label: Emergency mode
+        description: "1 blocks deposits, borrows and withdrawals; liquidations still allowed. Example: 1"
+      - path: new_orders_blocked
+        label: New orders blocked
+        description: >-
+          1 stops order creation while still allowing existing orders to be filled and cancelled.
+          Example: 1
+      - path: orders_taking_blocked
+        label: Filling blocked
+        description: "1 stops orders being filled while still allowing new ones to be placed. Example: 1"
+      - path: flash_take_order_blocked
+        label: Flash fills blocked
+        description: "1 blocks flash fills, the arbitrage path. Example: 1"
+      - path: host_fee_bps
+        label: Host fee
+        description: "The integrator's cut of each fill in bps. Example: 0"
+      - "order_close_delay_seconds"
+      - "total_tip_amount"
+      - "host_tip_amount"
+      - path: txn_fee_cost
+        label: Assumed tx fee
+        description: "Transaction cost the program reimburses a filler, in lamports. Example: 5000"
+      - path: ata_creation_cost
+        label: Assumed ATA rent
+        description: "Token-account rent the program reimburses a filler, in lamports. Example: 2039280"
+    address:
+      type: pubkey
+    llm_context: |
+      flash_take_order_blocked controls flash fills, where a taker borrows the maker's input inside
+      one transaction, swaps it elsewhere and returns the output. That is the arbitrage path.
+
+      HOW TO USE THIS TEMPLATE:
+      1. Set flash_take_order_blocked: 1 to test the rejection
+      2. Or leave it at 0 and pair this with a DEX pool override (whirlpool-*, raydium-*,
+         meteora-*) to build a profitable route
+
+      EXAMPLE - "halt the order book":
+      emergency_mode: 1

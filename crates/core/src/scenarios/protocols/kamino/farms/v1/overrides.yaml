@@ -1,0 +1,219 @@
+protocol: kamino-farms
+version: v1.6.5
+account_type: FarmState
+idl_file_path: idl.json
+
+tags:
+  - rewards
+  - staking
+  - farming
+  - lending
+  - defi
+
+templates:
+  - id: kamino-farms-reward-emissions
+    name: Override Farm Reward Emissions
+    description: Override a Kamino farm's reward schedule and budget
+    idl_account_name: FarmState
+    properties:
+      - path: reward_infos.0.token.mint
+        label: Reward token mint
+        description: "The token this reward slot pays out. Example: USDC's mint"
+      - path: reward_infos.0.rewards_vault
+        label: Reward vault
+        description: >-
+          Token account the farm pays rewards out of. Example: any token account for the reward mint
+      - path: reward_infos.0.rewards_available
+        label: Rewards remaining
+        description: "Reward budget still available, in the reward token's smallest unit. Example: 1000000000"
+      - path: reward_infos.0.reward_schedule_curve
+        label: Emission schedule
+        description: "Emission rate over time: 20 {ts_start, reward_per_time_unit} points. Example: 1000"
+      - path: reward_infos.0.rewards_per_second_decimals
+        label: Rate decimals
+        description: "Decimal places applied to the emission rate, allowing sub-unit precision. Example: 6"
+      - path: reward_infos.0.min_claim_duration_seconds
+        label: Min claim interval
+        description: "Seconds a user must wait between harvests. Example: 0"
+      - path: reward_infos.0.last_issuance_ts
+        label: Last issuance time
+        description: "When rewards were last accrued (unix seconds). Example: 1780000000"
+      - path: reward_infos.0.reward_type
+        label: Reward type
+        description: How the emission rate is applied; unlabelled in the IDL, keep as found
+      - path: num_reward_tokens
+        label: Active reward slots
+        description: "How many of the 10 reward slots are in use. Example: 1"
+    address:
+      type: pubkey
+    llm_context: |
+      A farm has 10 reward slots, reward_infos.0 through reward_infos.9, one per reward token.
+
+      HOW TO USE THIS TEMPLATE:
+      1. Replace the 0 in the property paths with the slot you are filling
+      2. Raise num_reward_tokens to cover it, or the program does not iterate that slot
+      3. Set reward_infos.N.rewards_available, or emissions stop when the budget empties
+      4. Set the rate through reward_schedule_curve - EXACTLY 20 {ts_start, reward_per_time_unit}
+         entries sorted ascending; a flat rate is one point at ts_start 0
+      5. Whether the rate is per second, slot or day comes from time_unit on kamino-farms-farm-config
+
+      EXAMPLE - "flat emission from the beginning of time":
+      reward_infos.0.reward_schedule_curve.points.0.ts_start: 0
+      reward_infos.0.reward_schedule_curve.points.0.reward_per_time_unit: 1000
+      reward_infos.0.rewards_available: 1000000000
+      num_reward_tokens: 1
+
+  - id: kamino-farms-reward-accumulator
+    name: Override Farm Reward Accumulator
+    description: Override a Kamino farm's reward accumulator and staked totals
+    idl_account_name: FarmState
+    properties:
+      - path: reward_infos.0.reward_per_share_scaled
+        label: Reward per share
+        description: "Rewards paid per unit of stake since the farm began (scaled x2^18). Example: 5000000"
+      - path: reward_infos.0.rewards_issued_unclaimed
+        label: Unclaimed pool
+        description: >-
+          Rewards issued by the farm but not yet harvested by users, in the reward token's smallest
+          unit. Example: 500000
+      - "total_active_stake_scaled"
+      - "total_pending_stake_scaled"
+      - "total_staked_amount"
+    address:
+      type: pubkey
+    llm_context: |
+      Claimable rewards = active_stake_scaled * reward_per_share_scaled - rewards_tally_scaled,
+      where the tally is the user's marker from their last claim (kamino-farms-user-rewards).
+
+      HOW TO USE THIS TEMPLATE:
+      1. To hand a user a reward without simulating time, RAISE
+         reward_infos.N.reward_per_share_scaled here and LEAVE their tally alone
+      2. To test dilution, halve total_active_stake_scaled while holding the accumulator constant
+      3. Keep total_staked_amount consistent with the scaled totals, or reward maths and withdrawal
+         accounting disagree
+
+      Stake and reward_per_share_scaled are scaled by 2^18.
+
+      EXAMPLE - "every staker is owed more":
+      reward_infos.0.reward_per_share_scaled: 5000000
+
+      DO NOT set persist: true here - transactions write these fields, and re-applying the
+      override reverts their writes at the start of every following slot.
+
+  - id: kamino-farms-user-rewards
+    name: Override Farm User Rewards
+    description: Override one user's farm stake and reward balances
+    idl_account_name: UserState
+    properties:
+      - path: farm_state
+        label: Farm
+        description: "The farm this user position belongs to. Example: the farm's address"
+      - path: owner
+        label: Owner
+        description: "Wallet that owns this staked position and may harvest it. Example: your test wallet"
+      - "delegatee"
+      - "is_farm_delegated"
+      - "active_stake_scaled"
+      - "pending_deposit_stake_scaled"
+      - "pending_deposit_stake_ts"
+      - "pending_withdrawal_unstake_scaled"
+      - "pending_withdrawal_unstake_ts"
+      - "rewards_tally_scaled"
+      - "rewards_issued_unclaimed"
+      - path: last_claim_ts
+        label: Last claim per reward
+        description: "Per-reward-slot timestamp of the last harvest (unix seconds). Example: 0"
+      - path: last_stake_ts
+        label: Last stake time
+        description: "When this user last staked (unix seconds). Example: 1780000000"
+    address:
+      type: pubkey
+    llm_context: |
+      The per-user half of reward distribution. Each array has 10 slots, one per reward token,
+      matching reward_infos on the FarmState.
+
+      TWO WAYS TO GIVE A USER REWARDS:
+      1. SIMPLEST - set rewards_issued_unclaimed.0 directly. An already-accrued balance, so this
+         tests only the claim path
+      2. REALISTIC - lower rewards_tally_scaled.0 (or raise the farm's reward_per_share_scaled) and
+         let the program compute the accrual
+
+      Set last_claim_ts.0 far in the past to get past min_claim_duration_seconds on the farm.
+      Raising active_stake_scaled without raising total_active_stake_scaled on the FarmState makes
+      the farm over-distribute - useful for insolvency tests, not a realistic starting state.
+
+      EXAMPLE - "user has 500 tokens waiting to be harvested":
+      rewards_issued_unclaimed.0: 500000000
+      last_claim_ts.0: 0
+
+      DO NOT set persist: true here - transactions write these fields, and re-applying the
+      override reverts their writes at the start of every following slot.
+
+  - id: kamino-farms-farm-config
+    name: Override Farm Configuration
+    description: Override Kamino farm caps, lockups and cooldowns
+    idl_account_name: FarmState
+    properties:
+      - "is_farm_frozen"
+      - "is_farm_delegated"
+      - path: is_harvesting_permissionless
+        label: Permissionless harvest
+        description: >-
+          1 lets anyone trigger a harvest on a user's behalf, 0 restricts it to the owner. Example: 1
+      - path: deposit_cap_amount
+        label: Deposit cap
+        description: "Maximum total stake, in the staked token's smallest unit. Example: 0"
+      - "deposit_warmup_period"
+      - "withdrawal_cooldown_period"
+      - "locking_mode"
+      - path: locking_start_timestamp
+        label: Lockup start
+        description: "When the lockup window opens (unix seconds). Example: 1780000000"
+      - path: locking_duration
+        label: Lockup duration
+        description: "How long stake stays locked, in seconds. Example: 604800"
+      - path: locking_early_withdrawal_penalty_bps
+        label: Early exit penalty
+        description: "Haircut applied when unstaking before the lockup ends in bps. Example: 500"
+      - "time_unit"
+      - path: scope_prices
+        label: Scope price account
+        description: >-
+          The Scope OraclePrices account used to value the staked token. Example:
+          3t4JZcueEzTbVP6kLxXrL3VpWx45jDer4eqysweBchNH
+      - path: scope_oracle_price_id
+        label: Scope index
+        description: "Which Scope entry values the staked token, 0-511. Example: 3"
+      - path: scope_oracle_max_age
+        label: Max price age
+        description: "How old the Scope price may be before the farm rejects it, in seconds. Example: 600"
+    address:
+      type: pubkey
+    llm_context: |
+      CRITICAL: time_unit rescales EVERY reward rate on the farm, so change it deliberately.
+      0 = seconds, 1 = slots, 2 = days.
+
+      HOW TO USE THIS TEMPLATE:
+      1. Zero deposit_warmup_period and withdrawal_cooldown_period so a stake or unstake settles in
+         the same scenario
+      2. Set is_farm_frozen: 1 to block stake and unstake while still allowing harvests
+      3. scope_prices and scope_oracle_price_id point at a Scope entry - use the kamino-scope
+         templates to move that price
+
+      EXAMPLE - "no waiting periods":
+      deposit_warmup_period: 0
+      withdrawal_cooldown_period: 0
+
+  - id: kamino-farms-global-config
+    name: Override Farms Global Config
+    description: Override the Kamino Farms treasury fee
+    idl_account_name: GlobalConfig
+    # Do not add the admin pubkeys here. Surfpool runs with signature verification disabled,
+    # so a scenario can already sign as the real admin without changing who it is.
+    properties:
+      - path: treasury_fee_bps
+        label: Treasury fee
+        description: >-
+          The protocol's cut of all rewards in bps, taken before users receive anything. Example: 0
+    address:
+      type: pubkey

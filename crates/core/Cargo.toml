@@ -132,6 +132,7 @@ sbpf-debugger = ["litesvm/sbpf-debugger"]
 sqlite = ["surfpool-db/sqlite"]
 postgres = ["surfpool-db/postgres"]
 ignore_tests_ci = []
+# Tests that fetch live mainnet accounts; off by default because they need a network.
 integration-tests = []
 register-tracing = ["litesvm/register-tracing"]
 prometheus = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-prometheus", "dep:prometheus", "dep:axum"]

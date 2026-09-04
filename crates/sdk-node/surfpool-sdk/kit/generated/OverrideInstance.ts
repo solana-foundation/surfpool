@@ -36,6 +36,10 @@ enabled: boolean,
  */
 fetchBeforeUse?: boolean, 
 /**
+ * Whether to re-apply this override on every subsequent slot, rather than only once
+ */
+persist?: boolean, 
+/**
  * Account address to override - use pubkey for known addresses or pda for derived addresses
  */
 account: AccountAddress, };

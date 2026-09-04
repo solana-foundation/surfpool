@@ -861,6 +861,7 @@
                       "label": "Option<String> (An optional label for this override instance)",
                       "enabled": "bool (Indicates whether this override instance is enabled)",
                       "fetchBeforeUse": "bool (Indicates whether to fetch the latest on-chain account data before applying overrides)",
+                      "persist": "bool (Optional, defaults to false. If true, re-applies this override on every following slot instead of only one, which is needed when something else writes the account in between. Use it only for values no transaction writes - an oracle price, a disabled switch, a risk parameter - never for state the transactions under test mutate: re-applying reverts their writes at the start of the next slot, so a pool would refill itself after every swap)",
                       "account": "AccountAddress (The account this override targets, as {\"pubkey\": \"<base-58 address>\"} or {\"pda\": {\"programId\": \"<base-58 program>\", \"seeds\": [ ... ]}})"
                     }
                   }

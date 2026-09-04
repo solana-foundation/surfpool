@@ -7,6 +7,7 @@ use std::{
 };
 
 use agave_feature_set::FeatureSet;
+use anchor_lang_idl::types::{IdlDefinedFields, IdlGenericArg, IdlType, IdlTypeDef, IdlTypeDefTy};
 use base64::{Engine, prelude::BASE64_STANDARD};
 use chrono::Utc;
 use convert_case::Casing;
@@ -178,46 +179,174 @@ pub fn apply_override_to_decoded_account(
     path: &str,
     value: &serde_json::Value,
 ) -> SurfpoolResult<()> {
+    let txtx_value = json_to_txtx_value(value)?;
+    set_decoded_account_value(decoded_value, path, txtx_value)
+}
+
+/// Same as [`apply_override_to_decoded_account`], but takes an already-converted [`Value`].
+pub fn apply_typed_override_to_decoded_account(
+    decoded_value: &mut Value,
+    path: &str,
+    value: Value,
+) -> SurfpoolResult<()> {
+    set_decoded_account_value(decoded_value, path, value)
+}
+
+fn set_decoded_account_value(
+    decoded_value: &mut Value,
+    path: &str,
+    new_value: Value,
+) -> SurfpoolResult<()> {
     let parts: Vec<&str> = path.split('.').collect();
 
-    if parts.is_empty() {
-        return Err(SurfpoolError::internal("Empty path provided for override"));
+    if parts.iter().any(|part| part.is_empty()) {
+        return Err(SurfpoolError::internal(format!(
+            "Invalid path '{}' provided for override - contains an empty segment",
+            path
+        )));
     }
 
     // Navigate to the parent of the target field
     let mut current = decoded_value;
     for part in &parts[..parts.len() - 1] {
-        match current {
-            Value::Object(map) => {
-                current = map.get_mut(&part.to_string()).ok_or_else(|| {
+        current = match current {
+            Value::Object(map) => map.get_mut(&part.to_string()).ok_or_else(|| {
+                SurfpoolError::internal(format!(
+                    "Path segment '{}' not found in decoded account",
+                    part
+                ))
+            })?,
+            Value::Array(items) => {
+                let index = parse_decoded_account_index(part, path)?;
+                let len = items.len();
+                items.get_mut(index).ok_or_else(|| {
                     SurfpoolError::internal(format!(
-                        "Path segment '{}' not found in decoded account",
-                        part
+                        "Index {} is out of bounds for array of length {} in path '{}'",
+                        index, len, path
                     ))
-                })?;
+                })?
             }
             _ => {
                 return Err(SurfpoolError::internal(format!(
-                    "Cannot navigate through field '{}' - not an object",
+                    "Cannot navigate through field '{}' - not an object or array",
                     part
                 )));
             }
-        }
+        };
     }
 
-    // Set the final field
     let final_key = parts[parts.len() - 1];
     match current {
         Value::Object(map) => {
-            // Convert serde_json::Value to txtx Value
-            let txtx_value = json_to_txtx_value(value)?;
-            map.insert(final_key.to_string(), txtx_value);
+            map.insert(final_key.to_string(), new_value);
+            Ok(())
+        }
+        Value::Array(items) => {
+            let index = parse_decoded_account_index(final_key, path)?;
+            let len = items.len();
+            let slot = items.get_mut(index).ok_or_else(|| {
+                SurfpoolError::internal(format!(
+                    "Index {} is out of bounds for array of length {} in path '{}'",
+                    index, len, path
+                ))
+            })?;
+            *slot = new_value;
             Ok(())
         }
         _ => Err(SurfpoolError::internal(format!(
-            "Cannot set field '{}' - parent is not an object",
+            "Cannot set field '{}' - parent is not an object or array",
             final_key
         ))),
+    }
+}
+
+fn parse_decoded_account_index(segment: &str, path: &str) -> SurfpoolResult<usize> {
+    segment.parse::<usize>().map_err(|_| {
+        SurfpoolError::internal(format!(
+            "Path segment '{}' in '{}' must be a zero-based array index",
+            segment, path
+        ))
+    })
+}
+
+fn json_integer_digits(json: &serde_json::Value, target: &str) -> SurfpoolResult<String> {
+    match json {
+        serde_json::Value::Number(n) if n.as_u64().is_none() && n.as_i64().is_none() => {
+            Err(SurfpoolError::internal(format!(
+                "{n} exceeds what a JSON number can hold exactly; pass this {target} as a decimal \
+                 string instead, e.g. \"1152921504606846976000\""
+            )))
+        }
+        serde_json::Value::Number(n) => Ok(n.to_string()),
+        serde_json::Value::String(s) => Ok(s.trim().to_string()),
+        other => Err(SurfpoolError::internal(format!(
+            "Expected a number or decimal string for {target}, found {other}"
+        ))),
+    }
+}
+
+/// Converts JSON into a txtx [`Value`] using the expected IDL type
+fn json_to_txtx_value_for_idl_type(
+    json: &serde_json::Value,
+    idl_type: &IdlType,
+    idl_types: &[IdlTypeDef],
+) -> SurfpoolResult<Value> {
+    match (idl_type, json) {
+        (IdlType::Pubkey, serde_json::Value::String(address)) => {
+            let pubkey = Pubkey::from_str(address).map_err(|e| {
+                SurfpoolError::internal(format!(
+                    "Invalid pubkey '{}' in account override: {}",
+                    address, e
+                ))
+            })?;
+            Ok(txtx_addon_network_svm_types::SvmValue::pubkey(
+                pubkey.to_bytes().to_vec(),
+            ))
+        }
+        (IdlType::Option(inner), _) if !json.is_null() => {
+            json_to_txtx_value_for_idl_type(json, inner, idl_types)
+        }
+        (IdlType::U128, _) => {
+            let digits = json_integer_digits(json, "u128")?;
+            let value = digits
+                .parse::<u128>()
+                .map_err(|e| SurfpoolError::internal(format!("Invalid u128 '{digits}': {e}")))?;
+            Ok(txtx_addon_network_svm_types::SvmValue::u128(value))
+        }
+        (IdlType::I128, _) => {
+            let digits = json_integer_digits(json, "i128")?;
+            let value = digits
+                .parse::<i128>()
+                .map_err(|e| SurfpoolError::internal(format!("Invalid i128 '{digits}': {e}")))?;
+            Ok(txtx_addon_network_svm_types::SvmValue::i128(value))
+        }
+        (IdlType::Vec(inner), serde_json::Value::Array(items))
+        | (IdlType::Array(inner, _), serde_json::Value::Array(items)) => {
+            let converted = items
+                .iter()
+                .map(|item| json_to_txtx_value_for_idl_type(item, inner, idl_types))
+                .collect::<SurfpoolResult<Vec<_>>>()?;
+            Ok(Value::Array(Box::new(converted)))
+        }
+        (IdlType::Defined { name, .. }, serde_json::Value::Object(fields)) => {
+            let Some(IdlTypeDefTy::Struct {
+                fields: Some(IdlDefinedFields::Named(named_fields)),
+            }) = idl_types.iter().find(|t| &t.name == name).map(|t| &t.ty)
+            else {
+                return json_to_txtx_value(json);
+            };
+
+            let mut object = IndexMap::new();
+            for (key, value) in fields.iter() {
+                let converted = match named_fields.iter().find(|f| &f.name == key) {
+                    Some(field) => json_to_txtx_value_for_idl_type(value, &field.ty, idl_types)?,
+                    None => json_to_txtx_value(value)?,
+                };
+                object.insert(key.clone(), converted);
+            }
+            Ok(Value::Object(object))
+        }
+        _ => json_to_txtx_value(json),
     }
 }
 
@@ -526,6 +655,18 @@ fn synthetic_blockhash_for_slot(slot: Slot, genesis_slot: Slot) -> SyntheticBloc
     // Pre-genesis slot hashes only exist to cover the finalized warmup window.
     // Keep them deterministic and distinct from local chain-index hashes.
     SyntheticBlockhash::new(u64::MAX - (genesis_slot - slot - 1))
+}
+
+/// What one `fetch_before_use` attempt settled. Decides whether a persisted override keeps
+/// asking on later slots, which it must while another attempt could still change the answer.
+enum FetchOutcome {
+    Retired,
+    /// There is no remote to ask. Only a local account can satisfy the request.
+    NoRemote,
+    /// The remote has no such account. It may be created later.
+    NotOnRemote,
+    /// No answer was obtained. Another attempt may get one.
+    Unanswered,
 }
 
 impl SurfnetSvm {
@@ -2708,7 +2849,25 @@ impl SurfnetSvm {
             target_slot
         );
 
-        for override_instance in overrides {
+        let mut settled_this_slot: HashSet<Pubkey> = HashSet::new();
+
+        // `take` already emptied the slot, so bailing out mid-loop would drop every override that
+        // has not been reached yet. Put the unprocessed tail back before returning the error.
+        let restore_unprocessed = |svm: &mut Self, from: usize| {
+            if let Err(e) = svm
+                .scheduled_overrides
+                .store(target_slot, overrides[from..].to_vec())
+            {
+                error!(
+                    "Failed to restore {} unprocessed override(s) for slot {}: {}",
+                    overrides.len() - from,
+                    target_slot,
+                    e
+                );
+            }
+        };
+
+        for (index, override_instance) in overrides.iter().enumerate() {
             if !override_instance.enabled {
                 debug!("Skipping disabled override: {}", override_instance.id);
                 continue;
@@ -2745,8 +2904,12 @@ impl SurfnetSvm {
                 override_instance.id, account_pubkey, override_instance.label
             );
 
+            // Defaults to Retired: nothing was asked for, the account was already forked by an
+            // earlier override this slot, or there is no remote to ask.
+            let mut fetch_outcome = FetchOutcome::Retired;
+
             // Fetch fresh account data from remote if requested
-            if override_instance.fetch_before_use {
+            if override_instance.fetch_before_use && !settled_this_slot.contains(&account_pubkey) {
                 if let Some((client, _)) = remote_ctx {
                     debug!(
                         "Fetching fresh account data for {} from remote",
@@ -2775,6 +2938,7 @@ impl SurfnetSvm {
                         )),
                         Ok(GetAccountResult::None(_)) => {
                             debug!("Account {} not found on remote", account_pubkey);
+                            fetch_outcome = FetchOutcome::NotOnRemote;
                             None
                         }
                         Err(e) => {
@@ -2782,6 +2946,7 @@ impl SurfnetSvm {
                                 "Failed to fetch account {} from remote: {}",
                                 account_pubkey, e
                             );
+                            fetch_outcome = FetchOutcome::Unanswered;
                             None
                         }
                     };
@@ -2824,6 +2989,9 @@ impl SurfnetSvm {
                                 "Failed to set account {} from remote: {}",
                                 account_pubkey, e
                             );
+                            fetch_outcome = FetchOutcome::Unanswered;
+                        } else {
+                            settled_this_slot.insert(account_pubkey);
                         }
                     }
                 } else {
@@ -2831,6 +2999,33 @@ impl SurfnetSvm {
                         "fetch_before_use enabled but no remote client available for override {}",
                         override_instance.id
                     );
+                    fetch_outcome = FetchOutcome::NoRemote;
+                }
+            }
+
+            let existing_account = match self.inner.get_account(&account_pubkey) {
+                Ok(account) => account,
+                Err(e) => {
+                    restore_unprocessed(self, index);
+                    return Err(e);
+                }
+            };
+
+            // The request is only retired when another attempt could no longer change anything.
+            let fetch_retired = match fetch_outcome {
+                FetchOutcome::Retired => true,
+                FetchOutcome::Unanswered => false,
+                FetchOutcome::NoRemote | FetchOutcome::NotOnRemote => existing_account.is_some(),
+            };
+
+            if override_instance.persist {
+                let mut requeued = override_instance.clone();
+                if requeued.fetch_before_use && fetch_retired {
+                    requeued.fetch_before_use = false;
+                }
+                if let Err(e) = self.reschedule_override_for_next_slot(&requeued, target_slot) {
+                    restore_unprocessed(self, index);
+                    return Err(e);
                 }
             }
 
@@ -2862,7 +3057,7 @@ impl SurfnetSvm {
                 );
 
                 // Get the account from the SVM
-                let Some(account) = self.inner.get_account(&account_pubkey)? else {
+                let Some(account) = existing_account else {
                     warn!(
                         "Account {} not found in SVM for override {}, skipping modifications",
                         account_pubkey, override_instance.id
@@ -2975,10 +3170,42 @@ impl SurfnetSvm {
                         account_pubkey,
                         override_instance.id
                     );
+                    settled_this_slot.insert(account_pubkey);
                 }
             }
         }
 
+        Ok(())
+    }
+
+    /// Re-queues `instance` for the slot after `target_slot`, replacing any copy of itself
+    /// already queued there. One entry per id, so an override cannot be applied twice to one slot.
+    fn reschedule_override_for_next_slot(
+        &mut self,
+        instance: &OverrideInstance,
+        target_slot: Slot,
+    ) -> SurfpoolResult<()> {
+        let next_slot = target_slot.checked_add(1).ok_or_else(|| {
+            SurfpoolError::internal(format!(
+                "Override {} cannot persist past slot {}: there is no next slot",
+                instance.id, target_slot
+            ))
+        })?;
+        let mut next = self
+            .scheduled_overrides
+            .get(&next_slot)?
+            .unwrap_or_default();
+
+        if let Some(existing) = next.iter_mut().find(|queued| {
+            queued.id == instance.id
+                && queued.account == instance.account
+                && queued.template_id == instance.template_id
+        }) {
+            *existing = instance.clone();
+        } else {
+            next.push(instance.clone());
+        }
+        self.scheduled_overrides.store(next_slot, next)?;
         Ok(())
     }
 
@@ -3072,12 +3299,15 @@ impl SurfnetSvm {
 
         // Apply overrides to the decoded value
         for (path, value) in overrides {
-            apply_override_to_decoded_account(&mut parsed_value, path, value)?;
+            let converted = match surfpool_types::resolve_idl_type(idl, &account_type.name, path) {
+                Ok(idl_type) => json_to_txtx_value_for_idl_type(value, idl_type, &idl.types)?,
+                Err(_) => json_to_txtx_value(value)?,
+            };
+            apply_typed_override_to_decoded_account(&mut parsed_value, path, converted)?;
         }
 
         // Construct an IdlType::Defined that references the account type
         // This is needed because borsh_encode_value_to_idl_type expects IdlType, not IdlTypeDefTy
-        use anchor_lang_idl::types::{IdlGenericArg, IdlType};
         let defined_type = IdlType::Defined {
             name: account_type.name.clone(),
             generics: account_type
@@ -4267,7 +4497,13 @@ impl SurfnetSvm {
         // Schedule overrides by adding base slot to their scenario-relative slots
         for override_instance in scenario.overrides {
             let scenario_relative_slot = override_instance.scenario_relative_slot;
-            let absolute_slot = base_slot + scenario_relative_slot;
+            // Both operands are caller-supplied, so the sum has to be checked.
+            let absolute_slot = base_slot.checked_add(scenario_relative_slot).ok_or_else(|| {
+                SurfpoolError::internal(format!(
+                    "Override {} cannot be scheduled: base slot {} plus relative slot {} overflows",
+                    override_instance.id, base_slot, scenario_relative_slot
+                ))
+            })?;
 
             debug!(
                 "Scheduling override at absolute slot {} (base {} + relative {})",
@@ -4276,9 +4512,7 @@ impl SurfnetSvm {
 
             let mut slot_overrides = self
                 .scheduled_overrides
-                .get(&absolute_slot)
-                .ok()
-                .flatten()
+                .get(&absolute_slot)?
                 .unwrap_or_default();
             slot_overrides.push(override_instance);
             self.scheduled_overrides
@@ -7347,5 +7581,590 @@ mod tests {
             .expect("get_account should not error")
             .expect("Valid account should be restored");
         assert_eq!(restored_account.lamports, 1_000_000);
+    }
+
+    /// `Obligation.unhealthy_borrow_value_sf` (u128), counting the discriminator.
+    const UNHEALTHY_OFFSET: usize = 2256;
+
+    /// A zeroed Kamino `Obligation` owned by klend. `SurfnetSvm::default()` already registers
+    /// the bundled template IDLs, so klend's is resolvable by owner program.
+    fn scheduled_persist_fixture(
+        persist: bool,
+    ) -> (SurfnetSvm, Pubkey, surfpool_types::OverrideInstance) {
+        let (mut surfnet_svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+
+        let klend = Pubkey::from_str_const("KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD");
+        let idl: Idl = serde_json::from_str(crate::scenarios::registry::KAMINO_V1_IDL_CONTENT)
+            .expect("kamino idl");
+        let obligation_disc = &idl
+            .accounts
+            .iter()
+            .find(|a| a.name == "Obligation")
+            .expect("Obligation account")
+            .discriminator;
+
+        let mut data = vec![0u8; 3344];
+        data[..8].copy_from_slice(obligation_disc);
+
+        let account_pubkey = Pubkey::new_unique();
+        surfnet_svm
+            .inner
+            .set_account(
+                account_pubkey,
+                Account {
+                    lamports: 1_000_000,
+                    data,
+                    owner: klend,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .expect("set obligation account");
+
+        let mut instance = surfpool_types::OverrideInstance::new(
+            "kamino-obligation-health".to_string(),
+            0,
+            surfpool_types::AccountAddress::Pubkey(account_pubkey.to_string()),
+        )
+        .with_values(HashMap::from([(
+            "unhealthy_borrow_value_sf".to_string(),
+            serde_json::json!(1_234u64),
+        )]));
+        instance.persist = persist;
+
+        (surfnet_svm, account_pubkey, instance)
+    }
+
+    #[tokio::test]
+    async fn test_persisted_override_is_rescheduled_for_the_next_slot() {
+        const SLOT: u64 = 500;
+
+        let (mut svm, account_pubkey, instance) = scheduled_persist_fixture(true);
+        let instance_id = instance.id.clone();
+        svm.scheduled_overrides
+            .store(SLOT, vec![instance])
+            .expect("schedule override");
+
+        svm.materialize_overrides_for_slot(&None, SLOT)
+            .await
+            .expect("materialize");
+
+        let account = svm
+            .inner
+            .get_account(&account_pubkey)
+            .expect("get_account")
+            .expect("account present");
+        let unhealthy = u128::from_le_bytes(
+            account.data[UNHEALTHY_OFFSET..UNHEALTHY_OFFSET + 16]
+                .try_into()
+                .expect("16 bytes"),
+        );
+        assert_eq!(unhealthy, 1_234, "override should have been applied");
+
+        let next = svm
+            .scheduled_overrides
+            .get(&(SLOT + 1))
+            .expect("storage read")
+            .expect("next slot should have queued overrides");
+        assert_eq!(
+            next.len(),
+            1,
+            "exactly one override queued for the next slot"
+        );
+        assert_eq!(next[0].id, instance_id);
+        assert!(next[0].persist, "persist flag must survive rescheduling");
+
+        assert!(
+            svm.scheduled_overrides
+                .get(&SLOT)
+                .expect("storage read")
+                .is_none(),
+            "materialized slot should be drained"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_persisted_override_stops_refetching_once_the_account_is_forked() {
+        const SLOT: u64 = 500;
+
+        let (mut svm, _account_pubkey, mut instance) = scheduled_persist_fixture(true);
+        instance.fetch_before_use = true;
+        svm.scheduled_overrides
+            .store(SLOT, vec![instance])
+            .expect("schedule override");
+
+        svm.materialize_overrides_for_slot(&None, SLOT)
+            .await
+            .expect("materialize");
+
+        let next = svm
+            .scheduled_overrides
+            .get(&(SLOT + 1))
+            .expect("storage read")
+            .expect("next slot should have queued overrides");
+        assert_eq!(next.len(), 1, "one entry per override id");
+        assert!(next[0].persist, "persist must survive rescheduling");
+        assert!(
+            !next[0].fetch_before_use,
+            "the account is forked, so later slots must not re-fetch it and discard local writes"
+        );
+    }
+
+    /// An override that writes no account fields still forks the account, so it must stop fetching too.
+    #[tokio::test]
+    async fn test_persisted_override_that_writes_no_fields_stops_refetching() {
+        const SLOT: u64 = 500;
+
+        let (mut svm, account_pubkey, _instance) = scheduled_persist_fixture(true);
+
+        // Values consumed entirely by PDA derivation, so `account_values` filters down to empty.
+        let seed_only = surfpool_types::OverrideInstance::new(
+            "kamino-obligation-health".to_string(),
+            0,
+            surfpool_types::AccountAddress::Pda {
+                program_id: "KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD".to_string(),
+                seeds: vec![surfpool_types::PdaSeed::PropertyRef("market".to_string())],
+            },
+        )
+        .with_values(HashMap::from([(
+            "market".to_string(),
+            serde_json::json!(account_pubkey.to_string()),
+        )]));
+
+        // Point the derived address at a real forked account so presence is what is being tested.
+        let derived = seed_only
+            .account
+            .resolve(Some(&seed_only.values))
+            .expect("derive pda");
+        let forked = svm
+            .inner
+            .get_account(&account_pubkey)
+            .expect("get_account")
+            .expect("fixture account present");
+        svm.inner
+            .set_account(derived, forked)
+            .expect("set derived account");
+
+        let mut no_values = surfpool_types::OverrideInstance::new(
+            "kamino-obligation-noop".to_string(),
+            0,
+            surfpool_types::AccountAddress::Pubkey(account_pubkey.to_string()),
+        );
+        no_values.persist = true;
+        no_values.fetch_before_use = true;
+
+        let mut seed_only = seed_only;
+        seed_only.persist = true;
+        seed_only.fetch_before_use = true;
+
+        svm.scheduled_overrides
+            .store(SLOT, vec![seed_only, no_values])
+            .expect("schedule overrides");
+
+        svm.materialize_overrides_for_slot(&None, SLOT)
+            .await
+            .expect("materialize");
+
+        let next = svm
+            .scheduled_overrides
+            .get(&(SLOT + 1))
+            .expect("storage read")
+            .expect("next slot should have queued overrides");
+        assert_eq!(next.len(), 2, "both overrides re-armed, one entry each");
+        for queued in &next {
+            assert!(queued.persist, "persist must survive rescheduling");
+            assert!(
+                !queued.fetch_before_use,
+                "override {} forked its account, so later slots must not re-fetch it",
+                queued.id
+            );
+        }
+    }
+
+    /// The remote having no such account is only an answer about this slot - accounts get created
+    /// later. While there is nothing local to work on, a persisted override must keep asking, or
+    /// it stays inert for the rest of the run.
+    #[tokio::test]
+    async fn test_persisted_override_retries_while_the_account_is_not_on_remote() {
+        const SLOT: u64 = 500;
+        const NULL_ACCOUNT: &str = r#"{"context":{"apiVersion":"2.1.0","slot":1},"value":null}"#;
+
+        let url = canned_rpc(NULL_ACCOUNT).await;
+        let remote = (SurfnetRemoteClient::new(url), CommitmentConfig::confirmed());
+
+        let (mut svm, _account_pubkey, _instance) = scheduled_persist_fixture(true);
+
+        // An address the SVM has never seen, so there is no local account to fall back on.
+        let mut absent = surfpool_types::OverrideInstance::new(
+            "kamino-obligation-health".to_string(),
+            0,
+            surfpool_types::AccountAddress::Pubkey(Pubkey::new_unique().to_string()),
+        )
+        .with_values(HashMap::from([(
+            "unhealthy_borrow_value_sf".to_string(),
+            serde_json::json!(1_234u64),
+        )]));
+        absent.persist = true;
+        absent.fetch_before_use = true;
+
+        svm.scheduled_overrides
+            .store(SLOT, vec![absent])
+            .expect("schedule override");
+
+        svm.materialize_overrides_for_slot(&Some(remote), SLOT)
+            .await
+            .expect("materialize");
+
+        let next = svm
+            .scheduled_overrides
+            .get(&(SLOT + 1))
+            .expect("storage read")
+            .expect("next slot should have queued overrides");
+        assert_eq!(next.len(), 1, "one entry per override id");
+        assert!(
+            next[0].fetch_before_use,
+            "the account may appear later, so the next slot must keep asking for it"
+        );
+    }
+
+    /// The mirror case: the remote has nothing but a local account already exists, so the override
+    /// can work. Asking again would only risk overwriting that local account once the address is
+    /// populated upstream.
+    #[tokio::test]
+    async fn test_persisted_override_stops_asking_when_only_a_local_account_exists() {
+        const SLOT: u64 = 500;
+        const NULL_ACCOUNT: &str = r#"{"context":{"apiVersion":"2.1.0","slot":1},"value":null}"#;
+
+        let url = canned_rpc(NULL_ACCOUNT).await;
+        let remote = (SurfnetRemoteClient::new(url), CommitmentConfig::confirmed());
+
+        let (mut svm, _account_pubkey, mut instance) = scheduled_persist_fixture(true);
+        instance.fetch_before_use = true;
+        svm.scheduled_overrides
+            .store(SLOT, vec![instance])
+            .expect("schedule override");
+
+        svm.materialize_overrides_for_slot(&Some(remote), SLOT)
+            .await
+            .expect("materialize");
+
+        let next = svm
+            .scheduled_overrides
+            .get(&(SLOT + 1))
+            .expect("storage read")
+            .expect("next slot should have queued overrides");
+        assert_eq!(next.len(), 1, "one entry per override id");
+        assert!(
+            !next[0].fetch_before_use,
+            "the local account is usable, so later fetches must not overwrite it"
+        );
+    }
+
+    /// With no remote client there is nothing to fetch from, but the request is still unmet while
+    /// the account is absent. `materialize_overrides_for_slot` is public, so a caller can pass a
+    /// client on a later slot - retiring the flag here would permanently disable that.
+    #[tokio::test]
+    async fn test_persisted_override_keeps_asking_when_absent_and_no_remote() {
+        const SLOT: u64 = 500;
+
+        let (mut svm, _account_pubkey, _instance) = scheduled_persist_fixture(true);
+
+        let mut absent = surfpool_types::OverrideInstance::new(
+            "kamino-obligation-health".to_string(),
+            0,
+            surfpool_types::AccountAddress::Pubkey(Pubkey::new_unique().to_string()),
+        )
+        .with_values(HashMap::from([(
+            "unhealthy_borrow_value_sf".to_string(),
+            serde_json::json!(1_234u64),
+        )]));
+        absent.persist = true;
+        absent.fetch_before_use = true;
+
+        svm.scheduled_overrides
+            .store(SLOT, vec![absent])
+            .expect("schedule override");
+
+        svm.materialize_overrides_for_slot(&None, SLOT)
+            .await
+            .expect("materialize");
+
+        let next = svm
+            .scheduled_overrides
+            .get(&(SLOT + 1))
+            .expect("storage read")
+            .expect("next slot should have queued overrides");
+        assert_eq!(next.len(), 1, "one entry per override id");
+        assert!(
+            next[0].fetch_before_use,
+            "the request is still unmet, so it must not be retired"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_slot_overflow_is_an_error_not_a_wrap() {
+        let (mut svm, account_pubkey, instance) = scheduled_persist_fixture(true);
+
+        assert!(
+            svm.reschedule_override_for_next_slot(&instance, u64::MAX)
+                .is_err(),
+            "there is no slot after u64::MAX"
+        );
+
+        let mut far = surfpool_types::OverrideInstance::new(
+            "kamino-obligation-health".to_string(),
+            10,
+            surfpool_types::AccountAddress::Pubkey(account_pubkey.to_string()),
+        );
+        far.scenario_relative_slot = 10;
+        let scenario = surfpool_types::Scenario {
+            id: "overflow".to_string(),
+            name: "overflow".to_string(),
+            description: String::new(),
+            tags: vec![],
+            overrides: vec![far],
+        };
+
+        assert!(
+            svm.register_scenario(scenario, Some(u64::MAX - 1)).is_err(),
+            "base slot plus relative slot overflows and must be rejected"
+        );
+    }
+
+    /// A transient RPC failure must not be mistaken for a satisfied fetch. The account already
+    /// being present locally is not enough - the override asked for fresh data and did not get it,
+    /// so with `persist` the flag has to survive or it pins stale data for the rest of the run.
+    #[tokio::test]
+    async fn test_persisted_override_retries_after_a_failed_fetch() {
+        const SLOT: u64 = 500;
+
+        // Unroutable port: the fetch fails without touching the network.
+        let unreachable = (
+            SurfnetRemoteClient::new("http://127.0.0.1:1"),
+            CommitmentConfig::confirmed(),
+        );
+
+        let (mut svm, _account_pubkey, mut instance) = scheduled_persist_fixture(true);
+        instance.fetch_before_use = true;
+        svm.scheduled_overrides
+            .store(SLOT, vec![instance])
+            .expect("schedule override");
+
+        svm.materialize_overrides_for_slot(&Some(unreachable), SLOT)
+            .await
+            .expect("materialize");
+
+        let next = svm
+            .scheduled_overrides
+            .get(&(SLOT + 1))
+            .expect("storage read")
+            .expect("next slot should have queued overrides");
+        assert_eq!(next.len(), 1, "one entry per override id");
+        assert!(next[0].persist, "persist must survive rescheduling");
+        assert!(
+            next[0].fetch_before_use,
+            "the fetch failed, so the next slot must retry it instead of pinning stale data"
+        );
+    }
+
+    /// Guards the ordering invariant only. The re-fetch that used to clobber the first override
+    /// needs a remote client, so `remote_ctx: &None` cannot reproduce it here - that path is
+    /// covered against a live fork.
+    #[tokio::test]
+    async fn test_two_fetching_overrides_on_one_account_both_apply() {
+        const SLOT: u64 = 500;
+        // immediately precedes unhealthy_borrow_value_sf in the Obligation layout
+        const ALLOWED_OFFSET: usize = UNHEALTHY_OFFSET - 16;
+
+        let (mut svm, account_pubkey, first) = scheduled_persist_fixture(false);
+        let mut first = first;
+        first.fetch_before_use = true;
+
+        let mut second = surfpool_types::OverrideInstance::new(
+            "kamino-obligation-health".to_string(),
+            0,
+            surfpool_types::AccountAddress::Pubkey(account_pubkey.to_string()),
+        )
+        .with_values(HashMap::from([(
+            "allowed_borrow_value_sf".to_string(),
+            serde_json::json!(5_678u64),
+        )]));
+        second.fetch_before_use = true;
+
+        svm.scheduled_overrides
+            .store(SLOT, vec![first, second])
+            .expect("schedule overrides");
+
+        svm.materialize_overrides_for_slot(&None, SLOT)
+            .await
+            .expect("materialize");
+
+        let account = svm
+            .inner
+            .get_account(&account_pubkey)
+            .expect("get_account")
+            .expect("account present");
+        let read = |off: usize| {
+            u128::from_le_bytes(account.data[off..off + 16].try_into().expect("16 bytes"))
+        };
+        assert_eq!(
+            read(UNHEALTHY_OFFSET),
+            1_234,
+            "the first override must survive the second override's fetch"
+        );
+        assert_eq!(
+            read(ALLOWED_OFFSET),
+            5_678,
+            "the second override must apply"
+        );
+    }
+
+    /// Two persistent overrides that share a caller-supplied id but target different accounts must both survive re-arming.
+    #[tokio::test]
+    async fn test_reschedule_keeps_overrides_sharing_an_id_across_accounts() {
+        const SLOT: u64 = 500;
+        let (mut surfnet_svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+
+        let first_account = Pubkey::new_unique();
+        let second_account = Pubkey::new_unique();
+
+        let mut first = surfpool_types::OverrideInstance::new(
+            "kamino-obligation-health".to_string(),
+            0,
+            surfpool_types::AccountAddress::Pubkey(first_account.to_string()),
+        );
+        // The collision this guards against: a hand-written scenario reusing a plain id.
+        first.id = "ov-1".to_string();
+        first.persist = true;
+
+        let mut second = first.clone();
+        second.account = surfpool_types::AccountAddress::Pubkey(second_account.to_string());
+
+        surfnet_svm
+            .reschedule_override_for_next_slot(&first, SLOT)
+            .expect("reschedule");
+        surfnet_svm
+            .reschedule_override_for_next_slot(&second, SLOT)
+            .expect("reschedule");
+
+        let queued = surfnet_svm
+            .scheduled_overrides
+            .get(&(SLOT + 1))
+            .expect("read scheduled overrides")
+            .expect("overrides queued for the next slot");
+        assert_eq!(
+            queued.len(),
+            2,
+            "two overrides on different accounts share the id 'ov-1'; keying only on the id drops \
+             one of them, so a scenario silently stops being applied"
+        );
+
+        surfnet_svm
+            .reschedule_override_for_next_slot(&first, SLOT)
+            .expect("reschedule");
+        let queued = surfnet_svm
+            .scheduled_overrides
+            .get(&(SLOT + 1))
+            .expect("read scheduled overrides")
+            .expect("overrides queued for the next slot");
+        assert_eq!(
+            queued.len(),
+            2,
+            "re-arming an override must replace its own queued copy, not append a duplicate"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_non_persisted_override_is_not_rescheduled() {
+        const SLOT: u64 = 500;
+
+        let (mut svm, _account_pubkey, instance) = scheduled_persist_fixture(false);
+        svm.scheduled_overrides
+            .store(SLOT, vec![instance])
+            .expect("schedule override");
+
+        svm.materialize_overrides_for_slot(&None, SLOT)
+            .await
+            .expect("materialize");
+
+        assert!(
+            svm.scheduled_overrides
+                .get(&(SLOT + 1))
+                .expect("storage read")
+                .is_none(),
+            "a one-shot override must not be rescheduled"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_persisted_override_survives_a_run_of_slots() {
+        const FIRST_SLOT: u64 = 900;
+        const SLOTS: u64 = 5;
+
+        let (mut svm, account_pubkey, instance) = scheduled_persist_fixture(true);
+        svm.scheduled_overrides
+            .store(FIRST_SLOT, vec![instance])
+            .expect("schedule override");
+
+        for slot in FIRST_SLOT..FIRST_SLOT + SLOTS {
+            // Clobber the field, the way `refresh_obligation` would.
+            let mut account = svm
+                .inner
+                .get_account(&account_pubkey)
+                .expect("get_account")
+                .expect("account present");
+            account.data[UNHEALTHY_OFFSET..UNHEALTHY_OFFSET + 16]
+                .copy_from_slice(&0u128.to_le_bytes());
+            svm.inner
+                .set_account(account_pubkey, account)
+                .expect("clobber account");
+
+            svm.materialize_overrides_for_slot(&None, slot)
+                .await
+                .expect("materialize");
+
+            let account = svm
+                .inner
+                .get_account(&account_pubkey)
+                .expect("get_account")
+                .expect("account present");
+            let unhealthy = u128::from_le_bytes(
+                account.data[UNHEALTHY_OFFSET..UNHEALTHY_OFFSET + 16]
+                    .try_into()
+                    .expect("16 bytes"),
+            );
+            assert_eq!(
+                unhealthy, 1_234,
+                "persisted override should be re-applied on slot {slot} after being clobbered"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_persisted_override_does_not_duplicate_itself() {
+        const SLOT: u64 = 700;
+
+        let (mut svm, _account_pubkey, instance) = scheduled_persist_fixture(true);
+        svm.scheduled_overrides
+            .store(SLOT + 1, vec![instance.clone()])
+            .expect("pre-queue next slot");
+        svm.scheduled_overrides
+            .store(SLOT, vec![instance])
+            .expect("schedule override");
+
+        svm.materialize_overrides_for_slot(&None, SLOT)
+            .await
+            .expect("materialize");
+
+        let next = svm
+            .scheduled_overrides
+            .get(&(SLOT + 1))
+            .expect("storage read")
+            .expect("next slot queue");
+        assert_eq!(
+            next.len(),
+            1,
+            "override must not be queued twice for one slot"
+        );
     }
 }

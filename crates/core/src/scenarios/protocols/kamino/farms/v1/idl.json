@@ -1,0 +1,885 @@
+{
+  "address": "FarmsPZpWu9i7Kky8tPN37rs2TpmMrAZrC7S7vJa91Hr",
+  "metadata": {
+    "name": "farms",
+    "version": "1.6.5",
+    "spec": "0.1.0"
+  },
+  "instructions": [],
+  "accounts": [
+    {
+      "name": "FarmState",
+      "discriminator": [
+        198,
+        102,
+        216,
+        74,
+        63,
+        66,
+        163,
+        190
+      ]
+    },
+    {
+      "name": "GlobalConfig",
+      "discriminator": [
+        149,
+        8,
+        156,
+        202,
+        160,
+        252,
+        176,
+        217
+      ]
+    },
+    {
+      "name": "UserState",
+      "discriminator": [
+        72,
+        177,
+        85,
+        249,
+        76,
+        167,
+        186,
+        126
+      ]
+    },
+    {
+      "name": "OraclePrices",
+      "discriminator": [
+        89,
+        128,
+        118,
+        221,
+        6,
+        72,
+        180,
+        146
+      ]
+    }
+  ],
+  "types": [
+    {
+      "name": "FarmConfigOption",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "UpdateRewardRps"
+          },
+          {
+            "name": "UpdateRewardMinClaimDuration"
+          },
+          {
+            "name": "WithdrawAuthority"
+          },
+          {
+            "name": "DepositWarmupPeriod"
+          },
+          {
+            "name": "WithdrawCooldownPeriod"
+          },
+          {
+            "name": "RewardType"
+          },
+          {
+            "name": "RpsDecimals"
+          },
+          {
+            "name": "LockingMode"
+          },
+          {
+            "name": "LockingStartTimestamp"
+          },
+          {
+            "name": "LockingDuration"
+          },
+          {
+            "name": "LockingEarlyWithdrawalPenaltyBps"
+          },
+          {
+            "name": "DepositCapAmount"
+          },
+          {
+            "name": "SlashedAmountSpillAddress"
+          },
+          {
+            "name": "ScopePricesAccount"
+          },
+          {
+            "name": "ScopeOraclePriceId"
+          },
+          {
+            "name": "ScopeOracleMaxAge"
+          },
+          {
+            "name": "UpdateRewardScheduleCurvePoints"
+          },
+          {
+            "name": "UpdatePendingFarmAdmin"
+          },
+          {
+            "name": "UpdateStrategyId"
+          },
+          {
+            "name": "UpdateDelegatedRpsAdmin"
+          },
+          {
+            "name": "UpdateVaultId"
+          },
+          {
+            "name": "UpdateExtraDelegatedAuthority"
+          },
+          {
+            "name": "UpdateIsRewardUserOnceEnabled"
+          },
+          {
+            "name": "UpdateDelegatedAuthority"
+          },
+          {
+            "name": "UpdateIsHarvestingPermissionless"
+          }
+        ]
+      }
+    },
+    {
+      "name": "GlobalConfigOption",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "SetPendingGlobalAdmin"
+          },
+          {
+            "name": "SetTreasuryFeeBps"
+          }
+        ]
+      }
+    },
+    {
+      "name": "LockingMode",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "None"
+          },
+          {
+            "name": "Continuous"
+          },
+          {
+            "name": "WithExpiry"
+          }
+        ]
+      }
+    },
+    {
+      "name": "RewardInfo",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "token",
+            "type": {
+              "defined": {
+                "name": "TokenInfo"
+              }
+            }
+          },
+          {
+            "name": "rewards_vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "rewards_available",
+            "type": "u64"
+          },
+          {
+            "name": "reward_schedule_curve",
+            "type": {
+              "defined": {
+                "name": "RewardScheduleCurve"
+              }
+            }
+          },
+          {
+            "name": "min_claim_duration_seconds",
+            "type": "u64"
+          },
+          {
+            "name": "last_issuance_ts",
+            "type": "u64"
+          },
+          {
+            "name": "rewards_issued_unclaimed",
+            "type": "u64"
+          },
+          {
+            "name": "rewards_issued_cumulative",
+            "type": "u64"
+          },
+          {
+            "name": "reward_per_share_scaled",
+            "type": "u128"
+          },
+          {
+            "name": "placeholder0",
+            "type": "u64"
+          },
+          {
+            "name": "reward_type",
+            "type": "u8"
+          },
+          {
+            "name": "rewards_per_second_decimals",
+            "type": "u8"
+          },
+          {
+            "name": "padding0",
+            "type": {
+              "array": [
+                "u8",
+                6
+              ]
+            }
+          },
+          {
+            "name": "padding1",
+            "type": {
+              "array": [
+                "u64",
+                20
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "RewardPerTimeUnitPoint",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "ts_start",
+            "type": "u64"
+          },
+          {
+            "name": "reward_per_time_unit",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "RewardScheduleCurve",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "points",
+            "docs": [
+              "This is a stepwise function, meaning that each point represents",
+              "how many rewards are issued per time unit since the beginning",
+              "of that point until the beginning of the next point.",
+              "This is not a linear curve, there is no interpolation going on.",
+              "A curve can be [[t0, 100], [t1, 50], [t2, 0]]",
+              "meaning that from t0 to t1, 100 rewards are issued per time unit,",
+              "from t1 to t2, 50 rewards are issued per time unit, and after t2 it stops",
+              "Another curve, can be [[t0, 100], [u64::max, 0]]",
+              "meaning that from t0 to u64::max, 100 rewards are issued per time unit"
+            ],
+            "type": {
+              "array": [
+                {
+                  "defined": {
+                    "name": "RewardPerTimeUnitPoint"
+                  }
+                },
+                20
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "RewardType",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "Proportional"
+          },
+          {
+            "name": "Constant"
+          }
+        ]
+      }
+    },
+    {
+      "name": "TimeUnit",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "Seconds"
+          },
+          {
+            "name": "Slots"
+          }
+        ]
+      }
+    },
+    {
+      "name": "TokenInfo",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "decimals",
+            "type": "u64"
+          },
+          {
+            "name": "token_program",
+            "type": "pubkey"
+          },
+          {
+            "name": "padding",
+            "type": {
+              "array": [
+                "u64",
+                6
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "DatedPrice",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "price",
+            "type": {
+              "defined": {
+                "name": "Price"
+              }
+            }
+          },
+          {
+            "name": "last_updated_slot",
+            "type": "u64"
+          },
+          {
+            "name": "unix_timestamp",
+            "type": "u64"
+          },
+          {
+            "name": "reserved",
+            "type": {
+              "array": [
+                "u64",
+                2
+              ]
+            }
+          },
+          {
+            "name": "reserved2",
+            "type": {
+              "array": [
+                "u16",
+                3
+              ]
+            }
+          },
+          {
+            "name": "index",
+            "type": "u16"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Price",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "value",
+            "type": "u64"
+          },
+          {
+            "name": "exp",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "FarmState",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "farm_admin",
+            "type": "pubkey"
+          },
+          {
+            "name": "global_config",
+            "type": "pubkey"
+          },
+          {
+            "name": "token",
+            "type": {
+              "defined": {
+                "name": "TokenInfo"
+              }
+            }
+          },
+          {
+            "name": "reward_infos",
+            "type": {
+              "array": [
+                {
+                  "defined": {
+                    "name": "RewardInfo"
+                  }
+                },
+                10
+              ]
+            }
+          },
+          {
+            "name": "num_reward_tokens",
+            "type": "u64"
+          },
+          {
+            "name": "num_users",
+            "docs": [
+              "Data used to calculate the rewards of the user"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "total_staked_amount",
+            "docs": [
+              "The number of token in the `farm_vault` staked (getting rewards and fees)",
+              "Set such as `farm_vault.amount = total_staked_amount + total_pending_amount`"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "farm_vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "farm_vaults_authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "farm_vaults_authority_bump",
+            "type": "u64"
+          },
+          {
+            "name": "delegate_authority",
+            "docs": [
+              "Only used for delegate farms",
+              "Set to `default()` otherwise"
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "time_unit",
+            "docs": [
+              "Raw representation of a `TimeUnit`",
+              "Seconds = 0, Slots = 1"
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "is_farm_frozen",
+            "docs": [
+              "Automatically set to true in case of a full authority withdrawal",
+              "If true, the farm is frozen and no more deposits are allowed"
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "is_farm_delegated",
+            "docs": [
+              "Indicates if the farm is a delegate farm",
+              "If true, the farm is a delegate farm and the `delegate_authority` is set*"
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "is_reward_user_once_enabled",
+            "docs": [
+              "If set to 1, indicates that the \"reward user once\" feature is enabled"
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "is_harvesting_permissionless",
+            "type": "u8"
+          },
+          {
+            "name": "padding0",
+            "type": {
+              "array": [
+                "u8",
+                3
+              ]
+            }
+          },
+          {
+            "name": "withdraw_authority",
+            "docs": [
+              "Withdraw authority for the farm, allowed to lock deposited funds and withdraw them",
+              "Set to `default()` if unused (only the depositors can withdraw their funds)"
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "deposit_warmup_period",
+            "docs": [
+              "Delay between a user deposit and the moment it is considered as staked",
+              "0 if unused"
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "withdrawal_cooldown_period",
+            "docs": [
+              "Delay between a user unstake and the ability to withdraw his deposit."
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "total_active_stake_scaled",
+            "docs": [
+              "Total active stake of tokens in the farm (scaled from `Decimal` representation)."
+            ],
+            "type": "u128"
+          },
+          {
+            "name": "total_pending_stake_scaled",
+            "docs": [
+              "Total pending stake of tokens in the farm (scaled from `Decimal` representation).",
+              "(can be used by `withdraw_authority` but don't get rewards or fees)"
+            ],
+            "type": "u128"
+          },
+          {
+            "name": "total_pending_amount",
+            "docs": [
+              "Total pending amount of tokens in the farm"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "slashed_amount_current",
+            "docs": [
+              "Slashed amounts from early withdrawal"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "slashed_amount_cumulative",
+            "type": "u64"
+          },
+          {
+            "name": "slashed_amount_spill_address",
+            "type": "pubkey"
+          },
+          {
+            "name": "locking_mode",
+            "docs": [
+              "Locking stake"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "locking_start_timestamp",
+            "type": "u64"
+          },
+          {
+            "name": "locking_duration",
+            "type": "u64"
+          },
+          {
+            "name": "locking_early_withdrawal_penalty_bps",
+            "type": "u64"
+          },
+          {
+            "name": "deposit_cap_amount",
+            "type": "u64"
+          },
+          {
+            "name": "scope_prices",
+            "type": "pubkey"
+          },
+          {
+            "name": "scope_oracle_price_id",
+            "type": "u64"
+          },
+          {
+            "name": "scope_oracle_max_age",
+            "type": "u64"
+          },
+          {
+            "name": "pending_farm_admin",
+            "type": "pubkey"
+          },
+          {
+            "name": "strategy_id",
+            "type": "pubkey"
+          },
+          {
+            "name": "delegated_rps_admin",
+            "type": "pubkey"
+          },
+          {
+            "name": "vault_id",
+            "type": "pubkey"
+          },
+          {
+            "name": "second_delegated_authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "padding",
+            "type": {
+              "array": [
+                "u64",
+                74
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "GlobalConfig",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "global_admin",
+            "type": "pubkey"
+          },
+          {
+            "name": "treasury_fee_bps",
+            "type": "u64"
+          },
+          {
+            "name": "treasury_vaults_authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "treasury_vaults_authority_bump",
+            "type": "u64"
+          },
+          {
+            "name": "pending_global_admin",
+            "type": "pubkey"
+          },
+          {
+            "name": "padding1",
+            "type": {
+              "array": [
+                "u128",
+                126
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "UserState",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "user_id",
+            "type": "u64"
+          },
+          {
+            "name": "farm_state",
+            "type": "pubkey"
+          },
+          {
+            "name": "owner",
+            "type": "pubkey"
+          },
+          {
+            "name": "is_farm_delegated",
+            "docs": [
+              "Indicate if this user state is part of a delegated farm"
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "padding0",
+            "type": {
+              "array": [
+                "u8",
+                7
+              ]
+            }
+          },
+          {
+            "name": "rewards_tally_scaled",
+            "docs": [
+              "Rewards tally used for computation of gained rewards",
+              "(scaled from `Decimal` representation)."
+            ],
+            "type": {
+              "array": [
+                "u128",
+                10
+              ]
+            }
+          },
+          {
+            "name": "rewards_issued_unclaimed",
+            "docs": [
+              "Number of reward tokens ready for claim"
+            ],
+            "type": {
+              "array": [
+                "u64",
+                10
+              ]
+            }
+          },
+          {
+            "name": "last_claim_ts",
+            "type": {
+              "array": [
+                "u64",
+                10
+              ]
+            }
+          },
+          {
+            "name": "active_stake_scaled",
+            "docs": [
+              "User stake deposited and usable, generating rewards and fees.",
+              "(scaled from `Decimal` representation)."
+            ],
+            "type": "u128"
+          },
+          {
+            "name": "pending_deposit_stake_scaled",
+            "docs": [
+              "User stake deposited but not usable and not generating rewards yet.",
+              "(scaled from `Decimal` representation)."
+            ],
+            "type": "u128"
+          },
+          {
+            "name": "pending_deposit_stake_ts",
+            "docs": [
+              "After this timestamp, pending user stake can be moved to user stake",
+              "Initialized to now() + delayed user stake period"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "pending_withdrawal_unstake_scaled",
+            "docs": [
+              "User deposits unstaked, pending for withdrawal, not usable and not generating rewards.",
+              "(scaled from `Decimal` representation)."
+            ],
+            "type": "u128"
+          },
+          {
+            "name": "pending_withdrawal_unstake_ts",
+            "docs": [
+              "After this timestamp, user can withdraw their deposit."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "bump",
+            "docs": [
+              "User bump used for account address validation"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "delegatee",
+            "docs": [
+              "Delegatee used for initialisation - useful to check against"
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "last_stake_ts",
+            "type": "u64"
+          },
+          {
+            "name": "rewards_issued_cumulative",
+            "docs": [
+              "Cumulative rewards issued to the user - ONLY used for stats/analytics",
+              "DO NOT USE IN ANY CALCULATIONS",
+              "Old userStates will have this field populated only from the point of release",
+              "not reflecting any historical data before this was released"
+            ],
+            "type": {
+              "array": [
+                "u64",
+                10
+              ]
+            }
+          },
+          {
+            "name": "padding1",
+            "type": {
+              "array": [
+                "u64",
+                40
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "OraclePrices",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "oracle_mappings",
+            "type": "pubkey"
+          },
+          {
+            "name": "prices",
+            "type": {
+              "array": [
+                {
+                  "defined": {
+                    "name": "DatedPrice"
+                  }
+                },
+                512
+              ]
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

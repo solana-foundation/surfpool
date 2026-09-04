@@ -1,0 +1,224 @@
+protocol: kamino-vault
+version: v2.2.2
+account_type: VaultState
+idl_file_path: idl.json
+
+tags:
+  - vault
+  - yield
+  - lending
+  - defi
+
+templates:
+  - id: kamino-vault-state
+    name: Override Earn Vault Balances
+    description: Override Kamino Earn vault balances and deposit limits
+    idl_account_name: VaultState
+    # Do not add `token_mint`, `shares_mint` or their `*_decimals` here. The mints are wiring
+    # for token accounts that must exist and be funded, so repointing them only produces a
+    # broken vault - fork a real one instead. The decimals are cached copies of the SPL mints
+    # and changing them silently desyncs every amount.
+    properties:
+      - path: token_available
+        label: Idle tokens
+        description: "Tokens idle in the vault, not yet lent out. Example: 1000000000"
+      - path: shares_issued
+        label: Shares outstanding
+        description: "Total shares held by depositors. Example: 1000000000"
+      - path: prev_aum_sf
+        label: AUM at last fee charge
+        description: "AUM recorded at the last fee charge (scaled fraction, x2^60). Example: 1000 x 2^60"
+      - "deposit_cap"
+      - path: min_deposit_amount
+        label: Minimum deposit
+        description: "Smallest accepted deposit, in the token's smallest unit. Example: 1000000"
+      - path: min_withdraw_amount
+        label: Minimum withdrawal
+        description: "Smallest accepted withdrawal, smallest unit. Example: 1000000"
+      - path: min_invest_amount
+        label: Minimum invest
+        description: "Least the vault will deploy into a reserve in one go, smallest unit. Example: 1000000"
+      - path: min_invest_delay_slots
+        label: Invest cooldown
+        description: "Slots that must pass between deployments. Example: 0"
+      - path: unallocated_tokens_cap
+        label: Idle ceiling
+        description: "Most the vault will deliberately leave idle, smallest unit. Example: 1000000000"
+      - path: unallocated_weight
+        label: Idle weight
+        description: >-
+          The idle bucket's share of the vault, expressed relative to the reserve weights rather than as
+          a percentage. Example: 100
+    address:
+      type: pubkey
+    llm_context: |
+      Share price = total assets (token_available plus what is deployed into reserves) /
+      shares_issued.
+
+      HOW TO USE THIS TEMPLATE:
+      1. Raise token_available alone to simulate the vault earning yield
+      2. Raise shares_issued alone to dilute every holder
+      3. Set deposit_cap: 0 to block new deposits
+
+      EXAMPLE - "the vault earned 1000 USDC of yield" (6 decimals):
+      token_available: 1000000000
+
+      DO NOT set persist: true here - transactions write these fields, and re-applying the
+      override reverts their writes at the start of every following slot.
+
+  - id: kamino-vault-fees
+    name: Override Earn Vault Fees
+    description: Override Kamino Earn vault performance, management and exit fees
+    idl_account_name: VaultState
+    properties:
+      - path: performance_fee_bps
+        label: Performance fee
+        description: "Charged on yield the vault earns in bps. Example: 0"
+      - path: management_fee_bps
+        label: Management fee
+        description: "Charged annually on assets held in bps. Example: 0"
+      - path: last_fee_charge_timestamp
+        label: Last fee charge
+        description: "When fees were last taken (unix seconds). Example: 1780000000"
+      - path: pending_fees_sf
+        label: Accrued fees
+        description: "Fees accrued but not yet taken (scaled fraction, x2^60). Example: 0"
+      - path: withdrawal_penalty_bps
+        label: Withdrawal penalty
+        description: "Exit fee charged on withdrawal, in bps. Example: 100"
+      - path: withdrawal_penalty_lamports
+        label: Withdrawal penalty (lamports)
+        description: "Flat SOL charge on withdrawal, in lamports. Example: 0"
+    address:
+      type: pubkey
+    llm_context: |
+      Use this template to isolate depositor returns from fees, or to stress the fee maths.
+
+      HOW TO USE THIS TEMPLATE:
+      1. Set both fee rates to 0 to remove fees from a share-price assertion
+      2. Move last_fee_charge_timestamp into the past so the next charge covers a longer period,
+         which simulates elapsed time without waiting
+
+      EXAMPLE - "no fees":
+      performance_fee_bps: 0
+      management_fee_bps: 0
+
+  - id: kamino-vault-allocation
+    name: Override Earn Vault Allocation
+    description: Override how a Kamino Earn vault spreads deposits across reserves
+    idl_account_name: VaultState
+    properties:
+      - path: vault_allocation_strategy.0.reserve
+        label: Target reserve
+        description: >-
+          The Kamino Lend reserve this slot lends into. Example:
+          D6q6wuQSrifJKZYpR1M8R4YawnLDtDsMmWM1NbBmgJ59
+      - path: vault_allocation_strategy.0.target_allocation_weight
+        label: Target weight
+        description: "This reserve's share of the vault, a proportion not a percentage. Example: 0"
+      - "vault_allocation_strategy.0.token_allocation_cap"
+      - path: vault_allocation_strategy.0.ctoken_allocation
+        label: Collateral held
+        description: >-
+          How many of the reserve's collateral tokens the vault currently holds there, smallest unit.
+          Example: 1000000000
+      - path: vault_allocation_strategy.0.ctoken_allocation_cap
+        label: Collateral cap
+        description: "Ceiling on collateral tokens held in this reserve, smallest unit. Example: 1000000000"
+      - path: vault_allocation_strategy.0.token_target_allocation_sf
+        label: Target amount
+        description: "Target holding for this reserve (scaled fraction, x2^60). Example: 1000 x 2^60"
+      - path: vault_allocation_strategy.0.last_invest_slot
+        label: Last invest slot
+        description: "Slot at which the vault last deployed into this reserve. Example: 370000000"
+      - path: allow_allocations_in_whitelisted_reserves_only
+        label: Whitelist allocations
+        description: "1 restricts which reserves may be given a weight to whitelisted ones. Example: 1"
+      - path: allow_invest_in_whitelisted_reserves_only
+        label: Whitelist investing
+        description: "1 restricts actual deployment to whitelisted reserves. Example: 1"
+    address:
+      type: pubkey
+    llm_context: |
+      vault_allocation_strategy has 25 slots - replace the 0 in the property paths to target slots
+      0-24. Weights are PROPORTIONS relative to each other plus unallocated_weight, not percentages.
+
+      HOW TO USE THIS TEMPLATE:
+      1. Set vault_allocation_strategy.N.reserve to the Kamino Lend reserve for that slot
+      2. Set target_allocation_weight: 0 to make the vault withdraw from it on the next crank
+      3. To set up a withdrawal failure, concentrate the full weight into one reserve and then make
+         that reserve illiquid with kamino-reserve-limits
+
+      EXAMPLE - "pull out of this reserve":
+      vault_allocation_strategy.0.target_allocation_weight: 0
+
+  - id: kamino-vault-rewards
+    name: Override Earn Vault Rewards
+    description: Override Kamino Earn vault reward emissions
+    idl_account_name: VaultState
+    properties:
+      - path: reward_info.reward_per_second
+        label: Emission rate
+        description: >-
+          Rewards paid to vault depositors per second, in the reward token's smallest unit. Example:
+          1000
+      - "reward_info.rewards_available"
+      - path: reward_info.last_issuance_ts
+        label: Last issuance time
+        description: "When vault rewards last accrued (unix seconds). Example: 1780000000"
+      - path: vault_farm
+        label: Linked farm
+        description: >-
+          Kamino Farms account if the vault also distributes through Farms. Example: the farm's address
+      - path: first_loss_capital_farm
+        label: First-loss farm
+        description: >-
+          Farm holding first-loss capital that absorbs losses before depositors. Example: the farm's
+          address
+    address:
+      type: pubkey
+    llm_context: |
+      A THIRD reward mechanism, separate from reserve rewards (kamino-reserve-rewards) and Kamino
+      Farms (kamino-farms-*). This one pays vault depositors directly.
+
+      HOW TO USE THIS TEMPLATE:
+      1. Set reward_info.reward_per_second to the emission rate
+      2. Raise reward_info.rewards_available too, or emissions stop when the budget empties
+      3. Move reward_info.last_issuance_ts backwards to accrue a longer period without waiting
+      4. When vault_farm is set, the vault also distributes through Farms - use the kamino-farms-*
+         templates for the per-user side
+
+      EXAMPLE - "emit 1 USDC per second" (6 decimals):
+      reward_info.reward_per_second: 1000000
+      reward_info.rewards_available: 1000000000
+
+  - id: kamino-vault-reserve-whitelist
+    name: Override Earn Vault Reserve Whitelist
+    description: Override a Kamino Earn vault reserve whitelist entry
+    idl_account_name: ReserveWhitelistEntry
+    properties:
+      - "token_mint"
+      - path: reserve
+        label: Reserve
+        description: >-
+          The Kamino Lend reserve this entry whitelists. Example:
+          D6q6wuQSrifJKZYpR1M8R4YawnLDtDsMmWM1NbBmgJ59 (Main Market USDC)
+      - path: whitelist_add_allocation
+        label: May be allocated
+        description: "1 permits the vault to give this reserve a target weight, 0 refuses it. Example: 1"
+      - path: whitelist_invest
+        label: May be invested in
+        description: "1 permits the vault to actually deploy funds into this reserve, 0 refuses it. Example: 1"
+    address:
+      type: pubkey
+    llm_context: |
+      CRITICAL: Without an entry here, the whitelist switches on kamino-vault-allocation can only be
+      turned on - with nothing whitelisted, every allocation is refused. Build one with
+      surfnet_setAccount, since a vault that has never used whitelisting has no entries.
+
+      One account per (vault, reserve) pair.
+
+      EXAMPLE - "this reserve is approved for both allocation and investment":
+      reserve: D6q6wuQSrifJKZYpR1M8R4YawnLDtDsMmWM1NbBmgJ59
+      whitelist_add_allocation: 1
+      whitelist_invest: 1

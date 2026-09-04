@@ -1,30 +1,44 @@
 {
   "id": "kamino-liquidation-arb-example",
-  "name": "Kamino Liquidation Arbitrage - POPCAT/SOL",
-  "description": "A scenario replicating the liquidation arbitrage from tx 5xDtqZcY4CzDHjdT61VsGuF1YL7fADUhPz6hCdA2RVMFMhUjuSh5rqkrLKFXfh4gXevMN1L2NjnCaRCAZYxVmqpz. This scenario sets up a Kamino obligation to be liquidatable, and manipulates Whirlpool and Raydium AMM pool states to create a profitable arbitrage opportunity.",
-  "tags": ["liquidation", "arbitrage", "kamino", "whirlpool", "raydium"],
+  "name": "Kamino Liquidation Arbitrage - POPCAT/USDC",
+  "description": "Puts a live Kamino obligation on the Altcoins Market underwater and leaves a profitable exit. Halving POPCAT in Scope makes Kamino value the collateral below its USDC debt while the Whirlpool pools keep their real price, so a liquidator seizes POPCAT cheaply and sells it POPCAT -> SOL -> USDC. Obligation: 3iprSGrEQdBxhmqV399tYQQPG8Z1Hh2aYFrBwgqFXjGS",
+  "tags": ["liquidation", "arbitrage", "kamino", "scope", "whirlpool"],
   "overrides": [
     {
-      "id": "obligation-unhealthy",
-      "templateId": "kamino-obligation-health",
-      "label": "Make Obligation Unhealthy",
+      "id": "scope-crash-popcat",
+      "templateId": "kamino-scope-price",
+      "label": "POPCAT crashes 50% in Scope (index 492)",
+      "scenarioRelativeSlot": 0,
+      "enabled": true,
+      "fetchBeforeUse": true,
+      "persist": true,
+      "account": {
+        "pubkey": "3NJYftD5sjVfxSnUdZ1wVML8f3aC6mp1CXCL6L7TnU8C"
+      },
+      "values": {
+        "prices.492.price.value": 2124828,
+        "prices.492.price.exp": 8
+      }
+    },
+    {
+      "id": "popcat-reserve-tighten-threshold",
+      "templateId": "kamino-reserve-config",
+      "label": "POPCAT reserve liquidates above 29% LTV (was 40%)",
       "scenarioRelativeSlot": 0,
       "enabled": true,
       "fetchBeforeUse": true,
       "account": {
-        "pubkey": "3iprSGrEQdBxhmqV399tYQQPG8Z1Hh2aYFrBwgqFXjGS"
+        "pubkey": "3xSpNvuHAfyzpWxUg2kJkVHWhrBcGLL7RxkZyzecQZkw"
       },
       "values": {
-        "borrowed_value_sf": 1000000000000000000,
-        "unhealthy_borrow_value_sf": 500000000000000000,
-        "deposited_value_sf": 800000000000000000,
-        "allowed_borrow_value_sf": 600000000000000000
+        "config.liquidation_threshold_pct": 29,
+        "config.max_liquidation_bonus_bps": 1000
       }
     },
     {
-      "id": "whirlpool-popcat-sol-price",
+      "id": "whirlpool-popcat-sol-depth",
       "templateId": "whirlpool-popcat-sol",
-      "label": "Set Whirlpool POPCAT/SOL Price",
+      "label": "Deepen POPCAT/SOL so the exit does not slip",
       "scenarioRelativeSlot": 0,
       "enabled": true,
       "fetchBeforeUse": true,
@@ -32,27 +46,21 @@
         "pubkey": "Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE"
       },
       "values": {
-        "liquidity": "5000000000000000",
-        "sqrt_price": "1844674407370955161",
-        "tick_current_index": 0
+        "liquidity": 5000000000000000
       }
     },
     {
-      "id": "raydium-amm-popcat-sol-state",
-      "templateId": "raydium-amm-popcat-sol",
-      "label": "Set Raydium AMM POPCAT/SOL State",
+      "id": "whirlpool-sol-usdc-depth",
+      "templateId": "whirlpool-sol-usdc",
+      "label": "Deepen SOL/USDC to close the route back to USDC",
       "scenarioRelativeSlot": 0,
       "enabled": true,
       "fetchBeforeUse": true,
       "account": {
-        "pubkey": "FRhB8L7Y9Qq41qZXYLtC2nw8An1RJfLLxRF2x9RwLLMo"
+        "pubkey": "HJPjoWUrhoZzkNfRpHuieeFk9WcZWjwy6PBjZ81ngndJ"
       },
       "values": {
-        "status": 1,
-        "state": 1,
-        "lp_amount": 10000000000000,
-        "fees.swap_fee_numerator": 25,
-        "fees.swap_fee_denominator": 10000
+        "liquidity": 50000000000000000
       }
     }
   ]

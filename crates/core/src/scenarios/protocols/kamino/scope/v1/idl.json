@@ -1,0 +1,1590 @@
+{
+  "address": "HFn8GnPADiny6XqUoWE8uRPPxb29ikn4yTuPa9MF2fWJ",
+  "metadata": {
+    "name": "scope",
+    "version": "0.39.0",
+    "spec": "0.1.0"
+  },
+  "instructions": [],
+  "accounts": [
+    {
+      "name": "Configuration",
+      "discriminator": [
+        192,
+        79,
+        172,
+        30,
+        21,
+        173,
+        25,
+        43
+      ]
+    },
+    {
+      "name": "MintsToScopeChains",
+      "discriminator": [
+        156,
+        236,
+        56,
+        20,
+        39,
+        141,
+        42,
+        183
+      ]
+    },
+    {
+      "name": "OracleMappings",
+      "discriminator": [
+        40,
+        244,
+        110,
+        80,
+        255,
+        214,
+        243,
+        188
+      ]
+    },
+    {
+      "name": "OraclePrices",
+      "discriminator": [
+        89,
+        128,
+        118,
+        221,
+        6,
+        72,
+        180,
+        146
+      ]
+    },
+    {
+      "name": "OracleTwaps",
+      "discriminator": [
+        192,
+        139,
+        27,
+        250,
+        53,
+        166,
+        101,
+        61
+      ]
+    },
+    {
+      "name": "TokenMetadatas",
+      "discriminator": [
+        221,
+        107,
+        64,
+        103,
+        67,
+        0,
+        165,
+        22
+      ]
+    }
+  ],
+  "types": [
+    {
+      "name": "UpdateOracleMappingAndMetadataEntriesWithId",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "entry_id",
+            "type": "u16"
+          },
+          {
+            "name": "updates",
+            "type": {
+              "vec": {
+                "defined": {
+                  "name": "UpdateOracleMappingAndMetadataEntry"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "CappedFlooredData",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "source_entry",
+            "type": "u16"
+          },
+          {
+            "name": "cap_entry",
+            "type": {
+              "option": "u16"
+            }
+          },
+          {
+            "name": "floor_entry",
+            "type": {
+              "option": "u16"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "CappedMostRecentOfData",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "source_entries",
+            "type": {
+              "array": [
+                "u16",
+                4
+              ]
+            }
+          },
+          {
+            "name": "max_divergence_bps",
+            "type": "u16"
+          },
+          {
+            "name": "sources_max_age_s",
+            "type": "u64"
+          },
+          {
+            "name": "cap_entry",
+            "type": "u16"
+          }
+        ]
+      }
+    },
+    {
+      "name": "V3",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "confidence_factor",
+            "type": "u32"
+          }
+        ]
+      }
+    },
+    {
+      "name": "V8V10",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market_status_behavior",
+            "type": {
+              "defined": {
+                "name": "MarketStatusBehavior"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "ChainlinkStandardPriceData",
+      "docs": [
+        "Price data for standard Chainlink types (v3, v7, v8, v9)"
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "observations_timestamp",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "ChainlinkXPriceData",
+      "docs": [
+        "Price data for ChainlinkX type (v10)"
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "observations_timestamp",
+            "type": "u64"
+          },
+          {
+            "name": "suspended",
+            "type": "bool"
+          },
+          {
+            "name": "activation_date_time",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "ConditionalData",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "condition",
+            "type": "u8"
+          },
+          {
+            "name": "tolerance_bps",
+            "type": "u16"
+          },
+          {
+            "name": "sources",
+            "docs": [
+              "Extension-prone source list is stored last so future versioned layouts can",
+              "add more sources without shifting earlier scalar fields."
+            ],
+            "type": {
+              "array": [
+                "u16",
+                3
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "DiscountToMaturityData",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "discount_per_year_bps",
+            "type": "u16"
+          },
+          {
+            "name": "maturity_timestamp",
+            "type": "i64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "MostRecentOfData",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "source_entries",
+            "type": {
+              "array": [
+                "u16",
+                4
+              ]
+            }
+          },
+          {
+            "name": "max_divergence_bps",
+            "type": "u16"
+          },
+          {
+            "name": "sources_max_age_s",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Fee",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "basis_points",
+            "type": "u32"
+          }
+        ]
+      }
+    },
+    {
+      "name": "LiqPool",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "lp_mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "lp_mint_authority_bump_seed",
+            "type": "u8"
+          },
+          {
+            "name": "sol_leg_bump_seed",
+            "type": "u8"
+          },
+          {
+            "name": "msol_leg_authority_bump_seed",
+            "type": "u8"
+          },
+          {
+            "name": "msol_leg",
+            "type": "pubkey"
+          },
+          {
+            "name": "lp_liquidity_target",
+            "docs": [
+              "Liquidity target. If the Liquidity reach this amount, the fee reaches lp_min_discount_fee"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "lp_max_fee",
+            "docs": [
+              "Liquidity pool max fee"
+            ],
+            "type": {
+              "defined": {
+                "name": "Fee"
+              }
+            }
+          },
+          {
+            "name": "lp_min_fee",
+            "docs": [
+              "SOL/mSOL Liquidity pool min fee"
+            ],
+            "type": {
+              "defined": {
+                "name": "Fee"
+              }
+            }
+          },
+          {
+            "name": "treasury_cut",
+            "docs": [
+              "Treasury cut"
+            ],
+            "type": {
+              "defined": {
+                "name": "Fee"
+              }
+            }
+          },
+          {
+            "name": "lp_supply",
+            "type": "u64"
+          },
+          {
+            "name": "lent_from_sol_leg",
+            "type": "u64"
+          },
+          {
+            "name": "liquidity_sol_cap",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "List",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "account",
+            "type": "pubkey"
+          },
+          {
+            "name": "item_size",
+            "type": "u32"
+          },
+          {
+            "name": "count",
+            "type": "u32"
+          },
+          {
+            "name": "new_account",
+            "type": "pubkey"
+          },
+          {
+            "name": "copied_count",
+            "type": "u32"
+          }
+        ]
+      }
+    },
+    {
+      "name": "StakeSystem",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "stake_list",
+            "type": {
+              "defined": {
+                "name": "List"
+              }
+            }
+          },
+          {
+            "name": "delayed_unstake_cooling_down",
+            "type": "u64"
+          },
+          {
+            "name": "stake_deposit_bump_seed",
+            "type": "u8"
+          },
+          {
+            "name": "stake_withdraw_bump_seed",
+            "type": "u8"
+          },
+          {
+            "name": "slots_for_stake_delta",
+            "docs": [
+              "set by admin, how much slots before the end of the epoch, stake-delta can start"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "last_stake_delta_epoch",
+            "docs": [
+              "Marks the start of stake-delta operations, meaning that if somebody starts a delayed-unstake ticket",
+              "after this var is set with epoch_num the ticket will have epoch_created = current_epoch+1",
+              "(the user must wait one more epoch, because their unstake-delta will be execute in this epoch)"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "min_stake",
+            "type": "u64"
+          },
+          {
+            "name": "extra_stake_delta_runs",
+            "docs": [
+              "can be set by validator-manager-auth to allow a second run of stake-delta to stake late stakers in the last minute of the epoch",
+              "so we maximize user's rewards"
+            ],
+            "type": "u32"
+          }
+        ]
+      }
+    },
+    {
+      "name": "ValidatorSystem",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "validator_list",
+            "type": {
+              "defined": {
+                "name": "List"
+              }
+            }
+          },
+          {
+            "name": "manager_authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "total_validator_score",
+            "type": "u32"
+          },
+          {
+            "name": "total_active_balance",
+            "docs": [
+              "sum of all active lamports staked"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "auto_add_validator_enabled",
+            "docs": [
+              "allow & auto-add validator when a user deposits a stake-account of a non-listed validator"
+            ],
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "State",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "msol_mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "admin_authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "operational_sol_account",
+            "type": "pubkey"
+          },
+          {
+            "name": "treasury_msol_account",
+            "type": "pubkey"
+          },
+          {
+            "name": "reserve_bump_seed",
+            "type": "u8"
+          },
+          {
+            "name": "msol_mint_authority_bump_seed",
+            "type": "u8"
+          },
+          {
+            "name": "rent_exempt_for_token_acc",
+            "type": "u64"
+          },
+          {
+            "name": "reward_fee",
+            "type": {
+              "defined": {
+                "name": "Fee"
+              }
+            }
+          },
+          {
+            "name": "stake_system",
+            "type": {
+              "defined": {
+                "name": "StakeSystem"
+              }
+            }
+          },
+          {
+            "name": "validator_system",
+            "type": {
+              "defined": {
+                "name": "ValidatorSystem"
+              }
+            }
+          },
+          {
+            "name": "liq_pool",
+            "type": {
+              "defined": {
+                "name": "LiqPool"
+              }
+            }
+          },
+          {
+            "name": "available_reserve_balance",
+            "type": "u64"
+          },
+          {
+            "name": "msol_supply",
+            "type": "u64"
+          },
+          {
+            "name": "msol_price",
+            "type": "u64"
+          },
+          {
+            "name": "circulating_ticket_count",
+            "docs": [
+              "count tickets for delayed-unstake"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "circulating_ticket_balance",
+            "docs": [
+              "total lamports amount of generated and not claimed yet tickets"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "lent_from_reserve",
+            "type": "u64"
+          },
+          {
+            "name": "min_deposit",
+            "type": "u64"
+          },
+          {
+            "name": "min_withdraw",
+            "type": "u64"
+          },
+          {
+            "name": "staking_sol_cap",
+            "type": "u64"
+          },
+          {
+            "name": "emergency_cooling_down",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "MultiplicationChainData",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "source_entries",
+            "type": {
+              "array": [
+                "u16",
+                6
+              ]
+            }
+          },
+          {
+            "name": "sources_max_age_s",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "PythLazerData",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "feed_id",
+            "type": "u16"
+          },
+          {
+            "name": "exponent",
+            "type": "u8"
+          },
+          {
+            "name": "bid_ask_spread_factor",
+            "docs": [
+              "Tolerance factor for the bid/ask spread check (`ask - bid` against the",
+              "price). `0` disables the spread check entirely, in which case the payload",
+              "is not required to carry `BestBidPrice`/`BestAskPrice`."
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "ema_enabled",
+            "type": "bool"
+          },
+          {
+            "name": "ema_confidence_factor",
+            "type": "u32"
+          },
+          {
+            "name": "price_confidence_factor",
+            "docs": [
+              "Tolerance factor for the native Lazer `Confidence` check; `0` disables it."
+            ],
+            "type": "u32"
+          }
+        ]
+      }
+    },
+    {
+      "name": "PythLazerEmaRefData",
+      "docs": [
+        "Reference-oracle config for `OracleType::PythLazerEMA`.",
+        "",
+        "Stored in `oracle_mappings.generic[index]` for an EMA entry. The EMA value",
+        "itself lives in the source `PythLazer` entry's `dated_price.generic_data`,",
+        "populated by `update_price` whenever the spot refresh payload includes an",
+        "`EmaPrice` property. See `get_ema_price`."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "source_entry",
+            "docs": [
+              "Token index of the source `PythLazer` entry to read the EMA from."
+            ],
+            "type": "u16"
+          }
+        ]
+      }
+    },
+    {
+      "name": "PythLazerStoredData",
+      "docs": [
+        "Layout of `DatedPrice.generic_data` (24 bytes) for `PythLazer` entries.",
+        "",
+        "`update_price` writes the spot feed timestamp on every refresh, and the EMA",
+        "fields whenever the payload carries an `EmaPrice`. `ema_feed_update_timestamp_us == 0`",
+        "is the \"EMA never received\" sentinel consumed by `get_ema_price`."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "spot_feed_update_timestamp_us",
+            "type": "u64"
+          },
+          {
+            "name": "ema_price_value",
+            "type": "u64"
+          },
+          {
+            "name": "ema_feed_update_timestamp_us",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Price",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "value",
+            "type": "u64"
+          },
+          {
+            "name": "exp",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "DatedPrice",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "price",
+            "type": {
+              "defined": {
+                "name": "Price"
+              }
+            }
+          },
+          {
+            "name": "last_updated_slot",
+            "type": "u64"
+          },
+          {
+            "name": "unix_timestamp",
+            "type": "u64"
+          },
+          {
+            "name": "generic_data",
+            "type": {
+              "array": [
+                "u8",
+                24
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "MintToScopeChain",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "scope_chain",
+            "type": {
+              "array": [
+                "u16",
+                4
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "EmaTwap",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "last_update_slot",
+            "type": "u64"
+          },
+          {
+            "name": "last_update_unix_timestamp",
+            "type": "u64"
+          },
+          {
+            "name": "current_ema1h",
+            "type": "u128"
+          },
+          {
+            "name": "updates_tracker1h",
+            "docs": [
+              "The sample tracker is a 64 bit number where each bit represents a point in time."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "updates_tracker7d",
+            "type": "u64"
+          },
+          {
+            "name": "current_ema8h",
+            "type": "u128"
+          },
+          {
+            "name": "current_ema24h",
+            "type": "u128"
+          },
+          {
+            "name": "updates_tracker8h",
+            "type": "u64"
+          },
+          {
+            "name": "updates_tracker24h",
+            "type": "u64"
+          },
+          {
+            "name": "current_ema7d",
+            "type": "u128"
+          },
+          {
+            "name": "padding1",
+            "type": {
+              "array": [
+                "u128",
+                35
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "TwapEnabledBitmask",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "bitmask",
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "TokenMetadata",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "name",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "max_age_price_slots",
+            "type": "u64"
+          },
+          {
+            "name": "group_ids_bitset",
+            "type": "u64"
+          },
+          {
+            "name": "reserved",
+            "type": {
+              "array": [
+                "u64",
+                15
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "UpdateOracleMappingAndMetadataEntry",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "RemoveEntry"
+          },
+          {
+            "name": "MappingConfig",
+            "fields": [
+              {
+                "name": "price_type",
+                "type": {
+                  "defined": {
+                    "name": "OracleType"
+                  }
+                }
+              },
+              {
+                "name": "generic_data",
+                "type": {
+                  "array": [
+                    "u8",
+                    20
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "name": "MappingTwapEntry",
+            "fields": [
+              {
+                "name": "price_type",
+                "type": {
+                  "defined": {
+                    "name": "OracleType"
+                  }
+                }
+              },
+              {
+                "name": "twap_source",
+                "type": "u16"
+              }
+            ]
+          },
+          {
+            "name": "MappingTwapEnabledBitmask",
+            "fields": [
+              "u8"
+            ]
+          },
+          {
+            "name": "MappingRefPrice",
+            "fields": [
+              {
+                "name": "ref_price_index",
+                "type": {
+                  "option": "u16"
+                }
+              },
+              {
+                "name": "ref_price_tolerance_bps",
+                "type": {
+                  "option": "u16"
+                }
+              }
+            ]
+          },
+          {
+            "name": "MetadataName",
+            "fields": [
+              "string"
+            ]
+          },
+          {
+            "name": "MetadataMaxPriceAgeSlots",
+            "fields": [
+              "u64"
+            ]
+          },
+          {
+            "name": "MetadataGroupIdsBitset",
+            "fields": [
+              "u64"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "ReportDataMarketStatus",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "Unknown"
+          },
+          {
+            "name": "Closed"
+          },
+          {
+            "name": "Open"
+          }
+        ]
+      }
+    },
+    {
+      "name": "MarketStatusBehavior",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "AllUpdates"
+          },
+          {
+            "name": "Open"
+          },
+          {
+            "name": "OpenAndPrePost"
+          }
+        ]
+      }
+    },
+    {
+      "name": "ReportDataV9RipcordFlag",
+      "docs": [
+        "# Ripcord Flag",
+        "- `0` (false): Feed's data provider is OK. Fund's data provider and accuracy is as expected.",
+        "- `1` (true): Feed's data provider is flagging a pause. Data provider detected outliers,",
+        "deviated thresholds, or operational issues. **DO NOT consume NAV data when ripcord=1.**"
+      ],
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "Normal"
+          },
+          {
+            "name": "Paused"
+          }
+        ]
+      }
+    },
+    {
+      "name": "PriceUpdateResult",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "Updated"
+          },
+          {
+            "name": "SuspendExistingPrice"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Condition",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "Gt"
+          },
+          {
+            "name": "Gte"
+          },
+          {
+            "name": "Lt"
+          },
+          {
+            "name": "Lte"
+          },
+          {
+            "name": "Eq"
+          },
+          {
+            "name": "Neq"
+          },
+          {
+            "name": "WithinRangeAbs"
+          },
+          {
+            "name": "OutsideRangeAbs"
+          },
+          {
+            "name": "WithinRangeBps"
+          },
+          {
+            "name": "OutsideRangeBps"
+          },
+          {
+            "name": "NonZero"
+          }
+        ]
+      }
+    },
+    {
+      "name": "TokenTypes",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "TokenA"
+          },
+          {
+            "name": "TokenB"
+          }
+        ]
+      }
+    },
+    {
+      "name": "RefPriceToleranceOrTwapSource",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "None"
+          },
+          {
+            "name": "RefPriceToleranceBps",
+            "fields": [
+              "u16"
+            ]
+          },
+          {
+            "name": "TwapSource",
+            "fields": [
+              "u16"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "EmaType",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "Ema1h"
+          },
+          {
+            "name": "Ema8h"
+          },
+          {
+            "name": "Ema24h"
+          },
+          {
+            "name": "Ema7d"
+          }
+        ]
+      }
+    },
+    {
+      "name": "OracleType",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "Unused"
+          },
+          {
+            "name": "DeprecatedPlaceholder1"
+          },
+          {
+            "name": "DeprecatedPlaceholder2"
+          },
+          {
+            "name": "DeprecatedPlaceholder3"
+          },
+          {
+            "name": "DeprecatedPlaceholder4"
+          },
+          {
+            "name": "SplStake"
+          },
+          {
+            "name": "KToken"
+          },
+          {
+            "name": "DeprecatedPlaceholder5"
+          },
+          {
+            "name": "MsolStake"
+          },
+          {
+            "name": "KTokenToTokenA"
+          },
+          {
+            "name": "KTokenToTokenB"
+          },
+          {
+            "name": "JupiterLpFetch"
+          },
+          {
+            "name": "ScopeTwap1h"
+          },
+          {
+            "name": "OrcaWhirlpoolAtoB"
+          },
+          {
+            "name": "OrcaWhirlpoolBtoA"
+          },
+          {
+            "name": "RaydiumAmmV3AtoB"
+          },
+          {
+            "name": "RaydiumAmmV3BtoA"
+          },
+          {
+            "name": "DeprecatedPlaceholder6"
+          },
+          {
+            "name": "MeteoraDlmmAtoB"
+          },
+          {
+            "name": "MeteoraDlmmBtoA"
+          },
+          {
+            "name": "DeprecatedPlaceholder7"
+          },
+          {
+            "name": "PythPull"
+          },
+          {
+            "name": "PythPullEMA"
+          },
+          {
+            "name": "FixedPrice"
+          },
+          {
+            "name": "SwitchboardOnDemand"
+          },
+          {
+            "name": "JitoRestaking"
+          },
+          {
+            "name": "Chainlink"
+          },
+          {
+            "name": "DiscountToMaturity"
+          },
+          {
+            "name": "MostRecentOf"
+          },
+          {
+            "name": "PythLazer"
+          },
+          {
+            "name": "RedStone"
+          },
+          {
+            "name": "AdrenaLp"
+          },
+          {
+            "name": "Securitize"
+          },
+          {
+            "name": "CappedFloored"
+          },
+          {
+            "name": "ChainlinkRWA"
+          },
+          {
+            "name": "ChainlinkNAV"
+          },
+          {
+            "name": "FlashtradeLp"
+          },
+          {
+            "name": "ChainlinkX"
+          },
+          {
+            "name": "ChainlinkExchangeRate"
+          },
+          {
+            "name": "CappedMostRecentOf"
+          },
+          {
+            "name": "ScopeTwap8h"
+          },
+          {
+            "name": "ScopeTwap24h"
+          },
+          {
+            "name": "ScopeTwap7d"
+          },
+          {
+            "name": "MultiplicationChain"
+          },
+          {
+            "name": "SplBalance"
+          },
+          {
+            "name": "StakedSolBalance"
+          },
+          {
+            "name": "TotalMintSupply"
+          },
+          {
+            "name": "Conditional"
+          },
+          {
+            "name": "PythLazerEMA"
+          }
+        ]
+      }
+    },
+    {
+      "name": "ScopeChainError",
+      "docs": [
+        "Errors that can be raised while creating or manipulating a scope chain"
+      ],
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "PriceChainTooLong"
+          },
+          {
+            "name": "PriceChainConversionFailure"
+          },
+          {
+            "name": "NoChainForToken"
+          },
+          {
+            "name": "InvalidPricesInChain"
+          },
+          {
+            "name": "MathOverflow"
+          },
+          {
+            "name": "IntegerConversionOverflow"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Configuration",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "admin",
+            "type": "pubkey"
+          },
+          {
+            "name": "oracle_mappings",
+            "type": "pubkey"
+          },
+          {
+            "name": "oracle_prices",
+            "type": "pubkey"
+          },
+          {
+            "name": "tokens_metadata",
+            "type": "pubkey"
+          },
+          {
+            "name": "oracle_twaps",
+            "type": "pubkey"
+          },
+          {
+            "name": "admin_cached",
+            "type": "pubkey"
+          },
+          {
+            "name": "emergency_council",
+            "type": "pubkey"
+          },
+          {
+            "name": "resume_authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "padding",
+            "type": {
+              "array": [
+                "u64",
+                1247
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "MintsToScopeChains",
+      "docs": [
+        "Map of mints to scope chain only valid for a given price feed"
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "oracle_prices",
+            "type": "pubkey"
+          },
+          {
+            "name": "seed_pk",
+            "type": "pubkey"
+          },
+          {
+            "name": "seed_id",
+            "type": "u64"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "mapping",
+            "type": {
+              "vec": {
+                "defined": {
+                  "name": "MintToScopeChain"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "OracleMappings",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "price_info_accounts",
+            "type": {
+              "array": [
+                "pubkey",
+                512
+              ]
+            }
+          },
+          {
+            "name": "price_types",
+            "type": {
+              "array": [
+                "u8",
+                512
+              ]
+            }
+          },
+          {
+            "name": "twap_source_or_ref_price_tolerance_bps",
+            "type": {
+              "array": [
+                "u16",
+                512
+              ]
+            }
+          },
+          {
+            "name": "twap_enabled_bitmask",
+            "type": {
+              "array": [
+                {
+                  "defined": {
+                    "name": "TwapEnabledBitmask"
+                  }
+                },
+                512
+              ]
+            }
+          },
+          {
+            "name": "ref_price",
+            "type": {
+              "array": [
+                "u16",
+                512
+              ]
+            }
+          },
+          {
+            "name": "generic",
+            "type": {
+              "array": [
+                {
+                  "array": [
+                    "u8",
+                    20
+                  ]
+                },
+                512
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "OraclePrices",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "oracle_mappings",
+            "type": "pubkey"
+          },
+          {
+            "name": "prices",
+            "type": {
+              "array": [
+                {
+                  "defined": {
+                    "name": "DatedPrice"
+                  }
+                },
+                512
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "OracleTwaps",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "oracle_prices",
+            "type": "pubkey"
+          },
+          {
+            "name": "oracle_mappings",
+            "type": "pubkey"
+          },
+          {
+            "name": "twaps",
+            "type": {
+              "array": [
+                {
+                  "defined": {
+                    "name": "EmaTwap"
+                  }
+                },
+                512
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "TokenMetadatas",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "metadatas_array",
+            "type": {
+              "array": [
+                {
+                  "defined": {
+                    "name": "TokenMetadata"
+                  }
+                },
+                512
+              ]
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,546 @@
+{
+  "address": "LiMoM9rMhrdYrfzUCxQppvxCSG1FcrUK9G8uLq4A1GF",
+  "metadata": {
+    "name": "limo",
+    "version": "0.1.0",
+    "spec": "0.1.0"
+  },
+  "instructions": [],
+  "accounts": [
+    {
+      "name": "Order",
+      "discriminator": [
+        134,
+        173,
+        223,
+        185,
+        77,
+        86,
+        28,
+        51
+      ]
+    },
+    {
+      "name": "UserSwapBalancesState",
+      "discriminator": [
+        140,
+        228,
+        152,
+        62,
+        231,
+        27,
+        245,
+        198
+      ]
+    },
+    {
+      "name": "GlobalConfig",
+      "discriminator": [
+        149,
+        8,
+        156,
+        202,
+        160,
+        252,
+        176,
+        217
+      ]
+    }
+  ],
+  "types": [
+    {
+      "name": "OrderStatus",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "Active"
+          },
+          {
+            "name": "Filled"
+          },
+          {
+            "name": "Cancelled"
+          }
+        ]
+      }
+    },
+    {
+      "name": "OrderType",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "Vanilla"
+          }
+        ]
+      }
+    },
+    {
+      "name": "UpdateGlobalConfigMode",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "UpdateEmergencyMode"
+          },
+          {
+            "name": "UpdateFlashTakeOrderBlocked"
+          },
+          {
+            "name": "UpdateBlockNewOrders"
+          },
+          {
+            "name": "UpdateBlockOrderTaking"
+          },
+          {
+            "name": "UpdateHostFeeBps"
+          },
+          {
+            "name": "UpdateAdminAuthorityCached"
+          },
+          {
+            "name": "UpdateOrderTakingPermissionless"
+          },
+          {
+            "name": "UpdateOrderCloseDelaySeconds"
+          },
+          {
+            "name": "UpdateTxnFeeCost"
+          },
+          {
+            "name": "UpdateAtaCreationCost"
+          }
+        ]
+      }
+    },
+    {
+      "name": "UpdateGlobalConfigValue",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "Bool",
+            "fields": [
+              "bool"
+            ]
+          },
+          {
+            "name": "U16",
+            "fields": [
+              "u16"
+            ]
+          },
+          {
+            "name": "U64",
+            "fields": [
+              "u64"
+            ]
+          },
+          {
+            "name": "Pubkey",
+            "fields": [
+              "pubkey"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "UpdateOrderMode",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "UpdatePermissionless"
+          },
+          {
+            "name": "UpdateCounterparty"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Order",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "global_config",
+            "type": "pubkey"
+          },
+          {
+            "name": "maker",
+            "type": "pubkey"
+          },
+          {
+            "name": "input_mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "input_mint_program_id",
+            "type": "pubkey"
+          },
+          {
+            "name": "output_mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "output_mint_program_id",
+            "type": "pubkey"
+          },
+          {
+            "name": "initial_input_amount",
+            "docs": [
+              "The amount of input token the maker wants to swap"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "expected_output_amount",
+            "docs": [
+              "The amount of output token the maker wants to receive"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "remaining_input_amount",
+            "docs": [
+              "The amount of input token remaining to be swapped"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "filled_output_amount",
+            "docs": [
+              "The amount of output token that the maker has received so far"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "tip_amount",
+            "docs": [
+              "The amount of tips the maker is due to receive for this order -",
+              "in lamports, stored in the pda_authority account"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "number_of_fills",
+            "docs": [
+              "The number of times the order has been filled"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "order_type",
+            "type": "u8"
+          },
+          {
+            "name": "status",
+            "type": "u8"
+          },
+          {
+            "name": "in_vault_bump",
+            "type": "u8"
+          },
+          {
+            "name": "flash_ix_lock",
+            "docs": [
+              "This is normally set to 0, but can be set to 1 to indicate that the",
+              "order is part of a flash operation, in whcih case the order can not be",
+              "modified until the flash operation is completed."
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "permissionless",
+            "type": "u8"
+          },
+          {
+            "name": "padding0",
+            "type": {
+              "array": [
+                "u8",
+                3
+              ]
+            }
+          },
+          {
+            "name": "last_updated_timestamp",
+            "type": "u64"
+          },
+          {
+            "name": "flash_start_taker_output_balance",
+            "docs": [
+              "This is only used for flash operations, and is set to the blanance on the start",
+              "operation, and than back to 0 on the end operation. It is used to compute the difference",
+              "between start and end balances in order to compute the amount received from a potential swap"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "counterparty",
+            "type": "pubkey"
+          },
+          {
+            "name": "padding",
+            "type": {
+              "array": [
+                "u64",
+                15
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "UserSwapBalancesState",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "user_lamports",
+            "type": "u64"
+          },
+          {
+            "name": "input_ta_balance",
+            "type": "u64"
+          },
+          {
+            "name": "output_ta_balance",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "GlobalConfig",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "emergency_mode",
+            "type": "u8"
+          },
+          {
+            "name": "flash_take_order_blocked",
+            "type": "u8"
+          },
+          {
+            "name": "new_orders_blocked",
+            "type": "u8"
+          },
+          {
+            "name": "orders_taking_blocked",
+            "type": "u8"
+          },
+          {
+            "name": "host_fee_bps",
+            "type": "u16"
+          },
+          {
+            "name": "padding0",
+            "type": {
+              "array": [
+                "u8",
+                2
+              ]
+            }
+          },
+          {
+            "name": "order_close_delay_seconds",
+            "docs": [
+              "The number of seconds after an order has been updated before it can be closed"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "padding1",
+            "type": {
+              "array": [
+                "u64",
+                9
+              ]
+            }
+          },
+          {
+            "name": "pda_authority_previous_lamports_balance",
+            "docs": [
+              "The total amount of lamports that were present in the pda_authority last",
+              "time a program instructions which alters the pda_authority account was",
+              "executed"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "total_tip_amount",
+            "docs": [
+              "The total amount of tips that have been paid out - should be at least",
+              "as much as the total lamports present in the pda_authority account"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "host_tip_amount",
+            "docs": [
+              "The amount of tips the host is due to receive -",
+              "in lamports, stored in the pda_authority account"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "pda_authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "pda_authority_bump",
+            "type": "u64"
+          },
+          {
+            "name": "admin_authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "admin_authority_cached",
+            "type": "pubkey"
+          },
+          {
+            "name": "txn_fee_cost",
+            "type": "u64"
+          },
+          {
+            "name": "ata_creation_cost",
+            "type": "u64"
+          },
+          {
+            "name": "padding2",
+            "type": {
+              "array": [
+                "u64",
+                241
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "OrderDisplay",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "initial_input_amount",
+            "type": "u64"
+          },
+          {
+            "name": "expected_output_amount",
+            "type": "u64"
+          },
+          {
+            "name": "remaining_input_amount",
+            "type": "u64"
+          },
+          {
+            "name": "filled_output_amount",
+            "type": "u64"
+          },
+          {
+            "name": "tip_amount",
+            "type": "u64"
+          },
+          {
+            "name": "number_of_fills",
+            "type": "u64"
+          },
+          {
+            "name": "on_event_output_amount_filled",
+            "type": "u64"
+          },
+          {
+            "name": "on_event_tip_amount",
+            "type": "u64"
+          },
+          {
+            "name": "order_type",
+            "type": "u8"
+          },
+          {
+            "name": "status",
+            "type": "u8"
+          },
+          {
+            "name": "last_updated_timestamp",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "UserSwapBalanceDiffs",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "user_lamports_before",
+            "type": "u64"
+          },
+          {
+            "name": "input_ta_balance_before",
+            "type": "u64"
+          },
+          {
+            "name": "output_ta_balance_before",
+            "type": "u64"
+          },
+          {
+            "name": "user_lamports_after",
+            "type": "u64"
+          },
+          {
+            "name": "input_ta_balance_after",
+            "type": "u64"
+          },
+          {
+            "name": "output_ta_balance_after",
+            "type": "u64"
+          },
+          {
+            "name": "swap_program",
+            "type": "pubkey"
+          },
+          {
+            "name": "simulated_swap_amount_out",
+            "type": "u64"
+          },
+          {
+            "name": "simulated_ts",
+            "type": "u64"
+          },
+          {
+            "name": "minimum_amount_out",
+            "type": "u64"
+          },
+          {
+            "name": "swap_amount_in",
+            "type": "u64"
+          },
+          {
+            "name": "simulated_amount_out_next_best",
+            "type": "u64"
+          },
+          {
+            "name": "aggregator",
+            "type": "u8"
+          },
+          {
+            "name": "next_best_aggregator",
+            "type": "u8"
+          }
+        ]
+      }
+    }
+  ]
+}

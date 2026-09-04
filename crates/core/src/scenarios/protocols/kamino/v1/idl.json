@@ -2,49 +2,226 @@
   "address": "KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD",
   "metadata": {
     "name": "kamino_lending",
-    "version": "1.12.6",
+    "version": "1.23.0",
     "spec": "0.1.0"
   },
   "instructions": [],
   "accounts": [
     {
       "name": "UserState",
-      "discriminator": [72, 177, 85, 249, 76, 167, 186, 126]
+      "discriminator": [
+        72,
+        177,
+        85,
+        249,
+        76,
+        167,
+        186,
+        126
+      ]
     },
     {
       "name": "GlobalConfig",
-      "discriminator": [149, 8, 156, 202, 160, 252, 176, 217]
+      "discriminator": [
+        149,
+        8,
+        156,
+        202,
+        160,
+        252,
+        176,
+        217
+      ]
     },
     {
       "name": "LendingMarket",
-      "discriminator": [246, 114, 50, 98, 72, 157, 28, 120]
+      "discriminator": [
+        246,
+        114,
+        50,
+        98,
+        72,
+        157,
+        28,
+        120
+      ]
     },
     {
       "name": "Obligation",
-      "discriminator": [168, 206, 141, 106, 88, 76, 172, 167]
+      "discriminator": [
+        168,
+        206,
+        141,
+        106,
+        88,
+        76,
+        172,
+        167
+      ]
     },
     {
       "name": "ReferrerState",
-      "discriminator": [194, 81, 217, 103, 12, 19, 12, 66]
+      "discriminator": [
+        194,
+        81,
+        217,
+        103,
+        12,
+        19,
+        12,
+        66
+      ]
     },
     {
       "name": "ReferrerTokenState",
-      "discriminator": [39, 15, 208, 77, 32, 195, 105, 56]
+      "discriminator": [
+        39,
+        15,
+        208,
+        77,
+        32,
+        195,
+        105,
+        56
+      ]
     },
     {
       "name": "ShortUrl",
-      "discriminator": [28, 89, 174, 25, 226, 124, 126, 212]
+      "discriminator": [
+        28,
+        89,
+        174,
+        25,
+        226,
+        124,
+        126,
+        212
+      ]
     },
     {
       "name": "UserMetadata",
-      "discriminator": [157, 214, 220, 235, 98, 135, 171, 28]
+      "discriminator": [
+        157,
+        214,
+        220,
+        235,
+        98,
+        135,
+        171,
+        28
+      ]
     },
     {
       "name": "Reserve",
-      "discriminator": [43, 242, 204, 202, 26, 247, 59, 127]
+      "discriminator": [
+        43,
+        242,
+        204,
+        202,
+        26,
+        247,
+        59,
+        127
+      ]
+    },
+    {
+      "name": "WithdrawTicket",
+      "discriminator": [
+        237,
+        23,
+        164,
+        58,
+        53,
+        248,
+        240,
+        94
+      ]
     }
   ],
   "types": [
+    {
+      "name": "ReserveConfigCustomizationArgs",
+      "docs": [
+        "A definition of optional customizations that should be applied after cloning the config."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "override_fixed_rate_bps",
+            "docs": [
+              "A gate for [Self::fixed_borrow_rate_bps]."
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "fixed_borrow_rate_bps",
+            "docs": [
+              "If [Self::override_fixed_rate_bps] is non-zero, this borrow rate will be used to override",
+              "the [ReserveConfig::borrow_rate_curve] with a fixed one."
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "override_debt_term_seconds",
+            "docs": [
+              "A gate for [Self::debt_term_seconds]."
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "debt_term_seconds",
+            "docs": [
+              "If [Self::override_debt_term_seconds] is non-zero, this value will be used to override the",
+              "[ReserveConfig::debt_term_seconds]."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "clear_elevation_groups",
+            "docs": [
+              "Whether the target reserve should have zeroed [ReserveConfig::elevation_groups] (i.e. not",
+              "cloned from source).",
+              "",
+              "This customization is mandatory when cloning a reserve (with some elevation groups) into a",
+              "different market (where those elevation group indices would have different meaning)."
+            ],
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "BorrowOrderConfigArgs",
+      "docs": [
+        "A subset of [BorrowOrderConfig] excluding the accounts passed via [SetBorrowOrder]."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "remaining_debt_amount",
+            "type": "u64"
+          },
+          {
+            "name": "max_borrow_rate_bps",
+            "type": "u32"
+          },
+          {
+            "name": "min_debt_term_seconds",
+            "type": "u64"
+          },
+          {
+            "name": "fillable_until_timestamp",
+            "type": "u64"
+          },
+          {
+            "name": "enable_auto_rollover_on_filled_borrows",
+            "type": "bool"
+          }
+        ]
+      }
+    },
     {
       "name": "UpdateConfigMode",
       "type": {
@@ -123,7 +300,7 @@
             "name": "UpdateBorrowRateCurve"
           },
           {
-            "name": "UpdateEntireReserveConfig"
+            "name": "DeprecatedUpdateEntireReserveConfig"
           },
           {
             "name": "UpdateDebtWithdrawalCap"
@@ -150,7 +327,7 @@
             "name": "UpdateBorrowFactor"
           },
           {
-            "name": "UpdateAssetTier"
+            "name": "DeprecatedUpdateAssetTier"
           },
           {
             "name": "UpdateElevationGroup"
@@ -208,6 +385,24 @@
           },
           {
             "name": "UpdateBlockCTokenUsage"
+          },
+          {
+            "name": "UpdateDebtMaturityTimestamp"
+          },
+          {
+            "name": "UpdateDebtTermSeconds"
+          },
+          {
+            "name": "UpdateEarlyRepayRemainingInterestPct"
+          },
+          {
+            "name": "UpdateReserveEmergencyMode"
+          },
+          {
+            "name": "UpdateRewardsAmountPerSlot"
+          },
+          {
+            "name": "UpdateReservePermissionedOps"
           }
         ]
       }
@@ -219,35 +414,50 @@
         "variants": [
           {
             "name": "Bool",
-            "fields": ["bool"]
+            "fields": [
+              "bool"
+            ]
           },
           {
             "name": "U8",
-            "fields": ["u8"]
+            "fields": [
+              "u8"
+            ]
           },
           {
             "name": "U8Array",
             "fields": [
               {
-                "array": ["u8", 8]
+                "array": [
+                  "u8",
+                  8
+                ]
               }
             ]
           },
           {
             "name": "U16",
-            "fields": ["u16"]
+            "fields": [
+              "u16"
+            ]
           },
           {
             "name": "U64",
-            "fields": ["u64"]
+            "fields": [
+              "u64"
+            ]
           },
           {
             "name": "U128",
-            "fields": ["u128"]
+            "fields": [
+              "u128"
+            ]
           },
           {
             "name": "Pubkey",
-            "fields": ["pubkey"]
+            "fields": [
+              "pubkey"
+            ]
           },
           {
             "name": "ElevationGroup",
@@ -263,7 +473,10 @@
             "name": "Name",
             "fields": [
               {
-                "array": ["u8", 32]
+                "array": [
+                  "u8",
+                  32
+                ]
               }
             ]
           }
@@ -294,7 +507,7 @@
             "name": "UpdateGlobalAllowedBorrow"
           },
           {
-            "name": "UpdateRiskCouncil"
+            "name": "UpdateEmergencyCouncil"
           },
           {
             "name": "UpdateMinFullLiquidationThreshold"
@@ -355,6 +568,63 @@
           },
           {
             "name": "UpdatePriceTriggeredLiquidationDisabled"
+          },
+          {
+            "name": "UpdateMatureReserveDebtLiquidationEnabled"
+          },
+          {
+            "name": "UpdateObligationBorrowDebtTermLiquidationEnabled"
+          },
+          {
+            "name": "UpdateBorrowOrderCreationEnabled"
+          },
+          {
+            "name": "UpdateBorrowOrderExecutionEnabled"
+          },
+          {
+            "name": "UpdateMinBorrowOrderFillValue"
+          },
+          {
+            "name": "UpdateWithdrawTicketIssuanceEnabled"
+          },
+          {
+            "name": "UpdateWithdrawTicketRedemptionEnabled"
+          },
+          {
+            "name": "UpdateMinWithdrawQueuedLiquidityValue"
+          },
+          {
+            "name": "UpdateFixedTermRolloverWindowDurationSeconds"
+          },
+          {
+            "name": "UpdateOpenTermRolloverWindowDurationSeconds"
+          },
+          {
+            "name": "UpdateObligationBorrowRolloverConfigurationEnabled"
+          },
+          {
+            "name": "UpdateTermBasedFullLiquidationDurationSecs"
+          },
+          {
+            "name": "UpdateObligationBorrowMigrationToFixedExecutionEnabled"
+          },
+          {
+            "name": "UpdateMinPartialRolloverValue"
+          },
+          {
+            "name": "UpdateWithdrawTicketCancellationEnabled"
+          },
+          {
+            "name": "UpdatePermissioningAuthority"
+          },
+          {
+            "name": "UpdatePermissionedOps"
+          },
+          {
+            "name": "DeprecatedUpdateReserveRewardsMaxAprPct"
+          },
+          {
+            "name": "UpdateReserveRewardsMaxAprBps"
           }
         ]
       }
@@ -375,29 +645,40 @@
     },
     {
       "name": "LastUpdate",
-      "docs": ["Last update state"],
+      "docs": [
+        "Last update state"
+      ],
       "type": {
         "kind": "struct",
         "fields": [
           {
             "name": "slot",
-            "docs": ["Last slot when updated"],
+            "docs": [
+              "Last slot when updated"
+            ],
             "type": "u64"
           },
           {
             "name": "stale",
-            "docs": ["True when marked stale, false when slot updated"],
+            "docs": [
+              "True when marked stale, false when slot updated"
+            ],
             "type": "u8"
           },
           {
             "name": "price_status",
-            "docs": ["Status of the prices used to calculate the last update"],
+            "docs": [
+              "Status of the prices used to calculate the last update"
+            ],
             "type": "u8"
           },
           {
             "name": "placeholder",
             "type": {
-              "array": ["u8", 6]
+              "array": [
+                "u8",
+                6
+              ]
             }
           }
         ]
@@ -438,14 +719,269 @@
           },
           {
             "name": "debt_reserve",
-            "docs": ["Mandatory debt reserve for this elevation group"],
+            "docs": [
+              "Mandatory debt reserve for this elevation group"
+            ],
             "type": "pubkey"
           },
           {
             "name": "padding1",
             "type": {
-              "array": ["u64", 4]
+              "array": [
+                "u64",
+                4
+              ]
             }
+          }
+        ]
+      }
+    },
+    {
+      "name": "BorrowOrder",
+      "docs": [
+        "A borrow order.",
+        "",
+        "When the [Obligation::borrow_order] is populated (i.e. non-zeroed) on an Obligation, then the",
+        "permissionless \"fill\" operations may borrow liquidity to the owner according to this",
+        "specification."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "debt_liquidity_mint",
+            "docs": [
+              "The asset to be borrowed.",
+              "The reserves used for [Obligation::borrows] *must* all provide exactly this asset."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "remaining_debt_amount",
+            "docs": [
+              "The amount of debt that still needs to be filled, in lamports."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "filled_debt_destination",
+            "docs": [
+              "The token account owned by the [Obligation::owner] and holding [Self::debt_liquidity_mint],",
+              "where the filled funds should be transferred to."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "min_debt_term_seconds",
+            "docs": [
+              "The minimum allowed debt term that the obligation owner agrees to.",
+              "The reserves used to fill this order *cannot* define their debt term *lower* than this.",
+              "",
+              "If zeroed, then only open-term reserves may be used."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "fillable_until_timestamp",
+            "docs": [
+              "The time until which the borrow order can still be filled."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "placed_at_timestamp",
+            "docs": [
+              "The time at which this order was placed.",
+              "Currently, this is only a piece of metadata."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "last_updated_at_timestamp",
+            "docs": [
+              "The time at which this order was most-recently updated (including: created).",
+              "Currently, this is only a piece of metadata."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "requested_debt_amount",
+            "docs": [
+              "The amount of debt that was originally requested when this order was most-recently updated.",
+              "In other words: this field holds a value of [Self::remaining_debt_amount] captured at",
+              "[Self::last_updated_at_timestamp].",
+              "Currently, this is only a piece of metadata."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "max_borrow_rate_bps",
+            "docs": [
+              "The maximum borrow rate that the obligation owner agrees to.",
+              "The reserves used for [Obligation::borrows] *cannot* define their maximum borrow rate",
+              "*higher* than this."
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "active",
+            "docs": [
+              "Whether the [Self::remaining_debt_amount] is non-zero.",
+              "",
+              "This field is *not* used by smart contract logic (which prefers to treat the above",
+              "[Self::remaining_debt_amount]-based definition as the single source of truth). However, it",
+              "is useful for off-chain bots (order-searchers) to efficiently list (i.e. `memcmp` filter)",
+              "just the obligations that have active borrow orders."
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "enable_auto_rollover_on_filled_borrows",
+            "docs": [
+              "When `1`, all [Obligation::borrows] that get filled by this order will have their",
+              "[FixedTermBorrowRolloverConfig::auto_rollover_enabled] flag set.",
+              "",
+              "Additionally, their rollover customizations:",
+              "- will exactly match this order's constraints regarding [Self::min_debt_term_seconds] and",
+              "[Self::max_borrow_rate_bps];",
+              "- will use the [FixedTermBorrowRolloverConfig::open_term_allowed] fallback.",
+              "",
+              "See [BorrowOrder::get_rollover_config_for_filled_borrow()].",
+              "",
+              "Clarification note: when `0`, this setting has no effect on any borrow (i.e. if an existing",
+              "borrow was independently marked for auto-rollover, it will *not* be unmarked when filled by",
+              "this order).",
+              "",
+              "Feature flag note: when [LendingMarket::obligation_borrow_rollover_configuration_enabled] is",
+              "disabled, this setting has no effect on any borrow (i.e. the fill will be successful, but",
+              "the borrow will not be marked for auto-rollover."
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "padding1",
+            "docs": [
+              "Alignment padding."
+            ],
+            "type": {
+              "array": [
+                "u8",
+                2
+              ]
+            }
+          },
+          {
+            "name": "end_padding",
+            "docs": [
+              "End padding."
+            ],
+            "type": {
+              "array": [
+                "u64",
+                5
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "FixedTermBorrowRolloverConfig",
+      "docs": [
+        "Settings driving the auto-rollover (or migration) of an [ObligationLiquidity]'s borrow.",
+        "",
+        "This covers three flavors:",
+        "- *fixed-to-fixed*: a fixed-term borrow rolling into another fixed-term reserve,",
+        "- *fixed-to-open*: a fixed-term borrow rolling into an open-term reserve,",
+        "- *open-to-fixed*: an open-term borrow migrating into a fixed-term reserve.",
+        "",
+        "By its nature (not a special case), the zeroed struct means \"no auto-rollover/migration\"."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "auto_rollover_enabled",
+            "docs": [
+              "Whether this *fixed-term* borrow can be permissionlessly prolonged. The funds used to roll",
+              "over can come:",
+              "- either from a *fixed-term* reserve (same or a different one):",
+              "- This can only happen within [LendingMarket::fixed_term_rollover_window_duration_seconds].",
+              "- The target reserve must meet all the criteria defined in this config (see",
+              "[Self::max_borrow_rate_bps] and [Self::min_debt_term_seconds]).",
+              "- Note: not possible when [Self::min_debt_term_seconds] is `0` (open-term only).",
+              "- or from an *open-term* reserve:",
+              "- This can only happen within [LendingMarket::open_term_rollover_window_duration_seconds].",
+              "- The user must explicitly set [Self::open_term_allowed] here.",
+              "",
+              "This setting is not effective when the borrow is currently using an *open-term* reserve."
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "open_term_allowed",
+            "docs": [
+              "When `1`, then [Self::auto_rollover_enabled] is allowed to roll this borrow over into any",
+              "open-term reserve.",
+              "",
+              "Please note that if such rollover actually happens, then [Self::max_borrow_rate_bps]",
+              "condition does not apply - technically, it could be evaluated, but open-term reserves",
+              "typically use float-rate (utilization-driven borrow rate curve) which has very high maximum",
+              "(when at 100% utilization) that would not meet any practical criteria here."
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "migration_to_fixed_enabled",
+            "docs": [
+              "Whether this *open-term* borrow can be permissionlessly migrated into a fixed-term reserve:",
+              "- This can happen at any moment (as soon as liquidity becomes available).",
+              "- The target fixed-term reserve must meet all the criteria defined in this config (see",
+              "[Self::max_borrow_rate_bps] and [Self::min_debt_term_seconds]).",
+              "",
+              "This setting is not effective when the borrow is currently using a *fixed-term* reserve.",
+              "",
+              "Cannot be enabled when [Self::min_debt_term_seconds] is `0` (open-term only), because",
+              "migrating into a fixed-term reserve contradicts the open-term-only intent."
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "alignment_padding",
+            "docs": [
+              "Internal alignment padding (free to reuse)."
+            ],
+            "type": {
+              "array": [
+                "u8",
+                1
+              ]
+            }
+          },
+          {
+            "name": "max_borrow_rate_bps",
+            "docs": [
+              "A maximum allowed borrow rate of a reserve that can be used for a rollover/migration.",
+              "",
+              "Note: this must be set (i.e. non-zero) when enabling any rollover/migration flavor, but is",
+              "of course not effective when rollover/migration is not enabled."
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "min_debt_term_seconds",
+            "docs": [
+              "A minimum debt term (in seconds) of a fixed-term reserve that can be used for a",
+              "rollover/migration.",
+              "",
+              "When `0`, the owner only accepts open-term reserves as rollover targets \u2014 i.e. rolling over",
+              "(or migrating) into a fixed-term reserve is not allowed. This is consistent with the",
+              "semantics of [BorrowOrder::min_debt_term_seconds].",
+              "",
+              "This means that `0` is incompatible with [Self::migration_to_fixed_enabled] (which requires",
+              "a fixed-term target) \u2014 this combination is rejected at configuration time."
+            ],
+            "type": "u64"
           }
         ]
       }
@@ -468,18 +1004,24 @@
     },
     {
       "name": "ObligationCollateral",
-      "docs": ["Obligation collateral state"],
+      "docs": [
+        "Obligation collateral state"
+      ],
       "type": {
         "kind": "struct",
         "fields": [
           {
             "name": "deposit_reserve",
-            "docs": ["Reserve collateral is deposited to"],
+            "docs": [
+              "Reserve collateral is deposited to"
+            ],
             "type": "pubkey"
           },
           {
             "name": "deposited_amount",
-            "docs": ["Amount of collateral deposited"],
+            "docs": [
+              "Amount of collateral deposited"
+            ],
             "type": "u64"
           },
           {
@@ -502,7 +1044,10 @@
           {
             "name": "padding",
             "type": {
-              "array": ["u64", 9]
+              "array": [
+                "u64",
+                9
+              ]
             }
           }
         ]
@@ -510,13 +1055,17 @@
     },
     {
       "name": "ObligationLiquidity",
-      "docs": ["Obligation liquidity state"],
+      "docs": [
+        "Obligation liquidity state"
+      ],
       "type": {
         "kind": "struct",
         "fields": [
           {
             "name": "borrow_reserve",
-            "docs": ["Reserve liquidity is borrowed from"],
+            "docs": [
+              "Reserve liquidity is borrowed from"
+            ],
             "type": "pubkey"
           },
           {
@@ -531,7 +1080,18 @@
             }
           },
           {
-            "name": "padding",
+            "name": "last_borrowed_at_timestamp",
+            "docs": [
+              "The timestamp at which this debt was taken.",
+              "",
+              "Conceptually, every borrow can be interpreted as \"closing the previous loan and starting a",
+              "new one\" (which would make a plain ` borrowed_at ` an even better name). But in terms of",
+              "implementation, this fields records when the *last* borrow operation from this reserve",
+              "happened (i.e. adding debt of the same reserve *does* move this timestamp).",
+              "",
+              "Note: this field is *not* only metadata: it is used in the logic, e.g. for enforcing the",
+              "fixed-term borrows (i.e. those induced by [ReserveConfig::debt_term_seconds])."
+            ],
             "type": "u64"
           },
           {
@@ -563,9 +1123,40 @@
             "type": "u64"
           },
           {
+            "name": "fixed_term_borrow_rollover_config",
+            "docs": [
+              "The user's auto-rollover/migration opt-ins. Some settings are effective only for fixed-term",
+              "borrows, while others only for open-term borrows - see individual field docs."
+            ],
+            "type": {
+              "defined": {
+                "name": "FixedTermBorrowRolloverConfig"
+              }
+            }
+          },
+          {
+            "name": "borrowed_amount_at_expiration",
+            "docs": [
+              "An amount of liquidity that was borrowed when this fixed-term borrow expired (i.e. zeroed if",
+              "this borrow is not fixed-term, or if it did not yet expire).",
+              "",
+              "Needed to honor the [LendingMarket::term_based_full_liquidation_duration_secs].",
+              "",
+              "This value is captured by [Self::capture_borrowed_amount_at_expiration] during obligation's",
+              "refresh - please see the method's docs for gotchas.",
+              "",
+              "Note on precision: we use a `u64` field, since the remaining space within this struct is",
+              "rather scarce, and we do not need sub-lamport precision for the liquidation throttling rate."
+            ],
+            "type": "u64"
+          },
+          {
             "name": "padding2",
             "type": {
-              "array": ["u64", 7]
+              "array": [
+                "u64",
+                4
+              ]
             }
           }
         ]
@@ -573,7 +1164,10 @@
     },
     {
       "name": "ObligationOrder",
-      "docs": ["A single obligation order.", "See [Obligation::orders]."],
+      "docs": [
+        "A single obligation order.",
+        "See [Obligation::obligation_orders]."
+      ],
       "type": {
         "kind": "struct",
         "fields": [
@@ -669,12 +1263,15 @@
           {
             "name": "padding1",
             "docs": [
-              "Internal padding.",
+              "Alignment padding.",
               "The fields above take up 2+2+1+1 bytes = 48 bits, which means we need 80 bits = 10 bytes to",
               "align with `u128`s."
             ],
             "type": {
-              "array": ["u8", 10]
+              "array": [
+                "u8",
+                10
+              ]
             }
           },
           {
@@ -684,25 +1281,44 @@
               "The total size of a single instance is 8*u128 = 128 bytes."
             ],
             "type": {
-              "array": ["u128", 5]
+              "array": [
+                "u128",
+                5
+              ]
             }
           }
         ]
       }
     },
     {
-      "name": "AssetTier",
+      "name": "UpdateObligationConfigMode",
+      "docs": [
+        "A discriminator of a user-configurable piece of [Obligation].",
+        "",
+        "Implementation note: due to TS-side codegen quirks (and a \"convention\" currently seen e.g.",
+        "within reserve and market update operations), this is not a true Rust enum. The new value of",
+        "a config item is provided in a separate handler argument (borsh-serialized), and its expected",
+        "type is defined by each discriminator here. Additionally, each update mode acts on a specific",
+        "[ObligationConfigUpdateSubject] (e.g. the auto-rollover of fixed-term borrows is configured on",
+        "a per-borrow basis), which is also specified by separate handler arguments."
+      ],
       "type": {
         "kind": "enum",
         "variants": [
           {
-            "name": "Regular"
+            "name": "FixedTermRolloverEnabled"
           },
           {
-            "name": "IsolatedCollateral"
+            "name": "FixedTermRolloverMaxBorrowRateBps"
           },
           {
-            "name": "IsolatedDebt"
+            "name": "FixedTermRolloverMinDebtTermSeconds"
+          },
+          {
+            "name": "FixedTermRolloverOpenTermAllowed"
+          },
+          {
+            "name": "MigrationToFixedEnabled"
           }
         ]
       }
@@ -715,13 +1331,19 @@
           {
             "name": "value",
             "type": {
-              "array": ["u64", 4]
+              "array": [
+                "u64",
+                4
+              ]
             }
           },
           {
             "name": "padding",
             "type": {
-              "array": ["u64", 2]
+              "array": [
+                "u64",
+                2
+              ]
             }
           }
         ]
@@ -729,7 +1351,9 @@
     },
     {
       "name": "FeeCalculation",
-      "docs": ["Calculate fees exlusive or inclusive of an amount"],
+      "docs": [
+        "Calculate fees exlusive or inclusive of an amount"
+      ],
       "type": {
         "kind": "enum",
         "variants": [
@@ -744,35 +1368,49 @@
     },
     {
       "name": "ReserveCollateral",
-      "docs": ["Reserve collateral"],
+      "docs": [
+        "Reserve collateral"
+      ],
       "type": {
         "kind": "struct",
         "fields": [
           {
             "name": "mint_pubkey",
-            "docs": ["Reserve collateral mint address"],
+            "docs": [
+              "Reserve collateral mint address"
+            ],
             "type": "pubkey"
           },
           {
             "name": "mint_total_supply",
-            "docs": ["Reserve collateral mint supply, used for exchange rate"],
+            "docs": [
+              "Reserve collateral mint supply, used for exchange rate"
+            ],
             "type": "u64"
           },
           {
             "name": "supply_vault",
-            "docs": ["Reserve collateral supply address"],
+            "docs": [
+              "Reserve collateral supply address"
+            ],
             "type": "pubkey"
           },
           {
             "name": "padding1",
             "type": {
-              "array": ["u128", 32]
+              "array": [
+                "u128",
+                32
+              ]
             }
           },
           {
             "name": "padding2",
             "type": {
-              "array": ["u128", 32]
+              "array": [
+                "u128",
+                32
+              ]
             }
           }
         ]
@@ -780,17 +1418,21 @@
     },
     {
       "name": "ReserveConfig",
-      "docs": ["Reserve configuration values"],
+      "docs": [
+        "Reserve configuration values"
+      ],
       "type": {
         "kind": "struct",
         "fields": [
           {
             "name": "status",
-            "docs": ["Status of the reserve Active/Obsolete/Hidden"],
+            "docs": [
+              "Status of the reserve Active/Obsolete/Hidden"
+            ],
             "type": "u8"
           },
           {
-            "name": "asset_tier",
+            "name": "padding_deprecated_asset_tier",
             "docs": [
               "Asset tier -> 0 - regular (collateral & debt), 1 - isolated collateral, 2 - isolated debt"
             ],
@@ -798,7 +1440,9 @@
           },
           {
             "name": "host_fixed_interest_rate_bps",
-            "docs": ["Flat rate that goes to the host"],
+            "docs": [
+              "Flat rate that goes to the host"
+            ],
             "type": "u16"
           },
           {
@@ -818,10 +1462,34 @@
             "type": "u8"
           },
           {
+            "name": "early_repay_remaining_interest_pct",
+            "docs": [
+              "The percentage of remaining interest over the debt term that is charged as early repay penalty.",
+              "Only meaningful when `debt_term_seconds > 0`."
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "emergency_mode",
+            "docs": [
+              "Whether the reserve is in emergency mode.",
+              "Blocks most user operations involving this reserve, similar to [LendingMarket::emergency_mode]",
+              "but scoped to a single reserve. Also cascades to obligations using this reserve as",
+              "collateral or debt, blocking borrows and withdrawals on other reserves but still",
+              "allowing repays and deposits."
+            ],
+            "type": "u8"
+          },
+          {
             "name": "reserved1",
-            "docs": ["Past reserved space - feel free to reuse."],
+            "docs": [
+              "Past reserved space - feel free to reuse."
+            ],
             "type": {
-              "array": ["u8", 6]
+              "array": [
+                "u8",
+                4
+              ]
             }
           },
           {
@@ -911,7 +1579,9 @@
           },
           {
             "name": "borrow_rate_curve",
-            "docs": ["Borrow rate curve based on utilization"],
+            "docs": [
+              "Borrow rate curve based on utilization"
+            ],
             "type": {
               "defined": {
                 "name": "BorrowRateCurve"
@@ -920,7 +1590,9 @@
           },
           {
             "name": "borrow_factor_pct",
-            "docs": ["Borrow factor in percentage - used for risk adjustment"],
+            "docs": [
+              "Borrow factor in percentage - used for risk adjustment"
+            ],
             "type": "u64"
           },
           {
@@ -939,7 +1611,9 @@
           },
           {
             "name": "token_info",
-            "docs": ["Token id from TokenInfos struct"],
+            "docs": [
+              "Token id from TokenInfos struct"
+            ],
             "type": {
               "defined": {
                 "name": "TokenInfo"
@@ -948,7 +1622,9 @@
           },
           {
             "name": "deposit_withdrawal_cap",
-            "docs": ["Deposit withdrawal caps - deposit & redeem"],
+            "docs": [
+              "Deposit withdrawal caps - deposit & redeem"
+            ],
             "type": {
               "defined": {
                 "name": "WithdrawalCaps"
@@ -957,7 +1633,9 @@
           },
           {
             "name": "debt_withdrawal_cap",
-            "docs": ["Debt withdrawal caps - borrow & repay"],
+            "docs": [
+              "Debt withdrawal caps - borrow & repay"
+            ],
             "type": {
               "defined": {
                 "name": "WithdrawalCaps"
@@ -967,7 +1645,10 @@
           {
             "name": "elevation_groups",
             "type": {
-              "array": ["u8", 20]
+              "array": [
+                "u8",
+                20
+              ]
             }
           },
           {
@@ -987,8 +1668,7 @@
               "Whether this reserve should be subject to auto-deleveraging after deposit or borrow limit is",
               "crossed.",
               "Besides this flag, the lending market's flag also needs to be enabled (logical `AND`).",
-              "**NOTE:** the manual \"target LTV\" deleveraging (enabled by the risk council for individual",
-              "obligations) is NOT affected by this flag."
+              "**NOTE:** the manual \"target LTV\" deleveraging is NOT affected by this flag."
             ],
             "type": "u8"
           },
@@ -1021,7 +1701,10 @@
               "- 0 to disable borrows in this elevation group (expected value for the debt asset)"
             ],
             "type": {
-              "array": ["u64", 32]
+              "array": [
+                "u64",
+                32
+              ]
             }
           },
           {
@@ -1029,6 +1712,53 @@
             "docs": [
               "The rate at which the deleveraging-related liquidation bonus increases, in bps per day.",
               "Only relevant when `autodeleverage_enabled == 1`, and must not be 0 in such case."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "debt_maturity_timestamp",
+            "docs": [
+              "The timestamp at which all [Obligation::borrows] using this reserve become liquidatable",
+              "(on the same terms as reserve-wide deleveraging).",
+              "Inactive when zeroed (i.e. debt never matures).",
+              "",
+              "Note: this feature is independent of [Self::debt_term_seconds] - the liquidation mechanism",
+              "is based directly on the timestamp defined here, on Reserve's level."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "debt_term_seconds",
+            "docs": [
+              "The duration after which any debt coming from this Reserve must be repaid.",
+              "Inactive when zeroed (i.e. funds can be borrowed indefinitely).",
+              "",
+              "Note: this feature is independent of [Self::debt_maturity_timestamp] - the liquidation",
+              "mechanism is based on the [ObligationLiquidity::last_borrowed_at_timestamp]."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "rewards_amount_per_slot",
+            "docs": [
+              "Rewards distributed per slot to depositors. Drained from",
+              "[ReserveLiquidity::rewards_amount_available] into",
+              "[ReserveLiquidity::total_available_amount] at each refresh, capped by the",
+              "market-level [LendingMarket::reserve_rewards_max_apr_bps]. `0` disables.",
+              "",
+              "**Note:** because rewards inflate `total_available_amount`, a non-zero RPS on a",
+              "reserve with [Self::autodeleverage_enabled] and a finite [Self::deposit_limit]",
+              "will eventually cross the cap and arm the autodeleverage countdown. Size",
+              "`deposit_limit` and RPS together."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "permissioned_ops",
+            "docs": [
+              "Bitmask of [PermissionedOp]s gated by the parent market's `permissioning_authority`",
+              "when this reserve is the operation's target. `0` = no operation is restricted at the",
+              "reserve level. Use [Reserve::get_permissioned_ops] for a typed view."
             ],
             "type": "u64"
           }
@@ -1083,9 +1813,14 @@
           },
           {
             "name": "padding",
-            "docs": ["Used for allignment"],
+            "docs": [
+              "Used for allignment"
+            ],
             "type": {
-              "array": ["u8", 8]
+              "array": [
+                "u8",
+                8
+              ]
             }
           }
         ]
@@ -1093,33 +1828,49 @@
     },
     {
       "name": "ReserveLiquidity",
-      "docs": ["Reserve liquidity"],
+      "docs": [
+        "Reserve liquidity"
+      ],
       "type": {
         "kind": "struct",
         "fields": [
           {
             "name": "mint_pubkey",
-            "docs": ["Reserve liquidity mint address"],
+            "docs": [
+              "Reserve liquidity mint address"
+            ],
             "type": "pubkey"
           },
           {
             "name": "supply_vault",
-            "docs": ["Reserve liquidity supply address"],
+            "docs": [
+              "Reserve liquidity supply address"
+            ],
             "type": "pubkey"
           },
           {
             "name": "fee_vault",
-            "docs": ["Reserve liquidity fee collection address"],
+            "docs": [
+              "Reserve liquidity fee collection address"
+            ],
             "type": "pubkey"
           },
           {
-            "name": "available_amount",
-            "docs": ["Reserve liquidity available"],
+            "name": "total_available_amount",
+            "docs": [
+              "Total reserve liquidity available.",
+              "",
+              "Note: not all of this liquidity can be freely used for any purpose. Production code should",
+              "use the specialized getters - see e.g. [Reserve::total_available_liquidity_amount()],",
+              "[Reserve::freely_available_liquidity_amount()]."
+            ],
             "type": "u64"
           },
           {
             "name": "borrowed_amount_sf",
-            "docs": ["Reserve liquidity borrowed (scaled fraction)"],
+            "docs": [
+              "Reserve liquidity borrowed (scaled fraction)"
+            ],
             "type": "u128"
           },
           {
@@ -1131,12 +1882,16 @@
           },
           {
             "name": "market_price_last_updated_ts",
-            "docs": ["Unix timestamp of the market price (from the oracle)"],
+            "docs": [
+              "Unix timestamp of the market price (from the oracle)"
+            ],
             "type": "u64"
           },
           {
             "name": "mint_decimals",
-            "docs": ["Reserve liquidity mint decimals"],
+            "docs": [
+              "Reserve liquidity mint decimals"
+            ],
             "type": "u64"
           },
           {
@@ -1168,12 +1923,16 @@
           },
           {
             "name": "accumulated_protocol_fees_sf",
-            "docs": ["Reserve cumulative protocol fees (scaled fraction)"],
+            "docs": [
+              "Reserve cumulative protocol fees (scaled fraction)"
+            ],
             "type": "u128"
           },
           {
             "name": "accumulated_referrer_fees_sf",
-            "docs": ["Reserve cumulative referrer fees (scaled fraction)"],
+            "docs": [
+              "Reserve cumulative referrer fees (scaled fraction)"
+            ],
             "type": "u128"
           },
           {
@@ -1192,19 +1951,40 @@
           },
           {
             "name": "token_program",
-            "docs": ["Token program of the liquidity mint"],
+            "docs": [
+              "Token program of the liquidity mint"
+            ],
             "type": "pubkey"
+          },
+          {
+            "name": "rewards_amount_available",
+            "docs": [
+              "Reserve rewards budget remaining for distribution.",
+              "",
+              "Tokens are deposited via `topup_reserve_rewards` and increase this counter (without",
+              "touching [Self::total_available_amount]). On every `refresh_reserve`, up to",
+              "`rewards_amount_per_slot * slots_elapsed` tokens are moved from this counter into",
+              "[Self::total_available_amount], inflating the cToken exchange rate, capped by the",
+              "market-level `reserve_rewards_max_apr_bps` cap."
+            ],
+            "type": "u64"
           },
           {
             "name": "padding2",
             "type": {
-              "array": ["u64", 51]
+              "array": [
+                "u64",
+                50
+              ]
             }
           },
           {
             "name": "padding3",
             "type": {
-              "array": ["u128", 32]
+              "array": [
+                "u128",
+                32
+              ]
             }
           }
         ]
@@ -1228,8 +2008,45 @@
       }
     },
     {
+      "name": "WithdrawQueue",
+      "docs": [
+        "A tracker of ticket-based withdrawals."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "queued_collateral_amount",
+            "docs": [
+              "The part of [ReserveLiquidity::total_available_amount] locked for ticketed withdrawals."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "next_issued_ticket_sequence_number",
+            "docs": [
+              "The sequence number of the next ticket to be issued when enqueueing to withdraw.",
+              "Note: it is also a number of tickets issued so far."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "next_withdrawable_ticket_sequence_number",
+            "docs": [
+              "The sequence number of the next ticket to be used for actually transferring the withdrawn",
+              "liquidity (assuming it is available in the reserve).",
+              "Note: it is also a number of fully-consumed tickets so far."
+            ],
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
       "name": "WithdrawalCaps",
-      "docs": ["Reserve Withdrawal Caps State"],
+      "docs": [
+        "Reserve Withdrawal Caps State"
+      ],
       "type": {
         "kind": "struct",
         "fields": [
@@ -1259,17 +2076,23 @@
         "fields": [
           {
             "name": "lower",
-            "docs": ["Lower value of acceptable price"],
+            "docs": [
+              "Lower value of acceptable price"
+            ],
             "type": "u64"
           },
           {
             "name": "upper",
-            "docs": ["Upper value of acceptable price"],
+            "docs": [
+              "Upper value of acceptable price"
+            ],
             "type": "u64"
           },
           {
             "name": "exp",
-            "docs": ["Number of decimals of the previously defined values"],
+            "docs": [
+              "Number of decimals of the previously defined values"
+            ],
             "type": "u64"
           }
         ]
@@ -1308,14 +2131,22 @@
               "This is the scope_id price chain that results in a price for the token"
             ],
             "type": {
-              "array": ["u16", 4]
+              "array": [
+                "u16",
+                4
+              ]
             }
           },
           {
             "name": "twap_chain",
-            "docs": ["This is the scope_id price chain for the twap"],
+            "docs": [
+              "This is the scope_id price chain for the twap"
+            ],
             "type": {
-              "array": ["u16", 4]
+              "array": [
+                "u16",
+                4
+              ]
             }
           }
         ]
@@ -1347,14 +2178,21 @@
         "fields": [
           {
             "name": "name",
-            "docs": ["UTF-8 encoded name of the token (null-terminated)"],
+            "docs": [
+              "UTF-8 encoded name of the token (null-terminated)"
+            ],
             "type": {
-              "array": ["u8", 32]
+              "array": [
+                "u8",
+                32
+              ]
             }
           },
           {
             "name": "heuristic",
-            "docs": ["Heuristics limits of acceptable price"],
+            "docs": [
+              "Heuristics limits of acceptable price"
+            ],
             "type": {
               "defined": {
                 "name": "PriceHeuristic"
@@ -1363,7 +2201,9 @@
           },
           {
             "name": "max_twap_divergence_bps",
-            "docs": ["Max divergence between twap and price in bps"],
+            "docs": [
+              "Max divergence between twap and price in bps"
+            ],
             "type": "u64"
           },
           {
@@ -1376,7 +2216,9 @@
           },
           {
             "name": "scope_configuration",
-            "docs": ["Scope price configuration"],
+            "docs": [
+              "Scope price configuration"
+            ],
             "type": {
               "defined": {
                 "name": "ScopeConfiguration"
@@ -1385,7 +2227,9 @@
           },
           {
             "name": "switchboard_configuration",
-            "docs": ["Switchboard configuration"],
+            "docs": [
+              "Switchboard configuration"
+            ],
             "type": {
               "defined": {
                 "name": "SwitchboardConfiguration"
@@ -1394,7 +2238,9 @@
           },
           {
             "name": "pyth_configuration",
-            "docs": ["Pyth configuration"],
+            "docs": [
+              "Pyth configuration"
+            ],
             "type": {
               "defined": {
                 "name": "PythConfiguration"
@@ -1408,14 +2254,45 @@
           {
             "name": "reserved",
             "type": {
-              "array": ["u8", 7]
+              "array": [
+                "u8",
+                7
+              ]
             }
           },
           {
             "name": "padding",
             "type": {
-              "array": ["u64", 19]
+              "array": [
+                "u64",
+                19
+              ]
             }
+          }
+        ]
+      }
+    },
+    {
+      "name": "ProgressCallbackType",
+      "docs": [
+        "A callback to be notified when the ticket is being processed.",
+        "",
+        "## Why an enum?",
+        "",
+        "Only reliable programs may be used for callbacks (since any error or panic returned from a CPI",
+        "aborts an entire transaction, which would stall the queue progress). Hence, we need a whitelist,",
+        "and the simplest initial implementation is a hardcoded enum. If we want to be able to add new",
+        "whitelist items without SC updates, we can implement such support using a special enum value",
+        "(e.g. `SPECIFIED_BY_PDA = 255`)."
+      ],
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "None"
+          },
+          {
+            "name": "KlendQueueAccountingHandlerOnKvault"
           }
         ]
       }
@@ -1481,25 +2358,37 @@
           {
             "name": "padding0",
             "type": {
-              "array": ["u8", 7]
+              "array": [
+                "u8",
+                7
+              ]
             }
           },
           {
             "name": "rewards_tally_scaled",
             "type": {
-              "array": ["u128", 10]
+              "array": [
+                "u128",
+                10
+              ]
             }
           },
           {
             "name": "rewards_issued_unclaimed",
             "type": {
-              "array": ["u64", 10]
+              "array": [
+                "u64",
+                10
+              ]
             }
           },
           {
             "name": "last_claim_ts",
             "type": {
-              "array": ["u64", 10]
+              "array": [
+                "u64",
+                10
+              ]
             }
           },
           {
@@ -1537,7 +2426,10 @@
           {
             "name": "padding1",
             "type": {
-              "array": ["u64", 50]
+              "array": [
+                "u64",
+                50
+              ]
             }
           }
         ]
@@ -1550,7 +2442,9 @@
         "fields": [
           {
             "name": "global_admin",
-            "docs": ["Global admin of the program"],
+            "docs": [
+              "Global admin of the program"
+            ],
             "type": "pubkey"
           },
           {
@@ -1569,9 +2463,14 @@
           },
           {
             "name": "padding",
-            "docs": ["Padding to make the struct size 1024 bytes"],
+            "docs": [
+              "Padding to make the struct size 1024 bytes"
+            ],
             "type": {
-              "array": ["u8", 928]
+              "array": [
+                "u8",
+                928
+              ]
             }
           }
         ]
@@ -1584,17 +2483,23 @@
         "fields": [
           {
             "name": "version",
-            "docs": ["Version of lending market"],
+            "docs": [
+              "Version of lending market"
+            ],
             "type": "u64"
           },
           {
             "name": "bump_seed",
-            "docs": ["Bump seed for derived authority address"],
+            "docs": [
+              "Bump seed for derived authority address"
+            ],
             "type": "u64"
           },
           {
             "name": "lending_market_owner",
-            "docs": ["Owner authority which can add new reserves"],
+            "docs": [
+              "Owner authority which can add new reserves"
+            ],
             "type": "pubkey"
           },
           {
@@ -1611,7 +2516,10 @@
               "e.g. \"USD\" null padded (`*b\"USD\\0\\0\\0\\0\\0\\0\\0\\0\\0\\0\\0\\0\\0\\0\\0\\0\\0\\0\\0\\0\\0\\0\\0\\0\\0\\0\\0\\0\\0\"`) or a SPL token mint pubkey"
             ],
             "type": {
-              "array": ["u8", 32]
+              "array": [
+                "u8",
+                32
+              ]
             }
           },
           {
@@ -1665,13 +2573,16 @@
           {
             "name": "min_full_liquidation_value_threshold",
             "docs": [
-              "Minimum liquidation value threshold triggering full liquidation for an obligation"
+              "Minimum liquidation value threshold triggering full liquidation for an obligation, in full",
+              "units of the quote currency (e.g. `2` means \"$2\", not \"2 lamports of USDC\")."
             ],
             "type": "u64"
           },
           {
             "name": "max_liquidatable_debt_market_value_at_once",
-            "docs": ["Max allowed liquidation value in one ix call"],
+            "docs": [
+              "Max allowed liquidation value in one ix call"
+            ],
             "type": "u64"
           },
           {
@@ -1680,7 +2591,10 @@
               "[DEPRECATED] Global maximum unhealthy borrow value allowed for any obligation"
             ],
             "type": {
-              "array": ["u8", 8]
+              "array": [
+                "u8",
+                8
+              ]
             }
           },
           {
@@ -1691,9 +2605,9 @@
             "type": "u64"
           },
           {
-            "name": "risk_council",
+            "name": "emergency_council",
             "docs": [
-              "The address of the risk council, in charge of making parameter and risk decisions on behalf of the protocol"
+              "The address of the emergency council, in charge of taking emergency actions on the market (e.g., enabling emergency mode)"
             ],
             "type": "pubkey"
           },
@@ -1703,7 +2617,10 @@
               "[DEPRECATED] Reward points multiplier per obligation type"
             ],
             "type": {
-              "array": ["u8", 8]
+              "array": [
+                "u8",
+                8
+              ]
             }
           },
           {
@@ -1725,7 +2642,10 @@
           {
             "name": "elevation_group_padding",
             "type": {
-              "array": ["u64", 90]
+              "array": [
+                "u64",
+                90
+              ]
             }
           },
           {
@@ -1744,9 +2664,14 @@
           },
           {
             "name": "name",
-            "docs": ["Market name, zero-padded."],
+            "docs": [
+              "Market name, zero-padded."
+            ],
             "type": {
-              "array": ["u8", 32]
+              "array": [
+                "u8",
+                32
+              ]
             }
           },
           {
@@ -1760,7 +2685,7 @@
             "name": "individual_autodeleverage_margin_call_period_secs",
             "docs": [
               "Time (in seconds) that must pass before liquidation is allowed on an obligation that has",
-              "been individually marked for auto-deleveraging (by the risk council)."
+              "been individually marked for auto-deleveraging."
             ],
             "type": "u64"
           },
@@ -1781,7 +2706,9 @@
           },
           {
             "name": "immutable",
-            "docs": ["Whether the lending market is set as immutable."],
+            "docs": [
+              "Whether the lending market is set as immutable."
+            ],
             "type": "u8"
           },
           {
@@ -1805,10 +2732,35 @@
             "type": "u8"
           },
           {
-            "name": "padding2",
-            "type": {
-              "array": ["u8", 4]
-            }
+            "name": "mature_reserve_debt_liquidation_enabled",
+            "docs": [
+              "Whether the debts that reached their reserve's [ReserveConfig::debt_maturity_timestamp] can",
+              "be liquidated."
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "obligation_borrow_debt_term_liquidation_enabled",
+            "docs": [
+              "Whether the [Obligation::borrows] that reached their [ReserveConfig::debt_term_seconds] can",
+              "be liquidated."
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "borrow_order_creation_enabled",
+            "docs": [
+              "Whether new borrow orders can be created.",
+              "Note: updating or cancelling existing orders is *not* affected by this flag."
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "borrow_order_execution_enabled",
+            "docs": [
+              "Whether the existing borrow orders can be filled."
+            ],
+            "type": "u8"
           },
           {
             "name": "proposer_authority",
@@ -1818,9 +2770,172 @@
             "type": "pubkey"
           },
           {
+            "name": "min_borrow_order_fill_value",
+            "docs": [
+              "Minimum value that can be filled in a single `fill_borrow_order()` call, in full units of",
+              "the quote currency (e.g. `2` means \"$2\", not \"2 lamports of USDC\")."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "withdraw_ticket_issuance_enabled",
+            "docs": [
+              "Whether any new withdraw tickets can be issued (i.e. whether new requests can enter the",
+              "withdraw queue)."
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "withdraw_ticket_redemption_enabled",
+            "docs": [
+              "Whether the existing withdraw tickets can be redeemed (i.e. whether the tickets can be used",
+              "to transfer accumulated pending liquidity to destination accounts)."
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "obligation_borrow_rollover_configuration_enabled",
+            "docs": [
+              "Whether the owners can enable the borrow rollover/migration on their obligations.",
+              "",
+              "*Note 1:* the actual execution of (different kinds of) rollovers are enabled/disabled by:",
+              "- [Self::fixed_term_rollover_window_duration_seconds],",
+              "- [Self::open_term_rollover_window_duration_seconds],",
+              "- [Self::obligation_borrow_migration_to_fixed_execution_enabled].",
+              "",
+              "*Note 2:* when this configuration is disabled, the obligation owners can still disable their",
+              "rollover (i.e. set the obligation's flags to zeroes)."
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "obligation_borrow_migration_to_fixed_execution_enabled",
+            "docs": [
+              "Whether the actual execution of a \"migration to fixed\" rollover flavor is allowed.",
+              "",
+              "See [FixedTermBorrowRolloverConfig::migration_to_fixed_enabled]."
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "withdraw_ticket_cancellation_enabled",
+            "docs": [
+              "Whether the ticket owners can cancel their withdraw tickets (i.e. recover ctokens from the",
+              "queued collateral vault back to their wallet)."
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "padding2",
+            "type": {
+              "array": [
+                "u8",
+                1
+              ]
+            }
+          },
+          {
+            "name": "reserve_rewards_max_apr_bps",
+            "docs": [
+              "Maximum APR (in basis points; `FULL_BPS = 10_000` = 100%) at which reserves on this market",
+              "may distribute their `rewards_amount_per_slot`. `0` disables rewards on this market",
+              "entirely (`topup_reserve_rewards` is rejected). Bounded by `FULL_BPS` (100% APR) when set.",
+              "See [ReserveConfig::rewards_amount_per_slot] for the depositor-cap interaction."
+            ],
+            "type": "u16"
+          },
+          {
+            "name": "min_withdraw_queued_liquidity_value",
+            "docs": [
+              "Minimum value that can be withdrawn in a single `withdraw_queued_liquidity()` call, in full",
+              "units of the quote currency (e.g. `2` means \"$2\", not \"2 lamports of USDC\")."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "fixed_term_rollover_window_duration_seconds",
+            "docs": [
+              "A configurable time window (right before the end of a fixed debt term) during which an",
+              "auto-rollover into another *fixed* rate/term can happen.",
+              "",
+              "When zeroed, this rollover mode is effectively disabled.",
+              "Can only be enabled when [Self::min_partial_rollover_value] is configured.",
+              "",
+              "See [FixedTermBorrowRolloverConfig]."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "open_term_rollover_window_duration_seconds",
+            "docs": [
+              "A configurable time window (right before the end of a fixed debt term) during which an",
+              "auto-rollover into a *variable* (indefinite) rate/term can happen.",
+              "",
+              "When zeroed, this rollover mode is effectively disabled.",
+              "Can only be enabled when [Self::min_partial_rollover_value] is configured.",
+              "",
+              "This will typically be shorter than [Self::fixed_term_rollover_window_duration_seconds],",
+              "acting as a fallback if a fixed reserve liquidity remains unavailable for considerable time."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "min_partial_rollover_value",
+            "docs": [
+              "Minimum dollar value for a partial rollover into a different reserve.",
+              "When the achievable rollover amount is below this threshold (and it's not a full rollover),",
+              "the rollover is rejected.",
+              "",
+              "In full units of the quote currency (e.g. `2` means \"$2\")."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "term_based_full_liquidation_duration_secs",
+            "docs": [
+              "The time that must pass before an entire expired debt becomes liquidatable.",
+              "",
+              "For example:",
+              "Let's assume this duration is configured as 100 seconds; then:",
+              "- right after fixed-term debt expiration, effectively no debt can be liquidated.",
+              "- 30 seconds after expiration, we allow to 30% of the expired debt to be liquidated",
+              "- to be specific: at this point in time, we \"protect\" from liquidation 70% of the",
+              "[ObligationLiquidity::borrowed_amount_at_expiration] (regardless of how much interest",
+              "was accrued or how much debt was repaid while expired).",
+              "- 100 seconds after expiration we allow the entire debt to be liquidated.",
+              "",
+              "Only effective when [Self::obligation_borrow_debt_term_liquidation_enabled].",
+              "",
+              "Motivation note: this throttling feature gives an opportunity to execute a configured",
+              "auto-rollover (after a partial liquidation brings the debt size down so that there is enough",
+              "available liquidity in some compatible reserve).",
+              "",
+              "When zeroed, an entire expired debt can be liquidated right after expiration (i.e. no",
+              "throttling)."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "permissioning_authority",
+            "docs": [
+              "If not NULL, operations encoded in permissioned_ops require a signature from this authority"
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "permissioned_ops",
+            "docs": [
+              "Bitmap of operations that require permissioning authority signature"
+            ],
+            "type": "u64"
+          },
+          {
             "name": "padding1",
             "type": {
-              "array": ["u64", 165]
+              "array": [
+                "u64",
+                153
+              ]
             }
           }
         ]
@@ -1828,13 +2943,17 @@
     },
     {
       "name": "Obligation",
-      "docs": ["Lending market obligation state"],
+      "docs": [
+        "Lending market obligation state"
+      ],
       "type": {
         "kind": "struct",
         "fields": [
           {
             "name": "tag",
-            "docs": ["Version of the struct"],
+            "docs": [
+              "Version of the struct"
+            ],
             "type": "u64"
           },
           {
@@ -1850,12 +2969,16 @@
           },
           {
             "name": "lending_market",
-            "docs": ["Lending market address"],
+            "docs": [
+              "Lending market address"
+            ],
             "type": "pubkey"
           },
           {
             "name": "owner",
-            "docs": ["Owner authority which can borrow liquidity"],
+            "docs": [
+              "Owner authority which can borrow liquidity"
+            ],
             "type": "pubkey"
           },
           {
@@ -1883,7 +3006,9 @@
           },
           {
             "name": "deposited_value_sf",
-            "docs": ["Market value of deposits (scaled fraction)"],
+            "docs": [
+              "Market value of deposits (scaled fraction)"
+            ],
             "type": "u128"
           },
           {
@@ -1931,22 +3056,22 @@
             "type": "u128"
           },
           {
-            "name": "deposits_asset_tiers",
-            "docs": ["The asset tier of the deposits"],
+            "name": "padding_deprecated_asset_tiers",
+            "docs": [
+              "The asset tier of the deposits"
+            ],
             "type": {
-              "array": ["u8", 8]
-            }
-          },
-          {
-            "name": "borrows_asset_tiers",
-            "docs": ["The asset tier of the borrows"],
-            "type": {
-              "array": ["u8", 5]
+              "array": [
+                "u8",
+                13
+              ]
             }
           },
           {
             "name": "elevation_group",
-            "docs": ["The elevation group id the obligation opted into."],
+            "docs": [
+              "The elevation group id the obligation opted into."
+            ],
             "type": "u8"
           },
           {
@@ -1965,18 +3090,22 @@
           },
           {
             "name": "referrer",
-            "docs": ["Wallet address of the referrer"],
+            "docs": [
+              "Wallet address of the referrer"
+            ],
             "type": "pubkey"
           },
           {
             "name": "borrowing_disabled",
-            "docs": ["Marked = 1 if borrowing disabled, 0 = borrowing enabled"],
+            "docs": [
+              "Marked = 1 if borrowing disabled, 0 = borrowing enabled"
+            ],
             "type": "u8"
           },
           {
             "name": "autodeleverage_target_ltv_pct",
             "docs": [
-              "A target LTV set by the risk council when marking this obligation for deleveraging.",
+              "A target LTV set by the market owner when marking this obligation for deleveraging.",
               "Only effective when `deleveraging_margin_call_started_slot != 0`."
             ],
             "type": "u8"
@@ -1996,9 +3125,19 @@
             "type": "u8"
           },
           {
+            "name": "ownership_transfer_state",
+            "docs": [
+              "State of ownership transfer, see [OwnershipTransferState]"
+            ],
+            "type": "u8"
+          },
+          {
             "name": "reserved",
             "type": {
-              "array": ["u8", 4]
+              "array": [
+                "u8",
+                3
+              ]
             }
           },
           {
@@ -2008,15 +3147,15 @@
           {
             "name": "autodeleverage_margin_call_started_timestamp",
             "docs": [
-              "A timestamp at which the risk council most-recently marked this obligation for deleveraging.",
+              "A timestamp at which the market owner most-recently marked this obligation for deleveraging.",
               "Zero if not currently subject to deleveraging."
             ],
             "type": "u64"
           },
           {
-            "name": "orders",
+            "name": "obligation_orders",
             "docs": [
-              "Owner-defined, liquidator-executed orders applicable to this obligation.",
+              "Owner-defined, permissionlessly-executed repay orders.",
               "Typical use-cases would be a stop-loss and a take-profit (possibly co-existing)."
             ],
             "type": {
@@ -2031,9 +3170,32 @@
             }
           },
           {
+            "name": "borrow_order",
+            "docs": [
+              "Owner-defined, permissionlessly-executed borrow order applicable to this obligation.",
+              "Non-zeroed only on a newly-initialized fixed-rate, fixed-term obligation."
+            ],
+            "type": {
+              "defined": {
+                "name": "BorrowOrder"
+              }
+            }
+          },
+          {
+            "name": "pending_owner",
+            "docs": [
+              "Pending owner during ownership transfer process.",
+              "Pubkey::default() means no pending owner (similar to Option::None)"
+            ],
+            "type": "pubkey"
+          },
+          {
             "name": "padding3",
             "type": {
-              "array": ["u64", 93]
+              "array": [
+                "u64",
+                69
+              ]
             }
           }
         ]
@@ -2065,12 +3227,16 @@
         "fields": [
           {
             "name": "referrer",
-            "docs": ["Pubkey of the referrer/owner"],
+            "docs": [
+              "Pubkey of the referrer/owner"
+            ],
             "type": "pubkey"
           },
           {
             "name": "mint",
-            "docs": ["Token mint for the account"],
+            "docs": [
+              "Token mint for the account"
+            ],
             "type": "pubkey"
           },
           {
@@ -2089,13 +3255,18 @@
           },
           {
             "name": "bump",
-            "docs": ["Referrer token state bump, used for address validation"],
+            "docs": [
+              "Referrer token state bump, used for address validation"
+            ],
             "type": "u64"
           },
           {
             "name": "padding",
             "type": {
-              "array": ["u64", 31]
+              "array": [
+                "u64",
+                31
+              ]
             }
           }
         ]
@@ -2134,7 +3305,9 @@
           },
           {
             "name": "bump",
-            "docs": ["Bump used for validation of account address"],
+            "docs": [
+              "Bump used for validation of account address"
+            ],
             "type": "u64"
           },
           {
@@ -2146,19 +3319,27 @@
           },
           {
             "name": "owner",
-            "docs": ["User metadata account owner"],
+            "docs": [
+              "User metadata account owner"
+            ],
             "type": "pubkey"
           },
           {
             "name": "padding1",
             "type": {
-              "array": ["u64", 51]
+              "array": [
+                "u64",
+                51
+              ]
             }
           },
           {
             "name": "padding2",
             "type": {
-              "array": ["u64", 64]
+              "array": [
+                "u64",
+                64
+              ]
             }
           }
         ]
@@ -2171,12 +3352,16 @@
         "fields": [
           {
             "name": "version",
-            "docs": ["Version of the reserve"],
+            "docs": [
+              "Version of the reserve"
+            ],
             "type": "u64"
           },
           {
             "name": "last_update",
-            "docs": ["Last slot when supply and rates updated"],
+            "docs": [
+              "Last slot when supply and rates updated"
+            ],
             "type": {
               "defined": {
                 "name": "LastUpdate"
@@ -2185,7 +3370,9 @@
           },
           {
             "name": "lending_market",
-            "docs": ["Lending market address"],
+            "docs": [
+              "Lending market address"
+            ],
             "type": "pubkey"
           },
           {
@@ -2198,7 +3385,9 @@
           },
           {
             "name": "liquidity",
-            "docs": ["Reserve liquidity"],
+            "docs": [
+              "Reserve liquidity"
+            ],
             "type": {
               "defined": {
                 "name": "ReserveLiquidity"
@@ -2208,12 +3397,17 @@
           {
             "name": "reserve_liquidity_padding",
             "type": {
-              "array": ["u64", 150]
+              "array": [
+                "u64",
+                150
+              ]
             }
           },
           {
             "name": "collateral",
-            "docs": ["Reserve collateral"],
+            "docs": [
+              "Reserve collateral"
+            ],
             "type": {
               "defined": {
                 "name": "ReserveCollateral"
@@ -2223,12 +3417,17 @@
           {
             "name": "reserve_collateral_padding",
             "type": {
-              "array": ["u64", 150]
+              "array": [
+                "u64",
+                150
+              ]
             }
           },
           {
             "name": "config",
-            "docs": ["Reserve configuration values"],
+            "docs": [
+              "Reserve configuration values"
+            ],
             "type": {
               "defined": {
                 "name": "ReserveConfig"
@@ -2238,7 +3437,10 @@
           {
             "name": "config_padding",
             "type": {
-              "array": ["u64", 116]
+              "array": [
+                "u64",
+                112
+              ]
             }
           },
           {
@@ -2252,13 +3454,253 @@
               "elevation group when this reserve is part of the collaterals."
             ],
             "type": {
-              "array": ["u64", 32]
+              "array": [
+                "u64",
+                32
+              ]
+            }
+          },
+          {
+            "name": "withdraw_queue",
+            "docs": [
+              "The tracker of ticket-based withdrawals."
+            ],
+            "type": {
+              "defined": {
+                "name": "WithdrawQueue"
+              }
             }
           },
           {
             "name": "padding",
             "type": {
-              "array": ["u64", 207]
+              "array": [
+                "u64",
+                204
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "WithdrawTicket",
+      "docs": [
+        "A finite-lifecycle account representing a specific depositor's place in the withdraw queue of",
+        "a specific reserve.",
+        "",
+        "The lifecycle:",
+        "1. The depositor holding ctokens wants to withdraw funds from the reserve, and finds out that",
+        "the required amount is not available (due to high utilization).",
+        "2. The depositor calls the `enqueue_to_withdraw` handler.",
+        "3. The handler transfers the depositor's ctokens to the reserve's internal \"pending\" vault.",
+        "4. The handler initializes a new [WithdrawTicket] account, with the next available sequence",
+        "number.",
+        "5. The depositor waits until his ticket is the next expected one for actual withdraw, and until",
+        "the reserve has enough liquidity.",
+        "6. Anyone (the depositor or a bot) calls the permissionless `withdraw_queued_liquidity`",
+        "handler. If the ticket became invalid (e.g. destination account no longer exists), then the",
+        "depositor can call the `recover_invalid_ticket_collateral` handler instead.",
+        "7. The handler transfers the liquidity amount according to the current exchange rate.",
+        "8. The handler closes the ticket account."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "sequence_number",
+            "docs": [
+              "This ticket's place in the queue; the same as used for PDA derivation."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "owner",
+            "docs": [
+              "The funds' owner (the user who called the `enqueue_to_withdraw` handler)."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "reserve",
+            "docs": [
+              "The reserve to withdraw from."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "user_destination_liquidity_ta",
+            "docs": [
+              "The token account to which the finally-available liquidity should be transferred (by the",
+              "`withdraw_queued_liquidity` handler)."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "queued_collateral_amount",
+            "docs": [
+              "The amount of collateral still waiting to be withdrawn using this ticket."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "created_at_timestamp",
+            "docs": [
+              "The timestamp at which the queue was entered.",
+              "",
+              "This is currently only a piece of metadata, not used by the logic."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "invalid",
+            "docs": [
+              "Whether the ticket has been found to be invalid (e.g. the [Self::user_destination_liquidity]",
+              "has been repurposed) by the `withdraw_queued_liquidity` handler.",
+              "To be specific: valid = `0`, invalid = `1`.",
+              "",
+              "An invalid ticket cannot be made valid again, and can only be passed to the",
+              "`recover_invalid_ticket_collateral` handler."
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "progress_callback_type",
+            "docs": [
+              "One of the valid [ProgressCallbackType] representations."
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "alignment_padding",
+            "docs": [
+              "Inner padding, for alignment."
+            ],
+            "type": {
+              "array": [
+                "u8",
+                6
+              ]
+            }
+          },
+          {
+            "name": "progress_callback_custom_accounts",
+            "docs": [
+              "The (optional) accounts to be used by [Self::progress_callback_type]s."
+            ],
+            "type": {
+              "array": [
+                "pubkey",
+                2
+              ]
+            }
+          },
+          {
+            "name": "end_padding",
+            "docs": [
+              "Trailing padding, for future developments."
+            ],
+            "type": {
+              "array": [
+                "u64",
+                40
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "BorrowOrderCancelEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "before",
+            "type": {
+              "defined": {
+                "name": "BorrowOrder"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "BorrowOrderFullFillEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "before",
+            "type": {
+              "defined": {
+                "name": "BorrowOrder"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "BorrowOrderPartialFillEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "before",
+            "type": {
+              "defined": {
+                "name": "BorrowOrder"
+              }
+            }
+          },
+          {
+            "name": "after",
+            "type": {
+              "defined": {
+                "name": "BorrowOrder"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "BorrowOrderPlaceEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "after",
+            "type": {
+              "defined": {
+                "name": "BorrowOrder"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "BorrowOrderUpdateEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "before",
+            "type": {
+              "defined": {
+                "name": "BorrowOrder"
+              }
+            }
+          },
+          {
+            "name": "after",
+            "type": {
+              "defined": {
+                "name": "BorrowOrder"
+              }
             }
           }
         ]

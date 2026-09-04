@@ -23,6 +23,27 @@ pub const METEORA_DLMM_OVERRIDES_CONTENT: &str =
 pub const KAMINO_V1_IDL_CONTENT: &str = include_str!("./protocols/kamino/v1/idl.json");
 pub const KAMINO_V1_OVERRIDES_CONTENT: &str = include_str!("./protocols/kamino/v1/overrides.yaml");
 
+pub const KAMINO_SCOPE_IDL_CONTENT: &str = include_str!("./protocols/kamino/scope/v1/idl.json");
+pub const KAMINO_SCOPE_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/kamino/scope/v1/overrides.yaml");
+
+pub const KAMINO_FARMS_IDL_CONTENT: &str = include_str!("./protocols/kamino/farms/v1/idl.json");
+pub const KAMINO_FARMS_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/kamino/farms/v1/overrides.yaml");
+
+pub const KAMINO_SWAP_IDL_CONTENT: &str = include_str!("./protocols/kamino/swap/v1/idl.json");
+pub const KAMINO_SWAP_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/kamino/swap/v1/overrides.yaml");
+
+pub const KAMINO_VAULT_IDL_CONTENT: &str = include_str!("./protocols/kamino/vault/v1/idl.json");
+pub const KAMINO_VAULT_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/kamino/vault/v1/overrides.yaml");
+
+pub const KAMINO_LIQUIDITY_IDL_CONTENT: &str =
+    include_str!("./protocols/kamino/liquidity/v1/idl.json");
+pub const KAMINO_LIQUIDITY_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/kamino/liquidity/v1/overrides.yaml");
+
 pub const DRIFT_V2_IDL_CONTENT: &str = include_str!("./protocols/drift/v2/idl.json");
 pub const DRIFT_V2_OVERRIDES_CONTENT: &str = include_str!("./protocols/drift/v2/overrides.yaml");
 
@@ -97,6 +118,36 @@ impl TemplateRegistry {
 
     pub fn load_kamino_overrides(&mut self) {
         self.load_protocol_overrides(KAMINO_V1_IDL_CONTENT, KAMINO_V1_OVERRIDES_CONTENT, "kamino");
+
+        self.load_protocol_overrides(
+            KAMINO_SCOPE_IDL_CONTENT,
+            KAMINO_SCOPE_OVERRIDES_CONTENT,
+            "kamino-scope",
+        );
+
+        self.load_protocol_overrides(
+            KAMINO_FARMS_IDL_CONTENT,
+            KAMINO_FARMS_OVERRIDES_CONTENT,
+            "kamino-farms",
+        );
+
+        self.load_protocol_overrides(
+            KAMINO_SWAP_IDL_CONTENT,
+            KAMINO_SWAP_OVERRIDES_CONTENT,
+            "kamino-swap",
+        );
+
+        self.load_protocol_overrides(
+            KAMINO_VAULT_IDL_CONTENT,
+            KAMINO_VAULT_OVERRIDES_CONTENT,
+            "kamino-vault",
+        );
+
+        self.load_protocol_overrides(
+            KAMINO_LIQUIDITY_IDL_CONTENT,
+            KAMINO_LIQUIDITY_OVERRIDES_CONTENT,
+            "kamino-liquidity",
+        );
     }
 
     pub fn load_drift_overrides(&mut self) {
@@ -199,7 +250,8 @@ impl TemplateRegistry {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, str::FromStr};
+    use anchor_lang_idl::types::IdlType;
+    use std::{collections::BTreeSet, collections::HashMap, str::FromStr};
 
     use solana_pubkey::Pubkey;
     use surfpool_types::{AccountAddress, PdaSeed};
@@ -426,11 +478,13 @@ mod tests {
     fn test_registry_loads_all_protocols() {
         let registry = TemplateRegistry::new();
 
-        // Should have Pyth (1 template) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Drift(4) + Meteora (2) + Kamino(3) + Whirlpool(6) + SPL Token (2) + Pump (2) + PumpSwap (3) = 29 total
+        // Pyth (1) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Drift (4) + Meteora (2)
+        // + Kamino (Lend 17, Scope 3, Farms 5, Swap 2, Vault 5, Liquidity 4 = 36)
+        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) = 62
         assert_eq!(
             registry.count(),
-            29,
-            "Registry should load 29 templates total"
+            62,
+            "Registry should load 62 templates total"
         );
 
         assert!(registry.contains("pyth-price-feed-v2"));
@@ -449,7 +503,36 @@ mod tests {
 
         assert!(registry.contains("kamino-reserve-state"));
         assert!(registry.contains("kamino-reserve-config"));
+        assert!(registry.contains("kamino-reserve-status"));
+        assert!(registry.contains("kamino-reserve-limits"));
+        assert!(registry.contains("kamino-reserve-fees"));
+        assert!(registry.contains("kamino-reserve-interest-rate"));
+        assert!(registry.contains("kamino-reserve-oracle"));
         assert!(registry.contains("kamino-obligation-health"));
+        assert!(registry.contains("kamino-obligation-positions"));
+        assert!(registry.contains("kamino-obligation-orders"));
+        assert!(registry.contains("kamino-lending-market-risk"));
+        assert!(registry.contains("kamino-lending-market-elevation-groups"));
+        assert!(registry.contains("kamino-reserve-rewards"));
+        assert!(registry.contains("kamino-reserve-debt-term"));
+        assert!(registry.contains("kamino-withdraw-ticket"));
+        assert!(registry.contains("kamino-scope-price"));
+        assert!(registry.contains("kamino-scope-price-source"));
+        assert!(registry.contains("kamino-scope-twap"));
+        assert!(registry.contains("kamino-farms-reward-emissions"));
+        assert!(registry.contains("kamino-farms-reward-accumulator"));
+        assert!(registry.contains("kamino-farms-user-rewards"));
+        assert!(registry.contains("kamino-farms-farm-config"));
+        assert!(registry.contains("kamino-farms-global-config"));
+        assert!(registry.contains("kamino-swap-order"));
+        assert!(registry.contains("kamino-swap-global-config"));
+        assert!(registry.contains("kamino-vault-state"));
+        assert!(registry.contains("kamino-vault-allocation"));
+        assert!(registry.contains("kamino-vault-rewards"));
+        assert!(registry.contains("kamino-vault-reserve-whitelist"));
+        assert!(registry.contains("kamino-liquidity-strategy-balances"));
+        assert!(registry.contains("kamino-liquidity-strategy-rewards"));
+        assert!(registry.contains("kamino-liquidity-strategy-guards"));
 
         assert!(registry.contains("drift-perp-market"));
         assert!(registry.contains("drift-spot-market"));
@@ -513,8 +596,70 @@ mod tests {
             "Should have 5 Raydium templates (1 CLMM + 4 AMM v4)"
         );
 
-        let kamino_templates = registry.by_protocol("Kamino");
-        assert_eq!(kamino_templates.len(), 3, "Should have 3 Kamino templates");
+        let kamino_templates = registry.by_protocol("kamino");
+        assert_eq!(
+            kamino_templates.len(),
+            17,
+            "Should have 17 Kamino Lend templates"
+        );
+        assert_eq!(
+            registry.by_protocol("kamino-scope").len(),
+            3,
+            "Should have 3 Kamino Scope templates"
+        );
+        assert_eq!(
+            registry.by_protocol("kamino-farms").len(),
+            5,
+            "Should have 5 Kamino Farms templates"
+        );
+        assert_eq!(
+            registry.by_protocol("kamino-swap").len(),
+            2,
+            "Should have 2 Kamino Swap templates"
+        );
+        assert_eq!(
+            registry.by_protocol("kamino-vault").len(),
+            5,
+            "Should have 5 Kamino Earn vault templates"
+        );
+        assert_eq!(
+            registry.by_protocol("kamino-liquidity").len(),
+            4,
+            "Should have 4 Kamino Liquidity templates"
+        );
+
+        // Each Kamino-family protocol must cover the accounts worth overriding
+        for (protocol, expected_accounts) in [
+            (
+                "kamino",
+                vec!["Reserve", "Obligation", "LendingMarket", "WithdrawTicket"],
+            ),
+            (
+                "kamino-scope",
+                vec!["OraclePrices", "OracleMappings", "OracleTwaps"],
+            ),
+            (
+                "kamino-farms",
+                vec!["FarmState", "UserState", "GlobalConfig"],
+            ),
+            ("kamino-swap", vec!["Order", "GlobalConfig"]),
+            ("kamino-vault", vec!["VaultState", "ReserveWhitelistEntry"]),
+            ("kamino-liquidity", vec!["WhirlpoolStrategy"]),
+        ] {
+            let account_types: BTreeSet<&str> = registry
+                .by_protocol(protocol)
+                .iter()
+                .map(|t| t.account_type.as_str())
+                .collect();
+            for expected in expected_accounts {
+                assert!(
+                    account_types.contains(expected),
+                    "{} should have at least one template for the {} account",
+                    protocol,
+                    expected
+                );
+            }
+        }
 
         let whirlpool_templates = registry.by_protocol("Whirlpool");
         assert_eq!(
@@ -541,8 +686,15 @@ mod tests {
         let oracle_templates = registry.by_tags(&[vec!["oracle".to_string()]].concat());
         assert_eq!(
             oracle_templates.len(),
-            1,
-            "Should find 1 oracle template (Pyth)"
+            4,
+            "Should find 4 oracle templates (Pyth + 3 Kamino Scope)"
+        );
+
+        let rewards_templates = registry.by_tags(&[vec!["rewards".to_string()]].concat());
+        assert_eq!(
+            rewards_templates.len(),
+            5,
+            "Should find 5 rewards templates (Kamino Farms)"
         );
 
         let dex_templates = registry.by_tags(&[vec!["dex".to_string()]].concat());
@@ -587,6 +739,11 @@ mod tests {
         assert!(ids.contains(&"kamino-reserve-state".to_string()));
         assert!(ids.contains(&"kamino-reserve-config".to_string()));
         assert!(ids.contains(&"kamino-obligation-health".to_string()));
+        assert!(ids.contains(&"kamino-obligation-positions".to_string()));
+        assert!(ids.contains(&"kamino-reserve-oracle".to_string()));
+        assert!(ids.contains(&"kamino-lending-market-risk".to_string()));
+        assert!(ids.contains(&"kamino-scope-price".to_string()));
+        assert!(ids.contains(&"kamino-farms-user-rewards".to_string()));
         assert!(ids.contains(&"drift-perp-market".to_string()));
         assert!(ids.contains(&"whirlpool-sol-usdc".to_string()));
         assert!(ids.contains(&"whirlpool-sol-usdt".to_string()));
@@ -990,6 +1147,251 @@ mod tests {
             resolved_address, expected_address,
             "PDA from JSON should match expected SOL/USD address.\nGot: {}\nExpected: {}",
             resolved_address, expected_address
+        );
+    }
+
+    /// A property that does not exist in the IDL is dropped at materialization time with only
+    /// a warning, so the scenario appears to run while changing nothing.
+    #[test]
+    fn test_all_template_property_paths_exist_in_idl() {
+        let registry = TemplateRegistry::new();
+        let mut errors = Vec::new();
+
+        for template in registry.all() {
+            for property in &template.properties {
+                // constant_ref properties are UI dropdowns (e.g. token pickers), not
+                // account fields, so they are not expected to resolve against the IDL.
+                if property.is_constant_ref() {
+                    continue;
+                }
+                if let Err(e) = surfpool_types::resolve_idl_type(
+                    &template.idl,
+                    &template.account_type,
+                    &property.path,
+                ) {
+                    errors.push(format!("[{}] {}: {}", template.id, property.path, e));
+                }
+            }
+        }
+
+        assert!(
+            errors.is_empty(),
+            "{} template propert(ies) do not exist in their IDL:\n  {}",
+            errors.len(),
+            errors.join("\n  ")
+        );
+    }
+
+    #[test]
+    fn test_array_index_override_path_errors() {
+        use txtx_addon_kit::{indexmap::IndexMap, types::types::Value};
+
+        use crate::surfnet::svm::apply_override_to_decoded_account;
+
+        let mut decoded = Value::Object(IndexMap::from([(
+            "deposits".to_string(),
+            Value::Array(Box::new(vec![Value::Integer(1), Value::Integer(2)])),
+        )]));
+
+        assert!(
+            apply_override_to_decoded_account(&mut decoded, "deposits.1", &serde_json::json!(9))
+                .is_ok()
+        );
+        match &decoded {
+            Value::Object(map) => match map.get("deposits") {
+                Some(Value::Array(items)) => assert_eq!(items[1], Value::Integer(9)),
+                _ => panic!("expected deposits array"),
+            },
+            _ => panic!("expected object"),
+        }
+
+        // out-of-bounds index
+        let err =
+            apply_override_to_decoded_account(&mut decoded, "deposits.7", &serde_json::json!(1))
+                .expect_err("index 7 is out of bounds for a 2-element array");
+        assert!(
+            format!("{err}").contains("out of bounds"),
+            "unexpected error: {err}"
+        );
+
+        // non-numeric segment on an array
+        let err = apply_override_to_decoded_account(
+            &mut decoded,
+            "deposits.first",
+            &serde_json::json!(1),
+        )
+        .expect_err("'first' is not an array index");
+        assert!(
+            format!("{err}").contains("zero-based array index"),
+            "unexpected error: {err}"
+        );
+
+        // empty segment
+        assert!(
+            apply_override_to_decoded_account(&mut decoded, "deposits..0", &serde_json::json!(1))
+                .is_err()
+        );
+    }
+
+    /// The Scope template must default to the Main Market's prices account, since every price
+    /// recipe in the docs is written against its indices.
+    #[test]
+    fn test_kamino_scope_template_defaults_to_the_main_market() {
+        let registry = TemplateRegistry::new();
+        let template = registry
+            .get("kamino-scope-price")
+            .expect("kamino-scope-price template should exist");
+        assert_eq!(
+            template.address,
+            AccountAddress::Pubkey("3t4JZcueEzTbVP6kLxXrL3VpWx45jDer4eqysweBchNH".to_string())
+        );
+    }
+
+    /// These addresses are hardcoded facts about mainnet, so guard their shape and uniqueness.
+    /// A liveness check would need network access.
+    #[test]
+    fn test_named_kamino_reserve_templates_have_baked_addresses() {
+        use std::{collections::BTreeSet, str::FromStr};
+
+        use solana_pubkey::Pubkey;
+
+        let registry = TemplateRegistry::new();
+
+        const NAMED: &[&str] = &["kamino-reserve-main-sol", "kamino-reserve-main-usdc"];
+
+        let mut addresses = BTreeSet::new();
+        for id in NAMED {
+            let template = registry
+                .get(id)
+                .unwrap_or_else(|| panic!("named reserve template {} should exist", id));
+
+            assert_eq!(
+                template.account_type, "Reserve",
+                "{} should target a Reserve",
+                id
+            );
+
+            let surfpool_types::AccountAddress::Pubkey(address) = &template.address else {
+                panic!("{} should carry a plain pubkey address, not a PDA", id);
+            };
+            assert!(
+                Pubkey::from_str(address).is_ok(),
+                "{} has an unparseable address: {}",
+                id,
+                address
+            );
+            assert!(
+                addresses.insert(address.clone()),
+                "{} reuses an address already used by another named template",
+                id
+            );
+
+            let paths: Vec<&str> = template.property_paths();
+            for required in [
+                "config.liquidation_threshold_pct",
+                "liquidity.market_price_sf",
+            ] {
+                assert!(
+                    paths.contains(&required),
+                    "{} should expose {}",
+                    id,
+                    required
+                );
+            }
+
+            // Each must point at the template that moves its price, and name its Scope index -
+            // the lookup a user would otherwise do by hand.
+            let context = template.llm_context.as_deref().unwrap_or_default();
+            assert!(
+                context.contains("kamino-scope-price"),
+                "{} should point at kamino-scope-price for moving its price",
+                id
+            );
+            assert!(
+                context.contains("index"),
+                "{} should name the Scope index its price comes from",
+                id
+            );
+        }
+
+        assert_eq!(
+            addresses.len(),
+            NAMED.len(),
+            "all addresses must be distinct"
+        );
+    }
+
+    /// A path ending on an index must resolve to the array's ELEMENT type. Resolving it to the
+    /// array instead sends the value down the untyped conversion, where an all-hex base58 pubkey
+    /// such as the default one is mistaken for hex and panics the request.
+    #[test]
+    fn test_terminal_array_index_resolves_to_the_element_type() {
+        use anchor_lang_idl::types::IdlType;
+
+        let registry = TemplateRegistry::new();
+        let template = registry
+            .get("kamino-scope-price-source")
+            .expect("kamino-scope-price-source should exist");
+
+        for (path, expected) in [
+            ("price_info_accounts.0", IdlType::Pubkey),
+            ("price_types.0", IdlType::U8),
+            ("ref_price.0", IdlType::U16),
+        ] {
+            let resolved =
+                surfpool_types::resolve_idl_type(&template.idl, &template.account_type, path)
+                    .unwrap_or_else(|e| panic!("{path} should resolve: {e}"));
+            assert_eq!(
+                *resolved, expected,
+                "{path} should resolve to its element type, not the array"
+            );
+        }
+
+        // An index mid-path already worked; keep it that way.
+        let obligation = registry
+            .get("kamino-obligation-positions")
+            .expect("kamino-obligation-positions should exist");
+        let resolved = surfpool_types::resolve_idl_type(
+            &obligation.idl,
+            &obligation.account_type,
+            "deposits.0.deposit_reserve",
+        )
+        .expect("deposits.0.deposit_reserve should resolve");
+        assert_eq!(*resolved, IdlType::Pubkey);
+    }
+
+    /// Descriptions come from the IDL's own `docs`, or from an explicit `description` in the
+    /// YAML. Studio and any LLM reading a template rely on them.
+    #[test]
+    fn test_every_kamino_property_has_a_description() {
+        let registry = TemplateRegistry::new();
+        let mut missing = Vec::new();
+        let mut described = 0;
+
+        for protocol in [
+            "kamino",
+            "kamino-scope",
+            "kamino-farms",
+            "kamino-swap",
+            "kamino-vault",
+            "kamino-liquidity",
+        ] {
+            for template in registry.by_protocol(protocol) {
+                for property in &template.properties {
+                    match property.description.as_deref() {
+                        Some(text) if !text.trim().is_empty() => described += 1,
+                        _ => missing.push(format!("{}:{}", template.id, property.path)),
+                    }
+                }
+            }
+        }
+
+        assert!(
+            missing.is_empty(),
+            "{} Kamino propert(ies) have no description ({} do):\n  {}",
+            missing.len(),
+            described,
+            missing.join("\n  ")
         );
     }
 }

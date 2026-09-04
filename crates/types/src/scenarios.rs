@@ -500,6 +500,13 @@ pub struct OverrideInstance {
     #[serde(default)]
     #[cfg_attr(feature = "ts-bindings", ts(as = "Option<bool>", optional))]
     pub fetch_before_use: bool,
+    /// Whether to re-apply this override on every subsequent slot, rather than only once
+    #[schemars(
+        description = "If true, re-applies this override every following slot. Use only for values no transaction writes: it reverts transaction writes to the same fields."
+    )]
+    #[serde(default)]
+    #[cfg_attr(feature = "ts-bindings", ts(as = "Option<bool>", optional))]
+    pub persist: bool,
     /// Account address to override - use pubkey for known addresses or pda for derived addresses
     #[schemars(
         description = "Account address: either {\"pubkey\": \"base58_address\"} or {\"pda\": {\"programId\": \"...\", \"seeds\": [...]}}"
@@ -517,6 +524,7 @@ impl OverrideInstance {
             label: None,
             enabled: true,
             fetch_before_use: false,
+            persist: false,
             account,
         }
     }
@@ -528,6 +536,11 @@ impl OverrideInstance {
 
     pub fn with_label(mut self, label: String) -> Self {
         self.label = Some(label);
+        self
+    }
+
+    pub fn with_persist(mut self, persist: bool) -> Self {
+        self.persist = persist;
         self
     }
 }
@@ -941,6 +954,117 @@ pub struct YamlOverrideTemplateEntry {
     pub llm_context: Option<String>,
 }
 
+/// Walks a dot-notation path: struct fields by name, array elements by index.
+///
+/// Returns the last named field and the type at the path's end. They differ on a trailing index:
+/// `price_info_accounts.0` is documented by the array but its value is one Pubkey.
+fn resolve_idl_path<'a>(
+    idl: &'a Idl,
+    account_type: &str,
+    path: &str,
+) -> Result<
+    (
+        &'a anchor_lang_idl::types::IdlField,
+        &'a anchor_lang_idl::types::IdlType,
+    ),
+    String,
+> {
+    use anchor_lang_idl::types::{IdlDefinedFields, IdlType, IdlTypeDefTy};
+
+    fn named_fields<'a>(
+        idl: &'a Idl,
+        type_name: &str,
+    ) -> Result<&'a Vec<anchor_lang_idl::types::IdlField>, String> {
+        let def = idl
+            .types
+            .iter()
+            .find(|t| t.name == type_name)
+            .ok_or_else(|| format!("type '{}' not found in IDL types", type_name))?;
+        match &def.ty {
+            IdlTypeDefTy::Struct {
+                fields: Some(IdlDefinedFields::Named(fields)),
+            } => Ok(fields),
+            _ => Err(format!("'{}' is not a struct with named fields", type_name)),
+        }
+    }
+
+    let mut segments = path.split('.');
+    let first = segments
+        .next()
+        .ok_or_else(|| format!("empty property path for '{}'", account_type))?;
+    let mut field = named_fields(idl, account_type)?
+        .iter()
+        .find(|f| f.name == first)
+        .ok_or_else(|| format!("field '{}' not found in '{}'", first, account_type))?;
+    let mut ty: &IdlType = &field.ty;
+
+    for segment in segments {
+        match ty {
+            // An index descends into the element type while `field` stays on the array,
+            // which is what documents it.
+            IdlType::Array(inner, _) | IdlType::Vec(inner) => {
+                segment.parse::<usize>().map_err(|_| {
+                    format!("'{}' is an array; '{}' is not an index", path, segment)
+                })?;
+                ty = inner.as_ref();
+            }
+            IdlType::Defined { name, .. } => {
+                field = named_fields(idl, name)?
+                    .iter()
+                    .find(|f| f.name == segment)
+                    .ok_or_else(|| format!("field '{}' not found in type '{}'", segment, name))?;
+                ty = &field.ty;
+            }
+            other => {
+                return Err(format!(
+                    "cannot descend into '{}': leaf type {:?} has no fields",
+                    segment, other
+                ));
+            }
+        }
+    }
+
+    Ok((field, ty))
+}
+
+/// The IDL type of the value a property path writes. For a path ending on an index this is the
+/// array's element type, not the array - the conversion needs the element to encode it.
+pub fn resolve_idl_type<'a>(
+    idl: &'a Idl,
+    account_type: &str,
+    path: &str,
+) -> Result<&'a anchor_lang_idl::types::IdlType, String> {
+    resolve_idl_path(idl, account_type, path).map(|(_, ty)| ty)
+}
+
+fn idl_field_docs(idl: &Idl, account_type: &str, path: &str) -> Option<String> {
+    // The containing field, deliberately: an array element carries no docs of its own.
+    let docs = &resolve_idl_path(idl, account_type, path).ok()?.0.docs;
+    if docs.is_empty() {
+        return None;
+    }
+    Some(docs.join(" "))
+}
+
+/// Fills in each property's `description` from the IDL's own `docs` when the template did not
+/// supply one, so field guidance is not written twice.
+fn describe_properties_from_idl(
+    properties: Vec<YamlProperty>,
+    idl: &Idl,
+    account_type: &str,
+) -> Vec<Property> {
+    properties
+        .into_iter()
+        .map(|yaml| {
+            let mut property: Property = yaml.into();
+            if property.description.is_none() {
+                property.description = idl_field_docs(idl, account_type, &property.path);
+            }
+            property
+        })
+        .collect()
+}
+
 impl YamlOverrideTemplateCollection {
     /// Convert collection to runtime OverrideTemplates with loaded IDL
     pub fn to_override_templates(self, idl: Idl) -> Vec<OverrideTemplate> {
@@ -955,20 +1079,23 @@ impl YamlOverrideTemplateCollection {
 
         self.templates
             .into_iter()
-            .map(|entry| OverrideTemplate {
-                id: entry.id,
-                name: entry.name,
-                description: entry.description,
-                protocol: self.protocol.clone(),
-                idl: idl.clone(),
-                address: entry.address.into(),
-                account_type: entry
+            .map(|entry| {
+                let account_type = entry
                     .idl_account_name
-                    .unwrap_or_else(|| default_account_type.clone()),
-                properties: entry.properties.into_iter().map(Into::into).collect(),
-                constants: constants.clone(),
-                tags: self.tags.clone(),
-                llm_context: entry.llm_context,
+                    .unwrap_or_else(|| default_account_type.clone());
+                OverrideTemplate {
+                    id: entry.id,
+                    name: entry.name,
+                    description: entry.description,
+                    protocol: self.protocol.clone(),
+                    idl: idl.clone(),
+                    address: entry.address.into(),
+                    properties: describe_properties_from_idl(entry.properties, &idl, &account_type),
+                    account_type,
+                    constants: constants.clone(),
+                    tags: self.tags.clone(),
+                    llm_context: entry.llm_context,
+                }
             })
             .collect()
     }

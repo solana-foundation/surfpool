@@ -1,0 +1,127 @@
+protocol: kamino-scope
+version: v0.39.0
+account_type: OraclePrices
+idl_file_path: idl.json
+
+tags:
+  - oracle
+  - price-feed
+  - lending
+  - defi
+
+templates:
+  - id: kamino-scope-price
+    name: Override Scope Price
+    description: Override a price in Kamino's Scope oracle
+    idl_account_name: OraclePrices
+    properties:
+      - path: prices.0.price.value
+        label: Price value
+        description: "The price mantissa. Example: 12550000000"
+      - path: prices.0.price.exp
+        label: Price exponent
+        description: "Decimal exponent for `value`. Example: 8"
+      - path: prices.0.last_updated_slot
+        label: Last updated slot
+        description: "Slot at which this price was published. Example: 370000000"
+      - path: prices.0.unix_timestamp
+        label: Last updated time
+        description: "Publication time (unix seconds). Example: 1800000000"
+    address:
+      type: pubkey
+      # Main Market's price account. Kamino runs several OraclePrices accounts and a reserve
+      # names its own in `config.token_info.scope_configuration.price_feed` - check there before
+      # assuming this one. Captured 2026-08-06.
+      value: 3t4JZcueEzTbVP6kLxXrL3VpWx45jDer4eqysweBchNH
+    llm_context: |
+      CRITICAL: This is the correct way to move a Kamino price. A Reserve's
+      liquidity.market_price_sf is only a cache that refresh_reserve recomputes from Scope.
+
+      HOW TO USE THIS TEMPLATE:
+      1. Read the target Reserve's config.token_info.scope_configuration.price_feed and use that
+         account as the address (the default serves the Main Market)
+      2. Read its config.token_info.scope_configuration.price_chain - up to 4 indices, 65535 = unused
+      3. Replace the index 0 in the property paths with the entry you want to move. A chain of
+         [210, 3] means price = prices[210] * prices[3]
+      4. Set price.value = usd_price * 10^exp, keeping exp as you found it
+      5. Set last_updated_slot and unix_timestamp to now, or Kamino rejects the price as stale
+      6. Set persist: true if the scenario runs past one slot, so a transaction that writes
+         this account cannot restore the real price. Safe here: nothing in a fork cranks Scope
+
+      SCOPE INDICES (verified 2026-08-06, do not guess these):
+      - 3t4JZcueEzTbVP6kLxXrL3VpWx45jDer4eqysweBchNH (Main Market):
+        SOL=3, USDC=13, PYUSD=148, cbBTC=175, JitoSOL=[210,3]
+      - 3NJYftD5sjVfxSnUdZ1wVML8f3aC6mp1CXCL6L7TnU8C (JLP Market): SOL=0, JLP=416
+
+      EXAMPLE - "SOL crashes to $45" on the Main Market:
+      prices.3.price.value: 4500000000
+      prices.3.price.exp: 8
+
+  - id: kamino-scope-price-source
+    name: Override Scope Price Source Mapping
+    description: Override where a Scope index reads its price from
+    idl_account_name: OracleMappings
+    properties:
+      - path: price_info_accounts.0
+        label: Upstream oracle account
+        description: "Upstream feed Scope reads this index from. Example: a Pyth price account"
+      - path: price_types.0
+        label: Source type
+        description: How Scope interprets the upstream account; unlabelled in the IDL, keep as found
+      - path: twap_source_or_ref_price_tolerance_bps.0
+        label: Deviation tolerance
+        description: "Max deviation from the reference before Scope rejects a price, in bps. Example: 5000"
+      - path: ref_price.0
+        label: Reference index
+        description: "Index of the entry used as this one's sanity reference; 65535 means none. Example: 65535"
+    address:
+      type: pubkey
+    llm_context: |
+      Use this template to change WHERE Scope reads a price from on its next refresh.
+      Use kamino-scope-price instead to change a stored price directly.
+
+      HOW TO USE THIS TEMPLATE:
+      1. Find this account via the oracle_mappings field on the OraclePrices account you target
+      2. Replace the index 0 in the property paths with your entry (0-511)
+      3. Point price_info_accounts at an upstream feed you control, or raise
+         twap_source_or_ref_price_tolerance_bps to let an extreme simulated price through
+
+      EXAMPLE - let a 50% price move past the anomaly guard on entry 3:
+      twap_source_or_ref_price_tolerance_bps.3: 5000
+
+  - id: kamino-scope-twap
+    name: Override Scope TWAP
+    description: Override a Kamino Scope TWAP entry
+    idl_account_name: OracleTwaps
+    properties:
+      - path: twaps.0.current_ema1h
+        label: 1h EMA
+        description: "1h EMA (scaled fraction, x2^60). Example: 0.15 x 2^60"
+      - path: twaps.0.current_ema8h
+        label: 8h EMA
+        description: "8h EMA (scaled fraction, x2^60). Example: 0.15 x 2^60"
+      - path: twaps.0.current_ema24h
+        label: 24h EMA
+        description: "24h EMA (scaled fraction, x2^60). Example: 0.15 x 2^60"
+      - path: twaps.0.current_ema7d
+        label: 7d EMA
+        description: "7d EMA (scaled fraction, x2^60). Example: 0.15 x 2^60"
+      - path: twaps.0.last_update_slot
+        label: Last updated slot
+        description: "Slot at which this TWAP entry was last updated. Example: 370000000"
+      - path: twaps.0.last_update_unix_timestamp
+        label: Last updated time
+        description: "When this TWAP entry was last updated (unix seconds). Example: 1800000000"
+    address:
+      type: pubkey
+    llm_context: |
+      Use this template when a Scope price override is rejected for diverging from its TWAP.
+
+      HOW TO USE THIS TEMPLATE:
+      1. Find this account via the oracle_twaps field on the Scope Configuration account
+      2. Replace the index 0 in the property paths with the same entry you moved in kamino-scope-price
+      3. Move the EMA to match your new spot price, or raise max_twap_divergence_bps on
+         kamino-reserve-oracle instead
+
+      EXAMPLE - move the 1h EMA of entry 3 to $45 (EMAs are scaled by 2^60):
+      twaps.3.current_ema1h: "51879434184388608000"

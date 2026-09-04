@@ -1,0 +1,1781 @@
+{
+  "address": "KvauGMspG5k6rtzrqqn7WNn3oZdyKqLKwK2XWQ8FLjd",
+  "metadata": {
+    "name": "kamino_vault",
+    "version": "2.2.2",
+    "spec": "0.1.0"
+  },
+  "instructions": [],
+  "accounts": [
+    {
+      "name": "Reserve",
+      "discriminator": [
+        43,
+        242,
+        204,
+        202,
+        26,
+        247,
+        59,
+        127
+      ]
+    },
+    {
+      "name": "GlobalConfig",
+      "discriminator": [
+        149,
+        8,
+        156,
+        202,
+        160,
+        252,
+        176,
+        217
+      ]
+    },
+    {
+      "name": "ReserveWhitelistEntry",
+      "discriminator": [
+        135,
+        130,
+        156,
+        210,
+        58,
+        58,
+        91,
+        170
+      ]
+    },
+    {
+      "name": "VaultState",
+      "discriminator": [
+        228,
+        196,
+        82,
+        165,
+        98,
+        210,
+        235,
+        152
+      ]
+    }
+  ],
+  "types": [
+    {
+      "name": "LastUpdate",
+      "docs": [
+        "Last update state"
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "slot",
+            "docs": [
+              "Last slot when updated"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "stale",
+            "docs": [
+              "True when marked stale, false when slot updated"
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "price_status",
+            "docs": [
+              "Status of the prices used to calculate the last update"
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "placeholder",
+            "type": {
+              "array": [
+                "u8",
+                6
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "BigFractionBytes",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "value",
+            "type": {
+              "array": [
+                "u64",
+                4
+              ]
+            }
+          },
+          {
+            "name": "padding",
+            "type": {
+              "array": [
+                "u64",
+                2
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "ReserveCollateral",
+      "docs": [
+        "Reserve collateral"
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "mint_pubkey",
+            "docs": [
+              "Reserve collateral mint address"
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "mint_total_supply",
+            "docs": [
+              "Reserve collateral mint supply, used for exchange rate"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "supply_vault",
+            "docs": [
+              "Reserve collateral supply address"
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "padding1",
+            "type": {
+              "array": [
+                "u128",
+                32
+              ]
+            }
+          },
+          {
+            "name": "padding2",
+            "type": {
+              "array": [
+                "u128",
+                32
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "ReserveConfig",
+      "docs": [
+        "Reserve configuration values"
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "status",
+            "docs": [
+              "Status of the reserve Active/Obsolete/Hidden"
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "padding_deprecated_asset_tier",
+            "docs": [
+              "Asset tier -> 0 - regular (collateral & debt), 1 - isolated collateral, 2 - isolated debt"
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "host_fixed_interest_rate_bps",
+            "docs": [
+              "Flat rate that goes to the host"
+            ],
+            "type": "u16"
+          },
+          {
+            "name": "min_deleveraging_bonus_bps",
+            "docs": [
+              "Starting bonus for deleveraging-related liquidations, in bps."
+            ],
+            "type": "u16"
+          },
+          {
+            "name": "block_ctoken_usage",
+            "docs": [
+              "Boolean flag to block minting/redeeming of ctokens",
+              "Blocks usage of ctokens (minting or withdrawing from obligation)",
+              "Effectively blocks deposit_reserve_liquidity and withdraw_obligation_collateral"
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "early_repay_remaining_interest_pct",
+            "docs": [
+              "The percentage of remaining interest over the debt term that is charged as early repay penalty.",
+              "Only meaningful when `debt_term_seconds > 0`."
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "emergency_mode",
+            "docs": [
+              "Whether the reserve is in emergency mode.",
+              "Blocks most user operations involving this reserve, similar to [LendingMarket::emergency_mode]",
+              "but scoped to a single reserve. Also cascades to obligations using this reserve as",
+              "collateral or debt, blocking borrows and withdrawals on other reserves but still",
+              "allowing repays and deposits."
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "reserved1",
+            "docs": [
+              "Past reserved space - feel free to reuse."
+            ],
+            "type": {
+              "array": [
+                "u8",
+                4
+              ]
+            }
+          },
+          {
+            "name": "protocol_order_execution_fee_pct",
+            "docs": [
+              "Cut of the order execution bonus that the protocol receives, as a percentage"
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "protocol_take_rate_pct",
+            "docs": [
+              "Protocol take rate is the amount borrowed interest protocol receives, as a percentage"
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "protocol_liquidation_fee_pct",
+            "docs": [
+              "Cut of the liquidation bonus that the protocol receives, as a percentage"
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "loan_to_value_pct",
+            "docs": [
+              "Target ratio of the value of borrows to deposits, as a percentage",
+              "0 if use as collateral is disabled"
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "liquidation_threshold_pct",
+            "docs": [
+              "Loan to value ratio at which an obligation can be liquidated, as percentage"
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "min_liquidation_bonus_bps",
+            "docs": [
+              "Minimum bonus a liquidator receives when repaying part of an unhealthy obligation, as bps"
+            ],
+            "type": "u16"
+          },
+          {
+            "name": "max_liquidation_bonus_bps",
+            "docs": [
+              "Maximum bonus a liquidator receives when repaying part of an unhealthy obligation, as bps"
+            ],
+            "type": "u16"
+          },
+          {
+            "name": "bad_debt_liquidation_bonus_bps",
+            "docs": [
+              "Bad debt liquidation bonus for an undercollateralized obligation, as bps"
+            ],
+            "type": "u16"
+          },
+          {
+            "name": "deleveraging_margin_call_period_secs",
+            "docs": [
+              "Time in seconds that must pass before redemptions are enabled after the deposit limit is",
+              "crossed.",
+              "Only relevant when `autodeleverage_enabled == 1`, and must not be 0 in such case."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "deleveraging_threshold_decrease_bps_per_day",
+            "docs": [
+              "The rate at which the deleveraging threshold decreases, in bps per day.",
+              "Only relevant when `autodeleverage_enabled == 1`, and must not be 0 in such case."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "fees",
+            "docs": [
+              "Program owner fees assessed, separate from gains due to interest accrual"
+            ],
+            "type": {
+              "defined": {
+                "name": "ReserveFees"
+              }
+            }
+          },
+          {
+            "name": "borrow_rate_curve",
+            "docs": [
+              "Borrow rate curve based on utilization"
+            ],
+            "type": {
+              "defined": {
+                "name": "BorrowRateCurve"
+              }
+            }
+          },
+          {
+            "name": "borrow_factor_pct",
+            "docs": [
+              "Borrow factor in percentage - used for risk adjustment"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "deposit_limit",
+            "docs": [
+              "Maximum deposit limit of liquidity in native units, u64::MAX for inf"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "borrow_limit",
+            "docs": [
+              "Maximum amount borrowed, u64::MAX for inf, 0 to disable borrows (protected deposits)"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "token_info",
+            "docs": [
+              "Token id from TokenInfos struct"
+            ],
+            "type": {
+              "defined": {
+                "name": "TokenInfo"
+              }
+            }
+          },
+          {
+            "name": "deposit_withdrawal_cap",
+            "docs": [
+              "Deposit withdrawal caps - deposit & redeem"
+            ],
+            "type": {
+              "defined": {
+                "name": "WithdrawalCaps"
+              }
+            }
+          },
+          {
+            "name": "debt_withdrawal_cap",
+            "docs": [
+              "Debt withdrawal caps - borrow & repay"
+            ],
+            "type": {
+              "defined": {
+                "name": "WithdrawalCaps"
+              }
+            }
+          },
+          {
+            "name": "elevation_groups",
+            "type": {
+              "array": [
+                "u8",
+                20
+              ]
+            }
+          },
+          {
+            "name": "disable_usage_as_coll_outside_emode",
+            "type": "u8"
+          },
+          {
+            "name": "utilization_limit_block_borrowing_above_pct",
+            "docs": [
+              "Utilization (in percentage) above which borrowing is blocked. 0 to disable."
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "autodeleverage_enabled",
+            "docs": [
+              "Whether this reserve should be subject to auto-deleveraging after deposit or borrow limit is",
+              "crossed.",
+              "Besides this flag, the lending market's flag also needs to be enabled (logical `AND`).",
+              "**NOTE:** the manual \"target LTV\" deleveraging is NOT affected by this flag."
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "proposer_authority_locked",
+            "docs": [
+              "Boolean flag indicating whether the reserve is locked for the proposer authority.",
+              "",
+              "Once the proposer have finished preparing the reserve, it must be locked to prevent",
+              "further changes to the reserve configuration allowing review and voting on the proposal",
+              "without alteration during the voting period."
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "borrow_limit_outside_elevation_group",
+            "docs": [
+              "Maximum amount liquidity of this reserve borrowed outside all elevation groups",
+              "- u64::MAX for inf",
+              "- 0 to disable borrows outside elevation groups"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "borrow_limit_against_this_collateral_in_elevation_group",
+            "docs": [
+              "Defines the maximum amount (in lamports of elevation group debt asset)",
+              "that can be borrowed when this reserve is used as collateral.",
+              "- u64::MAX for inf",
+              "- 0 to disable borrows in this elevation group (expected value for the debt asset)"
+            ],
+            "type": {
+              "array": [
+                "u64",
+                32
+              ]
+            }
+          },
+          {
+            "name": "deleveraging_bonus_increase_bps_per_day",
+            "docs": [
+              "The rate at which the deleveraging-related liquidation bonus increases, in bps per day.",
+              "Only relevant when `autodeleverage_enabled == 1`, and must not be 0 in such case."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "debt_maturity_timestamp",
+            "docs": [
+              "The timestamp at which all [Obligation::borrows] using this reserve become liquidatable",
+              "(on the same terms as reserve-wide deleveraging).",
+              "Inactive when zeroed (i.e. debt never matures).",
+              "",
+              "Note: this feature is independent of [Self::debt_term_seconds] - the liquidation mechanism",
+              "is based directly on the timestamp defined here, on Reserve's level."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "debt_term_seconds",
+            "docs": [
+              "The duration after which any debt coming from this Reserve must be repaid.",
+              "Inactive when zeroed (i.e. funds can be borrowed indefinitely).",
+              "",
+              "Note: this feature is independent of [Self::debt_maturity_timestamp] - the liquidation",
+              "mechanism is based on the [ObligationLiquidity::last_borrowed_at_timestamp]."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "rewards_amount_per_slot",
+            "docs": [
+              "Rewards distributed per slot to depositors. Drained from",
+              "[ReserveLiquidity::rewards_amount_available] into",
+              "[ReserveLiquidity::total_available_amount] at each refresh, capped by the",
+              "market-level [LendingMarket::reserve_rewards_max_apr_bps]. `0` disables.",
+              "",
+              "**Note:** because rewards inflate `total_available_amount`, a non-zero RPS on a",
+              "reserve with [Self::autodeleverage_enabled] and a finite [Self::deposit_limit]",
+              "will eventually cross the cap and arm the autodeleverage countdown. Size",
+              "`deposit_limit` and RPS together."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "permissioned_ops",
+            "docs": [
+              "Bitmask of [PermissionedOp]s gated by the parent market's `permissioning_authority`",
+              "when this reserve is the operation's target. `0` = no operation is restricted at the",
+              "reserve level. Use [Reserve::get_permissioned_ops] for a typed view."
+            ],
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "ReserveFees",
+      "docs": [
+        "Additional fee information on a reserve",
+        "",
+        "These exist separately from interest accrual fees, and are specifically for the program owner",
+        "and referral fee. The fees are paid out as a percentage of liquidity token amounts during",
+        "repayments and liquidations."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "origination_fee_sf",
+            "docs": [
+              "Fee assessed on `BorrowObligationLiquidity`, as scaled fraction (60 bits fractional part)",
+              "Must be between `0` and `2^60`, such that `2^60 = 1`.  A few examples for",
+              "clarity:",
+              "1% = (1 << 60) / 100 = 11529215046068470",
+              "0.01% (1 basis point) = 115292150460685",
+              "0.00001% (Aave origination fee) = 115292150461"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "flash_loan_fee_sf",
+            "docs": [
+              "Fee for flash loan, expressed as scaled fraction.",
+              "0.3% (Aave flash loan fee) = 0.003 * 2^60 = 3458764513820541"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "padding",
+            "docs": [
+              "Used for allignment"
+            ],
+            "type": {
+              "array": [
+                "u8",
+                8
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "ReserveLiquidity",
+      "docs": [
+        "Reserve liquidity"
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "mint_pubkey",
+            "docs": [
+              "Reserve liquidity mint address"
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "supply_vault",
+            "docs": [
+              "Reserve liquidity supply address"
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "fee_vault",
+            "docs": [
+              "Reserve liquidity fee collection address"
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "total_available_amount",
+            "docs": [
+              "Total reserve liquidity available.",
+              "",
+              "Note: not all of this liquidity can be freely used for any purpose. Production code should",
+              "use the specialized getters - see e.g. [Reserve::total_available_liquidity_amount()],",
+              "[Reserve::freely_available_liquidity_amount()]."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "borrowed_amount_sf",
+            "docs": [
+              "Reserve liquidity borrowed (scaled fraction)"
+            ],
+            "type": "u128"
+          },
+          {
+            "name": "market_price_sf",
+            "docs": [
+              "Reserve liquidity market price in quote currency (scaled fraction)"
+            ],
+            "type": "u128"
+          },
+          {
+            "name": "market_price_last_updated_ts",
+            "docs": [
+              "Unix timestamp of the market price (from the oracle)"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "mint_decimals",
+            "docs": [
+              "Reserve liquidity mint decimals"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "deposit_limit_crossed_timestamp",
+            "docs": [
+              "Timestamp when the last refresh reserve detected that the liquidity amount is above the deposit cap. When this threshold is crossed, then redemptions (auto-deleverage) are enabled.",
+              "If the threshold is not crossed, then the timestamp is set to 0"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "borrow_limit_crossed_timestamp",
+            "docs": [
+              "Timestamp when the last refresh reserve detected that the borrowed amount is above the borrow cap. When this threshold is crossed, then redemptions (auto-deleverage) are enabled.",
+              "If the threshold is not crossed, then the timestamp is set to 0"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "cumulative_borrow_rate_bsf",
+            "docs": [
+              "Reserve liquidity cumulative borrow rate (scaled fraction)"
+            ],
+            "type": {
+              "defined": {
+                "name": "BigFractionBytes"
+              }
+            }
+          },
+          {
+            "name": "accumulated_protocol_fees_sf",
+            "docs": [
+              "Reserve cumulative protocol fees (scaled fraction)"
+            ],
+            "type": "u128"
+          },
+          {
+            "name": "accumulated_referrer_fees_sf",
+            "docs": [
+              "Reserve cumulative referrer fees (scaled fraction)"
+            ],
+            "type": "u128"
+          },
+          {
+            "name": "pending_referrer_fees_sf",
+            "docs": [
+              "Reserve pending referrer fees, to be claimed in refresh_obligation by referrer or protocol (scaled fraction)"
+            ],
+            "type": "u128"
+          },
+          {
+            "name": "absolute_referral_rate_sf",
+            "docs": [
+              "Reserve referrer fee absolute rate calculated at each refresh_reserve operation (scaled fraction)"
+            ],
+            "type": "u128"
+          },
+          {
+            "name": "token_program",
+            "docs": [
+              "Token program of the liquidity mint"
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "rewards_amount_available",
+            "docs": [
+              "Reserve rewards budget remaining for distribution.",
+              "",
+              "Tokens are deposited via `topup_reserve_rewards` and increase this counter (without",
+              "touching [Self::total_available_amount]). On every `refresh_reserve`, up to",
+              "`rewards_amount_per_slot * slots_elapsed` tokens are moved from this counter into",
+              "[Self::total_available_amount], inflating the cToken exchange rate, capped by the",
+              "market-level `reserve_rewards_max_apr_bps` cap."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "padding2",
+            "type": {
+              "array": [
+                "u64",
+                50
+              ]
+            }
+          },
+          {
+            "name": "padding3",
+            "type": {
+              "array": [
+                "u128",
+                32
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "WithdrawQueue",
+      "docs": [
+        "A tracker of ticket-based withdrawals."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "queued_collateral_amount",
+            "docs": [
+              "The part of [ReserveLiquidity::total_available_amount] locked for ticketed withdrawals."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "next_issued_ticket_sequence_number",
+            "docs": [
+              "The sequence number of the next ticket to be issued when enqueueing to withdraw.",
+              "Note: it is also a number of tickets issued so far."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "next_withdrawable_ticket_sequence_number",
+            "docs": [
+              "The sequence number of the next ticket to be used for actually transferring the withdrawn",
+              "liquidity (assuming it is available in the reserve).",
+              "Note: it is also a number of fully-consumed tickets so far."
+            ],
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "WithdrawalCaps",
+      "docs": [
+        "Reserve Withdrawal Caps State"
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "config_capacity",
+            "type": "i64"
+          },
+          {
+            "name": "current_total",
+            "type": "i64"
+          },
+          {
+            "name": "last_interval_start_timestamp",
+            "type": "u64"
+          },
+          {
+            "name": "config_interval_length_seconds",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "PriceHeuristic",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "lower",
+            "docs": [
+              "Lower value of acceptable price"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "upper",
+            "docs": [
+              "Upper value of acceptable price"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "exp",
+            "docs": [
+              "Number of decimals of the previously defined values"
+            ],
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "PythConfiguration",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "price",
+            "docs": [
+              "Pubkey of the base price feed (disabled if `null` or `default`)"
+            ],
+            "type": "pubkey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "ScopeConfiguration",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "price_feed",
+            "docs": [
+              "Pubkey of the scope price feed (disabled if `null` or `default`)"
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "price_chain",
+            "docs": [
+              "This is the scope_id price chain that results in a price for the token"
+            ],
+            "type": {
+              "array": [
+                "u16",
+                4
+              ]
+            }
+          },
+          {
+            "name": "twap_chain",
+            "docs": [
+              "This is the scope_id price chain for the twap"
+            ],
+            "type": {
+              "array": [
+                "u16",
+                4
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "SwitchboardConfiguration",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "price_aggregator",
+            "docs": [
+              "Pubkey of the base price feed (disabled if `null` or `default`)"
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "twap_aggregator",
+            "type": "pubkey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "TokenInfo",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "name",
+            "docs": [
+              "UTF-8 encoded name of the token (null-terminated)"
+            ],
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "heuristic",
+            "docs": [
+              "Heuristics limits of acceptable price"
+            ],
+            "type": {
+              "defined": {
+                "name": "PriceHeuristic"
+              }
+            }
+          },
+          {
+            "name": "max_twap_divergence_bps",
+            "docs": [
+              "Max divergence between twap and price in bps"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "max_age_price_seconds",
+            "type": "u64"
+          },
+          {
+            "name": "max_age_twap_seconds",
+            "type": "u64"
+          },
+          {
+            "name": "scope_configuration",
+            "docs": [
+              "Scope price configuration"
+            ],
+            "type": {
+              "defined": {
+                "name": "ScopeConfiguration"
+              }
+            }
+          },
+          {
+            "name": "switchboard_configuration",
+            "docs": [
+              "Switchboard configuration"
+            ],
+            "type": {
+              "defined": {
+                "name": "SwitchboardConfiguration"
+              }
+            }
+          },
+          {
+            "name": "pyth_configuration",
+            "docs": [
+              "Pyth configuration"
+            ],
+            "type": {
+              "defined": {
+                "name": "PythConfiguration"
+              }
+            }
+          },
+          {
+            "name": "block_price_usage",
+            "type": "u8"
+          },
+          {
+            "name": "reserved",
+            "type": {
+              "array": [
+                "u8",
+                7
+              ]
+            }
+          },
+          {
+            "name": "padding",
+            "type": {
+              "array": [
+                "u64",
+                19
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "BorrowRateCurve",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "points",
+            "type": {
+              "array": [
+                {
+                  "defined": {
+                    "name": "CurvePoint"
+                  }
+                },
+                11
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "CurvePoint",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "utilization_rate_bps",
+            "type": "u32"
+          },
+          {
+            "name": "borrow_rate_bps",
+            "type": "u32"
+          }
+        ]
+      }
+    },
+    {
+      "name": "UpdateReserveWhitelistMode",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "Invest",
+            "fields": [
+              "u8"
+            ]
+          },
+          {
+            "name": "AddAllocation",
+            "fields": [
+              "u8"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "VaultConfigField",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "PerformanceFeeBps"
+          },
+          {
+            "name": "ManagementFeeBps"
+          },
+          {
+            "name": "MinDepositAmount"
+          },
+          {
+            "name": "MinWithdrawAmount"
+          },
+          {
+            "name": "MinInvestAmount"
+          },
+          {
+            "name": "MinInvestDelaySlots"
+          },
+          {
+            "name": "CrankFundFeePerReserve"
+          },
+          {
+            "name": "PendingVaultAdmin"
+          },
+          {
+            "name": "Name"
+          },
+          {
+            "name": "LookupTable"
+          },
+          {
+            "name": "Farm"
+          },
+          {
+            "name": "AllocationAdmin"
+          },
+          {
+            "name": "UnallocatedWeight"
+          },
+          {
+            "name": "UnallocatedTokensCap"
+          },
+          {
+            "name": "WithdrawalPenaltyLamports"
+          },
+          {
+            "name": "WithdrawalPenaltyBps"
+          },
+          {
+            "name": "FirstLossCapitalFarm"
+          },
+          {
+            "name": "AllowAllocationsInWhitelistedReservesOnly"
+          },
+          {
+            "name": "AllowInvestInWhitelistedReservesOnly"
+          },
+          {
+            "name": "RewardPerSecond"
+          },
+          {
+            "name": "DepositCap"
+          }
+        ]
+      }
+    },
+    {
+      "name": "VaultAllocation",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "reserve",
+            "type": "pubkey"
+          },
+          {
+            "name": "ctoken_vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "target_allocation_weight",
+            "type": "u64"
+          },
+          {
+            "name": "token_allocation_cap",
+            "docs": [
+              "Maximum token invested in this reserve"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "ctoken_vault_bump",
+            "type": "u64"
+          },
+          {
+            "name": "ctoken_allocation_cap",
+            "type": "u64"
+          },
+          {
+            "name": "config_padding",
+            "type": {
+              "array": [
+                "u64",
+                126
+              ]
+            }
+          },
+          {
+            "name": "ctoken_allocation",
+            "type": "u64"
+          },
+          {
+            "name": "last_invest_slot",
+            "type": "u64"
+          },
+          {
+            "name": "token_target_allocation_sf",
+            "type": "u128"
+          },
+          {
+            "name": "state_padding",
+            "type": {
+              "array": [
+                "u64",
+                128
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "VaultRewardInfo",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "reward_per_second",
+            "type": "u64"
+          },
+          {
+            "name": "last_issuance_ts",
+            "type": "u64"
+          },
+          {
+            "name": "rewards_available",
+            "docs": [
+              "Rewards available to distribute (topped up but not yet moved to vault.token_available)"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "cumulative_rewards_distributed_analytics",
+            "type": "u64"
+          },
+          {
+            "name": "padding",
+            "type": {
+              "array": [
+                "u64",
+                8
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "UpdateGlobalConfigMode",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "PendingAdmin",
+            "fields": [
+              "pubkey"
+            ]
+          },
+          {
+            "name": "MinWithdrawalPenaltyLamports",
+            "fields": [
+              "u64"
+            ]
+          },
+          {
+            "name": "MinWithdrawalPenaltyBPS",
+            "fields": [
+              "u64"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "Reserve",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "version",
+            "docs": [
+              "Version of the reserve"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "last_update",
+            "docs": [
+              "Last slot when supply and rates updated"
+            ],
+            "type": {
+              "defined": {
+                "name": "LastUpdate"
+              }
+            }
+          },
+          {
+            "name": "lending_market",
+            "docs": [
+              "Lending market address"
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "farm_collateral",
+            "type": "pubkey"
+          },
+          {
+            "name": "farm_debt",
+            "type": "pubkey"
+          },
+          {
+            "name": "liquidity",
+            "docs": [
+              "Reserve liquidity"
+            ],
+            "type": {
+              "defined": {
+                "name": "ReserveLiquidity"
+              }
+            }
+          },
+          {
+            "name": "reserve_liquidity_padding",
+            "type": {
+              "array": [
+                "u64",
+                150
+              ]
+            }
+          },
+          {
+            "name": "collateral",
+            "docs": [
+              "Reserve collateral"
+            ],
+            "type": {
+              "defined": {
+                "name": "ReserveCollateral"
+              }
+            }
+          },
+          {
+            "name": "reserve_collateral_padding",
+            "type": {
+              "array": [
+                "u64",
+                150
+              ]
+            }
+          },
+          {
+            "name": "config",
+            "docs": [
+              "Reserve configuration values"
+            ],
+            "type": {
+              "defined": {
+                "name": "ReserveConfig"
+              }
+            }
+          },
+          {
+            "name": "config_padding",
+            "type": {
+              "array": [
+                "u64",
+                112
+              ]
+            }
+          },
+          {
+            "name": "borrowed_amount_outside_elevation_group",
+            "type": "u64"
+          },
+          {
+            "name": "borrowed_amounts_against_this_reserve_in_elevation_groups",
+            "docs": [
+              "Amount of token borrowed in lamport of debt asset in the given",
+              "elevation group when this reserve is part of the collaterals."
+            ],
+            "type": {
+              "array": [
+                "u64",
+                32
+              ]
+            }
+          },
+          {
+            "name": "withdraw_queue",
+            "docs": [
+              "The tracker of ticket-based withdrawals."
+            ],
+            "type": {
+              "defined": {
+                "name": "WithdrawQueue"
+              }
+            }
+          },
+          {
+            "name": "padding",
+            "type": {
+              "array": [
+                "u64",
+                204
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "GlobalConfig",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "global_admin",
+            "type": "pubkey"
+          },
+          {
+            "name": "pending_admin",
+            "type": "pubkey"
+          },
+          {
+            "name": "withdrawal_penalty_lamports",
+            "type": "u64"
+          },
+          {
+            "name": "withdrawal_penalty_bps",
+            "type": "u64"
+          },
+          {
+            "name": "padding",
+            "type": {
+              "array": [
+                "u8",
+                944
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "ReserveWhitelistEntry",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "token_mint",
+            "docs": [
+              "The token mint is stored to solve the problem of finding all the whitelisted reserves for a particular token mint:",
+              "when storing the token mint inside the PDA, finding all the whitelisted reserves becomes a `getProgramAccounts` with",
+              "a filter on discriminator + the mint field",
+              "The reserve pubkey, as seed of the reserve whitelist PDA account, is stored so you can link back the PDA to its seeds",
+              "(for instance, in the operation above we easily find the reserve corresponding to the PDA)"
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "reserve",
+            "type": "pubkey"
+          },
+          {
+            "name": "whitelist_add_allocation",
+            "type": "u8"
+          },
+          {
+            "name": "whitelist_invest",
+            "type": "u8"
+          },
+          {
+            "name": "padding",
+            "type": {
+              "array": [
+                "u8",
+                62
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "VaultState",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "vault_admin_authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "base_vault_authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "base_vault_authority_bump",
+            "type": "u64"
+          },
+          {
+            "name": "token_mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "token_mint_decimals",
+            "type": "u64"
+          },
+          {
+            "name": "token_vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "token_program",
+            "type": "pubkey"
+          },
+          {
+            "name": "shares_mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "shares_mint_decimals",
+            "type": "u64"
+          },
+          {
+            "name": "token_available",
+            "type": "u64"
+          },
+          {
+            "name": "shares_issued",
+            "type": "u64"
+          },
+          {
+            "name": "available_crank_funds",
+            "type": "u64"
+          },
+          {
+            "name": "unallocated_weight",
+            "type": "u64"
+          },
+          {
+            "name": "performance_fee_bps",
+            "type": "u64"
+          },
+          {
+            "name": "management_fee_bps",
+            "type": "u64"
+          },
+          {
+            "name": "last_fee_charge_timestamp",
+            "type": "u64"
+          },
+          {
+            "name": "prev_aum_sf",
+            "type": "u128"
+          },
+          {
+            "name": "pending_fees_sf",
+            "type": "u128"
+          },
+          {
+            "name": "vault_allocation_strategy",
+            "type": {
+              "array": [
+                {
+                  "defined": {
+                    "name": "VaultAllocation"
+                  }
+                },
+                25
+              ]
+            }
+          },
+          {
+            "name": "padding1",
+            "type": {
+              "array": [
+                "u128",
+                256
+              ]
+            }
+          },
+          {
+            "name": "min_deposit_amount",
+            "type": "u64"
+          },
+          {
+            "name": "min_withdraw_amount",
+            "type": "u64"
+          },
+          {
+            "name": "min_invest_amount",
+            "type": "u64"
+          },
+          {
+            "name": "min_invest_delay_slots",
+            "type": "u64"
+          },
+          {
+            "name": "crank_fund_fee_per_reserve",
+            "type": "u64"
+          },
+          {
+            "name": "pending_admin",
+            "type": "pubkey"
+          },
+          {
+            "name": "cumulative_earned_interest_sf",
+            "type": "u128"
+          },
+          {
+            "name": "cumulative_mgmt_fees_sf",
+            "type": "u128"
+          },
+          {
+            "name": "cumulative_perf_fees_sf",
+            "type": "u128"
+          },
+          {
+            "name": "name",
+            "type": {
+              "array": [
+                "u8",
+                40
+              ]
+            }
+          },
+          {
+            "name": "vault_lookup_table",
+            "type": "pubkey"
+          },
+          {
+            "name": "vault_farm",
+            "type": "pubkey"
+          },
+          {
+            "name": "creation_timestamp",
+            "type": "u64"
+          },
+          {
+            "name": "unallocated_tokens_cap",
+            "type": "u64"
+          },
+          {
+            "name": "allocation_admin",
+            "type": "pubkey"
+          },
+          {
+            "name": "withdrawal_penalty_lamports",
+            "type": "u64"
+          },
+          {
+            "name": "withdrawal_penalty_bps",
+            "type": "u64"
+          },
+          {
+            "name": "first_loss_capital_farm",
+            "type": "pubkey"
+          },
+          {
+            "name": "allow_allocations_in_whitelisted_reserves_only",
+            "type": "u8"
+          },
+          {
+            "name": "allow_invest_in_whitelisted_reserves_only",
+            "type": "u8"
+          },
+          {
+            "name": "padding2",
+            "type": {
+              "array": [
+                "u8",
+                6
+              ]
+            }
+          },
+          {
+            "name": "deposit_cap",
+            "docs": [
+              "total vault deposit cap; 0 means uncapped for backward compatibility reasons; this is a soft cap that just blocks new deposits but the vault AUM can go above this cap because of the earned interest"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "reward_info",
+            "type": {
+              "defined": {
+                "name": "VaultRewardInfo"
+              }
+            }
+          },
+          {
+            "name": "padding3",
+            "type": {
+              "array": [
+                "u128",
+                232
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "DepositResultEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "shares_to_mint",
+            "type": "u64"
+          },
+          {
+            "name": "token_to_deposit",
+            "type": "u64"
+          },
+          {
+            "name": "crank_funds_to_deposit",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "DepositUserAtaBalanceEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "user_ata_balance",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "RedeemInKindResultEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "shares_to_burn",
+            "type": "u64"
+          },
+          {
+            "name": "ctokens_to_send_to_user",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "SharesToWithdrawEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "shares_amount",
+            "type": "u64"
+          },
+          {
+            "name": "user_shares_before",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "WithdrawResultEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "shares_to_burn",
+            "type": "u64"
+          },
+          {
+            "name": "available_to_send_to_user",
+            "type": "u64"
+          },
+          {
+            "name": "invested_to_disinvest_ctokens",
+            "type": "u64"
+          },
+          {
+            "name": "invested_liquidity_to_send_to_user",
+            "type": "u64"
+          }
+        ]
+      }
+    }
+  ]
+}

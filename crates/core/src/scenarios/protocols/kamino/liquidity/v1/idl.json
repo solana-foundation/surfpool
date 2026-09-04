@@ -1,0 +1,3276 @@
+{
+  "address": "6LtLpnUFNByNXLyCoK9wA2MykKAmQNZKBdY8s47dehDc",
+  "metadata": {
+    "name": "yvaults",
+    "version": "0.1.0",
+    "spec": "0.1.0"
+  },
+  "instructions": [],
+  "accounts": [
+    {
+      "name": "Whirlpool",
+      "discriminator": [
+        63,
+        149,
+        209,
+        12,
+        225,
+        128,
+        99,
+        9
+      ]
+    },
+    {
+      "name": "Position",
+      "discriminator": [
+        170,
+        188,
+        143,
+        228,
+        122,
+        64,
+        247,
+        208
+      ]
+    },
+    {
+      "name": "PoolState",
+      "discriminator": [
+        247,
+        237,
+        227,
+        245,
+        215,
+        195,
+        222,
+        70
+      ]
+    },
+    {
+      "name": "PersonalPositionState",
+      "discriminator": [
+        70,
+        111,
+        150,
+        126,
+        230,
+        15,
+        25,
+        117
+      ]
+    },
+    {
+      "name": "ProtocolPositionState",
+      "discriminator": [
+        100,
+        226,
+        145,
+        99,
+        146,
+        218,
+        160,
+        106
+      ]
+    },
+    {
+      "name": "WhirlpoolStrategy",
+      "discriminator": [
+        190,
+        178,
+        231,
+        184,
+        49,
+        186,
+        103,
+        13
+      ]
+    },
+    {
+      "name": "GlobalConfig",
+      "discriminator": [
+        149,
+        8,
+        156,
+        202,
+        160,
+        252,
+        176,
+        217
+      ]
+    },
+    {
+      "name": "CollateralInfos",
+      "discriminator": [
+        127,
+        210,
+        52,
+        226,
+        74,
+        169,
+        111,
+        9
+      ]
+    },
+    {
+      "name": "ScopeChainAccount",
+      "discriminator": [
+        180,
+        51,
+        138,
+        247,
+        240,
+        173,
+        119,
+        79
+      ]
+    },
+    {
+      "name": "TermsSignature",
+      "discriminator": [
+        197,
+        173,
+        136,
+        91,
+        182,
+        49,
+        113,
+        19
+      ]
+    }
+  ],
+  "types": [
+    {
+      "name": "PositionRewardInfo",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "growth_inside_checkpoint",
+            "type": "u128"
+          },
+          {
+            "name": "amount_owed",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "WhirlpoolRewardInfo",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "mint",
+            "docs": [
+              "Reward token mint."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "vault",
+            "docs": [
+              "Reward vault token account."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "authority",
+            "docs": [
+              "Authority account that has permission to initialize the reward and set emissions."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "emissions_per_second_x64",
+            "docs": [
+              "Q64.64 number that indicates how many tokens per second are earned per unit of liquidity."
+            ],
+            "type": "u128"
+          },
+          {
+            "name": "growth_global_x64",
+            "docs": [
+              "Q64.64 number that tracks the total tokens earned per unit of liquidity since the reward",
+              "emissions were turned on."
+            ],
+            "type": "u128"
+          }
+        ]
+      }
+    },
+    {
+      "name": "RewardInfo",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "reward_state",
+            "docs": [
+              "Reward state"
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "open_time",
+            "docs": [
+              "Reward open time"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "end_time",
+            "docs": [
+              "Reward end time"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "last_update_time",
+            "docs": [
+              "Reward last update time"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "emissions_per_second_x64",
+            "docs": [
+              "Q64.64 number indicates how many tokens per second are earned per unit of liquidity."
+            ],
+            "type": "u128"
+          },
+          {
+            "name": "reward_total_emissioned",
+            "docs": [
+              "The total amount of reward emissioned"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "reward_claimed",
+            "docs": [
+              "The total amount of claimed reward"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "token_mint",
+            "docs": [
+              "Reward token mint."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "token_vault",
+            "docs": [
+              "Reward vault token account."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "authority",
+            "docs": [
+              "The owner that has permission to set reward param"
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "reward_growth_global_x64",
+            "docs": [
+              "Q64.64 number that tracks the total tokens earned per unit of liquidity since the reward",
+              "emissions were turned on."
+            ],
+            "type": "u128"
+          }
+        ]
+      }
+    },
+    {
+      "name": "RebalanceRaw",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "params",
+            "type": {
+              "array": [
+                "u8",
+                128
+              ]
+            }
+          },
+          {
+            "name": "state",
+            "type": {
+              "array": [
+                "u8",
+                256
+              ]
+            }
+          },
+          {
+            "name": "reference_price_type",
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "CollateralInfo",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "lower_heuristic",
+            "type": "u64"
+          },
+          {
+            "name": "upper_heuristic",
+            "type": "u64"
+          },
+          {
+            "name": "exp_heuristic",
+            "type": "u64"
+          },
+          {
+            "name": "max_twap_divergence_bps",
+            "type": "u64"
+          },
+          {
+            "name": "scope_twap_price_chain",
+            "type": {
+              "array": [
+                "u16",
+                4
+              ]
+            }
+          },
+          {
+            "name": "scope_price_chain",
+            "type": {
+              "array": [
+                "u16",
+                4
+              ]
+            }
+          },
+          {
+            "name": "name",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "max_age_price_seconds",
+            "type": "u64"
+          },
+          {
+            "name": "max_age_twap_seconds",
+            "type": "u64"
+          },
+          {
+            "name": "max_ignorable_amount_as_reward",
+            "type": "u64"
+          },
+          {
+            "name": "disabled",
+            "type": "u8"
+          },
+          {
+            "name": "padding0",
+            "type": {
+              "array": [
+                "u8",
+                7
+              ]
+            }
+          },
+          {
+            "name": "scope_staking_rate_chain",
+            "type": {
+              "array": [
+                "u16",
+                4
+              ]
+            }
+          },
+          {
+            "name": "scope_feed",
+            "type": "pubkey"
+          },
+          {
+            "name": "padding",
+            "type": {
+              "array": [
+                "u64",
+                4
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "CollateralInfoParams",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "lower_heuristic",
+            "type": "u64"
+          },
+          {
+            "name": "upper_heuristic",
+            "type": "u64"
+          },
+          {
+            "name": "exp_heuristic",
+            "type": "u64"
+          },
+          {
+            "name": "max_twap_divergence_bps",
+            "type": "u64"
+          },
+          {
+            "name": "scope_twap_price_chain",
+            "type": {
+              "array": [
+                "u16",
+                4
+              ]
+            }
+          },
+          {
+            "name": "scope_price_chain",
+            "type": {
+              "array": [
+                "u16",
+                4
+              ]
+            }
+          },
+          {
+            "name": "name",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "max_age_price_seconds",
+            "type": "u64"
+          },
+          {
+            "name": "max_age_twap_seconds",
+            "type": "u64"
+          },
+          {
+            "name": "max_ignorable_amount_as_reward",
+            "type": "u64"
+          },
+          {
+            "name": "disabled",
+            "type": "u8"
+          },
+          {
+            "name": "scope_staking_rate_chain",
+            "type": {
+              "array": [
+                "u16",
+                4
+              ]
+            }
+          },
+          {
+            "name": "scope_feed",
+            "type": "pubkey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "KaminoRewardInfo",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "decimals",
+            "type": "u64"
+          },
+          {
+            "name": "reward_vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "reward_mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "reward_collateral_id",
+            "type": "u64"
+          },
+          {
+            "name": "last_issuance_ts",
+            "type": "u64"
+          },
+          {
+            "name": "reward_per_second",
+            "type": "u64"
+          },
+          {
+            "name": "amount_uncollected",
+            "type": "u64"
+          },
+          {
+            "name": "amount_issued_cumulative",
+            "type": "u64"
+          },
+          {
+            "name": "amount_available",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "WithdrawalCaps",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "config_capacity",
+            "type": "i64"
+          },
+          {
+            "name": "current_total",
+            "type": "i64"
+          },
+          {
+            "name": "last_interval_start_timestamp",
+            "type": "u64"
+          },
+          {
+            "name": "config_interval_length_seconds",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Price",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "value",
+            "type": "u64"
+          },
+          {
+            "name": "exp",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "RebalanceAutodriftParams",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "init_drift_ticks_per_epoch",
+            "type": "u32"
+          },
+          {
+            "name": "ticks_below_mid",
+            "type": "i32"
+          },
+          {
+            "name": "ticks_above_mid",
+            "type": "i32"
+          },
+          {
+            "name": "frontrun_multiplier_bps",
+            "type": "u16"
+          },
+          {
+            "name": "staking_rate_a_source",
+            "type": {
+              "defined": {
+                "name": "StakingRateSource"
+              }
+            }
+          },
+          {
+            "name": "staking_rate_b_source",
+            "type": {
+              "defined": {
+                "name": "StakingRateSource"
+              }
+            }
+          },
+          {
+            "name": "init_drift_direction",
+            "type": {
+              "defined": {
+                "name": "DriftDirection"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "RebalanceAutodriftWindow",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "staking_rate_a",
+            "type": {
+              "option": {
+                "defined": {
+                  "name": "Price"
+                }
+              }
+            }
+          },
+          {
+            "name": "staking_rate_b",
+            "type": {
+              "option": {
+                "defined": {
+                  "name": "Price"
+                }
+              }
+            }
+          },
+          {
+            "name": "epoch",
+            "type": "u64"
+          },
+          {
+            "name": "theoretical_tick",
+            "type": "i32"
+          },
+          {
+            "name": "strat_mid_tick",
+            "type": "i32"
+          }
+        ]
+      }
+    },
+    {
+      "name": "RebalanceAutodriftState",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "last_window",
+            "type": {
+              "defined": {
+                "name": "RebalanceAutodriftWindow"
+              }
+            }
+          },
+          {
+            "name": "current_window",
+            "type": {
+              "defined": {
+                "name": "RebalanceAutodriftWindow"
+              }
+            }
+          },
+          {
+            "name": "step",
+            "type": {
+              "defined": {
+                "name": "RebalanceAutodriftStep"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "RebalanceDriftParams",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "start_mid_tick",
+            "type": "i32"
+          },
+          {
+            "name": "ticks_below_mid",
+            "type": "i32"
+          },
+          {
+            "name": "ticks_above_mid",
+            "type": "i32"
+          },
+          {
+            "name": "seconds_per_tick",
+            "type": "u64"
+          },
+          {
+            "name": "direction",
+            "type": {
+              "defined": {
+                "name": "DriftDirection"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "RebalanceDriftState",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "step",
+            "type": {
+              "defined": {
+                "name": "RebalanceDriftStep"
+              }
+            }
+          },
+          {
+            "name": "last_drift_timestamp",
+            "type": "u64"
+          },
+          {
+            "name": "last_mid_tick",
+            "type": "i32"
+          }
+        ]
+      }
+    },
+    {
+      "name": "RebalanceExpanderState",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "initial_pool_price",
+            "type": "u128"
+          },
+          {
+            "name": "expansion_count",
+            "type": "u16"
+          }
+        ]
+      }
+    },
+    {
+      "name": "RebalanceManualState",
+      "type": {
+        "kind": "struct"
+      }
+    },
+    {
+      "name": "PeriodicRebalanceState",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "last_rebalance_timestamp",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "RebalancePricePercentageWithResetState",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "last_rebalance_lower_reset_pool_price",
+            "type": "u128"
+          },
+          {
+            "name": "last_rebalance_upper_reset_pool_price",
+            "type": "u128"
+          }
+        ]
+      }
+    },
+    {
+      "name": "RebalancePricePercentageState",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "last_rebalance_lower_pool_price",
+            "type": "u128"
+          },
+          {
+            "name": "last_rebalance_upper_pool_price",
+            "type": "u128"
+          }
+        ]
+      }
+    },
+    {
+      "name": "RebalanceTakeProfitState",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "step",
+            "type": {
+              "defined": {
+                "name": "RebalanceTakeProfitStep"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "BinAddLiquidityStrategy",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "Uniform",
+            "fields": [
+              {
+                "name": "current_bin_index",
+                "type": "i32"
+              },
+              {
+                "name": "lower_bin_index",
+                "type": "i32"
+              },
+              {
+                "name": "upper_bin_index",
+                "type": "i32"
+              },
+              {
+                "name": "amount_x_to_deposit",
+                "type": "u64"
+              },
+              {
+                "name": "amount_y_to_deposit",
+                "type": "u64"
+              },
+              {
+                "name": "x_current_bin",
+                "type": "u64"
+              },
+              {
+                "name": "y_current_bin",
+                "type": "u64"
+              }
+            ]
+          },
+          {
+            "name": "CurrentTick",
+            "fields": [
+              "i32"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "SimulationPrice",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "PoolPrice"
+          },
+          {
+            "name": "SqrtPrice",
+            "fields": [
+              "u128"
+            ]
+          },
+          {
+            "name": "TickIndex",
+            "fields": [
+              "i32"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "DexSpecificPrice",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "SqrtPrice",
+            "fields": [
+              "u128"
+            ]
+          },
+          {
+            "name": "Q64_64",
+            "fields": [
+              "u128"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "RemoveLiquidityMode",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "Liquidity",
+            "fields": [
+              "u128"
+            ]
+          },
+          {
+            "name": "Bps",
+            "fields": [
+              "u16"
+            ]
+          },
+          {
+            "name": "All"
+          }
+        ]
+      }
+    },
+    {
+      "name": "WithdrawalCapAccumulatorAction",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "KeepAccumulator"
+          },
+          {
+            "name": "ResetAccumulator"
+          }
+        ]
+      }
+    },
+    {
+      "name": "RebalanceEffects",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "NewRange",
+            "fields": [
+              "i32",
+              "i32"
+            ]
+          },
+          {
+            "name": "WithdrawAndFreeze"
+          }
+        ]
+      }
+    },
+    {
+      "name": "SwapLimit",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "Bps",
+            "fields": [
+              "u64"
+            ]
+          },
+          {
+            "name": "Absolute",
+            "fields": [
+              {
+                "name": "src_amount_to_swap",
+                "docs": [
+                  "Amount of src token expected by the user to perform the swap"
+                ],
+                "type": "u64"
+              },
+              {
+                "name": "dst_amount_to_vault",
+                "docs": [
+                  "Amount of dst token the user provides in exchange"
+                ],
+                "type": "u64"
+              },
+              {
+                "name": "a_to_b",
+                "type": "bool"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "MintingMethod",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "PriceBased"
+          },
+          {
+            "name": "Proportional"
+          }
+        ]
+      }
+    },
+    {
+      "name": "GlobalConfigOption",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "EmergencyMode"
+          },
+          {
+            "name": "BlockDeposit"
+          },
+          {
+            "name": "BlockInvest"
+          },
+          {
+            "name": "BlockWithdraw"
+          },
+          {
+            "name": "BlockCollectFees"
+          },
+          {
+            "name": "BlockCollectRewards"
+          },
+          {
+            "name": "BlockSwapRewards"
+          },
+          {
+            "name": "BlockSwapUnevenVaults"
+          },
+          {
+            "name": "WithdrawalFeeBps"
+          },
+          {
+            "name": "DeprecatedSwapDiscountBps"
+          },
+          {
+            "name": "ActionsAuthority"
+          },
+          {
+            "name": "DeprecatedTreasuryFeeVaults"
+          },
+          {
+            "name": "AdminAuthority"
+          },
+          {
+            "name": "BlockEmergencySwap"
+          },
+          {
+            "name": "BlockLocalAdmin"
+          },
+          {
+            "name": "UpdateTokenInfos"
+          },
+          {
+            "name": "ScopeProgramId"
+          },
+          {
+            "name": "UpdateScopePriceId"
+          },
+          {
+            "name": "MinPerformanceFeeBps"
+          },
+          {
+            "name": "MinSwapUnevenSlippageToleranceBps"
+          },
+          {
+            "name": "MinReferencePriceSlippageToleranceBps"
+          },
+          {
+            "name": "ActionsAfterRebalanceDelaySeconds"
+          },
+          {
+            "name": "TreasuryFeeVaultReceiver"
+          },
+          {
+            "name": "AddScopePriceId"
+          },
+          {
+            "name": "MaxDeviationFromRefPriceOnInvestBps"
+          },
+          {
+            "name": "InvestCooldownSlots"
+          },
+          {
+            "name": "MinInvestTriggerValueUsd"
+          }
+        ]
+      }
+    },
+    {
+      "name": "StrategyConfigOption",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "UpdateDepositCap"
+          },
+          {
+            "name": "UpdateDepositCapIxn"
+          },
+          {
+            "name": "UpdateWithdrawalCapACapacity"
+          },
+          {
+            "name": "UpdateWithdrawalCapAInterval"
+          },
+          {
+            "name": "UpdateWithdrawalCapACurrentTotal"
+          },
+          {
+            "name": "UpdateWithdrawalCapBCapacity"
+          },
+          {
+            "name": "UpdateWithdrawalCapBInterval"
+          },
+          {
+            "name": "UpdateWithdrawalCapBCurrentTotal"
+          },
+          {
+            "name": "UpdateMaxDeviationBps"
+          },
+          {
+            "name": "UpdateSwapVaultMaxSlippage"
+          },
+          {
+            "name": "UpdateStrategyType"
+          },
+          {
+            "name": "UpdateDepositFee"
+          },
+          {
+            "name": "UpdateWithdrawFee"
+          },
+          {
+            "name": "UpdateCollectFeesFee"
+          },
+          {
+            "name": "UpdateReward0Fee"
+          },
+          {
+            "name": "UpdateReward1Fee"
+          },
+          {
+            "name": "UpdateReward2Fee"
+          },
+          {
+            "name": "UpdateAdminAuthority"
+          },
+          {
+            "name": "KaminoRewardIndex0TS"
+          },
+          {
+            "name": "KaminoRewardIndex1TS"
+          },
+          {
+            "name": "KaminoRewardIndex2TS"
+          },
+          {
+            "name": "KaminoRewardIndex0RewardPerSecond"
+          },
+          {
+            "name": "KaminoRewardIndex1RewardPerSecond"
+          },
+          {
+            "name": "KaminoRewardIndex2RewardPerSecond"
+          },
+          {
+            "name": "UpdateDepositBlocked"
+          },
+          {
+            "name": "UpdateRaydiumProtocolPositionOrBaseVaultAuthority"
+          },
+          {
+            "name": "UpdateRaydiumPoolConfigOrBaseVaultAuthority"
+          },
+          {
+            "name": "UpdateInvestBlocked"
+          },
+          {
+            "name": "UpdateWithdrawBlocked"
+          },
+          {
+            "name": "UpdateLocalAdminBlocked"
+          },
+          {
+            "name": "DeprecatedUpdateCollateralIdA"
+          },
+          {
+            "name": "DeprecatedUpdateCollateralIdB"
+          },
+          {
+            "name": "UpdateFlashVaultSwap"
+          },
+          {
+            "name": "AllowDepositWithoutInvest"
+          },
+          {
+            "name": "UpdateSwapVaultMaxSlippageFromRef"
+          },
+          {
+            "name": "ResetReferencePrices"
+          },
+          {
+            "name": "UpdateStrategyCreationState"
+          },
+          {
+            "name": "UpdateIsCommunity"
+          },
+          {
+            "name": "UpdateRebalanceType"
+          },
+          {
+            "name": "UpdateRebalanceParams"
+          },
+          {
+            "name": "UpdateDepositMintingMethod"
+          },
+          {
+            "name": "UpdateLookupTable"
+          },
+          {
+            "name": "UpdateReferencePriceType"
+          },
+          {
+            "name": "UpdateReward0Amount"
+          },
+          {
+            "name": "UpdateReward1Amount"
+          },
+          {
+            "name": "UpdateReward2Amount"
+          },
+          {
+            "name": "UpdateFarm"
+          },
+          {
+            "name": "UpdateRebalancesCapCapacity"
+          },
+          {
+            "name": "UpdateRebalancesCapInterval"
+          },
+          {
+            "name": "UpdateRebalancesCapCurrentTotal"
+          },
+          {
+            "name": "DeprecatedUpdateSwapUnevenAuthority"
+          },
+          {
+            "name": "UpdatePendingStrategyAdmin"
+          },
+          {
+            "name": "UpdateMaxDeviationFromRefPriceOnInvestBps"
+          }
+        ]
+      }
+    },
+    {
+      "name": "StrategyStatus",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "Uninitialized"
+          },
+          {
+            "name": "Active"
+          },
+          {
+            "name": "Frozen"
+          },
+          {
+            "name": "Rebalancing"
+          },
+          {
+            "name": "NoPosition"
+          }
+        ]
+      }
+    },
+    {
+      "name": "StrategyType",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "Stable"
+          },
+          {
+            "name": "Pegged"
+          },
+          {
+            "name": "Volatile"
+          }
+        ]
+      }
+    },
+    {
+      "name": "CreationStatus",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "IGNORED"
+          },
+          {
+            "name": "SHADOW"
+          },
+          {
+            "name": "LIVE"
+          },
+          {
+            "name": "DEPRECATED"
+          },
+          {
+            "name": "STAGING"
+          }
+        ]
+      }
+    },
+    {
+      "name": "ExecutiveWithdrawAction",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "Freeze"
+          },
+          {
+            "name": "Unfreeze"
+          },
+          {
+            "name": "Rebalance"
+          }
+        ]
+      }
+    },
+    {
+      "name": "ReferencePriceType",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "POOL"
+          },
+          {
+            "name": "TWAP"
+          }
+        ]
+      }
+    },
+    {
+      "name": "LiquidityCalculationMode",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "Deposit"
+          },
+          {
+            "name": "Withdraw"
+          }
+        ]
+      }
+    },
+    {
+      "name": "UpdateCollateralInfoMode",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "CollateralId"
+          },
+          {
+            "name": "LowerHeuristic"
+          },
+          {
+            "name": "UpperHeuristic"
+          },
+          {
+            "name": "ExpHeuristic"
+          },
+          {
+            "name": "TwapDivergence"
+          },
+          {
+            "name": "UpdateScopeTwap"
+          },
+          {
+            "name": "UpdateScopeChain"
+          },
+          {
+            "name": "UpdateName"
+          },
+          {
+            "name": "UpdatePriceMaxAge"
+          },
+          {
+            "name": "UpdateTwapMaxAge"
+          },
+          {
+            "name": "UpdateDisabled"
+          },
+          {
+            "name": "UpdateStakingRateChain"
+          },
+          {
+            "name": "UpdateMaxIgnorableAmountAsReward"
+          },
+          {
+            "name": "UpdateScopeFeed"
+          }
+        ]
+      }
+    },
+    {
+      "name": "BalanceStatus",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "Balanced"
+          },
+          {
+            "name": "Unbalanced"
+          }
+        ]
+      }
+    },
+    {
+      "name": "RebalanceAutodriftStep",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "Uninitialized"
+          },
+          {
+            "name": "Autodrifting"
+          }
+        ]
+      }
+    },
+    {
+      "name": "StakingRateSource",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "Constant"
+          },
+          {
+            "name": "Scope"
+          }
+        ]
+      }
+    },
+    {
+      "name": "DriftDirection",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "Increasing"
+          },
+          {
+            "name": "Decreasing"
+          }
+        ]
+      }
+    },
+    {
+      "name": "RebalanceDriftStep",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "Uninitialized"
+          },
+          {
+            "name": "Drifting"
+          }
+        ]
+      }
+    },
+    {
+      "name": "ExpanderStep",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "ExpandOrContract",
+            "fields": [
+              "u16"
+            ]
+          },
+          {
+            "name": "Recenter"
+          }
+        ]
+      }
+    },
+    {
+      "name": "RebalanceTakeProfitToken",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "A"
+          },
+          {
+            "name": "B"
+          }
+        ]
+      }
+    },
+    {
+      "name": "RebalanceTakeProfitStep",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "Uninitialized"
+          },
+          {
+            "name": "TakingProfit"
+          },
+          {
+            "name": "Finished"
+          }
+        ]
+      }
+    },
+    {
+      "name": "RebalanceAction",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "NewPriceRange",
+            "fields": [
+              {
+                "defined": {
+                  "name": "DexSpecificPrice"
+                }
+              },
+              {
+                "defined": {
+                  "name": "DexSpecificPrice"
+                }
+              }
+            ]
+          },
+          {
+            "name": "NewTickRange",
+            "fields": [
+              "i32",
+              "i32"
+            ]
+          },
+          {
+            "name": "WithdrawAndFreeze"
+          }
+        ]
+      }
+    },
+    {
+      "name": "RebalanceType",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "Manual"
+          },
+          {
+            "name": "PricePercentage"
+          },
+          {
+            "name": "PricePercentageWithReset"
+          },
+          {
+            "name": "Drift"
+          },
+          {
+            "name": "TakeProfit"
+          },
+          {
+            "name": "PeriodicRebalance"
+          },
+          {
+            "name": "Expander"
+          },
+          {
+            "name": "Autodrift"
+          }
+        ]
+      }
+    },
+    {
+      "name": "CollateralTestToken",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "USDC"
+          },
+          {
+            "name": "USDH"
+          },
+          {
+            "name": "SOL"
+          },
+          {
+            "name": "ETH"
+          },
+          {
+            "name": "BTC"
+          },
+          {
+            "name": "MSOL"
+          },
+          {
+            "name": "STSOL"
+          },
+          {
+            "name": "USDT"
+          },
+          {
+            "name": "ORCA"
+          },
+          {
+            "name": "MNDE"
+          },
+          {
+            "name": "HBB"
+          },
+          {
+            "name": "JSOL"
+          },
+          {
+            "name": "USH"
+          },
+          {
+            "name": "DAI"
+          },
+          {
+            "name": "LDO"
+          },
+          {
+            "name": "SCNSOL"
+          },
+          {
+            "name": "UXD"
+          },
+          {
+            "name": "HDG"
+          },
+          {
+            "name": "DUST"
+          },
+          {
+            "name": "USDR"
+          },
+          {
+            "name": "RATIO"
+          },
+          {
+            "name": "UXP"
+          },
+          {
+            "name": "JITOSOL"
+          },
+          {
+            "name": "RAY"
+          },
+          {
+            "name": "BONK"
+          },
+          {
+            "name": "SAMO"
+          },
+          {
+            "name": "LaineSOL"
+          },
+          {
+            "name": "BSOL"
+          }
+        ]
+      }
+    },
+    {
+      "name": "ScopePriceIdTest",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "SOL"
+          },
+          {
+            "name": "ETH"
+          },
+          {
+            "name": "BTC"
+          },
+          {
+            "name": "SRM"
+          },
+          {
+            "name": "RAY"
+          },
+          {
+            "name": "FTT"
+          },
+          {
+            "name": "MSOL"
+          },
+          {
+            "name": "scnSOL_SOL"
+          },
+          {
+            "name": "BNB"
+          },
+          {
+            "name": "AVAX"
+          },
+          {
+            "name": "DaoSOL_SOL"
+          },
+          {
+            "name": "SaberMSOL_SOL"
+          },
+          {
+            "name": "USDH"
+          },
+          {
+            "name": "StSOL"
+          },
+          {
+            "name": "CSOL_SOL"
+          },
+          {
+            "name": "CETH_ETH"
+          },
+          {
+            "name": "CBTC_BTC"
+          },
+          {
+            "name": "CMSOL_SOL"
+          },
+          {
+            "name": "wstETH"
+          },
+          {
+            "name": "LDO"
+          },
+          {
+            "name": "USDC"
+          },
+          {
+            "name": "CUSDC_USDC"
+          },
+          {
+            "name": "USDT"
+          },
+          {
+            "name": "ORCA"
+          },
+          {
+            "name": "MNDE"
+          },
+          {
+            "name": "HBB"
+          },
+          {
+            "name": "CORCA_ORCA"
+          },
+          {
+            "name": "CSLND_SLND"
+          },
+          {
+            "name": "CSRM_SRM"
+          },
+          {
+            "name": "CRAY_RAY"
+          },
+          {
+            "name": "CFTT_FTT"
+          },
+          {
+            "name": "CSTSOL_STSOL"
+          },
+          {
+            "name": "SLND"
+          },
+          {
+            "name": "DAI"
+          },
+          {
+            "name": "JSOL_SOL"
+          },
+          {
+            "name": "USH"
+          },
+          {
+            "name": "UXD"
+          },
+          {
+            "name": "USDH_TWAP"
+          },
+          {
+            "name": "USH_TWAP"
+          },
+          {
+            "name": "UXD_TWAP"
+          },
+          {
+            "name": "HDG"
+          },
+          {
+            "name": "DUST"
+          },
+          {
+            "name": "USDR"
+          },
+          {
+            "name": "USDR_TWAP"
+          },
+          {
+            "name": "RATIO"
+          },
+          {
+            "name": "UXP"
+          },
+          {
+            "name": "KUXDUSDCORCA"
+          },
+          {
+            "name": "JITOSOL_SOL"
+          },
+          {
+            "name": "SOL_EMA"
+          },
+          {
+            "name": "ETH_EMA"
+          },
+          {
+            "name": "BTC_EMA"
+          },
+          {
+            "name": "SRM_EMA"
+          },
+          {
+            "name": "RAY_EMA"
+          },
+          {
+            "name": "FTT_EMA"
+          },
+          {
+            "name": "MSOL_EMA"
+          },
+          {
+            "name": "BNB_EMA"
+          },
+          {
+            "name": "AVAX_EMA"
+          },
+          {
+            "name": "STSOL_EMA"
+          },
+          {
+            "name": "USDC_EMA"
+          },
+          {
+            "name": "USDT_EMA"
+          },
+          {
+            "name": "SLND_EMA"
+          },
+          {
+            "name": "DAI_EMA"
+          },
+          {
+            "name": "wstETH_TWAP"
+          },
+          {
+            "name": "DUST_TWAP"
+          },
+          {
+            "name": "BONK"
+          },
+          {
+            "name": "BONK_TWAP"
+          },
+          {
+            "name": "SAMO"
+          },
+          {
+            "name": "SAMO_TWAP"
+          },
+          {
+            "name": "BSOL"
+          },
+          {
+            "name": "LaineSOL"
+          }
+        ]
+      }
+    },
+    {
+      "name": "DEX",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "Orca"
+          },
+          {
+            "name": "Raydium"
+          },
+          {
+            "name": "Meteora"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Whirlpool",
+      "docs": [
+        "External types"
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "whirlpools_config",
+            "type": "pubkey"
+          },
+          {
+            "name": "whirlpool_bump",
+            "type": {
+              "array": [
+                "u8",
+                1
+              ]
+            }
+          },
+          {
+            "name": "tick_spacing",
+            "type": "u16"
+          },
+          {
+            "name": "tick_spacing_seed",
+            "type": {
+              "array": [
+                "u8",
+                2
+              ]
+            }
+          },
+          {
+            "name": "fee_rate",
+            "type": "u16"
+          },
+          {
+            "name": "protocol_fee_rate",
+            "type": "u16"
+          },
+          {
+            "name": "liquidity",
+            "type": "u128"
+          },
+          {
+            "name": "sqrt_price",
+            "type": "u128"
+          },
+          {
+            "name": "tick_current_index",
+            "type": "i32"
+          },
+          {
+            "name": "protocol_fee_owed_a",
+            "type": "u64"
+          },
+          {
+            "name": "protocol_fee_owed_b",
+            "type": "u64"
+          },
+          {
+            "name": "token_mint_a",
+            "type": "pubkey"
+          },
+          {
+            "name": "token_vault_a",
+            "type": "pubkey"
+          },
+          {
+            "name": "fee_growth_global_a",
+            "type": "u128"
+          },
+          {
+            "name": "token_mint_b",
+            "type": "pubkey"
+          },
+          {
+            "name": "token_vault_b",
+            "type": "pubkey"
+          },
+          {
+            "name": "fee_growth_global_b",
+            "type": "u128"
+          },
+          {
+            "name": "reward_last_updated_timestamp",
+            "type": "u64"
+          },
+          {
+            "name": "reward_infos",
+            "type": {
+              "array": [
+                {
+                  "defined": {
+                    "name": "WhirlpoolRewardInfo"
+                  }
+                },
+                3
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "Position",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "whirlpool",
+            "type": "pubkey"
+          },
+          {
+            "name": "position_mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "liquidity",
+            "type": "u128"
+          },
+          {
+            "name": "tick_lower_index",
+            "type": "i32"
+          },
+          {
+            "name": "tick_upper_index",
+            "type": "i32"
+          },
+          {
+            "name": "fee_growth_checkpoint_a",
+            "type": "u128"
+          },
+          {
+            "name": "fee_owed_a",
+            "type": "u64"
+          },
+          {
+            "name": "fee_growth_checkpoint_b",
+            "type": "u128"
+          },
+          {
+            "name": "fee_owed_b",
+            "type": "u64"
+          },
+          {
+            "name": "reward_infos",
+            "type": {
+              "array": [
+                {
+                  "defined": {
+                    "name": "PositionRewardInfo"
+                  }
+                },
+                3
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "PoolState",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "bump",
+            "docs": [
+              "Bump to identify PDA"
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "amm_config",
+            "type": "pubkey"
+          },
+          {
+            "name": "owner",
+            "type": "pubkey"
+          },
+          {
+            "name": "token_mint0",
+            "docs": [
+              "Token pair of the pool, where token_mint_0 address < token_mint_1 address"
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "token_mint1",
+            "type": "pubkey"
+          },
+          {
+            "name": "token_vault0",
+            "docs": [
+              "Token pair vault"
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "token_vault1",
+            "type": "pubkey"
+          },
+          {
+            "name": "observation_key",
+            "docs": [
+              "observation account key"
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "mint_decimals0",
+            "docs": [
+              "mint0 and mint1 decimals"
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "mint_decimals1",
+            "type": "u8"
+          },
+          {
+            "name": "tick_spacing",
+            "docs": [
+              "The minimum number of ticks between initialized ticks"
+            ],
+            "type": "u16"
+          },
+          {
+            "name": "liquidity",
+            "docs": [
+              "The currently in range liquidity available to the pool."
+            ],
+            "type": "u128"
+          },
+          {
+            "name": "sqrt_price_x64",
+            "docs": [
+              "The current price of the pool as a sqrt(token_1/token_0) Q64.64 value"
+            ],
+            "type": "u128"
+          },
+          {
+            "name": "tick_current",
+            "docs": [
+              "The current tick of the pool, i.e. according to the last tick transition that was run."
+            ],
+            "type": "i32"
+          },
+          {
+            "name": "observation_index",
+            "docs": [
+              "the most-recently updated index of the observations array"
+            ],
+            "type": "u16"
+          },
+          {
+            "name": "observation_update_duration",
+            "type": "u16"
+          },
+          {
+            "name": "fee_growth_global0_x64",
+            "docs": [
+              "The fee growth as a Q64.64 number, i.e. fees of token_0 and token_1 collected per",
+              "unit of liquidity for the entire life of the pool."
+            ],
+            "type": "u128"
+          },
+          {
+            "name": "fee_growth_global1_x64",
+            "type": "u128"
+          },
+          {
+            "name": "protocol_fees_token0",
+            "docs": [
+              "The amounts of token_0 and token_1 that are owed to the protocol."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "protocol_fees_token1",
+            "type": "u64"
+          },
+          {
+            "name": "swap_in_amount_token0",
+            "docs": [
+              "The amounts in and out of swap token_0 and token_1"
+            ],
+            "type": "u128"
+          },
+          {
+            "name": "swap_out_amount_token1",
+            "type": "u128"
+          },
+          {
+            "name": "swap_in_amount_token1",
+            "type": "u128"
+          },
+          {
+            "name": "swap_out_amount_token0",
+            "type": "u128"
+          },
+          {
+            "name": "status",
+            "docs": [
+              "Bitwise representation of the state of the pool",
+              "bit0, 1: disable open position and increase liquidity, 0: normal",
+              "bit1, 1: disable decrease liquidity, 0: normal",
+              "bit2, 1: disable collect fee, 0: normal",
+              "bit3, 1: disable collect reward, 0: normal",
+              "bit4, 1: disable swap, 0: normal"
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "padding",
+            "docs": [
+              "Leave blank for future use"
+            ],
+            "type": {
+              "array": [
+                "u8",
+                7
+              ]
+            }
+          },
+          {
+            "name": "reward_infos",
+            "type": {
+              "array": [
+                {
+                  "defined": {
+                    "name": "RewardInfo"
+                  }
+                },
+                3
+              ]
+            }
+          },
+          {
+            "name": "tick_array_bitmap",
+            "docs": [
+              "Packed initialized tick array state"
+            ],
+            "type": {
+              "array": [
+                "u64",
+                16
+              ]
+            }
+          },
+          {
+            "name": "total_fees_token0",
+            "docs": [
+              "except protocol_fee and fund_fee"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "total_fees_claimed_token0",
+            "docs": [
+              "except protocol_fee and fund_fee"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "total_fees_token1",
+            "type": "u64"
+          },
+          {
+            "name": "total_fees_claimed_token1",
+            "type": "u64"
+          },
+          {
+            "name": "fund_fees_token0",
+            "type": "u64"
+          },
+          {
+            "name": "fund_fees_token1",
+            "type": "u64"
+          },
+          {
+            "name": "open_time",
+            "type": "u64"
+          },
+          {
+            "name": "padding1",
+            "type": {
+              "array": [
+                "u64",
+                25
+              ]
+            }
+          },
+          {
+            "name": "padding2",
+            "type": {
+              "array": [
+                "u64",
+                32
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "PersonalPositionState",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "bump",
+            "docs": [
+              "Bump to identify PDA"
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "nft_mint",
+            "docs": [
+              "Mint address of the tokenized position"
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "pool_id",
+            "docs": [
+              "The ID of the pool with which this token is connected"
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "tick_lower_index",
+            "docs": [
+              "The lower bound tick of the position"
+            ],
+            "type": "i32"
+          },
+          {
+            "name": "tick_upper_index",
+            "docs": [
+              "The upper bound tick of the position"
+            ],
+            "type": "i32"
+          },
+          {
+            "name": "liquidity",
+            "docs": [
+              "The amount of liquidity owned by this position"
+            ],
+            "type": "u128"
+          },
+          {
+            "name": "fee_growth_inside0_last_x64",
+            "docs": [
+              "The token_0 fee growth of the aggregate position as of the last action on the individual position"
+            ],
+            "type": "u128"
+          },
+          {
+            "name": "fee_growth_inside1_last_x64",
+            "docs": [
+              "The token_1 fee growth of the aggregate position as of the last action on the individual position"
+            ],
+            "type": "u128"
+          },
+          {
+            "name": "token_fees_owed0",
+            "docs": [
+              "The fees owed to the position owner in token_0, as of the last computation"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "token_fees_owed1",
+            "docs": [
+              "The fees owed to the position owner in token_1, as of the last computation"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "reward_infos",
+            "type": {
+              "array": [
+                {
+                  "defined": {
+                    "name": "PositionRewardInfo"
+                  }
+                },
+                3
+              ]
+            }
+          },
+          {
+            "name": "padding",
+            "type": {
+              "array": [
+                "u64",
+                8
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "ProtocolPositionState",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "bump",
+            "docs": [
+              "Bump to identify PDA"
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "pool_id",
+            "docs": [
+              "The ID of the pool with which this token is connected"
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "tick_lower_index",
+            "docs": [
+              "The lower bound tick of the position"
+            ],
+            "type": "i32"
+          },
+          {
+            "name": "tick_upper_index",
+            "docs": [
+              "The upper bound tick of the position"
+            ],
+            "type": "i32"
+          },
+          {
+            "name": "liquidity",
+            "docs": [
+              "The amount of liquidity owned by this position"
+            ],
+            "type": "u128"
+          },
+          {
+            "name": "fee_growth_inside0_last_x64",
+            "docs": [
+              "The token_0 fee growth per unit of liquidity as of the last update to liquidity or fees owed"
+            ],
+            "type": "u128"
+          },
+          {
+            "name": "fee_growth_inside1_last_x64",
+            "docs": [
+              "The token_1 fee growth per unit of liquidity as of the last update to liquidity or fees owed"
+            ],
+            "type": "u128"
+          },
+          {
+            "name": "token_fees_owed0",
+            "docs": [
+              "The fees owed to the position owner in token_0"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "token_fees_owed1",
+            "docs": [
+              "The fees owed to the position owner in token_1"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "reward_growth_inside",
+            "docs": [
+              "The reward growth per unit of liquidity as of the last update to liquidity"
+            ],
+            "type": {
+              "array": [
+                "u128",
+                3
+              ]
+            }
+          },
+          {
+            "name": "padding",
+            "type": {
+              "array": [
+                "u64",
+                8
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "WhirlpoolStrategy",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "admin_authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "global_config",
+            "type": "pubkey"
+          },
+          {
+            "name": "base_vault_authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "base_vault_authority_bump",
+            "type": "u64"
+          },
+          {
+            "name": "pool",
+            "type": "pubkey"
+          },
+          {
+            "name": "pool_token_vault_a",
+            "type": "pubkey"
+          },
+          {
+            "name": "pool_token_vault_b",
+            "type": "pubkey"
+          },
+          {
+            "name": "tick_array_lower",
+            "type": "pubkey"
+          },
+          {
+            "name": "tick_array_upper",
+            "type": "pubkey"
+          },
+          {
+            "name": "position",
+            "type": "pubkey"
+          },
+          {
+            "name": "position_mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "position_metadata",
+            "type": "pubkey"
+          },
+          {
+            "name": "position_token_account",
+            "type": "pubkey"
+          },
+          {
+            "name": "token_a_vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "token_b_vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "deprecated0",
+            "type": {
+              "array": [
+                "pubkey",
+                2
+              ]
+            }
+          },
+          {
+            "name": "deprecated1",
+            "type": {
+              "array": [
+                "u64",
+                2
+              ]
+            }
+          },
+          {
+            "name": "token_a_mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "token_b_mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "token_a_mint_decimals",
+            "type": "u64"
+          },
+          {
+            "name": "token_b_mint_decimals",
+            "type": "u64"
+          },
+          {
+            "name": "token_a_amounts",
+            "type": "u64"
+          },
+          {
+            "name": "token_b_amounts",
+            "type": "u64"
+          },
+          {
+            "name": "token_a_collateral_id",
+            "type": "u64"
+          },
+          {
+            "name": "token_b_collateral_id",
+            "type": "u64"
+          },
+          {
+            "name": "deprecated2",
+            "type": "pubkey"
+          },
+          {
+            "name": "deprecated3",
+            "type": "pubkey"
+          },
+          {
+            "name": "shares_mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "shares_mint_decimals",
+            "type": "u64"
+          },
+          {
+            "name": "shares_mint_authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "shares_mint_authority_bump",
+            "type": "u64"
+          },
+          {
+            "name": "shares_issued",
+            "type": "u64"
+          },
+          {
+            "name": "status",
+            "type": "u64"
+          },
+          {
+            "name": "reward0_amount",
+            "type": "u64"
+          },
+          {
+            "name": "reward0_vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "reward0_collateral_id",
+            "type": "u64"
+          },
+          {
+            "name": "reward0_decimals",
+            "type": "u64"
+          },
+          {
+            "name": "reward1_amount",
+            "type": "u64"
+          },
+          {
+            "name": "reward1_vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "reward1_collateral_id",
+            "type": "u64"
+          },
+          {
+            "name": "reward1_decimals",
+            "type": "u64"
+          },
+          {
+            "name": "reward2_amount",
+            "type": "u64"
+          },
+          {
+            "name": "reward2_vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "reward2_collateral_id",
+            "type": "u64"
+          },
+          {
+            "name": "reward2_decimals",
+            "type": "u64"
+          },
+          {
+            "name": "deposit_cap_usd",
+            "type": "u64"
+          },
+          {
+            "name": "fees_a_cumulative",
+            "type": "u64"
+          },
+          {
+            "name": "fees_b_cumulative",
+            "type": "u64"
+          },
+          {
+            "name": "reward0_amount_cumulative",
+            "type": "u64"
+          },
+          {
+            "name": "reward1_amount_cumulative",
+            "type": "u64"
+          },
+          {
+            "name": "reward2_amount_cumulative",
+            "type": "u64"
+          },
+          {
+            "name": "deposit_cap_usd_per_ixn",
+            "type": "u64"
+          },
+          {
+            "name": "withdrawal_cap_a",
+            "type": {
+              "defined": {
+                "name": "WithdrawalCaps"
+              }
+            }
+          },
+          {
+            "name": "withdrawal_cap_b",
+            "type": {
+              "defined": {
+                "name": "WithdrawalCaps"
+              }
+            }
+          },
+          {
+            "name": "max_price_deviation_bps",
+            "type": "u64"
+          },
+          {
+            "name": "swap_vault_max_slippage_bps",
+            "type": "u32"
+          },
+          {
+            "name": "swap_vault_max_slippage_from_reference_bps",
+            "type": "u32"
+          },
+          {
+            "name": "strategy_type",
+            "type": "u64"
+          },
+          {
+            "name": "padding0",
+            "type": "u64"
+          },
+          {
+            "name": "withdraw_fee",
+            "type": "u64"
+          },
+          {
+            "name": "fees_fee",
+            "type": "u64"
+          },
+          {
+            "name": "reward0_fee",
+            "type": "u64"
+          },
+          {
+            "name": "reward1_fee",
+            "type": "u64"
+          },
+          {
+            "name": "reward2_fee",
+            "type": "u64"
+          },
+          {
+            "name": "position_timestamp",
+            "type": "u64"
+          },
+          {
+            "name": "kamino_rewards",
+            "type": {
+              "array": [
+                {
+                  "defined": {
+                    "name": "KaminoRewardInfo"
+                  }
+                },
+                3
+              ]
+            }
+          },
+          {
+            "name": "strategy_dex",
+            "type": "u64"
+          },
+          {
+            "name": "raydium_protocol_position_or_base_vault_authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "allow_deposit_without_invest",
+            "type": "u64"
+          },
+          {
+            "name": "raydium_pool_config_or_base_vault_authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "deposit_blocked",
+            "type": "u8"
+          },
+          {
+            "name": "creation_status",
+            "type": "u8"
+          },
+          {
+            "name": "invest_blocked",
+            "type": "u8"
+          },
+          {
+            "name": "share_calculation_method",
+            "docs": [
+              "share_calculation_method can be either DOLAR_BASED=0 or PROPORTION_BASED=1"
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "withdraw_blocked",
+            "type": "u8"
+          },
+          {
+            "name": "reserved_flag2",
+            "type": "u8"
+          },
+          {
+            "name": "local_admin_blocked",
+            "type": "u8"
+          },
+          {
+            "name": "flash_vault_swap_allowed",
+            "type": "u8"
+          },
+          {
+            "name": "reference_swap_price_a",
+            "type": {
+              "defined": {
+                "name": "Price"
+              }
+            }
+          },
+          {
+            "name": "reference_swap_price_b",
+            "type": {
+              "defined": {
+                "name": "Price"
+              }
+            }
+          },
+          {
+            "name": "is_community",
+            "type": "u8"
+          },
+          {
+            "name": "rebalance_type",
+            "type": "u8"
+          },
+          {
+            "name": "flash_swap_in_progress",
+            "type": "u8"
+          },
+          {
+            "name": "padding1",
+            "type": {
+              "array": [
+                "u8",
+                5
+              ]
+            }
+          },
+          {
+            "name": "rebalance_raw",
+            "type": {
+              "defined": {
+                "name": "RebalanceRaw"
+              }
+            }
+          },
+          {
+            "name": "padding2",
+            "type": {
+              "array": [
+                "u8",
+                7
+              ]
+            }
+          },
+          {
+            "name": "token_a_fees_from_rewards_cumulative",
+            "type": "u64"
+          },
+          {
+            "name": "token_b_fees_from_rewards_cumulative",
+            "type": "u64"
+          },
+          {
+            "name": "strategy_lookup_table",
+            "type": "pubkey"
+          },
+          {
+            "name": "last_swap_uneven_step_timestamp",
+            "type": "u64"
+          },
+          {
+            "name": "farm",
+            "type": "pubkey"
+          },
+          {
+            "name": "rebalances_cap",
+            "type": {
+              "defined": {
+                "name": "WithdrawalCaps"
+              }
+            }
+          },
+          {
+            "name": "padding3_non_zeroed",
+            "type": {
+              "array": [
+                "u64",
+                4
+              ]
+            }
+          },
+          {
+            "name": "token_a_token_program",
+            "type": "pubkey"
+          },
+          {
+            "name": "token_b_token_program",
+            "type": "pubkey"
+          },
+          {
+            "name": "pending_admin",
+            "type": "pubkey"
+          },
+          {
+            "name": "max_deviation_from_ref_price_on_invest_bps",
+            "type": "u32"
+          },
+          {
+            "name": "padding3",
+            "type": "u32"
+          },
+          {
+            "name": "last_invest_slot",
+            "type": "u64"
+          },
+          {
+            "name": "padding4",
+            "type": "u64"
+          },
+          {
+            "name": "padding5",
+            "type": {
+              "array": [
+                "u128",
+                12
+              ]
+            }
+          },
+          {
+            "name": "padding6",
+            "type": {
+              "array": [
+                "u128",
+                32
+              ]
+            }
+          },
+          {
+            "name": "padding7",
+            "type": {
+              "array": [
+                "u128",
+                32
+              ]
+            }
+          },
+          {
+            "name": "padding8",
+            "type": {
+              "array": [
+                "u128",
+                32
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "GlobalConfig",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "emergency_mode",
+            "type": "u64"
+          },
+          {
+            "name": "block_deposit",
+            "type": "u64"
+          },
+          {
+            "name": "block_invest",
+            "type": "u64"
+          },
+          {
+            "name": "block_withdraw",
+            "type": "u64"
+          },
+          {
+            "name": "block_collect_fees",
+            "type": "u64"
+          },
+          {
+            "name": "block_collect_rewards",
+            "type": "u64"
+          },
+          {
+            "name": "block_swap_rewards",
+            "type": "u64"
+          },
+          {
+            "name": "block_swap_uneven_vaults",
+            "type": "u32"
+          },
+          {
+            "name": "block_emergency_swap",
+            "type": "u32"
+          },
+          {
+            "name": "min_withdrawal_fee_bps",
+            "type": "u64"
+          },
+          {
+            "name": "scope_program_id",
+            "type": "pubkey"
+          },
+          {
+            "name": "deprecated",
+            "type": "pubkey"
+          },
+          {
+            "name": "padding0_non_zeroed",
+            "type": {
+              "array": [
+                "u64",
+                256
+              ]
+            }
+          },
+          {
+            "name": "actions_authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "admin_authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "treasury_fee_vaults",
+            "type": {
+              "array": [
+                "pubkey",
+                256
+              ]
+            }
+          },
+          {
+            "name": "token_infos",
+            "type": "pubkey"
+          },
+          {
+            "name": "block_local_admin",
+            "type": "u64"
+          },
+          {
+            "name": "min_performance_fee_bps",
+            "type": "u64"
+          },
+          {
+            "name": "min_swap_uneven_slippage_tolerance_bps",
+            "type": "u64"
+          },
+          {
+            "name": "min_reference_price_slippage_tolerance_bps",
+            "type": "u64"
+          },
+          {
+            "name": "actions_after_rebalance_delay_seconds",
+            "type": "u64"
+          },
+          {
+            "name": "treasury_fee_vault_receiver",
+            "type": "pubkey"
+          },
+          {
+            "name": "scope_price_ids",
+            "type": {
+              "array": [
+                "pubkey",
+                16
+              ]
+            }
+          },
+          {
+            "name": "max_deviation_from_ref_price_on_invest_bps",
+            "type": "u32"
+          },
+          {
+            "name": "padding1",
+            "type": "u32"
+          },
+          {
+            "name": "invest_cooldown_slots",
+            "type": "u64"
+          },
+          {
+            "name": "min_invest_trigger_value_usd",
+            "type": "u64"
+          },
+          {
+            "name": "padding",
+            "type": {
+              "array": [
+                "u64",
+                1968
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "CollateralInfos",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "infos",
+            "type": {
+              "array": [
+                {
+                  "defined": {
+                    "name": "CollateralInfo"
+                  }
+                },
+                303
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "ScopeChainAccount",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "chain_array",
+            "type": {
+              "array": [
+                {
+                  "array": [
+                    "u16",
+                    4
+                  ]
+                },
+                512
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "TermsSignature",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "signature",
+            "type": {
+              "array": [
+                "u8",
+                64
+              ]
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

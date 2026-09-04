@@ -1,0 +1,231 @@
+protocol: kamino-liquidity
+version: v0.1.0
+account_type: WhirlpoolStrategy
+idl_file_path: idl.json
+
+tags:
+  - liquidity
+  - concentrated-liquidity
+  - yield
+  - defi
+
+templates:
+  - id: kamino-liquidity-strategy-balances
+    name: Override Liquidity Strategy Balances
+    description: Override a Kamino Liquidity strategy's holdings and shares
+    idl_account_name: WhirlpoolStrategy
+    properties:
+      - path: token_a_amounts
+        label: Idle token A
+        description: "Token A held outside the position, in the mint's smallest unit. Example: 1000000000"
+      - path: token_b_amounts
+        label: Idle token B
+        description: "Token B held outside the position, in the mint's smallest unit. Example: 1000000"
+      - path: shares_issued
+        label: Shares outstanding
+        description: "Total shares held by depositors. Example: 1000000000"
+      - path: position_timestamp
+        label: Position opened
+        description: "When the current position was opened (unix seconds). Example: 1780000000"
+      - path: last_invest_slot
+        label: Last invest slot
+        description: "Slot at which the strategy last deployed idle funds into the pool. Example: 370000000"
+    address:
+      type: pubkey
+    llm_context: |
+      Share price = total holdings (idle plus what is inside the position) / shares_issued.
+
+      HOW TO USE THIS TEMPLATE:
+      1. Raise token_a_amounts / token_b_amounts alone to simulate the strategy earning fees
+      2. Raise shares_issued alone to dilute holders
+      3. Pair with the underlying pool's own template - strategy_dex on
+         kamino-liquidity-strategy-guards says whether that is whirlpool-*, raydium-clmm-* or
+         meteora-*
+
+      The tick range and in-range liquidity live on the DEX's own position account, owned by Orca or
+      Raydium rather than Kamino, so override those through that protocol.
+
+      EXAMPLE - "the strategy collected 1 SOL of fees":
+      token_a_amounts: 1000000000
+
+      DO NOT set persist: true here - transactions write these fields, and re-applying the
+      override reverts their writes at the start of every following slot.
+
+  - id: kamino-liquidity-strategy-rewards
+    name: Override Liquidity Strategy Rewards
+    description: Override Kamino Liquidity strategy reward balances
+    idl_account_name: WhirlpoolStrategy
+    properties:
+      - path: reward0_amount
+        label: DEX reward 0
+        description: >-
+          Rewards harvested from the underlying DEX pool for slot 0, in that reward token's smallest
+          unit. Example: 1000000
+      - path: reward1_amount
+        label: DEX reward 1
+        description: "Harvested DEX pool rewards for slot 1, smallest unit. Example: 1000000"
+      - path: reward2_amount
+        label: DEX reward 2
+        description: "Harvested DEX pool rewards for slot 2, smallest unit. Example: 1000000"
+      - path: kamino_rewards.0.reward_per_second
+        label: Kamino rate
+        description: >-
+          Kamino's own emission rate for this slot, in the reward token's smallest unit per second.
+          Example: 1000
+      - path: kamino_rewards.0.amount_uncollected
+        label: Accrued, undistributed
+        description: "Rewards accrued but not yet distributed. Example: 5000000"
+      - path: kamino_rewards.0.amount_available
+        label: Budget remaining
+        description: "Reward budget left for this slot. Example: 1000000000"
+      - path: kamino_rewards.0.last_issuance_ts
+        label: Last issuance time
+        description: "When this slot last accrued (unix seconds). Example: 1780000000"
+      - path: kamino_rewards.0.reward_mint
+        label: Kamino reward mint
+        description: >-
+          Token this Kamino reward slot pays out. Example: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+          (USDC)
+      - path: farm
+        label: Linked farm
+        description: >-
+          Kamino Farms account if this strategy also pays through Farms. Example: the farm's address
+    address:
+      type: pubkey
+    llm_context: |
+      TWO reward streams: reward0_amount through reward2_amount are harvested from the underlying
+      DEX pool, while kamino_rewards holds Kamino's own emissions on top (3 slots).
+
+      HOW TO USE THIS TEMPLATE:
+      1. Replace the 0 in kamino_rewards paths with the slot you want (0-2)
+      2. Raising kamino_rewards.N.amount_uncollected is the quickest way to give a strategy a
+         pending reward to hand out
+      3. When farm is set, the strategy also pays through Kamino Farms - use the kamino-farms-*
+         templates for the per-user side
+
+      EXAMPLE - "strategy has rewards ready to distribute":
+      kamino_rewards.0.amount_uncollected: 5000000
+      kamino_rewards.0.amount_available: 1000000000
+
+      DO NOT set persist: true here - transactions write these fields, and re-applying the
+      override reverts their writes at the start of every following slot.
+
+  - id: kamino-liquidity-strategy-guards
+    name: Override Liquidity Strategy Guards
+    description: Override Kamino Liquidity strategy caps and slippage guards
+    idl_account_name: WhirlpoolStrategy
+    properties:
+      - path: status
+        label: Strategy status
+        description: Strategy lifecycle state; unlabelled in the IDL, keep as found
+      - path: strategy_type
+        label: Strategy type
+        description: Rebalancing style; unlabelled in the IDL, keep as found
+      - path: strategy_dex
+        label: Underlying DEX
+        description: >-
+          Which venue the position runs on: 0 = Orca Whirlpool, 1 = Raydium CLMM, 2 = Meteora. Example:
+          0
+      - path: deposit_blocked
+        label: Deposits blocked
+        description: "1 blocks new deposits, 0 allows them. Example: 1"
+      - path: withdraw_blocked
+        label: Withdrawals blocked
+        description: "1 blocks withdrawals, 0 allows them. Example: 1"
+      - path: invest_blocked
+        label: Investing blocked
+        description: >-
+          1 stops the strategy deploying idle funds into the pool, leaving deposits sitting in the
+          vaults. Example: 1
+      - path: creation_status
+        label: Creation status
+        description: Setup progress; unlabelled in the IDL, keep as found
+      - path: allow_deposit_without_invest
+        label: Deposit without invest
+        description: "1 lets a deposit settle without immediately deploying into the pool. Example: 1"
+      - path: flash_vault_swap_allowed
+        label: Flash swap allowed
+        description: >-
+          1 permits flash swaps through the strategy vaults, the path an arbitrage bot uses. Example: 1
+      - path: deposit_cap_usd
+        label: Deposit cap (USD)
+        description: "Total deposit ceiling in whole US dollars. Example: 0"
+      - path: deposit_cap_usd_per_ixn
+        label: Per-deposit cap (USD)
+        description: "Ceiling for a single deposit instruction, in whole US dollars. Example: 1000"
+      - path: max_price_deviation_bps
+        label: Max price deviation
+        description: >-
+          Max pool-price deviation from reference before the strategy refuses to act, in bps. Example:
+          2000
+      - path: max_deviation_from_ref_price_on_invest_bps
+        label: Max deviation on invest
+        description: "Same guard, applied when deploying idle funds in bps. Example: 2000"
+      - path: swap_vault_max_slippage_bps
+        label: Max swap slippage
+        description: "Slippage tolerated on an internal rebalancing swap in bps. Example: 100"
+      - path: swap_vault_max_slippage_from_reference_bps
+        label: Max slippage vs reference
+        description: "Slippage tolerated against the reference price on an internal swap in bps. Example: 100"
+      - path: rebalance_type
+        label: Rebalance type
+        description: Which rule picks new tick bounds; unlabelled in the IDL, keep as found
+      - path: withdrawal_cap_a.config_capacity
+        label: Token A withdrawal cap
+        description: "Maximum token A withdrawable per interval, smallest unit. Example: -1"
+      - path: withdrawal_cap_a.current_total
+        label: Token A withdrawn so far
+        description: "Running total withdrawn in the current interval. Example: 0"
+      - path: withdrawal_cap_b.config_capacity
+        label: Token B withdrawal cap
+        description: "Maximum token B withdrawable per interval, smallest unit. Example: -1"
+      - path: withdrawal_cap_b.current_total
+        label: Token B withdrawn so far
+        description: "Running total of token B withdrawn this interval. Example: 0"
+    address:
+      type: pubkey
+    llm_context: |
+      strategy_dex tells you which pool template to pair this with: 0 = Orca Whirlpool,
+      1 = Raydium CLMM, 2 = Meteora.
+
+      HOW TO USE THIS TEMPLATE:
+      1. If you move the underlying pool price and the transaction is rejected, raise
+         max_price_deviation_bps and max_deviation_from_ref_price_on_invest_bps
+      2. Set a withdrawal_cap_*.config_capacity of -1 to disable that cap
+      3. deposit_blocked / withdraw_blocked / invest_blocked are 0/1 switches
+
+      EXAMPLE - "let a 20% pool price move through":
+      max_price_deviation_bps: 2000
+      max_deviation_from_ref_price_on_invest_bps: 2000
+
+  - id: kamino-liquidity-strategy-fees
+    name: Override Liquidity Strategy Fees
+    description: Override the Kamino Liquidity strategy's cut of fees and rewards
+    idl_account_name: WhirlpoolStrategy
+    properties:
+      - path: withdraw_fee
+        label: Withdrawal fee
+        description: "Charged when a depositor exits in bps. Example: 0"
+      - path: fees_fee
+        label: Fee share
+        description: "Kamino's cut of trading fees earned by the position in bps. Example: 0"
+      - path: reward0_fee
+        label: Reward 0 fee
+        description: "Kamino's cut of reward slot 0 in bps. Example: 0"
+      - path: reward1_fee
+        label: Reward 1 fee
+        description: "Kamino's cut of reward slot 1 in bps. Example: 0"
+      - path: reward2_fee
+        label: Reward 2 fee
+        description: "Kamino's cut of reward slot 2 in bps. Example: 0"
+    address:
+      type: pubkey
+    llm_context: |
+      Use this template to remove protocol fees so an expected share price is easier to assert on.
+
+      EXAMPLE - "no fees at all":
+      withdraw_fee: 0
+      fees_fee: 0
+      reward0_fee: 0
+      reward1_fee: 0
+      reward2_fee: 0
