@@ -369,6 +369,8 @@ pub struct SurfnetSvm {
     /// For example, when an account is updated in the same slot multiple times,
     /// the update with higher write_version should supersede the one with lower write_version.
     pub write_version: u64,
+    /// Held by `send_bundle` from sandbox to commit, so two bundles on this surfnet never race each other's writes.
+    pub bundle_lock: Arc<tokio::sync::Mutex<()>>,
     pub registered_idls: Box<dyn Storage<String, Vec<VersionedIdl>>>,
     pub feature_set: FeatureSet,
     pub instruction_profiling_enabled: bool,
@@ -457,6 +459,8 @@ pub struct BundleSandbox {
     pub svm: SurfnetSvm,
     pub geyser_rx: Receiver<GeyserEvent>,
     pub simnet_rx: Receiver<SimnetEvent>,
+    /// The original's `write_version` at clone time; commit refuses a sandbox the original has moved past.
+    pub base_write_version: u64,
 }
 
 /// Generic helper: drain the overlay state of `sandbox_storage` (which must be an
@@ -661,6 +665,7 @@ impl SurfnetSvm {
             cached_genesis_hash: self.cached_genesis_hash,
             inflation: self.inflation,
             write_version: self.write_version,
+            bundle_lock: self.bundle_lock.clone(),
             feature_set: self.feature_set.clone(),
             instruction_profiling_enabled: self.instruction_profiling_enabled,
             max_profiles: self.max_profiles,
@@ -728,6 +733,7 @@ impl SurfnetSvm {
             svm,
             geyser_rx,
             simnet_rx,
+            base_write_version: self.write_version,
         }
     }
 
@@ -771,7 +777,15 @@ impl SurfnetSvm {
             mut svm,
             geyser_rx,
             simnet_rx,
+            base_write_version,
         } = sandbox;
+
+        // Step 2 installs the sandbox's whole account snapshot; a write the original took since the clone would be erased by it.
+        if self.write_version != base_write_version {
+            return Err(SurfpoolError::stale_bundle_sandbox(
+                self.write_version.saturating_sub(base_write_version),
+            ));
+        }
 
         // A tick may have closed the clone-time slot while the sandbox ran: stamp everything with the commit slot.
         let commit_slot = self.get_latest_absolute_slot();
@@ -1151,6 +1165,7 @@ impl SurfnetSvm {
             cached_genesis_hash: None,
             inflation: Inflation::default(),
             write_version: 0,
+            bundle_lock: Arc::new(tokio::sync::Mutex::new(())),
             registered_idls: registered_idls_db,
             feature_set,
             instruction_profiling_enabled: config.instruction_profiling_enabled,
@@ -1714,7 +1729,8 @@ impl SurfnetSvm {
         self.inner
             .set_account(*pubkey, account.clone())
             .map_err(|e| SurfpoolError::set_account(*pubkey, e))?;
-
+        // Counted like a transaction write: a bundle sandbox cloned before it must not commit over it.
+        self.increment_write_version();
         self.account_update_slots
             .insert(*pubkey, self.get_latest_absolute_slot());
 

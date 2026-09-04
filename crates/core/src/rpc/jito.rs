@@ -25,6 +25,9 @@ use crate::{
 /// Maximum number of transactions allowed in a single bundle, matching Jito's limit.
 const MAX_BUNDLE_SIZE: usize = 5;
 
+/// Sandbox re-runs a bundle gets when a `sendTransaction` lands while it is in flight, before the caller sees an error.
+const MAX_STALE_SANDBOX_RERUNS: usize = 5;
+
 /// Maximum number of bundle IDs accepted in a single `getBundleStatuses` request, matching
 /// Jito's documented limit. Larger batches are rejected with `invalid_params`.
 const MAX_BUNDLES_PER_QUERY: usize = 5;
@@ -307,123 +310,139 @@ impl Jito for SurfpoolJitoRpc {
                 decoded_txs.push(tx);
             }
 
-            // -- Phase A: Sandbox execution -------------------------------------------------
-            // Take a brief read lock on the original VM to construct a sandbox whose storages
-            // are overlay-wrapped, whose subscription registries are empty (no live WS leak),
-            // and whose event channels buffer into receivers we hold here.
-            let bundle_sandbox = ctx
+            let bundle_lock = ctx
                 .svm_locker
-                .with_svm_reader(|svm_reader| svm_reader.clone_for_bundle_sandbox());
+                .with_svm_reader(|svm| svm.bundle_lock.clone());
+            let _bundle_guard = bundle_lock.lock().await;
 
-            let BundleSandbox {
-                svm: sandbox_svm,
-                geyser_rx,
-                simnet_rx,
-            } = bundle_sandbox;
+            let mut attempt = 0;
+            let bundle_signatures = loop {
+                attempt += 1;
+                // -- Phase A: Sandbox execution -------------------------------------------------
+                // Take a brief read lock on the original VM to construct a sandbox whose storages
+                // are overlay-wrapped, whose subscription registries are empty (no live WS leak),
+                // and whose event channels buffer into receivers we hold here.
+                let bundle_sandbox = ctx
+                    .svm_locker
+                    .with_svm_reader(|svm_reader| svm_reader.clone_for_bundle_sandbox());
 
-            let sandbox_locker = SurfnetSvmLocker::new(sandbox_svm);
+                let BundleSandbox {
+                    svm: sandbox_svm,
+                    geyser_rx,
+                    simnet_rx,
+                    base_write_version,
+                } = bundle_sandbox;
 
-            let remote_ctx = &None;
-            let skip_preflight = true;
-            let sigverify = true;
+                let sandbox_locker = SurfnetSvmLocker::new(sandbox_svm);
 
-            let mut bundle_signatures: Vec<Signature> = Vec::with_capacity(decoded_txs.len());
-            for (idx, tx) in decoded_txs.iter().enumerate() {
-                let (status_tx, status_rx) = crossbeam_channel::bounded(1);
+                let remote_ctx = &None;
+                let skip_preflight = true;
+                let sigverify = true;
 
-                // Awaiting directly here lets the surrounding JSON-RPC runtime drive the
-                // future. We must NOT use `hiro_system_kit::nestable_block_on` because the
-                // HTTP worker thread is already inside a tokio runtime and `block_on` on the
-                // current handle panics with "Cannot start a runtime from within a runtime".
-                let process_res = sandbox_locker
-                    .process_transaction(
-                        remote_ctx,
-                        tx.clone(),
-                        status_tx,
-                        skip_preflight,
-                        sigverify,
-                    )
-                    .await;
+                let mut bundle_signatures: Vec<Signature> = Vec::with_capacity(decoded_txs.len());
+                for (idx, tx) in decoded_txs.iter().enumerate() {
+                    let (status_tx, status_rx) = crossbeam_channel::bounded(1);
 
-                bundle_signatures.push(tx.signatures[0]);
+                    // Awaiting directly here lets the surrounding JSON-RPC runtime drive the
+                    // future. We must NOT use `hiro_system_kit::nestable_block_on` because the
+                    // HTTP worker thread is already inside a tokio runtime and `block_on` on the
+                    // current handle panics with "Cannot start a runtime from within a runtime".
+                    let process_res = sandbox_locker
+                        .process_transaction(
+                            remote_ctx,
+                            tx.clone(),
+                            status_tx,
+                            skip_preflight,
+                            sigverify,
+                        )
+                        .await;
 
-                if let Err(e) = process_res {
-                    // Dropping `sandbox_locker` discards all overlay state and the cloned
-                    // LiteSVM, so the original VM is byte-identical to its pre-bundle state.
-                    return Err(Error::invalid_params(format!(
-                        "Jito bundle couldn't be executed, failed to process transaction {}: {e}",
-                        idx + 1
-                    )));
-                }
+                    bundle_signatures.push(tx.signatures[0]);
 
-                // `process_transaction` only returns after the sandbox has run the tx and
-                // dispatched a status event, so `try_recv`/`recv_timeout` will not actually
-                // park the worker for any meaningful time; the 2s timeout is a hard ceiling
-                // for an unexpectedly missed status.
-                match status_rx.recv_timeout(std::time::Duration::from_secs(2)) {
-                    Ok(TransactionStatusEvent::Success(_)) => {}
-                    Ok(TransactionStatusEvent::SimulationFailure(other)) => {
+                    if let Err(e) = process_res {
+                        // Dropping `sandbox_locker` discards all overlay state and the cloned
+                        // LiteSVM, so the original VM is byte-identical to its pre-bundle state.
                         return Err(Error::invalid_params(format!(
-                            "Jito bundle couldn't be executed: simulation failed for transaction {}: {:?}",
-                            idx + 1,
-                            other
+                            "Jito bundle couldn't be executed, failed to process transaction {}: {e}",
+                            idx + 1
                         )));
                     }
-                    Ok(TransactionStatusEvent::ExecutionFailure(other)) => {
-                        return Err(Error::invalid_params(format!(
-                            "Jito bundle couldn't be executed: Execution failed for transaction {}: {:?}",
-                            idx + 1,
-                            other
-                        )));
-                    }
-                    Ok(TransactionStatusEvent::VerificationFailure(ver_fail_err)) => {
-                        return Err(Error::invalid_params(format!(
-                            "Jito bundle couldn't be executed: Verification failed for transaction {}: {:?}",
-                            idx + 1,
-                            ver_fail_err
-                        )));
-                    }
-                    Err(_) => {
-                        return Err(RpcCustomError::NodeUnhealthy {
-                            num_slots_behind: None,
+
+                    // `process_transaction` only returns after the sandbox has run the tx and
+                    // dispatched a status event, so `try_recv`/`recv_timeout` will not actually
+                    // park the worker for any meaningful time; the 2s timeout is a hard ceiling
+                    // for an unexpectedly missed status.
+                    match status_rx.recv_timeout(std::time::Duration::from_secs(2)) {
+                        Ok(TransactionStatusEvent::Success(_)) => {}
+                        Ok(TransactionStatusEvent::SimulationFailure(other)) => {
+                            return Err(Error::invalid_params(format!(
+                                "Jito bundle couldn't be executed: simulation failed for transaction {}: {:?}",
+                                idx + 1,
+                                other
+                            )));
                         }
-                        .into());
+                        Ok(TransactionStatusEvent::ExecutionFailure(other)) => {
+                            return Err(Error::invalid_params(format!(
+                                "Jito bundle couldn't be executed: Execution failed for transaction {}: {:?}",
+                                idx + 1,
+                                other
+                            )));
+                        }
+                        Ok(TransactionStatusEvent::VerificationFailure(ver_fail_err)) => {
+                            return Err(Error::invalid_params(format!(
+                                "Jito bundle couldn't be executed: Verification failed for transaction {}: {:?}",
+                                idx + 1,
+                                ver_fail_err
+                            )));
+                        }
+                        Err(_) => {
+                            return Err(RpcCustomError::NodeUnhealthy {
+                                num_slots_behind: None,
+                            }
+                            .into());
+                        }
                     }
                 }
-            }
 
-            // -- Phase B: Atomic commit -----------------------------------------------------
-            // All bundle transactions succeeded on the sandbox. Extract the sandbox SVM (the
-            // only remaining Arc reference is the local `sandbox_locker`), reassemble the
-            // BundleSandbox and call commit_sandbox under the original VM's writer lock.
-            let sandbox_svm = match Arc::try_unwrap(sandbox_locker.0) {
-                Ok(rwlock) => rwlock.into_inner(),
-                Err(_) => {
-                    // Should never happen: sandbox_locker was constructed locally and never
-                    // shared.
-                    return Err(Error::internal_error());
+                // -- Phase B: Atomic commit -----------------------------------------------------
+                // All bundle transactions succeeded on the sandbox. Extract the sandbox SVM (the
+                // only remaining Arc reference is the local `sandbox_locker`), reassemble the
+                // BundleSandbox and call commit_sandbox under the original VM's writer lock.
+                let sandbox_svm = match Arc::try_unwrap(sandbox_locker.0) {
+                    Ok(rwlock) => rwlock.into_inner(),
+                    Err(_) => {
+                        // Should never happen: sandbox_locker was constructed locally and never
+                        // shared.
+                        return Err(Error::internal_error());
+                    }
+                };
+                let reassembled = BundleSandbox {
+                    svm: sandbox_svm,
+                    geyser_rx,
+                    simnet_rx,
+                    base_write_version,
+                };
+
+                // Use a discardable status channel for the bundle. The runloop will use it to
+                // attempt sending Confirmed/Finalized updates; nobody reads it so try_send fails
+                // silently.
+                let (bundle_status_tx, _bundle_status_rx) = crossbeam_channel::unbounded();
+
+                match ctx.svm_locker.with_svm_writer(move |original| {
+                    original.commit_sandbox(reassembled, bundle_status_tx)
+                }) {
+                    Ok(_) => break bundle_signatures,
+                    // The swap would erase what landed meanwhile, so the bundle is re-run against the new state.
+                    Err(e) if e.is_stale_bundle_sandbox() && attempt < MAX_STALE_SANDBOX_RERUNS => {
+                        continue;
+                    }
+                    Err(e) => {
+                        return Err(Error::invalid_params(format!(
+                            "Jito bundle commit failed after successful sandbox execution: {e}"
+                        )));
+                    }
                 }
             };
-            let reassembled = BundleSandbox {
-                svm: sandbox_svm,
-                geyser_rx,
-                simnet_rx,
-            };
-
-            // Use a discardable status channel for the bundle. The runloop will use it to
-            // attempt sending Confirmed/Finalized updates; nobody reads it so try_send fails
-            // silently.
-            let (bundle_status_tx, _bundle_status_rx) = crossbeam_channel::unbounded();
-
-            ctx.svm_locker
-                .with_svm_writer(move |original| {
-                    original.commit_sandbox(reassembled, bundle_status_tx)
-                })
-                .map_err(|e| {
-                    Error::invalid_params(format!(
-                        "Jito bundle commit failed after successful sandbox execution: {e}"
-                    ))
-                })?;
 
             // Calculate bundle ID by hashing comma-separated signatures (Jito-compatible)
             // https://github.com/jito-foundation/jito-solana/blob/master/sdk/src/bundle/mod.rs#L21
@@ -708,6 +727,7 @@ impl Jito for SurfpoolJitoRpc {
                 svm: sandbox_svm,
                 geyser_rx: _geyser_rx, // discarded on drop
                 simnet_rx: _simnet_rx, // discarded on drop
+                base_write_version: _,
             } = bundle_sandbox;
             let sandbox_locker = SurfnetSvmLocker::new(sandbox_svm);
 
@@ -2763,6 +2783,7 @@ mod tests {
             svm: sandbox_svm,
             geyser_rx: sandbox_geyser_rx,
             simnet_rx,
+            base_write_version,
         } = locker.with_svm_reader(|svm| svm.clone_for_bundle_sandbox());
         let clone_slot = sandbox_svm.get_latest_absolute_slot();
         let sandbox_locker = SurfnetSvmLocker::new(sandbox_svm);
@@ -2787,6 +2808,7 @@ mod tests {
                         svm: sandbox_svm,
                         geyser_rx: sandbox_geyser_rx,
                         simnet_rx,
+                        base_write_version,
                     },
                     bundle_status_tx,
                 )
@@ -2858,6 +2880,7 @@ mod tests {
             svm: sandbox_svm,
             geyser_rx,
             simnet_rx,
+            base_write_version,
         } = locker.with_svm_reader(|svm| svm.clone_for_bundle_sandbox());
         let sandbox_locker = SurfnetSvmLocker::new(sandbox_svm);
         let bundle_tx = build(Pubkey::new_unique());
@@ -2876,6 +2899,7 @@ mod tests {
                         svm: sandbox_svm,
                         geyser_rx,
                         simnet_rx,
+                        base_write_version,
                     },
                     bundle_status_tx,
                 )
@@ -2889,5 +2913,106 @@ mod tests {
                 .collect()
         });
         assert_eq!(queued, vec![pending_sig, bundle_sig]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_commit_sandbox_rejects_a_sandbox_the_surfnet_moved_past() {
+        let (svm, _simnet_rx, _geyser_rx) = SurfnetSvm::default();
+        let locker = SurfnetSvmLocker::new(svm);
+        let payer = Keypair::new();
+        let _ = locker
+            .0
+            .write()
+            .await
+            .airdrop(&payer.pubkey(), 4 * LAMPORTS_PER_SOL);
+        locker.with_svm_writer(|svm| svm.confirm_current_block().unwrap());
+        let recent_blockhash = locker.with_svm_reader(|svm| svm.latest_blockhash());
+        let build = |recipient: Pubkey| {
+            build_v0_transaction(
+                &payer.pubkey(),
+                &[&payer],
+                &[system_instruction::transfer(
+                    &payer.pubkey(),
+                    &recipient,
+                    LAMPORTS_PER_SOL,
+                )],
+                &recent_blockhash,
+            )
+        };
+
+        let sandbox = locker.with_svm_reader(|svm| svm.clone_for_bundle_sandbox());
+        let BundleSandbox {
+            svm: sandbox_svm,
+            geyser_rx,
+            simnet_rx,
+            base_write_version,
+        } = sandbox;
+        let sandbox_locker = SurfnetSvmLocker::new(sandbox_svm);
+        let bundle_tx = build(Pubkey::new_unique());
+        let bundle_sig = bundle_tx.signatures[0];
+        let (status_tx, _status_rx) = crossbeam_channel::bounded(1);
+        sandbox_locker
+            .process_transaction(&None, bundle_tx, status_tx, true, true)
+            .await
+            .unwrap();
+
+        // A transaction lands on the original while the sandbox is in flight.
+        let (status_tx, _status_rx) = crossbeam_channel::bounded(1);
+        locker
+            .process_transaction(&None, build(Pubkey::new_unique()), status_tx, true, true)
+            .await
+            .unwrap();
+        let payer_before = locker.with_svm_reader(|svm| {
+            svm.inner
+                .get_account(&payer.pubkey())
+                .unwrap()
+                .map(|a| a.lamports)
+        });
+        let queued_before =
+            locker.with_svm_reader(|svm| svm.transactions_queued_for_confirmation.len());
+
+        let sandbox_svm = Arc::try_unwrap(sandbox_locker.0).ok().unwrap().into_inner();
+        let (bundle_status_tx, _bundle_status_rx) = crossbeam_channel::unbounded();
+        let result = locker.with_svm_writer(|original| {
+            original.commit_sandbox(
+                BundleSandbox {
+                    svm: sandbox_svm,
+                    geyser_rx,
+                    simnet_rx,
+                    base_write_version,
+                },
+                bundle_status_tx,
+            )
+        });
+        assert!(result.is_err(), "a stale sandbox must not commit");
+
+        // Nothing of the bundle reached the original, and the original's own write survived.
+        let payer_after = locker.with_svm_reader(|svm| {
+            svm.inner
+                .get_account(&payer.pubkey())
+                .unwrap()
+                .map(|a| a.lamports)
+        });
+        assert_eq!(payer_after, payer_before);
+        assert_eq!(
+            locker.with_svm_reader(|svm| svm.transactions_queued_for_confirmation.len()),
+            queued_before
+        );
+        assert!(
+            locker
+                .with_svm_reader(|svm| svm.transactions.get(&bundle_sig.to_string()).unwrap())
+                .is_none()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_set_account_and_airdrop_count_as_writes() {
+        let (mut svm, _simnet_rx, _geyser_rx) = SurfnetSvm::default();
+        let v0 = svm.write_version;
+        svm.set_account(&Pubkey::new_unique(), solana_account::Account::default())
+            .unwrap();
+        assert_eq!(svm.write_version, v0 + 1);
+        let _ = svm.airdrop(&Pubkey::new_unique(), LAMPORTS_PER_SOL);
+        assert!(svm.write_version > v0 + 1);
     }
 }
