@@ -1399,6 +1399,8 @@ pub trait Full {
     /// # Notes
     /// - This method is useful for estimating fees before submitting transactions.
     /// - It helps users decide whether to rebroadcast or update a transaction.
+    /// - The fee covers both the base signature fee and the prioritization fee the message
+    ///   requests, so it matches what execution deducts from the fee payer.
     ///
     /// # See Also
     /// - `sendTransaction`, `simulateTransaction`
@@ -1408,7 +1410,7 @@ pub trait Full {
         meta: Self::Metadata,
         data: String,
         config: Option<RpcContextConfig>,
-    ) -> Result<RpcResponse<Option<u64>>>;
+    ) -> BoxFuture<Result<RpcResponse<Option<u64>>>>;
 
     /// Returns the current minimum delegation amount required for a stake account.
     ///
@@ -2511,9 +2513,14 @@ impl Full for SurfpoolFullRpc {
         meta: Self::Metadata,
         encoded: String,
         config: Option<RpcContextConfig>,
-    ) -> Result<RpcResponse<Option<u64>>> {
-        let (_, message) =
-            decode_and_deserialize::<VersionedMessage>(encoded, TransactionBinaryEncoding::Base64)?;
+    ) -> BoxFuture<Result<RpcResponse<Option<u64>>>> {
+        let message = match decode_and_deserialize::<VersionedMessage>(
+            encoded,
+            TransactionBinaryEncoding::Base64,
+        ) {
+            Ok((_, message)) => message,
+            Err(e) => return Box::pin(async move { Err(e) }),
+        };
 
         let RpcContextConfig {
             commitment,
@@ -2521,26 +2528,43 @@ impl Full for SurfpoolFullRpc {
         } = config.unwrap_or_default();
         let min_ctx_slot = min_context_slot.unwrap_or_default();
 
-        let svm_locker = meta.get_svm_locker()?;
-
-        let slot = if let Some(commitment_config) = commitment {
-            svm_locker.get_slot_for_commitment(&commitment_config)
-        } else {
-            svm_locker.get_latest_absolute_slot()
+        let SurfnetRpcContext {
+            svm_locker,
+            remote_ctx,
+        } = match meta.get_rpc_context(commitment.unwrap_or_default()) {
+            Ok(res) => res,
+            Err(e) => return e.into(),
         };
 
-        if let Some(min_slot) = min_context_slot
-            && slot < min_slot
-        {
-            return Err(RpcCustomError::MinContextSlotNotReached {
-                context_slot: min_ctx_slot,
-            }
-            .into());
-        }
+        Box::pin(async move {
+            let slot = if let Some(commitment_config) = commitment {
+                svm_locker.get_slot_for_commitment(&commitment_config)
+            } else {
+                svm_locker.get_latest_absolute_slot()
+            };
 
-        Ok(RpcResponse {
-            context: RpcResponseContext::new(slot),
-            value: Some((message.header().num_required_signatures as u64) * 5000),
+            if let Some(min_slot) = min_context_slot
+                && slot < min_slot
+            {
+                return Err(RpcCustomError::MinContextSlotNotReached {
+                    context_slot: min_ctx_slot,
+                }
+                .into());
+            }
+
+            let loaded_addresses = svm_locker
+                .get_loaded_addresses(&remote_ctx, &message)
+                .await?
+                .map(|loaded| loaded.loaded_addresses());
+
+            let fee = svm_locker.with_svm_reader(|svm_reader| {
+                svm_reader.estimate_fee_for_message(&message, loaded_addresses)
+            })?;
+
+            Ok(RpcResponse {
+                context: RpcResponseContext::new(slot),
+                value: Some(fee),
+            })
         })
     }
 
@@ -2983,11 +3007,9 @@ mod tests {
             .expect("message serialization");
         let encoded_message = base64::engine::general_purpose::STANDARD.encode(&message_bytes);
 
-        let get_fee_with_correct_config_pass_result = rpc_server.get_fee_for_message(
-            Some(runloop_context.clone()),
-            encoded_message.clone(),
-            None,
-        );
+        let get_fee_with_correct_config_pass_result = rpc_server
+            .get_fee_for_message(Some(runloop_context.clone()), encoded_message.clone(), None)
+            .await;
 
         assert!(
             get_fee_with_correct_config_pass_result.is_ok(),
@@ -3002,11 +3024,13 @@ mod tests {
             "Invalid return value"
         );
 
-        let get_fee_with_wrong_commitment_fail_result = rpc_server.get_fee_for_message(
-            Some(runloop_context.clone()),
-            encoded_message.clone(),
-            Some(rpc_ctx_config_with_wrong_commitment),
-        );
+        let get_fee_with_wrong_commitment_fail_result = rpc_server
+            .get_fee_for_message(
+                Some(runloop_context.clone()),
+                encoded_message.clone(),
+                Some(rpc_ctx_config_with_wrong_commitment),
+            )
+            .await;
 
         let wrong_comm_expected_err: Result<()> = Result::Err(
             RpcCustomError::MinContextSlotNotReached {
@@ -3025,11 +3049,13 @@ mod tests {
             wrong_comm_expected_err.err().unwrap()
         );
 
-        let get_fee_with_wrong_mint_slot_fail_result = rpc_server.get_fee_for_message(
-            Some(runloop_context.clone()),
-            encoded_message,
-            Some(rpc_ctx_config_with_wrong_min_slot),
-        );
+        let get_fee_with_wrong_mint_slot_fail_result = rpc_server
+            .get_fee_for_message(
+                Some(runloop_context.clone()),
+                encoded_message,
+                Some(rpc_ctx_config_with_wrong_min_slot),
+            )
+            .await;
 
         let wrong_min_slot_expected_err: Result<()> = Result::Err(
             RpcCustomError::MinContextSlotNotReached {
@@ -3044,6 +3070,105 @@ mod tests {
         assert_eq!(
             get_fee_with_wrong_mint_slot_fail_result.err().unwrap(),
             wrong_min_slot_expected_err.err().unwrap()
+        );
+    }
+
+    async fn get_fee_for_message(
+        setup: &TestSetup<SurfpoolFullRpc>,
+        message: &VersionedMessage,
+    ) -> u64 {
+        let encoded =
+            BASE64_STANDARD.encode(wincode::serialize(message).expect("message serialization"));
+
+        setup
+            .rpc
+            .get_fee_for_message(Some(setup.context.clone()), encoded, None)
+            .await
+            .expect("get_fee_for_message")
+            .value
+            .expect("fee")
+    }
+
+    /// A ComputeBudget price of 50_000 micro-lamports over a 300_000 CU limit is
+    /// 15_000 lamports of prioritization fee on top of the single signature.
+    #[test_case(TransactionVersion::Legacy(Legacy::Legacy) ; "Legacy transactions")]
+    #[test_case(TransactionVersion::Number(0) ; "V0 transactions")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_fee_for_message_includes_compute_budget_priority_fee(
+        version: TransactionVersion,
+    ) {
+        let setup = TestSetup::new(SurfpoolFullRpc);
+        let payer = Keypair::new();
+        let recipient = Pubkey::new_unique();
+
+        let instructions = [
+            ComputeBudgetInstruction::set_compute_unit_limit(300_000),
+            ComputeBudgetInstruction::set_compute_unit_price(50_000),
+            transfer(&payer.pubkey(), &recipient, LAMPORTS_PER_SOL),
+        ];
+        let latest_blockhash = setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm| svm.latest_blockhash());
+
+        let transaction = match version {
+            TransactionVersion::Number(0) => {
+                build_v0_transaction(&payer.pubkey(), &[&payer], &instructions, &latest_blockhash)
+            }
+            _ => build_legacy_transaction(
+                &payer.pubkey(),
+                &[&payer],
+                &instructions,
+                &latest_blockhash,
+            ),
+        };
+
+        assert_eq!(
+            get_fee_for_message(&setup, &transaction.message).await,
+            5_000 + 15_000
+        );
+    }
+
+    /// V1 carries the prioritization fee as flat lamports in the message config
+    /// instead of ComputeBudget instructions.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_fee_for_message_includes_v1_config_priority_fee() {
+        let setup = TestSetup::new(SurfpoolFullRpc);
+        let payer = Keypair::new();
+        let recipient = Pubkey::new_unique();
+        let instructions = [transfer(&payer.pubkey(), &recipient, LAMPORTS_PER_SOL)];
+        let latest_blockhash = setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm| svm.latest_blockhash());
+
+        let build = |config: TransactionConfig| {
+            VersionedMessage::V1(
+                V1Message::try_compile_with_config(
+                    &payer.pubkey(),
+                    &instructions,
+                    latest_blockhash,
+                    config,
+                )
+                .unwrap(),
+            )
+        };
+
+        let without_priority_fee =
+            build(TransactionConfig::empty().with_compute_unit_limit(20_000));
+        let with_priority_fee = build(
+            TransactionConfig::empty()
+                .with_compute_unit_limit(20_000)
+                .with_priority_fee(25_000),
+        );
+
+        assert_eq!(
+            get_fee_for_message(&setup, &without_priority_fee).await,
+            5_000
+        );
+        assert_eq!(
+            get_fee_for_message(&setup, &with_priority_fee).await,
+            5_000 + 25_000
         );
     }
 

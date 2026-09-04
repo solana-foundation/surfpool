@@ -32,16 +32,19 @@ use solana_clock::{Clock, Slot};
 use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_epoch_info::EpochInfo;
 use solana_epoch_schedule::EpochSchedule;
+use solana_fee::{FeeFeatures, calculate_fee};
 use solana_genesis_config::GenesisConfig;
 use solana_hash::Hash;
 use solana_inflation::Inflation;
 use solana_loader_v3_interface::state::UpgradeableLoaderState;
 use solana_message::{
-    Message, VersionedMessage, inline_nonce::is_advance_nonce_instruction_data, v0::LoadedAddresses,
+    Message, SanitizedMessage, SanitizedVersionedMessage, SimpleAddressLoader, VersionedMessage,
+    inline_nonce::is_advance_nonce_instruction_data, v0::LoadedAddresses,
 };
 use solana_program_option::COption;
 use solana_pubkey::Pubkey;
 use solana_rpc_client_api::response::{SlotInfo, SlotTransactionStats, SlotUpdate};
+use solana_runtime_transaction::transaction_meta::TransactionConfiguration;
 use solana_sdk_ids::{bpf_loader, system_program};
 use solana_signature::Signature;
 use solana_slot_hashes::MAX_ENTRIES as MAX_SLOT_HASHES_ENTRIES;
@@ -1559,6 +1562,61 @@ impl SurfnetSvm {
             .get_sysvar::<solana_sysvar::recent_blockhashes::RecentBlockhashes>()
             .iter()
             .any(|entry| entry.blockhash == *recent_blockhash)
+    }
+
+    /// Computes the fee a message would be charged, base plus prioritization.
+    ///
+    /// Goes through the same crates execution charges with, so the quote matches what the fee
+    /// payer is actually debited: `TransactionConfiguration` derives the prioritization fee
+    /// (ComputeBudget instructions on legacy and V0, the message config on V1), `solana_fee`
+    /// turns the signature counts into the base fee.
+    ///
+    /// # Arguments
+    /// * `message` - The message to price.
+    /// * `loaded_addresses` - Addresses resolved from the message's lookup tables. Required for
+    ///   V0 messages: a ComputeBudget instruction whose program id lives in a lookup table is
+    ///   invisible without them, and the prioritization fee would be dropped.
+    ///
+    /// # Returns
+    /// The fee in lamports, or an error if the message cannot be sanitized.
+    pub fn estimate_fee_for_message(
+        &self,
+        message: &VersionedMessage,
+        loaded_addresses: Option<LoadedAddresses>,
+    ) -> SurfpoolResult<u64> {
+        let address_loader = match message {
+            VersionedMessage::V0(_) => {
+                SimpleAddressLoader::Enabled(loaded_addresses.unwrap_or_default())
+            }
+            VersionedMessage::Legacy(_) | VersionedMessage::V1(_) => SimpleAddressLoader::Disabled,
+        };
+
+        let sanitized_versioned_message = SanitizedVersionedMessage::try_from(message.clone())
+            .map_err(|e| SurfpoolError::invalid_params(format!("Invalid message: {e:?}")))?;
+        let sanitized_message = SanitizedMessage::try_new(
+            sanitized_versioned_message,
+            address_loader,
+            &HashSet::new(), // reserved keys only drive writability, which fees do not depend on
+        )
+        .map_err(|e| SurfpoolError::invalid_params(format!("Invalid message: {e:?}")))?;
+
+        let configuration = TransactionConfiguration::try_from_sanitized_message(
+            &sanitized_message,
+            &self.feature_set,
+        )?;
+
+        Ok(calculate_fee(
+            &sanitized_message,
+            self.lamports_per_signature(),
+            configuration.priority_fee_lamports,
+            FeeFeatures::from(&self.feature_set),
+        ))
+    }
+
+    /// The rate execution charges per signature. Read from the fee structure rather than the
+    /// RecentBlockhashes sysvar, whose fee calculator LiteSVM leaves zeroed.
+    fn lamports_per_signature(&self) -> u64 {
+        self.inner.svm.get_fee_structure().lamports_per_signature
     }
 
     /// Validates the blockhash of a transaction, considering nonce accounts if present.
