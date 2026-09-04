@@ -1566,28 +1566,22 @@ impl SurfnetSvm {
 
     /// Computes the fee a message would be charged, base plus prioritization.
     ///
-    /// Goes through the same crates execution charges with, so the quote matches what the fee
-    /// payer is actually debited: `TransactionConfiguration` derives the prioritization fee
-    /// (ComputeBudget instructions on legacy and V0, the message config on V1), `solana_fee`
-    /// turns the signature counts into the base fee.
+    /// Matches what execution debits: `TransactionConfiguration` supplies the prioritization fee
+    /// (ComputeBudget instructions on legacy and V0, the message config on V1), `solana_fee` the
+    /// signature fee.
+    ///
+    /// V0 lookup tables are left unresolved because every fee input is static: signature counts
+    /// come from the header, and v0 sanitization rejects program ids loaded from a lookup table,
+    /// so the ComputeBudget instructions are always reachable.
     ///
     /// # Arguments
     /// * `message` - The message to price.
-    /// * `loaded_addresses` - Addresses resolved from the message's lookup tables. Required for
-    ///   V0 messages: a ComputeBudget instruction whose program id lives in a lookup table is
-    ///   invisible without them, and the prioritization fee would be dropped.
     ///
     /// # Returns
     /// The fee in lamports, or an error if the message cannot be sanitized.
-    pub fn estimate_fee_for_message(
-        &self,
-        message: &VersionedMessage,
-        loaded_addresses: Option<LoadedAddresses>,
-    ) -> SurfpoolResult<u64> {
+    pub fn estimate_fee_for_message(&self, message: &VersionedMessage) -> SurfpoolResult<u64> {
         let address_loader = match message {
-            VersionedMessage::V0(_) => {
-                SimpleAddressLoader::Enabled(loaded_addresses.unwrap_or_default())
-            }
+            VersionedMessage::V0(_) => SimpleAddressLoader::Enabled(LoadedAddresses::default()),
             VersionedMessage::Legacy(_) | VersionedMessage::V1(_) => SimpleAddressLoader::Disabled,
         };
 
@@ -1596,7 +1590,7 @@ impl SurfnetSvm {
         let sanitized_message = SanitizedMessage::try_new(
             sanitized_versioned_message,
             address_loader,
-            &HashSet::new(), // reserved keys only drive writability, which fees do not depend on
+            &HashSet::new(), // reserved keys only drive writability, which fees ignore
         )
         .map_err(|e| SurfpoolError::invalid_params(format!("Invalid message: {e:?}")))?;
 
@@ -1613,8 +1607,8 @@ impl SurfnetSvm {
         ))
     }
 
-    /// The rate execution charges per signature. Read from the fee structure rather than the
-    /// RecentBlockhashes sysvar, whose fee calculator LiteSVM leaves zeroed.
+    /// The rate execution charges per signature. Not the RecentBlockhashes sysvar, whose fee
+    /// calculator LiteSVM leaves zeroed.
     fn lamports_per_signature(&self) -> u64 {
         self.inner.svm.get_fee_structure().lamports_per_signature
     }
