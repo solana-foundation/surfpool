@@ -1143,6 +1143,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        surfnet::{GeyserEvent, svm::SurfnetSvm},
         tests::helpers::TestSetup,
         types::{SurfnetTransactionStatus, TransactionWithStatusMeta},
     };
@@ -2731,5 +2732,88 @@ mod tests {
             "omitted post config must yield None (got {:?})",
             result.post_execution_accounts,
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_commit_sandbox_stamps_events_with_the_commit_slot() {
+        let (svm, _simnet_rx, geyser_rx) = SurfnetSvm::default();
+        let locker = SurfnetSvmLocker::new(svm);
+        let payer = Keypair::new();
+        let recipient = Pubkey::new_unique();
+        let _ = locker
+            .0
+            .write()
+            .await
+            .airdrop(&payer.pubkey(), 2 * LAMPORTS_PER_SOL);
+        while geyser_rx.try_recv().is_ok() {}
+        let recent_blockhash = locker.with_svm_reader(|svm| svm.latest_blockhash());
+        let tx = build_v0_transaction(
+            &payer.pubkey(),
+            &[&payer],
+            &[system_instruction::transfer(
+                &payer.pubkey(),
+                &recipient,
+                LAMPORTS_PER_SOL,
+            )],
+            &recent_blockhash,
+        );
+        let sig = tx.signatures[0];
+
+        let BundleSandbox {
+            svm: sandbox_svm,
+            geyser_rx: sandbox_geyser_rx,
+            simnet_rx,
+        } = locker.with_svm_reader(|svm| svm.clone_for_bundle_sandbox());
+        let clone_slot = sandbox_svm.get_latest_absolute_slot();
+        let sandbox_locker = SurfnetSvmLocker::new(sandbox_svm);
+        let (status_tx, _status_rx) = crossbeam_channel::bounded(1);
+        sandbox_locker
+            .process_transaction(&None, tx, status_tx, true, true)
+            .await
+            .unwrap();
+
+        // The block tick races the sandbox and closes the slot it was cloned at.
+        locker.with_svm_writer(|svm| svm.confirm_current_block().unwrap());
+        let commit_slot = locker.with_svm_reader(|svm| svm.get_latest_absolute_slot());
+        assert!(commit_slot > clone_slot);
+        while geyser_rx.try_recv().is_ok() {}
+
+        let sandbox_svm = Arc::try_unwrap(sandbox_locker.0).ok().unwrap().into_inner();
+        let (bundle_status_tx, _bundle_status_rx) = crossbeam_channel::unbounded();
+        locker
+            .with_svm_writer(|original| {
+                original.commit_sandbox(
+                    BundleSandbox {
+                        svm: sandbox_svm,
+                        geyser_rx: sandbox_geyser_rx,
+                        simnet_rx,
+                    },
+                    bundle_status_tx,
+                )
+            })
+            .unwrap();
+
+        let mut replayed = 0;
+        while let Ok(event) = geyser_rx.try_recv() {
+            match event {
+                GeyserEvent::NotifyTransaction(meta, _) => {
+                    replayed += 1;
+                    assert_eq!(meta.slot, commit_slot);
+                }
+                GeyserEvent::UpdateAccount(update) => {
+                    replayed += 1;
+                    assert_eq!(update.slot, commit_slot);
+                }
+                _ => {}
+            }
+        }
+        assert!(replayed > 0, "the sandbox's geyser events must be replayed");
+        let stored = locker.with_svm_reader(|svm| {
+            svm.transactions
+                .get(&sig.to_string())
+                .unwrap()
+                .expect("bundle tx must be stored")
+        });
+        assert_eq!(stored.expect_processed().0.slot, commit_slot);
     }
 }

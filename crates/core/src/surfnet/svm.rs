@@ -770,6 +770,27 @@ impl SurfnetSvm {
             simnet_rx,
         } = sandbox;
 
+        // A tick may have closed the clone-time slot while the sandbox ran: stamp everything with the commit slot.
+        let commit_slot = self.get_latest_absolute_slot();
+        // Re-stamped inside the sandbox overlay, so no write reaches `self` after the commit begins.
+        let bundle_signatures: Vec<Signature> = svm
+            .transactions_queued_for_confirmation
+            .iter()
+            .map(|(tx, _, _)| tx.signatures[0])
+            .collect();
+        for sig in &bundle_signatures {
+            if let Some(SurfnetTransactionStatus::Processed(boxed)) =
+                svm.transactions.get(&sig.to_string()).ok().flatten()
+            {
+                let (mut meta, mutated) = *boxed;
+                meta.slot = commit_slot;
+                svm.transactions.store(
+                    sig.to_string(),
+                    SurfnetTransactionStatus::processed(meta, mutated),
+                )?;
+            }
+        }
+
         // 1. Drain all overlay storages onto self's real storages.
         commit_overlay_storage(svm.blocks.as_ref(), self.blocks.as_mut())?;
         commit_overlay_storage(svm.transactions.as_ref(), self.transactions.as_mut())?;
@@ -831,8 +852,8 @@ impl SurfnetSvm {
         // 4. Counter/version/queue state.
         self.transactions_processed = svm.transactions_processed;
         self.write_version = svm.write_version;
-        for (k, v) in svm.account_update_slots.drain() {
-            self.account_update_slots.insert(k, v);
+        for (k, _) in svm.account_update_slots.drain() {
+            self.account_update_slots.insert(k, commit_slot);
         }
         self.perf_samples = svm.perf_samples.clone();
         self.recent_blockhashes = svm.recent_blockhashes.clone();
@@ -862,10 +883,17 @@ impl SurfnetSvm {
 
         // 5. Drain buffered geyser events; replay onto self's real channel; for each
         //    UpdateAccount, also fire account/program subscribers on self's registries.
-        while let Ok(event) = geyser_rx.try_recv() {
-            if let GeyserEvent::UpdateAccount(update) = &event {
-                self.notify_account_subscribers(&update.pubkey, &update.account);
-                self.notify_program_subscribers(&update.pubkey, &update.account);
+        while let Ok(mut event) = geyser_rx.try_recv() {
+            match &mut event {
+                GeyserEvent::UpdateAccount(update) => {
+                    update.slot = commit_slot;
+                    self.notify_account_subscribers(&update.pubkey, &update.account);
+                    self.notify_program_subscribers(&update.pubkey, &update.account);
+                }
+                GeyserEvent::NotifyTransaction(meta, _) => {
+                    meta.slot = commit_slot;
+                }
+                _ => {}
             }
             let _ = self.geyser_events_tx.send(event);
         }
@@ -877,7 +905,7 @@ impl SurfnetSvm {
 
         // 7. Fire signature/logs subscribers and Success acks for each committed tx.
         //    Use the now-committed `self.transactions` storage as the source of err/logs.
-        let slot = self.get_latest_absolute_slot();
+        let slot = commit_slot;
         for sig in &signatures {
             let (err, logs) = match self.transactions.get(&sig.to_string()).ok().flatten() {
                 Some(SurfnetTransactionStatus::Processed(boxed)) => {
