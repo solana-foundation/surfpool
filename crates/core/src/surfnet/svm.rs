@@ -280,6 +280,8 @@ const DEFAULT_LOG_BYTES_LIMIT: Option<usize> = Some(10_000);
 pub struct SurfnetSvmConfig {
     pub surfnet_id: String,
     pub feature_config: SvmFeatureConfig,
+    /// Limit the bundled mainnet feature baseline to this slot before applying overrides.
+    pub fork_slot: Option<Slot>,
     pub slot_time: u64,
     pub instruction_profiling_enabled: bool,
     pub max_profiles: usize,
@@ -292,6 +294,7 @@ impl Default for SurfnetSvmConfig {
         Self {
             surfnet_id: "default".to_string(),
             feature_config: SvmFeatureConfig::default(),
+            fork_slot: None,
             slot_time: DEFAULT_SLOT_TIME_MS,
             instruction_profiling_enabled: true,
             max_profiles: DEFAULT_PROFILING_MAP_CAPACITY,
@@ -497,8 +500,18 @@ fn commit_overlay_storage<K, V>(
 /// then activated on top, and features in `config.disable` are deactivated.
 /// This is the single source of truth for the "mainnet defaults + deltas"
 /// semantic promised by `SvmFeatureConfig`.
-fn compose_feature_set(config: &SvmFeatureConfig) -> FeatureSet {
+fn compose_feature_set(config: &SvmFeatureConfig, fork_slot: Option<Slot>) -> FeatureSet {
     let mut feature_set = LiteSVM::mainnet_feature_set();
+    if let Some(slot) = fork_slot {
+        let future_features: Vec<_> = feature_set
+            .active()
+            .iter()
+            .filter_map(|(id, activated_at)| (*activated_at > slot).then_some(*id))
+            .collect();
+        for id in future_features {
+            feature_set.deactivate(&id);
+        }
+    }
     for pubkey in &config.enable {
         debug!("Activating feature {}", pubkey);
         feature_set.activate(pubkey, 0);
@@ -921,7 +934,7 @@ impl SurfnetSvm {
         // config.enable - config.disable) so that the inner LiteSVM is
         // constructed exactly once, with the correct features and feature
         // accounts loaded. See `compose_feature_set` for the composition rules.
-        let feature_set = compose_feature_set(&config.feature_config);
+        let feature_set = compose_feature_set(&config.feature_config, config.fork_slot);
         let storage_backend = StorageBackend::open(&database_url, &surfnet_id)?;
         let inner = SurfnetLiteSvm::new(&storage_backend, feature_set.clone())?;
 
@@ -5605,6 +5618,7 @@ mod tests {
         let config = SurfnetSvmConfig {
             surfnet_id: "constructor-test".to_string(),
             feature_config: SvmFeatureConfig::new().disable(disable_fees_sysvar::id()),
+            fork_slot: None,
             slot_time: 123,
             instruction_profiling_enabled: false,
             max_profiles: 17,
@@ -5639,6 +5653,7 @@ mod tests {
         let config = SurfnetSvmConfig {
             surfnet_id: "remote-init-test".to_string(),
             feature_config: SvmFeatureConfig::new().disable(disable_fees_sysvar::id()),
+            fork_slot: None,
             slot_time: 321,
             instruction_profiling_enabled: false,
             max_profiles: 23,
@@ -5731,6 +5746,24 @@ mod tests {
             "send should succeed when skip_blockhash_check is enabled: {:?}",
             send_result.err().map(|err| err.err)
         );
+    }
+
+    #[test]
+    fn fork_slot_feature_activation_boundary_and_overrides() {
+        let id = agave_feature_set::disable_fees_sysvar::id();
+        let activation = LiteSVM::mainnet_feature_set().activated_slot(&id).unwrap();
+        for (slot, enabled) in [(activation - 1, false), (activation, true)] {
+            let (svm, _, _) = SurfnetSvm::new(SurfnetSvmConfig {
+                fork_slot: Some(slot),
+                ..Default::default()
+            })
+            .unwrap();
+            assert_eq!(svm.feature_set.is_active(&id), enabled);
+        }
+        let overrides = SvmFeatureConfig::new().enable(id);
+        assert!(compose_feature_set(&overrides, Some(activation - 1)).is_active(&id));
+        let overrides = SvmFeatureConfig::new().disable(id);
+        assert!(!compose_feature_set(&overrides, Some(activation)).is_active(&id));
     }
 
     // Feature configuration tests

@@ -273,10 +273,16 @@ impl SurfnetSvmLocker {
             (epoch_info, epoch_schedule, some_genesis_hash)
         };
         epoch_info.transaction_count = None;
+        let fork_clock = remote_client.get_fork_clock().await?;
 
         self.with_svm_writer(move |svm_writer| {
             svm_writer.cached_genesis_hash = some_genesis_hash;
             svm_writer.initialize(epoch_info, epoch_schedule);
+            if let Some(clock) = fork_clock {
+                svm_writer.updated_at = clock.unix_timestamp as u64 * 1_000;
+                svm_writer.genesis_updated_at = svm_writer.updated_at;
+                svm_writer.inner.set_sysvar(&clock);
+            }
         });
         Ok(())
     }
@@ -1599,6 +1605,32 @@ impl SurfnetSvmLocker {
         pubkey: &Pubkey,
         config: Option<&RpcSignaturesForAddressConfig>,
     ) -> SurfpoolContextualizedResult<Vec<RpcConfirmedTransactionStatusWithSignature>> {
+        let mut historical_config;
+        let config = if let Some((client, _)) = remote_ctx {
+            if client.fork_slot.is_some() {
+                historical_config = config.cloned().unwrap_or_default();
+                let limit = historical_config.limit.unwrap_or(1000);
+                if !(1..=1000).contains(&limit) {
+                    return Err(SurfpoolError::invalid_params(
+                        "Signature limit must be between 1 and 1000",
+                    ));
+                }
+                if historical_config
+                    .min_context_slot
+                    .take()
+                    .is_some_and(|minimum| minimum > self.get_latest_absolute_slot())
+                {
+                    return Err(SurfpoolError::invalid_params(
+                        "Minimum context slot has not been reached",
+                    ));
+                }
+                Some(&historical_config)
+            } else {
+                config
+            }
+        } else {
+            config
+        };
         let results = if let Some((remote_client, _)) = remote_ctx {
             self.get_signatures_for_address_local_then_remote(remote_client, pubkey, config)
                 .await?
@@ -2681,8 +2713,17 @@ impl SurfnetSvmLocker {
         };
         epoch_info.transaction_count = None;
 
+        let fork_clock = match remote_ctx {
+            Some(client) => client.get_fork_clock().await?,
+            None => None,
+        };
         self.with_svm_writer(move |svm_writer| {
             let _ = svm_writer.reset_network(epoch_info, epoch_schedule);
+            if let Some(clock) = fork_clock {
+                svm_writer.updated_at = clock.unix_timestamp as u64 * 1_000;
+                svm_writer.genesis_updated_at = svm_writer.updated_at;
+                svm_writer.inner.set_sysvar(&clock);
+            }
             let _ = svm_writer.offline_accounts.clear();
         });
         Ok(())
@@ -2900,8 +2941,19 @@ impl SurfnetSvmLocker {
             inner: local_accounts,
         } = self.get_token_accounts_by_owner_local(owner, filter, config)?;
 
+        let mut remote_config = config.clone();
+        if remote_client.fork_slot.is_some()
+            && remote_config
+                .min_context_slot
+                .take()
+                .is_some_and(|minimum| minimum > slot)
+        {
+            return Err(SurfpoolError::invalid_params(
+                "Minimum context slot has not been reached",
+            ));
+        }
         let remote_accounts = remote_client
-            .get_token_accounts_by_owner(owner, filter, config)
+            .get_token_accounts_by_owner(owner, filter, &remote_config)
             .await?;
 
         let mut combined_accounts = remote_accounts;
@@ -4710,6 +4762,7 @@ mod tests {
         let expected_hash = Hash::new_from_array([8; 32]);
         let requests = Arc::new(AtomicUsize::new(0));
         let remote_client = SurfnetRemoteClient {
+            fork_slot: None,
             client: RpcClient::new_sender(
                 StartupRpcSender {
                     genesis_hash: expected_hash,

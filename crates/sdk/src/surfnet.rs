@@ -194,6 +194,7 @@ impl SurfnetBuilder {
             max_profiles: surfpool_config.simnets[0].max_profiles,
             log_bytes_limit: surfpool_config.simnets[0].log_bytes_limit,
             feature_config,
+            fork_slot: surfpool_config.simnets[0].fork_slot,
             skip_blockhash_check,
         };
         let (surfnet_svm, simnet_events_rx, geyser_events_rx) = SurfnetSvm::new(svm_config)

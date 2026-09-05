@@ -56,6 +56,14 @@ Surfpool Cloud extends that same experience to the cloud — letting you index m
 With Surfpool Scenarios you can curate slot-by-slot account states for key accounts, mixing live mainnet data with overridden account states.
 This allows you to stress test your protocol in key real-world situations and to reproduce any chain-state conditions. See the [Scenarios Docs](./crates/core/src/scenarios/README.md) for more details.
 
+## Historical forks
+
+`surfpool start --rpc-url <URL> --fork-slot <SLOT>` is intended to behave as if
+`--rpc-url` pointed to a historical RPC frozen at that slot. Surfpool still runs
+local transactions and advances slots; remote state stays pinned.
+
+Requires Alchemy's [Account Archive](https://www.alchemy.com/docs/solana/account-archive) APIs; ordinary archival. Certain methods like historical program/delegate scans, rankings and aggregate supply aren't supported. Large signature histories can time out while paging back to the fork slot.
+
 ## Installation
 
 Surfpool installer:
