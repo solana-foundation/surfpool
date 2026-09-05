@@ -6,7 +6,8 @@ use std::{
 use blake3::Hash;
 use crossbeam_channel::Sender;
 use jsonrpc_core::{
-    BoxFuture, Error, ErrorCode, FutureResponse, Metadata, Middleware, Request, Response,
+    BoxFuture, Call, Error, ErrorCode, FutureResponse, Metadata, Middleware, Output, Request,
+    Response,
     futures::{FutureExt, future::Either},
     middleware,
 };
@@ -138,6 +139,87 @@ impl SurfpoolMiddleware {
             plugin_commands_tx,
         }
     }
+
+    /// `Some` when the call must not reach the handler. Cheatcode gating sits above the method
+    /// table rather than in it, so it has to run once per batch element, not once per request.
+    fn disabled_cheatcode_error(&self, method_name: &str) -> Option<Error> {
+        if !method_name.starts_with("surfnet_") {
+            return None;
+        }
+
+        let Ok(cheatcode_config) = self.cheatcode_config.lock() else {
+            warn!("Request rejected due to cheatcode being disabled");
+            return Some(Error {
+                code: ErrorCode::InternalError,
+                message: "An internal server error occured".to_string(),
+                data: None,
+            });
+        };
+
+        if !cheatcode_config.is_cheatcode_disabled(&method_name.to_string()) {
+            return None;
+        }
+
+        warn!("Request rejected due to cheatcode rpc method being disabled");
+        Some(Error {
+            code: ErrorCode::InvalidRequest,
+            message: format!("Cheatcode rpc method: {method_name} is currently disabled"),
+            data: None,
+        })
+    }
+
+    fn dispatch_batch<F, X>(
+        &self,
+        calls: Vec<Call>,
+        meta: Option<RunloopContext>,
+        next: F,
+    ) -> Either<FutureResponse, X>
+    where
+        F: FnOnce(Request, Option<RunloopContext>) -> X + Send,
+        X: Future<Output = Option<Response>> + Send + 'static,
+    {
+        let mut forwarded = Vec::with_capacity(calls.len());
+        let mut rejected = Vec::new();
+
+        for call in calls {
+            // A malformed element carries no method to gate; the handler answers it per element.
+            let method_name = match &call {
+                Call::MethodCall(method_call) => Some(method_call.method.as_str()),
+                Call::Notification(notification) => Some(notification.method.as_str()),
+                Call::Invalid { .. } => None,
+            };
+
+            match method_name.and_then(|name| self.disabled_cheatcode_error(name)) {
+                None => forwarded.push(call),
+                // A notification is answered by nothing at all, gated or not.
+                Some(error) => {
+                    if let Call::MethodCall(method_call) = call {
+                        rejected.push(Output::from(
+                            Err(error),
+                            method_call.id,
+                            method_call.jsonrpc,
+                        ));
+                    }
+                }
+            }
+        }
+
+        if forwarded.is_empty() {
+            let response = (!rejected.is_empty()).then_some(Response::Batch(rejected));
+            return Either::Left(Box::pin(async move { response }));
+        }
+
+        // Order is not part of the batch contract: clients correlate on `id`.
+        Either::Left(Box::pin(next(Request::Batch(forwarded), meta).map(
+            move |res| match res {
+                Some(Response::Batch(mut outputs)) => {
+                    outputs.extend(rejected);
+                    Some(Response::Batch(outputs))
+                }
+                _ => (!rejected.is_empty()).then_some(Response::Batch(rejected)),
+            },
+        )))
+    }
 }
 
 impl Middleware<Option<RunloopContext>> for SurfpoolMiddleware {
@@ -154,7 +236,25 @@ impl Middleware<Option<RunloopContext>> for SurfpoolMiddleware {
         F: FnOnce(Request, Option<RunloopContext>) -> X + Send,
         X: Future<Output = Option<Response>> + Send + 'static,
     {
-        let Request::Single(jsonrpc_core::Call::MethodCall(ref method_call)) = request else {
+        let meta = Some(RunloopContext {
+            id: None,
+            svm_locker: self.surfnet_svm.clone(),
+            simnet_commands_tx: self.simnet_commands_tx.clone(),
+            remote_rpc_client: self.remote_rpc_client.clone(),
+            rpc_config: self.config.clone(),
+            cheatcode_config: self.cheatcode_config.clone(),
+            plugin_commands_tx: self.plugin_commands_tx.clone(),
+        });
+
+        let Request::Single(Call::MethodCall(ref method_call)) = request else {
+            // JSON-RPC 2.0 §6: an empty array is not a batch and answers with one Invalid
+            // Request object, which is what the arm below already returns.
+            if let Request::Batch(calls) = request
+                && !calls.is_empty()
+            {
+                return self.dispatch_batch(calls, meta, next);
+            }
+
             let error = Response::from(
                 Error {
                     code: ErrorCode::InvalidRequest,
@@ -171,48 +271,9 @@ impl Middleware<Option<RunloopContext>> for SurfpoolMiddleware {
         let method_name = method_call.method.clone();
         debug!("Processing request '{}'", method_name);
 
-        let meta = Some(RunloopContext {
-            id: None,
-            svm_locker: self.surfnet_svm.clone(),
-            simnet_commands_tx: self.simnet_commands_tx.clone(),
-            remote_rpc_client: self.remote_rpc_client.clone(),
-            rpc_config: self.config.clone(),
-            cheatcode_config: self.cheatcode_config.clone(),
-            plugin_commands_tx: self.plugin_commands_tx.clone(),
-        });
-
-        // All surfnet cheatcodes will start with surfnet. If the request is a cheatcode, make sure it isn't disabled.
-        if method_name.starts_with("surfnet_")
-            && let Some(meta_val) = meta.clone()
-        {
-            let Ok(meta_val) = meta_val.cheatcode_config.lock() else {
-                let error = Response::from(
-                    Error {
-                        code: ErrorCode::InternalError,
-                        message: "An internal server error occured".to_string(),
-                        data: None,
-                    },
-                    None,
-                );
-                warn!("Request rejected due to cheatcode being disabled");
-
-                return Either::Left(Box::pin(async move { Some(error) }));
-            };
-            if meta_val.is_cheatcode_disabled(&method_name) {
-                let error = Response::from(
-                    Error {
-                        code: ErrorCode::InvalidRequest,
-                        message: format!(
-                            "Cheatcode rpc method: {method_name} is currently disabled"
-                        ),
-                        data: None,
-                    },
-                    None,
-                );
-                warn!("Request rejected due to cheatcode rpc method being disabled");
-
-                return Either::Left(Box::pin(async move { Some(error) }));
-            }
+        if let Some(error) = self.disabled_cheatcode_error(&method_name) {
+            let error = Response::from(error, None);
+            return Either::Left(Box::pin(async move { Some(error) }));
         }
 
         Either::Left(Box::pin(next(request, meta).map(move |res| {
@@ -373,4 +434,108 @@ pub fn not_implemented_err_async<T>(method: &str) -> BoxFuture<Result<T, Error>>
             data: None,
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use jsonrpc_core::{MetaIoHandler, Value};
+    use serde_json::json;
+
+    use super::*;
+
+    /// A handler carrying the real middleware, one plain method and one cheatcode, so the tests
+    /// exercise the batch path end to end rather than the middleware in isolation.
+    fn test_handler() -> MetaIoHandler<Option<RunloopContext>, SurfpoolMiddleware> {
+        let (surfnet_svm, _events_rx, _) = SurfnetSvm::default();
+        let (simnet_commands_tx, _rx) = crossbeam_channel::unbounded();
+        let (plugin_commands_tx, _rx) = crossbeam_channel::unbounded();
+
+        let middleware = SurfpoolMiddleware::new(
+            SurfnetSvmLocker::new(surfnet_svm),
+            &simnet_commands_tx,
+            &RpcConfig::default(),
+            &None,
+            plugin_commands_tx,
+        );
+        middleware
+            .cheatcode_config
+            .lock()
+            .unwrap()
+            .disable_cheatcode(&"surfnet_setAccount".to_string())
+            .unwrap();
+
+        let mut io = MetaIoHandler::with_middleware(middleware);
+        io.add_method_with_meta("getSlot", |_params, _meta| async { Ok(Value::from(45)) });
+        io.add_method_with_meta("surfnet_setAccount", |_params, _meta| async {
+            Ok(Value::Null)
+        });
+        io
+    }
+
+    #[tokio::test]
+    async fn batch_of_method_calls_is_answered_with_an_array() {
+        let request = r#"[{"jsonrpc":"2.0","id":1,"method":"getSlot"},{"jsonrpc":"2.0","id":2,"method":"getSlot"}]"#;
+
+        let response = test_handler().handle_request(request, None).await.unwrap();
+
+        assert_eq!(
+            serde_json::from_str::<Value>(&response).unwrap(),
+            json!([
+                {"jsonrpc": "2.0", "result": 45, "id": 1},
+                {"jsonrpc": "2.0", "result": 45, "id": 2}
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn notifications_are_omitted_from_the_batch_response() {
+        let request =
+            r#"[{"jsonrpc":"2.0","method":"getSlot"},{"jsonrpc":"2.0","id":2,"method":"getSlot"}]"#;
+
+        let response = test_handler().handle_request(request, None).await.unwrap();
+
+        assert_eq!(
+            serde_json::from_str::<Value>(&response).unwrap(),
+            json!([{"jsonrpc": "2.0", "result": 45, "id": 2}])
+        );
+    }
+
+    #[tokio::test]
+    async fn all_notification_batch_is_answered_with_nothing() {
+        let request =
+            r#"[{"jsonrpc":"2.0","method":"getSlot"},{"jsonrpc":"2.0","method":"getSlot"}]"#;
+
+        assert_eq!(test_handler().handle_request(request, None).await, None);
+    }
+
+    #[tokio::test]
+    async fn a_rejected_element_fails_alone() {
+        let request = r#"[{"jsonrpc":"2.0","id":1,"method":"getSlot"},{"jsonrpc":"2.0","id":2,"method":"surfnet_setAccount"}]"#;
+
+        let response = test_handler().handle_request(request, None).await.unwrap();
+
+        assert_eq!(
+            serde_json::from_str::<Value>(&response).unwrap(),
+            json!([
+                {"jsonrpc": "2.0", "result": 45, "id": 1},
+                {"jsonrpc": "2.0", "error": {
+                    "code": -32600,
+                    "message": "Cheatcode rpc method: surfnet_setAccount is currently disabled"
+                }, "id": 2}
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_batch_is_answered_with_one_invalid_request() {
+        let response = test_handler().handle_request("[]", None).await.unwrap();
+
+        assert_eq!(
+            serde_json::from_str::<Value>(&response).unwrap(),
+            json!({
+                "error": {"code": -32600, "message": "Only method calls are supported"},
+                "id": null
+            })
+        );
+    }
 }
