@@ -1,7 +1,7 @@
 use std::{fmt::Display, future::Future, pin::Pin};
 
 use crossbeam_channel::TrySendError;
-use jsonrpc_core::{Error, Result};
+use jsonrpc_core::{Error, ErrorCode, Result};
 use litesvm::error::LiteSVMError;
 use serde::Serialize;
 use serde_json::json;
@@ -15,6 +15,9 @@ use solana_transaction_status::EncodeError;
 use crate::storage::StorageError;
 
 pub type SurfpoolResult<T> = std::result::Result<T, SurfpoolError>;
+
+/// JSON-RPC server error code carried by [`SurfpoolError::stale_bundle_sandbox`].
+pub const STALE_BUNDLE_SANDBOX_CODE: i64 = -32_090;
 
 #[derive(Debug, Clone)]
 pub struct SurfpoolError(Error);
@@ -282,6 +285,21 @@ impl SurfpoolError {
         let mut error = Error::invalid_params(format!("Invalid pubkey '{pubkey}'"));
         error.data = Some(json!(data));
         Self(error)
+    }
+
+    /// A bundle sandbox the surfnet has written past; `send_bundle` re-runs the bundle on the new state.
+    pub fn stale_bundle_sandbox(writes_since_clone: u64) -> Self {
+        Self(Error {
+            code: ErrorCode::ServerError(STALE_BUNDLE_SANDBOX_CODE),
+            message: format!(
+                "bundle sandbox is stale: {writes_since_clone} account write(s) landed on the surfnet since it was cloned"
+            ),
+            data: None,
+        })
+    }
+
+    pub fn is_stale_bundle_sandbox(&self) -> bool {
+        self.0.code == ErrorCode::ServerError(STALE_BUNDLE_SANDBOX_CODE)
     }
 
     /// Generic `Invalid params` error carrying a free-form message.
