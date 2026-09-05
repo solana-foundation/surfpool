@@ -1399,6 +1399,7 @@ pub trait Full {
     /// # Notes
     /// - This method is useful for estimating fees before submitting transactions.
     /// - It helps users decide whether to rebroadcast or update a transaction.
+    /// - The fee covers the base signature fee plus the prioritization fee the message requests.
     ///
     /// # See Also
     /// - `sendTransaction`, `simulateTransaction`
@@ -2538,9 +2539,12 @@ impl Full for SurfpoolFullRpc {
             .into());
         }
 
+        let fee = svm_locker
+            .with_svm_reader(|svm_reader| svm_reader.estimate_fee_for_message(&message))?;
+
         Ok(RpcResponse {
             context: RpcResponseContext::new(slot),
-            value: Some((message.header().num_required_signatures as u64) * 5000),
+            value: Some(fee),
         })
     }
 
@@ -2753,7 +2757,7 @@ mod tests {
     use solana_instruction::Instruction;
     use solana_keypair::Keypair;
     use solana_message::{
-        MessageHeader,
+        AddressLookupTableAccount, MessageHeader,
         legacy::Message as LegacyMessage,
         v0::Message as V0Message,
         v1::{MAX_TRANSACTION_SIZE, Message as V1Message, TransactionConfig},
@@ -3044,6 +3048,136 @@ mod tests {
         assert_eq!(
             get_fee_with_wrong_mint_slot_fail_result.err().unwrap(),
             wrong_min_slot_expected_err.err().unwrap()
+        );
+    }
+
+    fn get_fee_for_message(setup: &TestSetup<SurfpoolFullRpc>, message: &VersionedMessage) -> u64 {
+        let encoded =
+            BASE64_STANDARD.encode(wincode::serialize(message).expect("message serialization"));
+
+        setup
+            .rpc
+            .get_fee_for_message(Some(setup.context.clone()), encoded, None)
+            .expect("get_fee_for_message")
+            .value
+            .expect("fee")
+    }
+
+    /// 50_000 micro-lamports over a 300_000 CU limit is 15_000 lamports of prioritization fee.
+    #[test_case(TransactionVersion::Legacy(Legacy::Legacy) ; "Legacy transactions")]
+    #[test_case(TransactionVersion::Number(0) ; "V0 transactions")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_fee_for_message_includes_compute_budget_priority_fee(
+        version: TransactionVersion,
+    ) {
+        let setup = TestSetup::new(SurfpoolFullRpc);
+        let payer = Keypair::new();
+        let recipient = Pubkey::new_unique();
+
+        let instructions = [
+            ComputeBudgetInstruction::set_compute_unit_limit(300_000),
+            ComputeBudgetInstruction::set_compute_unit_price(50_000),
+            transfer(&payer.pubkey(), &recipient, LAMPORTS_PER_SOL),
+        ];
+        let latest_blockhash = setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm| svm.latest_blockhash());
+
+        let transaction = match version {
+            TransactionVersion::Number(0) => {
+                build_v0_transaction(&payer.pubkey(), &[&payer], &instructions, &latest_blockhash)
+            }
+            _ => build_legacy_transaction(
+                &payer.pubkey(),
+                &[&payer],
+                &instructions,
+                &latest_blockhash,
+            ),
+        };
+
+        assert_eq!(
+            get_fee_for_message(&setup, &transaction.message),
+            5_000 + 15_000
+        );
+    }
+
+    /// A V0 message that loads accounts from a lookup table is priced without resolving it:
+    /// v0 sanitization keeps program ids out of lookup tables.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_fee_for_message_with_address_lookup_table() {
+        let setup = TestSetup::new(SurfpoolFullRpc);
+        let payer = Keypair::new();
+        let recipient = Pubkey::new_unique();
+        let lookup_table = AddressLookupTableAccount {
+            key: Pubkey::new_unique(),
+            addresses: vec![recipient],
+        };
+
+        let instructions = [
+            ComputeBudgetInstruction::set_compute_unit_limit(300_000),
+            ComputeBudgetInstruction::set_compute_unit_price(50_000),
+            transfer(&payer.pubkey(), &recipient, LAMPORTS_PER_SOL),
+        ];
+        let latest_blockhash = setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm| svm.latest_blockhash());
+
+        let message = V0Message::try_compile(
+            &payer.pubkey(),
+            &instructions,
+            &[lookup_table],
+            latest_blockhash,
+        )
+        .unwrap();
+        assert!(
+            !message.address_table_lookups.is_empty(),
+            "the message must use the lookup table for this test to mean anything"
+        );
+
+        assert_eq!(
+            get_fee_for_message(&setup, &VersionedMessage::V0(message)),
+            5_000 + 15_000
+        );
+    }
+
+    /// V1 carries the prioritization fee in the message config, not ComputeBudget instructions.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_fee_for_message_includes_v1_config_priority_fee() {
+        let setup = TestSetup::new(SurfpoolFullRpc);
+        let payer = Keypair::new();
+        let recipient = Pubkey::new_unique();
+        let instructions = [transfer(&payer.pubkey(), &recipient, LAMPORTS_PER_SOL)];
+        let latest_blockhash = setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm| svm.latest_blockhash());
+
+        let build = |config: TransactionConfig| {
+            VersionedMessage::V1(
+                V1Message::try_compile_with_config(
+                    &payer.pubkey(),
+                    &instructions,
+                    latest_blockhash,
+                    config,
+                )
+                .unwrap(),
+            )
+        };
+
+        let without_priority_fee =
+            build(TransactionConfig::empty().with_compute_unit_limit(20_000));
+        let with_priority_fee = build(
+            TransactionConfig::empty()
+                .with_compute_unit_limit(20_000)
+                .with_priority_fee(25_000),
+        );
+
+        assert_eq!(get_fee_for_message(&setup, &without_priority_fee), 5_000);
+        assert_eq!(
+            get_fee_for_message(&setup, &with_priority_fee),
+            5_000 + 25_000
         );
     }
 

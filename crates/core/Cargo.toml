@@ -58,6 +58,7 @@ solana-commitment-config = { workspace = true }
 solana-compute-budget-interface = { workspace = true }
 solana-epoch-info = { workspace = true }
 solana-epoch-schedule = { workspace = true }
+solana-fee = { workspace = true }
 solana-feature-gate-interface = { workspace = true }
 solana-genesis-config = { workspace = true }
 solana-hash = { workspace = true }
@@ -74,6 +75,7 @@ solana-pubkey = { workspace = true }
 solana-rpc-client = { workspace = true }
 solana-rpc-client-api = { workspace = true }
 solana-runtime = { workspace = true }
+solana-runtime-transaction = { workspace = true }
 solana-sdk-ids = { workspace = true }
 solana-signature = { workspace = true, features = ["rand"] }
 solana-signer = { workspace = true }

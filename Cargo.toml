@@ -85,7 +85,11 @@ juniper_codegen = { version = "0.16.0", default-features = false }
 juniper_graphql_ws = { version = "0.4.0", default-features = false }
 lazy_static = "1.5.0"
 libloading = "0.7.4"
-litesvm = { version = "0.16.0", features = ["nodejs-internal", "precompiles"] }
+litesvm = { version = "0.16.0", features = [
+    "nodejs-internal",
+    "persistence-internal",
+    "precompiles",
+] }
 litesvm-token = { version = "0.16.0" }
 log = "0.4.27"
 mime_guess = { version = "2.0.4", default-features = false }
@@ -118,6 +122,7 @@ solana-compute-budget-interface = { version = "~3.0", default-features = false }
 solana-epoch-info = { version = "3.1", default-features = false }
 solana-epoch-schedule = { version = "~3.2", default-features = false }
 solana-ed25519-program = { version = "3.0", default-features = false }
+solana-fee = { version = "4.2", default-features = false, features = ["agave-unstable-api"] }
 solana-feature-gate-interface = { version = "3.1", default-features = false }
 solana-genesis-config = { version = "4.0", default-features = false }
 solana-hash = { version = "~4.5", default-features = false }
@@ -135,6 +140,9 @@ solana-pubkey = { version = "3.0", default-features = false }
 solana-rpc-client = { version = "4.0", default-features = false }
 solana-rpc-client-api = { version = "4.0", default-features = false }
 solana-runtime = { version = "4.2", default-features = false, features = ["agave-unstable-api"] }
+solana-runtime-transaction = { version = "4.2", default-features = false, features = [
+    "agave-unstable-api",
+] }
 solana-sdk-ids = { version = "3.1", default-features = false }
 solana-signature = { version = "~3.4", default-features = false, features = [
     "rand",
