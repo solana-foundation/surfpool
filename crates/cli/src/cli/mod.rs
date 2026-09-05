@@ -266,6 +266,14 @@ pub struct StartNetworkOptions {
         long_help = "Fork from this datasource RPC URL. Cannot be used with --network.\n\nThis can also be set with SURFPOOL_DATASOURCE_RPC_URL.\n\nExample: surfpool start --rpc-url https://api.mainnet-beta.solana.com"
     )]
     pub rpc_url: Option<String>,
+    /// Load remote accounts at a finalized slot (requires Alchemy Account Archive support).
+    #[arg(
+        long,
+        value_name = "SLOT",
+        requires = "rpc_url",
+        conflicts_with = "offline"
+    )]
+    pub fork_slot: Option<u64>,
     /// Fork from a predefined Solana network.
     #[arg(
         long = "network",
@@ -647,6 +655,7 @@ impl StartSimnet {
         SurfnetSvmConfig {
             surfnet_id: self.accounts.surfnet_id.clone(),
             feature_config: self.feature_config(),
+            fork_slot: self.network.fork_slot,
             slot_time: self.svm.slot_time,
             instruction_profiling_enabled: !self.observability.disable_instruction_profiling,
             max_profiles: self.observability.max_profiles,
@@ -672,6 +681,7 @@ impl StartSimnet {
 
         SimnetConfig {
             remote_rpc_url,
+            fork_slot: self.network.fork_slot,
             slot_time: self.svm.slot_time,
             block_production_mode: self.svm.block_production_mode.clone(),
             airdrop_addresses,
