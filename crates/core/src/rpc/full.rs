@@ -2088,12 +2088,20 @@ impl Full for SurfpoolFullRpc {
         meta: Self::Metadata,
         slot: Slot,
     ) -> BoxFuture<Result<Option<UnixTimestamp>>> {
-        let svm_locker = match meta.get_svm_locker() {
-            Ok(locker) => locker,
+        let SurfnetRpcContext {
+            svm_locker,
+            remote_ctx,
+        } = match meta.get_rpc_context(()) {
+            Ok(context) => context,
             Err(e) => return e.into(),
         };
 
         Box::pin(async move {
+            if let Some((client, _)) = &remote_ctx
+                && slot < svm_locker.with_svm_reader(|svm| svm.genesis_slot)
+            {
+                return client.get_block_time(slot).await.map_err(Into::into);
+            }
             let block_time = svm_locker.with_svm_reader(|svm_reader| {
                 Ok::<_, jsonrpc_core::Error>(match svm_reader.blocks.get(&slot)? {
                     Some(block) => Some(block.block_time),
@@ -2303,10 +2311,12 @@ impl Full for SurfpoolFullRpc {
                     let remote_end = committed_latest_slot.min(local_min.saturating_sub(1));
                     if start_slot <= remote_end {
                         remote_client
-                            .client
-                            .get_blocks(start_slot, Some(remote_end))
+                            .get_blocks_with_limit(start_slot, limit)
                             .await
                             .unwrap_or_else(|_| vec![])
+                            .into_iter()
+                            .take_while(|slot| *slot <= remote_end)
+                            .collect()
                     } else {
                         vec![]
                     }
@@ -2319,10 +2329,12 @@ impl Full for SurfpoolFullRpc {
                     .as_ref()
                     .unwrap()
                     .0
-                    .client
-                    .get_blocks(start_slot, Some(committed_latest_slot))
+                    .get_blocks_with_limit(start_slot, limit)
                     .await
                     .unwrap_or_else(|_| vec![])
+                    .into_iter()
+                    .take_while(|slot| *slot <= committed_latest_slot)
+                    .collect()
             } else {
                 vec![]
             };

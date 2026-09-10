@@ -856,6 +856,9 @@ pub enum StartupPlanner {
 pub struct SimnetConfig {
     pub offline_mode: bool,
     pub remote_rpc_url: Option<String>,
+    /// Finalized slot used for remote account reads. Requires an account archive RPC.
+    #[serde(default)]
+    pub fork_slot: Option<u64>,
     pub slot_time: u64,
     pub block_production_mode: BlockProductionMode,
     pub airdrop_addresses: Vec<Pubkey>,
@@ -880,6 +883,7 @@ impl Default for SimnetConfig {
         Self {
             offline_mode: false,
             remote_rpc_url: Some(DEFAULT_MAINNET_RPC_URL.to_string()),
+            fork_slot: None,
             slot_time: DEFAULT_SLOT_TIME_MS, // Default to 400ms to match CLI default
             block_production_mode: BlockProductionMode::Clock,
             airdrop_addresses: vec![],
