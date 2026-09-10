@@ -1605,32 +1605,25 @@ impl SurfnetSvmLocker {
         pubkey: &Pubkey,
         config: Option<&RpcSignaturesForAddressConfig>,
     ) -> SurfpoolContextualizedResult<Vec<RpcConfirmedTransactionStatusWithSignature>> {
-        let mut historical_config;
-        let config = if let Some((client, _)) = remote_ctx {
-            if client.fork_slot.is_some() {
-                historical_config = config.cloned().unwrap_or_default();
-                let limit = historical_config.limit.unwrap_or(1000);
-                if !(1..=1000).contains(&limit) {
-                    return Err(SurfpoolError::invalid_params(
-                        "Signature limit must be between 1 and 1000",
-                    ));
-                }
-                if historical_config
-                    .min_context_slot
-                    .take()
-                    .is_some_and(|minimum| minimum > self.get_latest_absolute_slot())
-                {
-                    return Err(SurfpoolError::invalid_params(
-                        "Minimum context slot has not been reached",
-                    ));
-                }
-                Some(&historical_config)
-            } else {
-                config
+        let mut config = config.cloned();
+        if let Some(config) = config.as_mut() {
+            if !(1..=1000).contains(&config.limit.unwrap_or(1000)) {
+                return Err(SurfpoolError::invalid_params(
+                    "Signature limit must be between 1 and 1000",
+                ));
             }
-        } else {
-            config
-        };
+            // Validate local progress; this is not a filter on transaction slots.
+            if config
+                .min_context_slot
+                .take()
+                .is_some_and(|min| min > self.get_latest_absolute_slot())
+            {
+                return Err(SurfpoolError::invalid_params(
+                    "Minimum context slot has not been reached",
+                ));
+            }
+        }
+        let config = config.as_ref();
         let results = if let Some((remote_client, _)) = remote_ctx {
             self.get_signatures_for_address_local_then_remote(remote_client, pubkey, config)
                 .await?
@@ -2883,6 +2876,14 @@ impl SurfnetSvmLocker {
         config: &RpcAccountInfoConfig,
     ) -> SurfpoolContextualizedResult<Vec<RpcKeyedAccount>> {
         let result = self.with_contextualized_svm_reader(|svm_reader| {
+            if config
+                .min_context_slot
+                .is_some_and(|min| min > svm_reader.get_latest_absolute_slot())
+            {
+                return Err(SurfpoolError::invalid_params(
+                    "Minimum context slot has not been reached",
+                ));
+            }
             svm_reader
                 .get_parsed_token_accounts_by_owner(&owner)
                 .iter()
@@ -2942,16 +2943,8 @@ impl SurfnetSvmLocker {
         } = self.get_token_accounts_by_owner_local(owner, filter, config)?;
 
         let mut remote_config = config.clone();
-        if remote_client.fork_slot.is_some()
-            && remote_config
-                .min_context_slot
-                .take()
-                .is_some_and(|minimum| minimum > slot)
-        {
-            return Err(SurfpoolError::invalid_params(
-                "Minimum context slot has not been reached",
-            ));
-        }
+        // The minimum context slot was validated against the local result above.
+        remote_config.min_context_slot = None;
         let remote_accounts = remote_client
             .get_token_accounts_by_owner(owner, filter, &remote_config)
             .await?;
@@ -6383,6 +6376,73 @@ mod tests {
             .iter()
             .map(|s| s.signature.clone())
             .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_signatures_for_address_validates_config_in_all_modes() {
+        let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let locker = SurfnetSvmLocker::new(svm);
+        let pubkey = Pubkey::new_unique();
+        let signature = Signature::new_unique();
+        seed_signature_history(&locker, &pubkey, &[(90, vec![signature])]);
+        locker.with_svm_writer(|svm| svm.latest_epoch_info.absolute_slot = 100);
+
+        for remote_mode in [None, Some(None), Some(Some(80))] {
+            let remote_ctx = remote_mode.map(|fork_slot| {
+                (
+                    SurfnetRemoteClient {
+                        fork_slot,
+                        client: RpcClient::new_mock("fails".to_string()).into(),
+                    },
+                    (),
+                )
+            });
+            for limit in [0, 1001] {
+                let error = locker
+                    .get_signatures_for_address(
+                        &remote_ctx,
+                        &pubkey,
+                        Some(&RpcSignaturesForAddressConfig {
+                            limit: Some(limit),
+                            ..Default::default()
+                        }),
+                    )
+                    .await
+                    .err()
+                    .expect("invalid config must be rejected");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("Signature limit must be between 1 and 1000")
+                );
+            }
+            let mut config = RpcSignaturesForAddressConfig {
+                limit: Some(1),
+                min_context_slot: Some(101),
+                ..Default::default()
+            };
+            let error = locker
+                .get_signatures_for_address(&remote_ctx, &pubkey, Some(&config))
+                .await
+                .err()
+                .expect("invalid config must be rejected");
+            assert!(
+                error
+                    .to_string()
+                    .contains("Minimum context slot has not been reached")
+            );
+
+            // A satisfied context requirement must still return older local signatures.
+            config.min_context_slot = Some(100);
+            let result = locker
+                .get_signatures_for_address(&remote_ctx, &pubkey, Some(&config))
+                .await
+                .unwrap()
+                .inner;
+            assert_eq!(result.len(), 1);
+            assert_eq!(result[0].signature, signature.to_string());
+            assert_eq!(config.min_context_slot, Some(100));
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

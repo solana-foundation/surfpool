@@ -2098,7 +2098,6 @@ impl Full for SurfpoolFullRpc {
 
         Box::pin(async move {
             if let Some((client, _)) = &remote_ctx
-                && client.fork_slot.is_some()
                 && slot < svm_locker.with_svm_reader(|svm| svm.genesis_slot)
             {
                 return client.get_block_time(slot).await.map_err(Into::into);
@@ -2212,8 +2211,10 @@ impl Full for SurfpoolFullRpc {
                     let remote_end = effective_end_slot.min(local_min.saturating_sub(1));
                     if start_slot <= remote_end {
                         remote_client
+                            .client
                             .get_blocks(start_slot, Some(remote_end))
-                            .await?
+                            .await
+                            .unwrap_or_else(|_| vec![])
                     } else {
                         vec![]
                     }
@@ -2225,8 +2226,10 @@ impl Full for SurfpoolFullRpc {
                     .as_ref()
                     .unwrap()
                     .0
+                    .client
                     .get_blocks(start_slot, Some(effective_end_slot))
-                    .await?
+                    .await
+                    .unwrap_or_else(|_| vec![])
             } else {
                 vec![]
             };
@@ -2307,18 +2310,13 @@ impl Full for SurfpoolFullRpc {
                 if start_slot < local_min {
                     let remote_end = committed_latest_slot.min(local_min.saturating_sub(1));
                     if start_slot <= remote_end {
-                        if remote_client.fork_slot.is_some() {
-                            remote_client
-                                .get_blocks_with_limit(start_slot, limit)
-                                .await?
-                                .into_iter()
-                                .take_while(|slot| *slot <= remote_end)
-                                .collect()
-                        } else {
-                            remote_client
-                                .get_blocks(start_slot, Some(remote_end))
-                                .await?
-                        }
+                        remote_client
+                            .get_blocks_with_limit(start_slot, limit)
+                            .await
+                            .unwrap_or_else(|_| vec![])
+                            .into_iter()
+                            .take_while(|slot| *slot <= remote_end)
+                            .collect()
                     } else {
                         vec![]
                     }
@@ -2331,8 +2329,12 @@ impl Full for SurfpoolFullRpc {
                     .as_ref()
                     .unwrap()
                     .0
-                    .get_blocks(start_slot, Some(committed_latest_slot))
-                    .await?
+                    .get_blocks_with_limit(start_slot, limit)
+                    .await
+                    .unwrap_or_else(|_| vec![])
+                    .into_iter()
+                    .take_while(|slot| *slot <= committed_latest_slot)
+                    .collect()
             } else {
                 vec![]
             };

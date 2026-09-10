@@ -266,7 +266,8 @@ pub struct StartNetworkOptions {
         long_help = "Fork from this datasource RPC URL. Cannot be used with --network.\n\nThis can also be set with SURFPOOL_DATASOURCE_RPC_URL.\n\nExample: surfpool start --rpc-url https://api.mainnet-beta.solana.com"
     )]
     pub rpc_url: Option<String>,
-    /// Load remote accounts at a finalized slot (requires Alchemy Account Archive support).
+    /// Load remote accounts at a finalized slot. Currently, only Alchemy Account Archive supports
+    /// this.
     #[arg(
         long,
         value_name = "SLOT",

@@ -8,7 +8,7 @@ use std::{
 use async_trait::async_trait;
 use serde_json::json;
 use solana_account::Account;
-use solana_account_decoder::UiAccount;
+use solana_account_decoder::{UiAccount, UiAccountEncoding, UiDataSliceConfig};
 use solana_client::{
     nonblocking::rpc_client::RpcClient,
     rpc_client::{GetConfirmedSignaturesForAddress2Config, RpcClientConfig},
@@ -39,7 +39,9 @@ use solana_rpc_client_api::client_error::{
 };
 use solana_signature::Signature;
 use solana_sysvar_id::SysvarId;
-use solana_transaction_status::{EncodedConfirmedTransactionWithStatusMeta, UiConfirmedBlock};
+use solana_transaction_status::{
+    EncodedConfirmedTransactionWithStatusMeta, UiConfirmedBlock, UiTransactionEncoding,
+};
 use surfpool_types::sanitized_datasource_url;
 
 use super::GetTransactionResult;
@@ -164,23 +166,80 @@ impl<S: RpcSender + Send + Sync> RpcSender for DeadlineSender<S> {
     }
 }
 
+#[derive(serde::Deserialize)]
+struct GetAccountInfoRequest(String, #[serde(default)] Option<RpcAccountInfoConfig>);
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ArchiveAccountInfoConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    encoding: Option<UiAccountEncoding>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data_slice: Option<UiDataSliceConfig>,
+    #[serde(flatten)]
+    commitment: CommitmentConfig,
+    slot: Slot,
+}
+
+impl GetAccountInfoRequest {
+    fn into_archive_request(self, slot: Slot) -> ClientResult<(String, ArchiveAccountInfoConfig)> {
+        let Self(pubkey, config) = self;
+        let account = config.unwrap_or_default();
+        if account
+            .min_context_slot
+            .is_some_and(|minimum| minimum > slot)
+        {
+            return Err(
+                ClientErrorKind::Custom("Minimum context slot is after the fork".into()).into(),
+            );
+        }
+        Ok((
+            pubkey,
+            ArchiveAccountInfoConfig {
+                encoding: account.encoding,
+                data_slice: account.data_slice,
+                commitment: CommitmentConfig::finalized(),
+                slot,
+            },
+        ))
+    }
+}
+
+struct PostForkBoundary {
+    signature: String,
+    slot: Slot,
+}
+
 /// Pins account hydration and bounds remote history to one slot.
 /// Queries without a historical source fail rather than mixing current state into the fork.
 struct ForkSender<S> {
     inner: S,
     slot: Option<Slot>,
-    signature_cursors: Mutex<HashMap<Pubkey, (String, Slot)>>,
+    /// Maps each address to the oldest signature/slot seen after the fork slot.
+    /// Reuses that cursor to skip already-scanned post-fork history on later queries.
+    post_fork_boundaries: Mutex<HashMap<Pubkey, PostForkBoundary>>,
 }
 
 impl<S: RpcSender + Send + Sync> ForkSender<S> {
     async fn transaction_slot(&self, signature: &str) -> ClientResult<Slot> {
         Signature::from_str(signature)
             .map_err(|_| ClientErrorKind::Custom("Invalid signature cursor".into()))?;
-        let response = self.inner.send(RpcRequest::GetTransaction,
-            json!([signature, {"encoding": "base64", "commitment": "finalized", "maxSupportedTransactionVersion": 0}])).await?;
-        response["slot"].as_u64().ok_or_else(|| {
-            ClientErrorKind::Custom("Cannot resolve historical signature cursor".into()).into()
-        })
+        let config = RpcTransactionConfig {
+            encoding: Some(UiTransactionEncoding::Base64),
+            commitment: Some(CommitmentConfig::finalized()),
+            max_supported_transaction_version: Some(0),
+        };
+        let response = self
+            .inner
+            .send(RpcRequest::GetTransaction, json!([signature, config]))
+            .await?;
+        let transaction: Option<EncodedConfirmedTransactionWithStatusMeta> =
+            serde_json::from_value(response)?;
+        transaction
+            .map(|transaction| transaction.slot)
+            .ok_or_else(|| {
+                ClientErrorKind::Custom("Cannot resolve historical signature cursor".into()).into()
+            })
     }
 
     async fn signatures(
@@ -188,22 +247,28 @@ impl<S: RpcSender + Send + Sync> ForkSender<S> {
         params: serde_json::Value,
         slot: Slot,
     ) -> ClientResult<serde_json::Value> {
-        let address = params[0]
-            .as_str()
-            .ok_or_else(|| ClientErrorKind::Custom("Invalid address".into()))?;
-        let address_key = Pubkey::from_str(address)
+        #[derive(serde::Deserialize)]
+        struct SignatureRequest(
+            String,
+            #[serde(default)] Option<RpcSignaturesForAddressConfig>,
+        );
+
+        let SignatureRequest(address, config) = serde_json::from_value(params)
+            .map_err(|_| ClientErrorKind::Custom("Invalid signature request parameters".into()))?;
+        let address_key = Pubkey::from_str(&address)
             .map_err(|_| ClientErrorKind::Custom("Invalid address".into()))?;
-        let mut config: RpcSignaturesForAddressConfig = if params[1].is_null() {
-            Default::default()
-        } else {
-            serde_json::from_value(params[1].clone())?
-        };
+        let mut config = config.unwrap_or_default();
         let limit = config.limit.unwrap_or(1000);
-        if !(1..=1000).contains(&limit) || config.min_context_slot.is_some_and(|min| min > slot) {
+        if !(1..=1000).contains(&limit) {
             return Err(ClientErrorKind::Custom(
-                "Invalid limit or minimum context slot for historical signatures".into(),
+                "Signature limit must be between 1 and 1000".into(),
             )
             .into());
+        }
+        if config.min_context_slot.is_some_and(|min| min > slot) {
+            return Err(
+                ClientErrorKind::Custom("Minimum context slot is after the fork".into()).into(),
+            );
         }
         let mut cursor_slot = u64::MAX;
         let mut until_slot = None;
@@ -224,11 +289,16 @@ impl<S: RpcSender + Send + Sync> ForkSender<S> {
             }
         }
         if config.before.is_none()
-            && let Some((cursor, cached_slot)) =
-                self.signature_cursors.lock().unwrap().get(&address_key)
+            && let Some(boundary) = self
+                .post_fork_boundaries
+                .lock()
+                .map_err(|_| {
+                    ClientErrorKind::Custom("Post-fork boundary cache mutex poisoned".into())
+                })?
+                .get(&address_key)
         {
-            config.before = Some(cursor.clone());
-            cursor_slot = *cached_slot;
+            config.before = Some(boundary.signature.clone());
+            cursor_slot = boundary.slot;
         }
         config.commitment = Some(CommitmentConfig::finalized());
         config.min_context_slot = None;
@@ -271,12 +341,20 @@ impl<S: RpcSender + Send + Sync> ForkSender<S> {
             // Binary search the descending page for the first signature at or before S.
             let cutoff = page.partition_point(|entry| entry.slot > slot);
             if cutoff > 0 {
-                let mut cursors = self.signature_cursors.lock().unwrap();
-                if cursors.len() >= 1024 && !cursors.contains_key(&address_key) {
-                    cursors.clear();
+                let mut boundaries = self.post_fork_boundaries.lock().map_err(|_| {
+                    ClientErrorKind::Custom("Post-fork boundary cache mutex poisoned".into())
+                })?;
+                if boundaries.len() >= 1024 && !boundaries.contains_key(&address_key) {
+                    boundaries.clear();
                 }
                 let boundary = &page[cutoff - 1];
-                cursors.insert(address_key, (boundary.signature.clone(), boundary.slot));
+                boundaries.insert(
+                    address_key,
+                    PostForkBoundary {
+                        signature: boundary.signature.clone(),
+                        slot: boundary.slot,
+                    },
+                );
             }
             config.before = page.last().map(|entry| entry.signature.clone());
             result.extend(page.into_iter().skip(cutoff).take(limit - result.len()));
@@ -356,7 +434,7 @@ impl<S: RpcSender + Send + Sync> ForkSender<S> {
                 let accounts = jsonrpc_core::futures::future::try_join_all(
                     chunk
                         .iter()
-                        .map(|entry| self.account(entry["pubkey"].clone(), config.clone(), slot)),
+                        .map(|entry| self.account(json!([entry["pubkey"], config]), slot)),
                 )
                 .await?;
                 for (entry, account) in chunk.iter().zip(accounts) {
@@ -393,28 +471,11 @@ impl<S: RpcSender + Send + Sync> ForkSender<S> {
     }
     async fn account(
         &self,
-        pubkey: serde_json::Value,
-        mut config: serde_json::Value,
+        params: serde_json::Value,
         slot: Slot,
     ) -> ClientResult<serde_json::Value> {
-        if config.is_null() {
-            config = json!({});
-        }
-        let config = config
-            .as_object_mut()
-            .ok_or_else(|| ClientErrorKind::Custom("Invalid account config".into()))?;
-        if config
-            .get("minContextSlot")
-            .and_then(serde_json::Value::as_u64)
-            .is_some_and(|minimum| minimum > slot)
-        {
-            return Err(
-                ClientErrorKind::Custom("Minimum context slot is after the fork".into()).into(),
-            );
-        }
-        config.remove("minContextSlot");
-        config.insert("slot".into(), json!(slot));
-        config.insert("commitment".into(), json!("finalized"));
+        let request: GetAccountInfoRequest = serde_json::from_value(params)?;
+        let (pubkey, config) = request.into_archive_request(slot)?;
         let response = self
             .inner
             .send(RpcRequest::GetAccountInfo, json!([pubkey, config]))
@@ -512,19 +573,16 @@ impl<S: RpcSender + Send + Sync> RpcSender for ForkSender<S> {
                         .collect::<Vec<_>>(),
                 )?)
             }
-            RpcRequest::GetAccountInfo => {
-                self.account(params[0].clone(), params[1].clone(), slot)
-                    .await
-            }
+            RpcRequest::GetAccountInfo => self.account(params, slot).await,
             RpcRequest::GetMultipleAccounts => {
                 let pubkeys = params[0]
                     .as_array()
                     .ok_or_else(|| ClientErrorKind::Custom("Invalid account list".into()))?;
-                // Archive providers may only support historical getAccountInfo.
+                // Currently, archive providers only support historical getAccountInfo so we unfortunately need this workaround
                 let responses = jsonrpc_core::futures::future::try_join_all(
                     pubkeys
                         .iter()
-                        .map(|pubkey| self.account(pubkey.clone(), params[1].clone(), slot)),
+                        .map(|pubkey| self.account(json!([pubkey, params[1]]), slot)),
                 )
                 .await?;
                 let values: Vec<_> = responses
@@ -601,7 +659,7 @@ impl SurfpoolRpcClient {
             ForkSender {
                 inner: HttpSender::new_with_client(remote_rpc_url, client),
                 slot: fork_slot,
-                signature_cursors: Mutex::default(),
+                post_fork_boundaries: Mutex::default(),
             },
             DATASOURCE_DEADLINE,
         );
@@ -635,7 +693,7 @@ impl SurfnetRemoteClient {
         Self::try_new(remote_rpc_url).expect("unable to initialize datasource client")
     }
 
-    pub fn try_new<U: ToString>(remote_rpc_url: U) -> Result<Self, reqwest::Error> {
+    fn try_new<U: ToString>(remote_rpc_url: U) -> Result<Self, reqwest::Error> {
         Self::try_new_at_slot(remote_rpc_url, None)
     }
 
@@ -974,9 +1032,8 @@ impl SurfnetRemoteClient {
             Ok(res) => Ok(res.value),
             // A mint that exists only on this surfnet is `could not find mint` upstream. That is
             // a definite "no remote accounts", not a failed lookup, and must not discard the
-            // local accounts the caller merges with. Historical walks propagate errors since
-            // an error may come from a later page or account hydration.
-            Err(e) if self.fork_slot.is_none() && is_unknown_mint(filter, &e) => {
+            // local accounts the caller merges with.
+            Err(e) if is_unknown_mint(filter, &e) => {
                 log::debug!(
                     "datasource does not know the mint in getTokenAccountsByOwner for {owner}; \
                      answering from local accounts only"
@@ -1115,21 +1172,13 @@ impl SurfnetRemoteClient {
             .map_err(Into::into)
     }
 
-    /// Historical lookup failures must not become incomplete block lists.
-    pub async fn get_blocks(&self, start: Slot, end: Option<Slot>) -> SurfpoolResult<Vec<Slot>> {
-        match self.client.get_blocks(start, end).await {
-            Err(_) if self.fork_slot.is_none() => Ok(vec![]), // Preserve the live datasource fallback.
-            result => result.map_err(Into::into),
-        }
-    }
-
     pub async fn get_blocks_with_limit(
         &self,
         start: Slot,
         limit: usize,
     ) -> SurfpoolResult<Vec<Slot>> {
         self.client
-            .send(RpcRequest::GetBlocksWithLimit, json!([start, limit]))
+            .get_blocks_with_limit(start, limit)
             .await
             .map_err(Into::into)
     }
@@ -1219,7 +1268,7 @@ mod tests {
                         json!([signature_row(99, FORK_SLOT - 1)])
                     }
                 }
-                RpcRequest::GetTransaction => json!({"slot": self.slot}),
+                RpcRequest::GetTransaction => transaction_response(self.slot),
                 RpcRequest::GetEpochSchedule => {
                     serde_json::to_value(EpochSchedule::without_warmup()).unwrap()
                 }
@@ -1257,7 +1306,7 @@ mod tests {
                         program,
                     },
                     slot: Some(FORK_SLOT),
-                    signature_cursors: Mutex::default(),
+                    post_fork_boundaries: Mutex::default(),
                 },
                 RpcClientConfig::default(),
             )
@@ -1389,7 +1438,7 @@ mod tests {
                 program: Pubkey::new_unique(),
             },
             slot: Some(FORK_SLOT),
-            signature_cursors: Mutex::default(),
+            post_fork_boundaries: Mutex::default(),
         };
         for (method, params) in [
             (RpcRequest::GetBlock, json!([FORK_SLOT + 1, {}])),
@@ -1409,7 +1458,7 @@ mod tests {
                     program: Pubkey::new_unique(),
                 },
                 slot: Some(FORK_SLOT),
-                signature_cursors: Mutex::default(),
+                post_fork_boundaries: Mutex::default(),
             };
             let response = historical
                 .send(RpcRequest::GetTransaction, json!(["signature"]))
@@ -1449,7 +1498,7 @@ mod tests {
                 requests: Arc::default(),
             },
             slot: Some(FORK_SLOT),
-            signature_cursors: Mutex::default(),
+            post_fork_boundaries: Mutex::default(),
         };
         assert!(
             malformed
@@ -1460,7 +1509,7 @@ mod tests {
         let unavailable = ForkSender {
             inner: ReturnsError,
             slot: Some(FORK_SLOT),
-            signature_cursors: Mutex::default(),
+            post_fork_boundaries: Mutex::default(),
         };
         assert!(
             unavailable
@@ -1474,7 +1523,7 @@ mod tests {
                 requests: Arc::clone(&requests),
             },
             slot: None,
-            signature_cursors: Mutex::default(),
+            post_fork_boundaries: Mutex::default(),
         };
         ordinary
             .send(RpcRequest::GetProgramAccounts, json!(["program"]))
@@ -1495,7 +1544,7 @@ mod tests {
                     ForkSender {
                         inner: ReturnsError,
                         slot: fork_slot,
-                        signature_cursors: Mutex::default(),
+                        post_fork_boundaries: Mutex::default(),
                     },
                     RpcClientConfig::default(),
                 )
@@ -1518,6 +1567,62 @@ mod tests {
                     Ok(RemoteRpcResult::MethodNotSupported)
                 ));
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn historical_account_request_preserves_config_and_applies_fork_policy() {
+        let pubkey = Pubkey::new_unique().to_string();
+        for config in [
+            None,
+            Some(json!(null)),
+            Some(json!({
+                "encoding": "base64",
+                "dataSlice": {"offset": 2, "length": 3},
+                "commitment": "processed",
+                "minContextSlot": FORK_SLOT,
+            })),
+        ] {
+            let params = match &config {
+                Some(config) => json!([pubkey, config]),
+                None => json!([pubkey]),
+            };
+            let response = json!({"context": {"slot": FORK_SLOT}, "value": null});
+            let sender = history(vec![Ok(response.clone())]);
+            assert_eq!(
+                sender
+                    .send(RpcRequest::GetAccountInfo, params)
+                    .await
+                    .unwrap(),
+                response,
+            );
+            let requests = sender.inner.requests.lock().unwrap();
+            let (method, params) = &requests[0];
+            assert_eq!(*method, RpcRequest::GetAccountInfo);
+            assert_eq!(params[0], pubkey);
+            assert_eq!(params[1]["slot"], FORK_SLOT);
+            assert_eq!(params[1]["commitment"], "finalized");
+            assert!(params[1].get("minContextSlot").is_none());
+            if let Some(config) = config {
+                assert_eq!(params[1]["encoding"], config["encoding"]);
+                assert_eq!(params[1]["dataSlice"], config["dataSlice"]);
+            }
+        }
+        for params in [
+            json!([pubkey, {"minContextSlot": FORK_SLOT + 1}]),
+            json!([pubkey, {"minContextSlot": "invalid"}]),
+            json!([pubkey, false]),
+            json!([pubkey, {}, null]),
+            json!([]),
+        ] {
+            let sender = history(vec![]);
+            assert!(
+                sender
+                    .send(RpcRequest::GetAccountInfo, params)
+                    .await
+                    .is_err()
+            );
+            assert!(sender.inner.requests.lock().unwrap().is_empty());
         }
     }
 
@@ -1555,13 +1660,111 @@ mod tests {
                 requests: Mutex::default(),
             },
             slot: Some(FORK_SLOT),
-            signature_cursors: Mutex::default(),
+            post_fork_boundaries: Mutex::default(),
         }
+    }
+
+    fn transaction_response(slot: Slot) -> serde_json::Value {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        use solana_transaction::versioned::VersionedTransaction;
+
+        let transaction =
+            STANDARD.encode(wincode::serialize(&VersionedTransaction::default()).unwrap());
+        json!({"slot": slot, "transaction": [transaction, "base64"], "meta": null, "blockTime": null})
     }
 
     fn signature_row(n: u8, slot: Slot) -> serde_json::Value {
         json!({"signature": Signature::from([n; 64]).to_string(), "slot": slot,
             "err": null, "memo": null, "blockTime": null, "confirmationStatus": "finalized"})
+    }
+
+    #[tokio::test]
+    async fn historical_signatures_return_error_for_poisoned_boundary_cache() {
+        let sender = history(vec![]);
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = sender.post_fork_boundaries.lock().unwrap();
+            panic!("poison the cache for the regression test");
+        }));
+        assert!(panic.is_err());
+        assert!(sender.post_fork_boundaries.is_poisoned());
+
+        let error = sender
+            .send(
+                RpcRequest::GetSignaturesForAddress,
+                json!([Pubkey::new_unique().to_string(), null]),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error.kind(), ClientErrorKind::Custom(message)
+            if message == "Post-fork boundary cache mutex poisoned"));
+    }
+
+    #[tokio::test]
+    async fn historical_signature_request_deserialization() {
+        let address = Pubkey::new_unique().to_string();
+        for params in [
+            json!([address]),
+            json!([address, null]),
+            json!([address, {"limit": 1}]),
+        ] {
+            let sender = history(vec![Ok(json!([]))]);
+            assert_eq!(
+                sender
+                    .send(RpcRequest::GetSignaturesForAddress, params)
+                    .await
+                    .unwrap(),
+                json!([])
+            );
+        }
+        for params in [
+            json!([]),
+            json!({}),
+            json!([42, null]),
+            json!([address, false]),
+            json!([address, {}, null]),
+        ] {
+            let sender = history(vec![]);
+            let error = sender
+                .send(RpcRequest::GetSignaturesForAddress, params)
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("Invalid signature request parameters")
+            );
+        }
+        for (config, expected) in [
+            (
+                json!({"limit": 0}),
+                "Signature limit must be between 1 and 1000",
+            ),
+            (
+                json!({"limit": 1001}),
+                "Signature limit must be between 1 and 1000",
+            ),
+            (
+                json!({"minContextSlot": FORK_SLOT + 1}),
+                "Minimum context slot is after the fork",
+            ),
+        ] {
+            let error = history(vec![])
+                .send(
+                    RpcRequest::GetSignaturesForAddress,
+                    json!([address, config]),
+                )
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains(expected));
+        }
+        let error = history(vec![])
+            .send(
+                RpcRequest::GetSignaturesForAddress,
+                json!(["invalid-pubkey", null]),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("Invalid address"));
     }
 
     #[tokio::test]
@@ -1615,8 +1818,8 @@ mod tests {
         let until = signature_row(4, FORK_SLOT - 1);
         let row = signature_row(2, FORK_SLOT);
         let sender = history(vec![
-            Ok(json!({"slot": FORK_SLOT})),
-            Ok(json!({"slot": FORK_SLOT - 1})),
+            Ok(transaction_response(FORK_SLOT)),
+            Ok(transaction_response(FORK_SLOT - 1)),
             Ok(json!([row])),
             Ok(json!([])),
         ]);
@@ -1625,11 +1828,22 @@ mod tests {
         assert_eq!(result.as_array().unwrap().len(), 1);
         {
             let requests = sender.inner.requests.lock().unwrap();
+            assert_eq!(
+                requests[0],
+                (
+                    RpcRequest::GetTransaction,
+                    json!([before["signature"], {"encoding": "base64", "commitment": "finalized", "maxSupportedTransactionVersion": 0}]),
+                )
+            );
             assert_eq!(requests[2].1[1]["before"], before["signature"]);
             assert_eq!(requests[3].1[1]["before"], row["signature"]);
             assert_eq!(requests[3].1[1]["until"], until["signature"]);
         }
-        for resolved in [json!(null), json!({"slot": FORK_SLOT + 1})] {
+        for resolved in [
+            json!(null),
+            transaction_response(FORK_SLOT + 1),
+            json!({"slot": FORK_SLOT}),
+        ] {
             let sender = history(vec![Ok(resolved)]);
             assert!(
                 sender
@@ -1815,74 +2029,132 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn historical_block_rpcs_merge_local_slots_and_propagate_errors() {
+    async fn block_rpcs_merge_local_slots_and_fall_back_on_remote_errors() {
         use crate::{
             rpc::full::{Full, SurfpoolFullRpc},
             tests::helpers::TestSetup,
         };
-        let mut setup = TestSetup::new(SurfpoolFullRpc);
-        setup.context.svm_locker.with_svm_writer(|svm| {
-            svm.genesis_slot = FORK_SLOT;
-            svm.latest_epoch_info.absolute_slot = FORK_SLOT + 3;
-        });
-        setup.context.remote_rpc_client = Some(SurfnetRemoteClient {
-            fork_slot: Some(FORK_SLOT),
-            client: RpcClient::new_sender(
-                history(vec![
-                    Ok(json!([FORK_SLOT - 2, FORK_SLOT - 1])),
-                    Ok(json!([
-                        FORK_SLOT - 2,
-                        FORK_SLOT - 1,
-                        FORK_SLOT,
-                        FORK_SLOT + 1
-                    ])),
-                    Ok(json!(1_600_000_005)),
-                    Err(ClientErrorKind::Custom("unavailable".into()).into()),
-                ]),
-                RpcClientConfig::default(),
-            )
-            .into(),
-        });
-        assert_eq!(
-            setup
-                .rpc
-                .get_blocks(Some(setup.context.clone()), FORK_SLOT - 2, None, None)
+        for fork_slot in [None, Some(FORK_SLOT)] {
+            let mut setup = TestSetup::new(SurfpoolFullRpc);
+            setup.context.svm_locker.with_svm_writer(|svm| {
+                svm.genesis_slot = FORK_SLOT;
+                svm.latest_epoch_info.absolute_slot = FORK_SLOT + 3;
+            });
+            setup.context.remote_rpc_client = Some(SurfnetRemoteClient {
+                fork_slot,
+                client: RpcClient::new_sender(
+                    {
+                        let mut sender = history(vec![
+                            Ok(json!([FORK_SLOT - 2, FORK_SLOT - 1])),
+                            Ok(json!([
+                                FORK_SLOT - 2,
+                                FORK_SLOT - 1,
+                                FORK_SLOT,
+                                FORK_SLOT + 1
+                            ])),
+                            Ok(json!(1_600_000_005)),
+                            Err(ClientErrorKind::Custom("unavailable".into()).into()),
+                            Err(ClientErrorKind::Custom("unavailable".into()).into()),
+                        ]);
+                        sender.slot = fork_slot;
+                        sender
+                    },
+                    RpcClientConfig::default(),
+                )
+                .into(),
+            });
+            assert_eq!(
+                setup
+                    .rpc
+                    .get_blocks(Some(setup.context.clone()), FORK_SLOT - 2, None, None)
+                    .await
+                    .unwrap(),
+                (FORK_SLOT - 2..=FORK_SLOT + 3).collect::<Vec<_>>()
+            );
+            // This spans over 500,000 slots but asks for only four blocks.
+            assert_eq!(
+                setup
+                    .rpc
+                    .get_blocks_with_limit(Some(setup.context.clone()), 0, 4, None)
+                    .await
+                    .unwrap(),
+                (FORK_SLOT - 2..=FORK_SLOT + 1).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                setup
+                    .rpc
+                    .get_block_time(Some(setup.context.clone()), FORK_SLOT - 1)
+                    .await
+                    .unwrap(),
+                Some(1_600_000_005)
+            );
+            assert!(
+                setup
+                    .rpc
+                    .get_block_time(Some(setup.context.clone()), FORK_SLOT + 1)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            assert_eq!(
+                setup
+                    .rpc
+                    .get_blocks(Some(setup.context.clone()), FORK_SLOT - 2, None, None)
+                    .await
+                    .unwrap(),
+                (FORK_SLOT..=FORK_SLOT + 3).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                setup
+                    .rpc
+                    .get_blocks_with_limit(Some(setup.context), FORK_SLOT - 2, 2, None)
+                    .await
+                    .unwrap(),
+                vec![FORK_SLOT, FORK_SLOT + 1]
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn owner_scan_validates_min_context_slot_in_all_modes() {
+        let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let locker = SurfnetSvmLocker::new(svm);
+        locker.with_svm_writer(|svm| svm.latest_epoch_info.absolute_slot = FORK_SLOT + 10);
+        let owner = Pubkey::new_unique();
+        let filter = TokenAccountsFilter::ProgramId(spl_token_interface::id());
+        for remote_mode in [None, Some(None), Some(Some(FORK_SLOT))] {
+            let remote = remote_mode.map(|fork_slot| {
+                let mut sender = history(vec![Ok(token_page(&[], json!(null)))]);
+                sender.slot = fork_slot;
+                SurfnetRemoteClient {
+                    fork_slot,
+                    client: RpcClient::new_sender(sender, RpcClientConfig::default()).into(),
+                }
+            });
+            let mut config = RpcAccountInfoConfig {
+                min_context_slot: Some(FORK_SLOT + 11),
+                ..Default::default()
+            };
+            let error = locker
+                .get_token_accounts_by_owner(&remote, owner, &filter, &config)
                 .await
-                .unwrap(),
-            (FORK_SLOT - 2..=FORK_SLOT + 3).collect::<Vec<_>>()
-        );
-        // This spans over 500,000 slots but asks for only four blocks.
-        assert_eq!(
-            setup
-                .rpc
-                .get_blocks_with_limit(Some(setup.context.clone()), 0, 4, None)
+                .err()
+                .expect("future context must be rejected before querying the remote");
+            assert!(
+                error
+                    .to_string()
+                    .contains("Minimum context slot has not been reached")
+            );
+
+            config.min_context_slot = Some(FORK_SLOT + 10);
+            let result = locker
+                .get_token_accounts_by_owner(&remote, owner, &filter, &config)
                 .await
-                .unwrap(),
-            (FORK_SLOT - 2..=FORK_SLOT + 1).collect::<Vec<_>>()
-        );
-        assert_eq!(
-            setup
-                .rpc
-                .get_block_time(Some(setup.context.clone()), FORK_SLOT - 1)
-                .await
-                .unwrap(),
-            Some(1_600_000_005)
-        );
-        assert!(
-            setup
-                .rpc
-                .get_block_time(Some(setup.context.clone()), FORK_SLOT + 1)
-                .await
-                .unwrap()
-                .is_some()
-        );
-        assert!(
-            setup
-                .rpc
-                .get_blocks(Some(setup.context), FORK_SLOT - 2, None, None)
-                .await
-                .is_err()
-        );
+                .unwrap();
+            assert_eq!(result.slot, FORK_SLOT + 10);
+            assert!(result.inner.is_empty());
+            assert_eq!(config.min_context_slot, Some(FORK_SLOT + 10));
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2361,7 +2633,6 @@ mod tests {
             .expect("a rejected filter is an empty remote answer, not a failure");
 
         assert!(accounts.is_empty());
-        // An error during a historical walk may occur after earlier pages succeeded.
         let historical = SurfnetRemoteClient {
             fork_slot: Some(FORK_SLOT),
             ..client
@@ -2374,7 +2645,8 @@ mod tests {
                     &RpcAccountInfoConfig::default()
                 )
                 .await
-                .is_err()
+                .expect("an unknown mint also has no remote accounts in historical mode")
+                .is_empty()
         );
     }
 
