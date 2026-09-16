@@ -59,7 +59,7 @@ use surfpool_types::{
     TransactionConfirmationStatus, TransactionStatusEvent, UiKeyedProfileResult, UuidOrSignature,
     VersionedIdl,
 };
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, RwLockWriteGuard};
 use txtx_addon_kit::indexmap::IndexSet;
 use uuid::Uuid;
 
@@ -250,6 +250,13 @@ impl SurfnetSvmLocker {
             let mut write_guard = write_lock.blocking_write();
             writer(&mut write_guard)
         })
+    }
+
+    /// Returns the write guard, so exclusive access can be held across `.await`.
+    /// [`SurfnetSvm::commit_sandbox`] needs this: it replaces account state
+    /// wholesale, discarding anything written since the sandbox was created.
+    pub async fn write_guard(&self) -> RwLockWriteGuard<'_, SurfnetSvm> {
+        self.0.write().await
     }
 }
 

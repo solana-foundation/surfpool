@@ -308,18 +308,17 @@ impl Jito for SurfpoolJitoRpc {
             }
 
             // -- Phase A: Sandbox execution -------------------------------------------------
-            // Take a brief read lock on the original VM to construct a sandbox whose storages
-            // are overlay-wrapped, whose subscription registries are empty (no live WS leak),
-            // and whose event channels buffer into receivers we hold here.
-            let bundle_sandbox = ctx
-                .svm_locker
-                .with_svm_reader(|svm_reader| svm_reader.clone_for_bundle_sandbox());
+            // Hold the write lock for the whole bundle: the Phase B commit replaces account
+            // state wholesale, so releasing it here would let concurrent writes land and
+            // then be discarded. This cannot stall or deadlock, as Phase A does no IO
+            // (`remote_ctx` is `None`) and runs against `sandbox_locker`.
+            let mut svm_guard = ctx.svm_locker.write_guard().await;
 
             let BundleSandbox {
                 svm: sandbox_svm,
                 geyser_rx,
                 simnet_rx,
-            } = bundle_sandbox;
+            } = svm_guard.clone_for_bundle_sandbox();
 
             let sandbox_locker = SurfnetSvmLocker::new(sandbox_svm);
 
@@ -395,7 +394,7 @@ impl Jito for SurfpoolJitoRpc {
             // -- Phase B: Atomic commit -----------------------------------------------------
             // All bundle transactions succeeded on the sandbox. Extract the sandbox SVM (the
             // only remaining Arc reference is the local `sandbox_locker`), reassemble the
-            // BundleSandbox and call commit_sandbox under the original VM's writer lock.
+            // BundleSandbox and commit it under the writer guard still held from Phase A.
             let sandbox_svm = match Arc::try_unwrap(sandbox_locker.0) {
                 Ok(rwlock) => rwlock.into_inner(),
                 Err(_) => {
@@ -415,15 +414,16 @@ impl Jito for SurfpoolJitoRpc {
             // silently.
             let (bundle_status_tx, _bundle_status_rx) = crossbeam_channel::unbounded();
 
-            ctx.svm_locker
-                .with_svm_writer(move |original| {
-                    original.commit_sandbox(reassembled, bundle_status_tx)
-                })
+            svm_guard
+                .commit_sandbox(reassembled, bundle_status_tx)
                 .map_err(|e| {
                     Error::invalid_params(format!(
                         "Jito bundle commit failed after successful sandbox execution: {e}"
                     ))
                 })?;
+
+            // `store_bundle` below re-acquires the lock.
+            drop(svm_guard);
 
             // Calculate bundle ID by hashing comma-separated signatures (Jito-compatible)
             // https://github.com/jito-foundation/jito-solana/blob/master/sdk/src/bundle/mod.rs#L21
@@ -703,7 +703,7 @@ impl Jito for SurfpoolJitoRpc {
             // distinguishes simulate from send.
             let bundle_sandbox = ctx
                 .svm_locker
-                .with_svm_reader(|svm_reader| svm_reader.clone_for_bundle_sandbox());
+                .with_svm_reader(|svm_reader| svm_reader.clone_for_bundle_simulation());
             let BundleSandbox {
                 svm: sandbox_svm,
                 geyser_rx: _geyser_rx, // discarded on drop
@@ -2730,6 +2730,112 @@ mod tests {
             result.post_execution_accounts.is_none(),
             "omitted post config must yield None (got {:?})",
             result.post_execution_accounts,
+        );
+    }
+
+    /// `commit_sandbox` replaces the live VM's account state with the sandbox's copy, so
+    /// while the sandbox was cloned under a lock that was then released, writes landing
+    /// during bundle execution were reverted even though they reported success. Every
+    /// account here is disjoint, so each acknowledged transfer must end up visible.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_transfers_survive_bundle_commits() {
+        const TRANSFERS: usize = 16;
+        const BUNDLES: usize = 8;
+        const TRANSFER_LAMPORTS: u64 = 5_000_000;
+
+        let setup = TestSetup::new(SurfpoolJitoRpc);
+        let recent_blockhash = setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm_reader| svm_reader.latest_blockhash());
+
+        let transfer_payers: Vec<Keypair> = (0..TRANSFERS).map(|_| Keypair::new()).collect();
+        let transfer_recipients: Vec<Pubkey> =
+            (0..TRANSFERS).map(|_| Pubkey::new_unique()).collect();
+        let bundle_payers: Vec<Keypair> = (0..BUNDLES).map(|_| Keypair::new()).collect();
+        let bundle_recipients: Vec<Pubkey> = (0..BUNDLES).map(|_| Pubkey::new_unique()).collect();
+
+        {
+            let mut svm = setup.context.svm_locker.0.write().await;
+            for payer in transfer_payers.iter().chain(bundle_payers.iter()) {
+                let _ = svm.airdrop(&payer.pubkey(), 2 * LAMPORTS_PER_SOL);
+            }
+        }
+
+        let mut tasks = Vec::new();
+
+        // Plain transactions, taking the same path the `sendTransaction` handler uses.
+        for (payer, recipient) in transfer_payers.iter().zip(transfer_recipients.iter()) {
+            let tx = build_v0_transaction(
+                &payer.pubkey(),
+                &[payer],
+                &[system_instruction::transfer(
+                    &payer.pubkey(),
+                    recipient,
+                    TRANSFER_LAMPORTS,
+                )],
+                &recent_blockhash,
+            );
+            let locker = setup.context.svm_locker.clone();
+            tasks.push(tokio::spawn(async move {
+                let (status_tx, _status_rx) = crossbeam_channel::unbounded();
+                locker
+                    .process_transaction(&None, tx, status_tx, true, true)
+                    .await
+                    .expect("concurrent transfer should be processed");
+            }));
+        }
+
+        // Bundles, each opening a sandbox over the whole VM.
+        for (payer, recipient) in bundle_payers.iter().zip(bundle_recipients.iter()) {
+            let tx = build_v0_transaction(
+                &payer.pubkey(),
+                &[payer],
+                &[system_instruction::transfer(
+                    &payer.pubkey(),
+                    recipient,
+                    TRANSFER_LAMPORTS,
+                )],
+                &recent_blockhash,
+            );
+            let encoded = bs58::encode(bincode::serialize(&tx).unwrap()).into_string();
+            let rpc = setup.rpc.clone();
+            let context = setup.context.clone();
+            tasks.push(tokio::spawn(async move {
+                rpc.send_bundle(Some(context), vec![encoded], None)
+                    .await
+                    .expect("bundle should succeed");
+            }));
+        }
+
+        for task in tasks {
+            task.await.expect("task should not panic");
+        }
+
+        let balance_of = |pubkey: &Pubkey| {
+            setup
+                .context
+                .svm_locker
+                .with_svm_reader(|svm| svm.get_account(pubkey))
+                .ok()
+                .flatten()
+                .map(|account| account.lamports)
+                .unwrap_or(0)
+        };
+
+        let lost: Vec<Pubkey> = transfer_recipients
+            .iter()
+            .chain(bundle_recipients.iter())
+            .filter(|recipient| balance_of(recipient) != TRANSFER_LAMPORTS)
+            .copied()
+            .collect();
+
+        assert!(
+            lost.is_empty(),
+            "{} of {} acknowledged transfers were discarded by a concurrent bundle commit: {:?}",
+            lost.len(),
+            TRANSFERS + BUNDLES,
+            lost
         );
     }
 }

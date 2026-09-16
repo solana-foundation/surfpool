@@ -628,9 +628,12 @@ impl SurfnetSvm {
             streamed_accounts: OverlayStorage::wrap(self.streamed_accounts.clone_box()),
             scheduled_overrides: OverlayStorage::wrap(self.scheduled_overrides.clone_box()),
 
+            // Only the runloop drains these, against the live VM. Cloning them would make
+            // `commit_sandbox` push back a duplicate of every in-flight transaction.
+            transactions_queued_for_confirmation: VecDeque::new(),
+            transactions_queued_for_finalization: VecDeque::new(),
+
             // Clone non-storage fields normally
-            transactions_queued_for_confirmation: self.transactions_queued_for_confirmation.clone(),
-            transactions_queued_for_finalization: self.transactions_queued_for_finalization.clone(),
             perf_samples: self.perf_samples.clone(),
             transactions_processed: self.transactions_processed,
             latest_epoch_info: self.latest_epoch_info.clone(),
@@ -707,18 +710,19 @@ impl SurfnetSvm {
         }
     }
 
-    /// Creates a sandbox tailored for atomic Jito-style bundle execution. Behavior matches
-    /// [`Self::clone_for_profiling`] (all storage fields are overlay-wrapped; subscription
-    /// containers are emptied so live WS subscribers cannot be notified from the sandbox),
-    /// but the `simnet_events_tx` and `geyser_events_tx` channels are replaced with
-    /// **unbounded buffered** channels whose receivers are returned alongside the sandbox.
-    /// The atomic-commit phase ([`Self::commit_sandbox`]) drains those receivers to replay
-    /// the captured events onto the original VM's real event channels on bundle success.
+    /// Creates a sandbox for Jito-style bundle execution that the caller discards rather than
+    /// commits. Behavior matches [`Self::clone_for_profiling`] (all storage fields are
+    /// overlay-wrapped; subscription containers are emptied so live WS subscribers cannot be
+    /// notified from the sandbox), but the `simnet_events_tx` and `geyser_events_tx` channels
+    /// are replaced with **unbounded buffered** channels whose receivers are returned
+    /// alongside the sandbox. The atomic-commit phase ([`Self::commit_sandbox`]) drains those
+    /// receivers to replay the captured events onto the original VM's real event channels on
+    /// bundle success.
     ///
     /// On bundle failure, simply dropping the returned [`BundleSandbox`] discards every
     /// buffered event, every overlay write, and the cloned `LiteSVM` state — the original
     /// VM is left byte-identical to its pre-bundle state.
-    pub fn clone_for_bundle_sandbox(&self) -> BundleSandbox {
+    pub fn clone_for_bundle_simulation(&self) -> BundleSandbox {
         let mut svm = self.clone_for_profiling();
         let (geyser_tx, geyser_rx) = crossbeam_channel::unbounded();
         let (simnet_tx, simnet_rx) = SimnetEventsTx::unbounded();
@@ -729,6 +733,15 @@ impl SurfnetSvm {
             geyser_rx,
             simnet_rx,
         }
+    }
+
+    /// Creates a sandbox that may later be committed with [`Self::commit_sandbox`].
+    ///
+    /// Takes `&mut self` because committing is only sound while the caller holds exclusive
+    /// access continuously from here through the commit. Use
+    /// [`Self::clone_for_bundle_simulation`] for a sandbox that is discarded.
+    pub fn clone_for_bundle_sandbox(&mut self) -> BundleSandbox {
+        self.clone_for_bundle_simulation()
     }
 
     /// Atomically commit the outcome of a fully-successful bundle sandbox onto `self`.
@@ -7399,5 +7412,31 @@ mod tests {
             .expect("get_account should not error")
             .expect("Valid account should be restored");
         assert_eq!(restored_account.lamports, 1_000_000);
+    }
+
+    /// Sandboxes used to inherit a copy of the live confirmation queue, so `commit_sandbox`
+    /// pushed back a duplicate of every transaction in flight when the bundle started,
+    /// promoting each one twice.
+    #[test]
+    fn test_commit_sandbox_does_not_duplicate_pending_confirmations() {
+        let (mut svm, _events_rx, _geyser_rx) = TestType::no_db().initialize_svm();
+
+        let inflight = VersionedTransaction {
+            signatures: vec![Signature::default()],
+            message: solana_message::VersionedMessage::Legacy(solana_message::Message::default()),
+        };
+        let (inflight_status_tx, _inflight_rx) = crossbeam_channel::unbounded();
+        svm.transactions_queued_for_confirmation
+            .push_back((inflight, inflight_status_tx, None));
+
+        let sandbox = svm.clone_for_bundle_sandbox();
+        let (bundle_status_tx, _rx) = crossbeam_channel::unbounded();
+        svm.commit_sandbox(sandbox, bundle_status_tx).unwrap();
+
+        assert_eq!(
+            svm.transactions_queued_for_confirmation.len(),
+            1,
+            "bundle commit duplicated a transaction already awaiting confirmation"
+        );
     }
 }
