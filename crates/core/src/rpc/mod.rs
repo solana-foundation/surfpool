@@ -356,6 +356,62 @@ impl SurfpoolWebsocketMiddleware {
             session,
         }
     }
+
+    fn dispatch_batch<F, X>(
+        &self,
+        calls: Vec<Call>,
+        meta: Option<SurfpoolWebsocketMeta>,
+        next: F,
+    ) -> Either<FutureResponse, X>
+    where
+        F: FnOnce(Request, Option<SurfpoolWebsocketMeta>) -> X + Send,
+        X: Future<Output = Option<Response>> + Send + 'static,
+    {
+        let mut used_ids = calls
+            .iter()
+            .filter_map(|call| match call {
+                Call::MethodCall(method_call) => Some(method_call.id.clone()),
+                Call::Invalid { id } => Some(id.clone()),
+                Call::Notification(_) => None,
+            })
+            .collect::<HashSet<_>>();
+        let mut notification_ids = HashSet::new();
+
+        let calls = calls
+            .into_iter()
+            .enumerate()
+            .map(|(index, call)| match call {
+                Call::Notification(notification) => {
+                    let mut sequence = index;
+                    let id = loop {
+                        let id = Id::Str(format!("__surfpool_notification_{sequence}"));
+                        sequence += 1;
+                        if used_ids.insert(id.clone()) {
+                            break id;
+                        }
+                    };
+                    notification_ids.insert(id.clone());
+                    Call::MethodCall(MethodCall {
+                        jsonrpc: notification.jsonrpc,
+                        method: notification.method,
+                        params: notification.params,
+                        id,
+                    })
+                }
+                call => call,
+            })
+            .collect();
+
+        Either::Left(Box::pin(next(Request::Batch(calls), meta).map(
+            move |response| match response {
+                Some(Response::Batch(mut outputs)) => {
+                    outputs.retain(|output| !notification_ids.contains(output.id()));
+                    (!outputs.is_empty()).then_some(Response::Batch(outputs))
+                }
+                response => response,
+            },
+        )))
+    }
 }
 
 impl Middleware<Option<SurfpoolWebsocketMeta>> for SurfpoolWebsocketMiddleware {
@@ -386,7 +442,22 @@ impl Middleware<Option<SurfpoolWebsocketMeta>> for SurfpoolWebsocketMiddleware {
             .and_then(|m| m.session.clone())
             .or(self.session.clone());
         let meta = Some(SurfpoolWebsocketMeta::new(runloop_context, session));
-        Either::Left(Box::pin(next(request, meta).map(move |res| res)))
+
+        match request {
+            Request::Single(Call::Notification(notification)) => {
+                // WebSocket unsubscribe RPCs are registered as methods. Dispatch notifications
+                // through those handlers, then discard every possible result.
+                let request = Request::Single(Call::MethodCall(MethodCall {
+                    jsonrpc: notification.jsonrpc,
+                    method: notification.method,
+                    params: notification.params,
+                    id: Id::Str("__surfpool_notification".into()),
+                }));
+                Either::Left(Box::pin(next(request, meta).map(|_| None)))
+            }
+            Request::Batch(calls) => self.dispatch_batch(calls, meta, next),
+            request => Either::Left(Box::pin(next(request, meta))),
+        }
     }
 }
 
@@ -546,6 +617,37 @@ mod tests {
         (io, notification_counter)
     }
 
+    fn websocket_test_handler_with_unsubscribe_counter() -> (
+        MetaIoHandler<Option<SurfpoolWebsocketMeta>, SurfpoolWebsocketMiddleware>,
+        Arc<AtomicUsize>,
+    ) {
+        let (surfnet_svm, _events_rx, _) = SurfnetSvm::default();
+        let (simnet_commands_tx, _rx) = crossbeam_channel::unbounded();
+        let (plugin_commands_tx, _rx) = crossbeam_channel::unbounded();
+        let middleware = SurfpoolMiddleware::new(
+            SurfnetSvmLocker::new(surfnet_svm),
+            &simnet_commands_tx,
+            &RpcConfig::default(),
+            &None,
+            plugin_commands_tx,
+        );
+
+        let mut io =
+            MetaIoHandler::with_middleware(SurfpoolWebsocketMiddleware::new(middleware, None));
+        io.add_method_with_meta("getSlot", |_params, _meta| async { Ok(Value::from(45)) });
+        let unsubscribe_counter = Arc::new(AtomicUsize::new(0));
+        let counter = unsubscribe_counter.clone();
+        io.add_method_with_meta("signatureUnsubscribe", move |_params, _meta| {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok(Value::from(true))
+            }
+        });
+
+        (io, unsubscribe_counter)
+    }
+
     #[tokio::test]
     async fn batch_of_method_calls_is_answered_with_an_array() {
         let request = r#"[{"jsonrpc":"2.0","id":1,"method":"getSlot"},{"jsonrpc":"2.0","id":2,"method":"getSlot"}]"#;
@@ -582,6 +684,29 @@ mod tests {
 
         assert_eq!(handler.handle_request(request, None).await, None);
         assert_eq!(notification_counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn websocket_notifications_execute_without_a_response() {
+        let (handler, unsubscribe_counter) = websocket_test_handler_with_unsubscribe_counter();
+        let request = r#"{"jsonrpc":"2.0","method":"signatureUnsubscribe","params":[1]}"#;
+
+        assert_eq!(handler.handle_request(request, None).await, None);
+        assert_eq!(unsubscribe_counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn websocket_batch_notifications_execute_and_are_omitted() {
+        let (handler, unsubscribe_counter) = websocket_test_handler_with_unsubscribe_counter();
+        let request = r#"[{"jsonrpc":"2.0","method":"signatureUnsubscribe","params":[1]},{"jsonrpc":"2.0","id":2,"method":"getSlot"}]"#;
+
+        let response = handler.handle_request(request, None).await.unwrap();
+
+        assert_eq!(
+            serde_json::from_str::<Value>(&response).unwrap(),
+            json!([{"jsonrpc": "2.0", "result": 45, "id": 2}])
+        );
+        assert_eq!(unsubscribe_counter.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
