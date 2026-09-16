@@ -25,7 +25,7 @@ use solana_client::{
         RpcSignaturesForAddressConfig, RpcTransactionConfig, RpcTransactionLogsFilter,
     },
     rpc_filter::RpcFilterType,
-    rpc_request::TokenAccountsFilter,
+    rpc_request::{MAX_GET_CONFIRMED_SIGNATURES_FOR_ADDRESS2_LIMIT, TokenAccountsFilter},
     rpc_response::{
         RpcAccountBalance, RpcConfirmedTransactionStatusWithSignature, RpcKeyedAccount,
         RpcLogsResponse, RpcTokenAccountBalance,
@@ -1000,8 +1000,7 @@ impl SurfnetSvmLocker {
 ///                              skip the remote call entirely.
 ///   - neither local-only   => forward the caller's boundaries unchanged.
 ///
-/// The returned config always pins `limit` to `remaining_limit` so the remote can't push the
-/// combined result past the caller's requested cap.
+/// The returned config pins the total remote result count to `remaining_limit`.
 fn signatures_for_address_remote_config(
     config: Option<&RpcSignaturesForAddressConfig>,
     before_is_local: bool,
@@ -1019,6 +1018,38 @@ fn signatures_for_address_remote_config(
         commitment: base.commitment,
         min_context_slot: base.min_context_slot,
     })
+}
+
+async fn get_remote_signatures_before_slot(
+    client: &SurfnetRemoteClient,
+    pubkey: &Pubkey,
+    mut config: RpcSignaturesForAddressConfig,
+    first_local_slot: Slot,
+) -> SurfpoolResult<Vec<RpcConfirmedTransactionStatusWithSignature>> {
+    let limit = config
+        .limit
+        .unwrap_or(MAX_GET_CONFIRMED_SIGNATURES_FOR_ADDRESS2_LIMIT);
+    let mut results = Vec::new();
+    while results.len() < limit {
+        // A caller-sized page may contain only post-fork signatures.
+        config.limit = Some(MAX_GET_CONFIRMED_SIGNATURES_FOR_ADDRESS2_LIMIT);
+        let page = client
+            .get_signatures_for_address(pubkey, Some(&config))
+            .await?;
+        let page_len = page.len();
+        let before = page.last().map(|result| result.signature.clone());
+        let remaining = limit - results.len();
+        results.extend(
+            page.into_iter()
+                .filter(|result| result.slot < first_local_slot)
+                .take(remaining),
+        );
+        if results.len() == limit || page_len < MAX_GET_CONFIRMED_SIGNATURES_FOR_ADDRESS2_LIMIT {
+            break;
+        }
+        config.before = before;
+    }
+    Ok(results)
 }
 
 /// Returns `true` if the queried owner holds a token account that appears in
@@ -1544,6 +1575,7 @@ impl SurfnetSvmLocker {
     ) -> SurfpoolContextualizedResult<Vec<RpcConfirmedTransactionStatusWithSignature>> {
         let results = self.get_signatures_for_address_local(pubkey, config);
         let limit = config.and_then(|c| c.limit).unwrap_or(1000);
+        let first_local_slot = self.with_svm_reader(|svm| svm.genesis_slot);
 
         let SvmAccessContext {
             slot,
@@ -1575,13 +1607,14 @@ impl SurfnetSvmLocker {
                 until_is_local,
                 remaining_limit,
             ) {
-                let mut remote_results = client
-                    .get_signatures_for_address(pubkey, Some(&remote_config))
-                    .await?;
+                let mut remote_results = get_remote_signatures_before_slot(
+                    client,
+                    pubkey,
+                    remote_config,
+                    first_local_slot,
+                )
+                .await?;
                 combined_results.append(&mut remote_results);
-                // Belt-and-suspenders: enforce the caller's cap even if the remote returned
-                // more than the requested slice.
-                combined_results.truncate(limit);
             }
         }
 
