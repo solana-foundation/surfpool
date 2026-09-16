@@ -6442,6 +6442,21 @@ async fn test_get_signatures_for_address_local_then_remote(test_type: TestType) 
         vec![datasource_sigs[0].to_string()],
         "scenario F: return the newest pre-fork signature"
     );
+
+    let error = local_rpc
+        .get_signatures_for_address_with_config(
+            &target,
+            GetConfirmedSignaturesForAddress2Config {
+                limit: Some(1_001),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("a limit above the RPC maximum must be rejected");
+    assert!(
+        error.to_string().contains("Invalid limit; max 1000"),
+        "unexpected error: {error}"
+    );
 }
 
 #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
