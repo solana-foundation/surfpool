@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     future::Future,
     sync::{Arc, Mutex},
 };
@@ -6,8 +7,8 @@ use std::{
 use blake3::Hash;
 use crossbeam_channel::Sender;
 use jsonrpc_core::{
-    BoxFuture, Call, Error, ErrorCode, FutureResponse, Metadata, Middleware, Output, Request,
-    Response,
+    BoxFuture, Call, Error, ErrorCode, FutureResponse, Id, Metadata, MethodCall, Middleware,
+    Output, Request, Response,
     futures::{FutureExt, future::Either},
     middleware,
 };
@@ -180,6 +181,18 @@ impl SurfpoolMiddleware {
     {
         let mut forwarded = Vec::with_capacity(calls.len());
         let mut rejected = Vec::new();
+        // Native RPCs are registered as methods, while jsonrpc-core only dispatches a
+        // `Call::Notification` to notification-specific handlers. Give notifications internal,
+        // collision-free IDs so they reach method handlers, then remove their outputs below.
+        let mut used_ids = calls
+            .iter()
+            .filter_map(|call| match call {
+                Call::MethodCall(method_call) => Some(method_call.id.clone()),
+                Call::Invalid { id } => Some(id.clone()),
+                Call::Notification(_) => None,
+            })
+            .collect::<HashSet<_>>();
+        let mut notification_ids = HashSet::new();
 
         for call in calls {
             // A malformed element carries no method to gate; the handler answers it per element.
@@ -190,7 +203,26 @@ impl SurfpoolMiddleware {
             };
 
             match method_name.and_then(|name| self.disabled_cheatcode_error(name)) {
-                None => forwarded.push(call),
+                None => match call {
+                    Call::Notification(notification) => {
+                        let mut sequence = notification_ids.len();
+                        let id = loop {
+                            let id = Id::Str(format!("__surfpool_notification_{sequence}"));
+                            sequence += 1;
+                            if used_ids.insert(id.clone()) {
+                                break id;
+                            }
+                        };
+                        notification_ids.insert(id.clone());
+                        forwarded.push(Call::MethodCall(MethodCall {
+                            jsonrpc: notification.jsonrpc,
+                            method: notification.method,
+                            params: notification.params,
+                            id,
+                        }));
+                    }
+                    call => forwarded.push(call),
+                },
                 // A notification is answered by nothing at all, gated or not.
                 Some(error) => {
                     if let Call::MethodCall(method_call) = call {
@@ -213,8 +245,9 @@ impl SurfpoolMiddleware {
         Either::Left(Box::pin(next(Request::Batch(forwarded), meta).map(
             move |res| match res {
                 Some(Response::Batch(mut outputs)) => {
+                    outputs.retain(|output| !notification_ids.contains(output.id()));
                     outputs.extend(rejected);
-                    Some(Response::Batch(outputs))
+                    (!outputs.is_empty()).then_some(Response::Batch(outputs))
                 }
                 _ => (!rejected.is_empty()).then_some(Response::Batch(rejected)),
             },
@@ -247,6 +280,26 @@ impl Middleware<Option<RunloopContext>> for SurfpoolMiddleware {
         });
 
         let Request::Single(Call::MethodCall(ref method_call)) = request else {
+            if let Request::Single(Call::Notification(notification)) = request {
+                if self
+                    .disabled_cheatcode_error(&notification.method)
+                    .is_some()
+                {
+                    return Either::Left(Box::pin(async { None }));
+                }
+
+                // Native RPCs are methods, not notification handlers. Dispatch this notification
+                // as a method and discard every possible result to preserve its no-response
+                // contract.
+                let request = Request::Single(Call::MethodCall(MethodCall {
+                    jsonrpc: notification.jsonrpc,
+                    method: notification.method,
+                    params: notification.params,
+                    id: Id::Str("__surfpool_notification".into()),
+                }));
+                return Either::Left(Box::pin(next(request, meta).map(|_| None)));
+            }
+
             // JSON-RPC 2.0 §6: an empty array is not a batch and answers with one Invalid
             // Request object, which is what the arm below already returns.
             if let Request::Batch(calls) = request
@@ -438,6 +491,11 @@ pub fn not_implemented_err_async<T>(method: &str) -> BoxFuture<Result<T, Error>>
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
     use jsonrpc_core::{MetaIoHandler, Value};
     use serde_json::json;
 
@@ -446,6 +504,13 @@ mod tests {
     /// A handler carrying the real middleware, one plain method and one cheatcode, so the tests
     /// exercise the batch path end to end rather than the middleware in isolation.
     fn test_handler() -> MetaIoHandler<Option<RunloopContext>, SurfpoolMiddleware> {
+        test_handler_with_notification_counter().0
+    }
+
+    fn test_handler_with_notification_counter() -> (
+        MetaIoHandler<Option<RunloopContext>, SurfpoolMiddleware>,
+        Arc<AtomicUsize>,
+    ) {
         let (surfnet_svm, _events_rx, _) = SurfnetSvm::default();
         let (simnet_commands_tx, _rx) = crossbeam_channel::unbounded();
         let (plugin_commands_tx, _rx) = crossbeam_channel::unbounded();
@@ -466,10 +531,19 @@ mod tests {
 
         let mut io = MetaIoHandler::with_middleware(middleware);
         io.add_method_with_meta("getSlot", |_params, _meta| async { Ok(Value::from(45)) });
+        let notification_counter = Arc::new(AtomicUsize::new(0));
+        let counter = notification_counter.clone();
+        io.add_method_with_meta("increment", move |_params, _meta| {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok(Value::Null)
+            }
+        });
         io.add_method_with_meta("surfnet_setAccount", |_params, _meta| async {
             Ok(Value::Null)
         });
-        io
+        (io, notification_counter)
     }
 
     #[tokio::test]
@@ -488,16 +562,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn notifications_are_omitted_from_the_batch_response() {
-        let request =
-            r#"[{"jsonrpc":"2.0","method":"getSlot"},{"jsonrpc":"2.0","id":2,"method":"getSlot"}]"#;
+    async fn notifications_execute_and_are_omitted_from_the_batch_response() {
+        let (handler, notification_counter) = test_handler_with_notification_counter();
+        let request = r#"[{"jsonrpc":"2.0","method":"increment"},{"jsonrpc":"2.0","id":2,"method":"getSlot"}]"#;
 
-        let response = test_handler().handle_request(request, None).await.unwrap();
+        let response = handler.handle_request(request, None).await.unwrap();
 
         assert_eq!(
             serde_json::from_str::<Value>(&response).unwrap(),
             json!([{"jsonrpc": "2.0", "result": 45, "id": 2}])
         );
+        assert_eq!(notification_counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn standalone_notifications_execute_without_a_response() {
+        let (handler, notification_counter) = test_handler_with_notification_counter();
+        let request = r#"{"jsonrpc":"2.0","method":"increment"}"#;
+
+        assert_eq!(handler.handle_request(request, None).await, None);
+        assert_eq!(notification_counter.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
