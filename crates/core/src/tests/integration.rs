@@ -4584,6 +4584,8 @@ fn boot_simnet(
         simnets: vec![SimnetConfig {
             slot_time: slot_time.unwrap_or(DEFAULT_SLOT_TIME_MS),
             block_production_mode,
+            offline_mode: true,
+            remote_rpc_url: None,
             ..SimnetConfig::default()
         }],
         rpc: RpcConfig {
