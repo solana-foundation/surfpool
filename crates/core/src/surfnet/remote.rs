@@ -99,16 +99,21 @@ fn sanitized_client_error(error: &ClientError, datasource_url: &str) -> String {
     }
 }
 
-/// The datasource's answer for a `Mint` filter it cannot resolve: JSON-RPC `-32602` with
-/// `could not find mint`. Any other `-32602` (bad encoding, bad program filter) is a request
-/// error the caller must see.
+/// The datasource's answer for a mint it cannot resolve: JSON-RPC `-32602` with
+/// `could not find mint`. Any other `-32602` (bad encoding, bad program filter, `not a Token
+/// mint`) is a request error the caller must see.
+fn is_unknown_mint_error(error: &ClientError) -> bool {
+    matches!(
+        error.kind(),
+        ClientErrorKind::RpcError(RpcError::RpcResponseError { code: -32602, message, .. })
+            if message.contains("could not find mint")
+    )
+}
+
+/// [`is_unknown_mint_error`] for a token-accounts request: only a `Mint` filter can be answered
+/// by an unknown mint.
 fn is_unknown_mint(filter: &TokenAccountsFilter, error: &ClientError) -> bool {
-    matches!(filter, TokenAccountsFilter::Mint(_))
-        && matches!(
-            error.kind(),
-            ClientErrorKind::RpcError(RpcError::RpcResponseError { code: -32602, message, .. })
-                if message.contains("could not find mint")
-        )
+    matches!(filter, TokenAccountsFilter::Mint(_)) && is_unknown_mint_error(error)
 }
 
 /// Bounds how long the sender it wraps may take, so a datasource that stops
@@ -510,11 +515,24 @@ impl SurfnetRemoteClient {
         mint: &Pubkey,
         commitment_config: CommitmentConfig,
     ) -> SurfpoolResult<Vec<RpcTokenAccountBalance>> {
-        self.client
+        let res = self
+            .client
             .get_token_largest_accounts_with_commitment(mint, commitment_config)
-            .await
-            .map(|response| response.value)
-            .map_err(|e| SurfpoolError::get_token_largest_accounts(*mint, e))
+            .await;
+        match res {
+            Ok(res) => Ok(res.value),
+            // A mint that exists only on this surfnet is `could not find mint` upstream. That is
+            // a definite "no remote holders", not a failed lookup, and must not discard the
+            // local accounts the caller merges with.
+            Err(e) if is_unknown_mint_error(&e) => {
+                log::debug!(
+                    "datasource does not know mint {mint} in getTokenLargestAccounts; answering \
+                     from local accounts only"
+                );
+                Ok(vec![])
+            }
+            Err(e) => Err(SurfpoolError::get_token_largest_accounts(*mint, e)),
+        }
     }
 
     pub async fn get_token_accounts_by_delegate(
@@ -1184,5 +1202,98 @@ mod tests {
 
         assert_eq!(accounts.len(), 1);
         assert_eq!(accounts[0].pubkey, token_account_pubkey.to_string());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_mint_unknown_to_the_datasource_has_no_remote_largest_accounts() {
+        let client = SurfnetRemoteClient {
+            client: RpcClient::new_sender(RejectsUnknownMint, RpcClientConfig::default()).into(),
+        };
+
+        let accounts = client
+            .get_token_largest_accounts(&Pubkey::new_unique(), CommitmentConfig::default())
+            .await
+            .expect("a mint the datasource has never seen has no remote holders, not a failure");
+
+        assert!(accounts.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_largest_accounts_provider_failure_is_still_an_error() {
+        let client = SurfnetRemoteClient {
+            client: RpcClient::new_sender(ReturnsError, RpcClientConfig::default()).into(),
+        };
+
+        let error = client
+            .get_token_largest_accounts(&Pubkey::new_unique(), CommitmentConfig::default())
+            .await
+            .expect_err("a provider failure must not be reported as an empty answer");
+
+        assert!(
+            error
+                .to_string()
+                .contains("Failed to get largest token accounts")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn any_other_invalid_params_rejection_on_largest_accounts_is_still_an_error() {
+        let client = SurfnetRemoteClient {
+            client: RpcClient::new_sender(RejectsParams, RpcClientConfig::default()).into(),
+        };
+
+        let error = client
+            .get_token_largest_accounts(&Pubkey::new_unique(), CommitmentConfig::default())
+            .await
+            .expect_err("a rejected parameter is a request error, not an empty answer");
+
+        assert!(error.to_string().contains("unsupported encoding"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fork_born_mint_keeps_its_local_largest_accounts() {
+        use solana_account::Account;
+        use solana_program_pack::Pack;
+        use spl_token_interface::state::{Account as TokenAccount, AccountState};
+
+        let (svm, _, _) = SurfnetSvm::default();
+        let locker = SurfnetSvmLocker::new(svm);
+        let mint = Pubkey::new_unique();
+        let holder = Pubkey::new_unique();
+        let mut data = vec![0u8; TokenAccount::LEN];
+        TokenAccount {
+            mint,
+            owner: Pubkey::new_unique(),
+            amount: 42,
+            state: AccountState::Initialized,
+            ..Default::default()
+        }
+        .pack_into_slice(&mut data);
+        locker.with_svm_writer(|svm| {
+            svm.set_account(
+                &holder,
+                Account {
+                    lamports: 2_039_280,
+                    data,
+                    owner: spl_token_interface::id(),
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+        });
+        let remote = SurfnetRemoteClient {
+            client: RpcClient::new_sender(RejectsUnknownMint, RpcClientConfig::default()).into(),
+        };
+
+        let accounts = locker
+            .get_token_largest_accounts(&Some((remote, CommitmentConfig::default())), &mint)
+            .await
+            .expect("local holders survive a datasource that has never seen the mint")
+            .inner;
+
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].address, holder.to_string());
+        assert_eq!(accounts[0].amount.amount, "42");
     }
 }
