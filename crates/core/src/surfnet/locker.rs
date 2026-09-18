@@ -17,7 +17,7 @@ use solana_account_decoder::{
     parse_bpf_loader::{BpfUpgradeableLoaderAccountType, UiProgram, parse_bpf_upgradeable_loader},
     parse_token::{UiTokenAmount, real_number_string_trimmed},
 };
-use solana_address_lookup_table_interface::state::AddressLookupTable;
+use solana_address_lookup_table_interface::{error::AddressLookupError, state::AddressLookupTable};
 use solana_client::{
     rpc_client::SerializableTransaction,
     rpc_config::{
@@ -3287,15 +3287,27 @@ impl SurfnetSvmLocker {
                 )
             })?;
 
+            // A table deactivated after `current_slot` is also outside the `SlotHashes`
+            // window, so `lookup` reports it as missing. That is not an invalid index, and
+            // reporting it as one would point the caller at the wrong problem.
+            let lookup_error = |err: AddressLookupError| match err {
+                AddressLookupError::LookupTableAccountNotFound => {
+                    SurfpoolError::inactive_lookup_table(
+                        address_table_lookup.account_key,
+                        lookup_table.meta.deactivation_slot,
+                        current_slot,
+                    )
+                }
+                _ => SurfpoolError::invalid_lookup_index(address_table_lookup.account_key),
+            };
+
             let writable = lookup_table
                 .lookup(
                     current_slot,
                     &address_table_lookup.writable_indexes,
                     &slot_hashes,
                 )
-                .map_err(|_ix_err| {
-                    SurfpoolError::invalid_lookup_index(address_table_lookup.account_key)
-                })?;
+                .map_err(lookup_error)?;
 
             let readable = lookup_table
                 .lookup(
@@ -3303,9 +3315,7 @@ impl SurfnetSvmLocker {
                     &address_table_lookup.readonly_indexes,
                     &slot_hashes,
                 )
-                .map_err(|_ix_err| {
-                    SurfpoolError::invalid_lookup_index(address_table_lookup.account_key)
-                })?;
+                .map_err(lookup_error)?;
 
             let MessageAddressTableLookup {
                 account_key,
@@ -4664,6 +4674,7 @@ mod tests {
     use async_trait::async_trait;
     use solana_account::Account;
     use solana_account_decoder::UiAccountEncoding;
+    use solana_address_lookup_table_interface::state::LookupTableMeta;
     use solana_client::{
         nonblocking::rpc_client::RpcClient, rpc_client::RpcClientConfig, rpc_request::RpcRequest,
     };
@@ -7085,6 +7096,62 @@ mod tests {
 
         // Matching only static keys would miss this; ALT-loaded keys are folded in.
         assert_eq!(tfa_signatures(&result), vec![sig.to_string()]);
+    }
+
+    /// A surfnet executing at a past slot reads a lookup table as it stands today, so the table
+    /// can be deactivated after the slot being executed. The error has to name both slots.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_table_deactivated_after_the_current_slot_names_both_slots() {
+        let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let locker = SurfnetSvmLocker::new(svm);
+        let current_slot = locker.with_contextualized_svm_reader(|_| ()).slot;
+        let deactivation_slot = current_slot + 100;
+
+        let table_address = Pubkey::new_unique();
+        let data = AddressLookupTable {
+            meta: LookupTableMeta {
+                deactivation_slot,
+                ..LookupTableMeta::new(Pubkey::new_unique())
+            },
+            addresses: std::borrow::Cow::Owned(vec![Pubkey::new_unique()]),
+        }
+        .serialize_for_tests()
+        .unwrap();
+        locker
+            .with_svm_writer(|svm| {
+                svm.set_account(
+                    &table_address,
+                    Account {
+                        lamports: 1_000_000,
+                        data,
+                        owner: solana_sdk_ids::address_lookup_table::id(),
+                        executable: false,
+                        rent_epoch: 0,
+                    },
+                )
+            })
+            .unwrap();
+
+        let message = locker
+            .get_lookup_table_addresses(
+                &None,
+                &MessageAddressTableLookup {
+                    account_key: table_address,
+                    writable_indexes: vec![0],
+                    readonly_indexes: vec![],
+                },
+                &mut TransactionLoadedAddresses::new(),
+            )
+            .await
+            .expect_err("a deactivated table should not resolve")
+            .to_string();
+
+        assert!(
+            message.contains(&format!(
+                "deactivated at slot {deactivation_slot} and cannot be used at slot {current_slot}"
+            )),
+            "the error should name both slots: {message}"
+        );
     }
 
     #[test]
