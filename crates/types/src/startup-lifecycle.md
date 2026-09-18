@@ -9,35 +9,33 @@ Startup is modeled as two state machines:
 `startup.phase` is a projection of those machines. It is derived from the
 current state and is never stored.
 
-The shape at a glance: sealing is the single exit from planning, the plan's
-tasks run concurrently inside initializing, and leaving it is a join.
+The shape at a glance: sealing is the single forward exit from planning, and
+a seal lands in the first phase its declared tasks leave outstanding (an
+empty plan is ready at once). The tasks run concurrently after sealing;
+`Ready` is their join, and any failure is terminal.
 
+<!-- BEGIN GENERATED: diagram -->
 <!-- BEGIN MERMAID: lifecycle -->
 ```mermaid
 stateDiagram-v2
     [*] --> Planning
-    Planning : inspect project configuration,<br/>compute and seal the required task set
+    Planning : Planning<br/>inspect project configuration,<br/>compute and seal the required task set
     Planning --> CloningRemoteAccounts : StartupPlanSealed
+    Planning --> ExecutingRunbooks : StartupPlanSealed
+    Planning --> Ready : StartupPlanSealed
     Planning --> Failed : StartupFailed
-
-    state "CloningRemoteAccounts (plan tasks run concurrently)" as CloningRemoteAccounts {
-        [*] --> Hydrating
-        Hydrating : fetch and install clones
-        Hydrating --> [*]
-        --
-        [*] --> ExecutingRunbooks
-        ExecutingRunbooks : run startup runbooks
-        ExecutingRunbooks --> [*]
-    }
-
-    CloningRemoteAccounts --> Ready : every required task succeeded
-    CloningRemoteAccounts --> Failed : any task failed
-
-    Ready : first publicly observable state
-    Failed : terminal, reason recorded
+    CloningRemoteAccounts : CloningRemoteAccounts<br/>account hydration outstanding
+    CloningRemoteAccounts --> ExecutingRunbooks : StartupTaskSucceeded
+    CloningRemoteAccounts --> Ready : StartupTaskSucceeded
+    CloningRemoteAccounts --> Failed : StartupTaskFailed
+    ExecutingRunbooks : ExecutingRunbooks<br/>runbook execution outstanding
+    ExecutingRunbooks --> Ready : StartupTaskSucceeded
+    ExecutingRunbooks --> Failed : StartupTaskFailed
+    Ready : Ready<br/>first publicly observable state
+    Failed : Failed<br/>terminal, reason recorded
 ```
 <!-- END MERMAID: lifecycle -->
-
+<!-- END GENERATED: diagram -->
 
 ## Plan lifecycle
 
@@ -138,11 +136,11 @@ the final clone task succeeds.
   independently written specification (the `spec` module beside the machine)
   and verifies that the compatibility projection presented to clients agrees
   with it.
-- Every table in this document is generated and compared byte-for-byte: the
-  lifecycle and projection tables render from the `spec` module, the phase
-  transition table from the model-checking sweep. `cargo
-  surfpool-update-startup-spec` regenerates them all; the surrounding prose
-  is authored.
+- Every table and the diagram in this document are generated and compared
+  byte-for-byte: the lifecycle and projection tables render from the `spec`
+  module, the phase transition table and the diagram from the model-checking
+  sweep. `cargo surfpool-update-startup-spec` regenerates them all; the
+  surrounding prose is authored.
 
 <!-- BEGIN GENERATED: links -->
 [StartupTransition::CompleteTask]: StartupTransition::CompleteTask

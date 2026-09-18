@@ -1,0 +1,15 @@
+[package]
+name = "surfpool-spec-harness"
+# Never published: the crate reaches its consumers as a path-only
+# dev-dependency, which cargo strips from published manifests.
+publish = false
+version = { workspace = true }
+edition = { workspace = true }
+description = "Checking harness for spec documents: generated regions and pre-rendered mermaid diagrams"
+readme = { workspace = true }
+repository = { workspace = true }
+license = { workspace = true }
+keywords = { workspace = true }
+categories = { workspace = true }
+
+[dependencies]

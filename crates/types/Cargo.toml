@@ -49,6 +49,7 @@ txtx-addon-network-svm-types = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
+surfpool-spec-harness = { workspace = true }
 test-case = { workspace = true }
 
 [features]
