@@ -1,5 +1,5 @@
 [workspace.package]
-version = "1.5.0"
+version = "1.6.0"
 edition = "2024"
 description = "Surfpool is where developers start their Solana journey."
 license = "Apache-2.0"
@@ -180,11 +180,11 @@ wincode = "0.5"
 zip = { version = "0.6", features = ["deflate"], default-features = false }
 sha2 = { version = "0.10" }
 
-surfpool-core = { path = "crates/core", default-features = false, version = "1.5.0"}
-surfpool-sdk = { path = "crates/sdk", default-features = false, version = "1.5.0" }
-surfpool-db = { path = "crates/db", version = "1.5.0" }
-surfpool-mcp = { path = "crates/mcp", default-features = false, version = "1.5.0" }
-surfpool-types = { path = "crates/types", default-features = false, version = "1.5.0" }
+surfpool-core = { path = "crates/core", default-features = false, version = "1.6.0"}
+surfpool-sdk = { path = "crates/sdk", default-features = false, version = "1.6.0" }
+surfpool-db = { path = "crates/db", version = "1.6.0" }
+surfpool-mcp = { path = "crates/mcp", default-features = false, version = "1.6.0" }
+surfpool-types = { path = "crates/types", default-features = false, version = "1.6.0" }
 surfpool-studio-ui = { path = "crates/studio", default-features = false, version = "0.1.1" }
 
 txtx-addon-kit = "0.4.15"
