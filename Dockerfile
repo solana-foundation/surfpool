@@ -1,14 +1,15 @@
-FROM rust:bullseye AS build
+FROM rust:bookworm AS build
 
 ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
 
-RUN apt update && apt install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
   ca-certificates \
   pkg-config \
   libssl-dev \
-  libclang-11-dev \
+  libclang-dev \
   wget \
-  tar
+  tar \
+  && rm -rf /var/lib/apt/lists/*
 
 COPY . /src/surfpool
 
@@ -20,14 +21,18 @@ RUN cargo build --release --bin surfpool --locked
 
 RUN cp /src/surfpool/target/release/surfpool /out
 
-FROM debian:bullseye-slim
+FROM debian:bookworm-slim
 
 # Bind on all container interfaces, but advertise localhost by default so
 # local Docker users get client-friendly URLs without extra configuration.
 ENV SURFPOOL_NETWORK_HOST=0.0.0.0
 ENV SURFPOOL_PUBLIC_HOST=127.0.0.1
 
-RUN apt update && apt install -y ca-certificates curl libssl-dev
+RUN apt-get update && apt-get install -y --no-install-recommends \
+  ca-certificates \
+  curl \
+  libssl-dev \
+  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /out/ /bin/
 
