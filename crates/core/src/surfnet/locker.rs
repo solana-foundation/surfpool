@@ -3993,8 +3993,7 @@ impl SurfnetSvmLocker {
 
     /// Retrieves the latest blockhash for the given commitment config from the underlying SVM.
     pub fn get_latest_blockhash(&self, config: &CommitmentConfig) -> Option<Hash> {
-        let slot = self.get_slot_for_commitment(config);
-        self.with_svm_reader(|svm_reader| svm_reader.blockhash_for_slot(slot))
+        self.with_svm_reader(|svm_reader| svm_reader.blockhash_for_commitment(config))
     }
 
     pub fn latest_absolute_blockhash(&self) -> Hash {
@@ -4002,14 +4001,7 @@ impl SurfnetSvmLocker {
     }
 
     pub fn get_slot_for_commitment(&self, commitment: &CommitmentConfig) -> Slot {
-        self.with_svm_reader(|svm_reader| {
-            let slot = svm_reader.get_latest_absolute_slot();
-            match commitment.commitment {
-                CommitmentLevel::Processed => slot,
-                CommitmentLevel::Confirmed => slot.saturating_sub(1),
-                CommitmentLevel::Finalized => slot.saturating_sub(FINALIZATION_SLOT_THRESHOLD),
-            }
-        })
+        self.with_svm_reader(|svm_reader| svm_reader.slot_for_commitment(commitment))
     }
 
     /// Executes an airdrop via the underlying SVM.

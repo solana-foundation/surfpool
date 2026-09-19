@@ -4156,7 +4156,7 @@ mod tests {
     fn test_get_latest_blockhash() {
         let setup = TestSetup::new(SurfpoolFullRpc);
 
-        insert_test_blocks(&setup, 100..=150);
+        confirm_blocks(&setup, FINALIZATION_SLOT_THRESHOLD);
 
         // processed commitment
         {
@@ -4259,6 +4259,35 @@ mod tests {
                 "Last valid block height does not match expected value"
             );
         }
+    }
+
+    #[test]
+    fn test_get_latest_blockhash_finalized_trails_the_tip_across_empty_slots() {
+        let setup = TestSetup::new(SurfpoolFullRpc);
+        let latest_blockhash = |commitment: CommitmentConfig| {
+            setup
+                .rpc
+                .get_latest_blockhash(
+                    Some(setup.context.clone()),
+                    Some(RpcContextConfig {
+                        commitment: Some(commitment),
+                        ..Default::default()
+                    }),
+                )
+                .unwrap()
+                .value
+                .blockhash
+        };
+
+        confirm_blocks(&setup, FINALIZATION_SLOT_THRESHOLD);
+        let tip = latest_blockhash(CommitmentConfig::confirmed());
+
+        // No transaction lands, so none of these slots is stored as a block.
+        confirm_blocks(&setup, FINALIZATION_SLOT_THRESHOLD - 2);
+        assert_ne!(latest_blockhash(CommitmentConfig::finalized()), tip);
+        confirm_blocks(&setup, 1);
+        assert_eq!(latest_blockhash(CommitmentConfig::finalized()), tip);
+        assert_ne!(latest_blockhash(CommitmentConfig::confirmed()), tip);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -4733,6 +4762,14 @@ mod tests {
     }
 
     // helper to insert blocks into the SVM at specific slots
+    fn confirm_blocks(setup: &TestSetup<SurfpoolFullRpc>, count: u64) {
+        setup.context.svm_locker.with_svm_writer(|svm_writer| {
+            for _ in 0..count {
+                svm_writer.confirm_current_block().unwrap();
+            }
+        });
+    }
+
     fn insert_test_blocks<I>(setup: &TestSetup<SurfpoolFullRpc>, slots: I)
     where
         I: IntoIterator<Item = u64>,

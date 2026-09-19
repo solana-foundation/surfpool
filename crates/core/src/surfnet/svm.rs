@@ -1693,6 +1693,47 @@ impl SurfnetSvm {
             .any(|entry| entry.blockhash == *recent_blockhash)
     }
 
+    /// Returns the slot visible at `commitment`.
+    pub fn slot_for_commitment(&self, commitment: &CommitmentConfig) -> Slot {
+        let slot = self.get_latest_absolute_slot();
+        match commitment.commitment {
+            CommitmentLevel::Processed => slot,
+            CommitmentLevel::Confirmed => slot.saturating_sub(1),
+            CommitmentLevel::Finalized => slot.saturating_sub(FINALIZATION_SLOT_THRESHOLD),
+        }
+    }
+
+    /// Recent blockhashes from the chain tip back, newest first.
+    fn blockhashes_from_tip(&self) -> Vec<Hash> {
+        let tip = self.latest_blockhash();
+        #[allow(deprecated)]
+        let mut blockhashes: Vec<Hash> = self
+            .inner
+            .get_sysvar::<solana_sysvar::recent_blockhashes::RecentBlockhashes>()
+            .iter()
+            .map(|entry| entry.blockhash)
+            .skip_while(|blockhash| *blockhash != tip)
+            .collect();
+        // `reconstruct_sysvars` seeds one blockhash past the tip, which the next block repeats.
+        blockhashes.dedup();
+        blockhashes
+    }
+
+    /// Blocks a blockhash must age before `commitment` can see it. The tip blockhash
+    /// belongs to the last closed slot, one behind the latest slot.
+    fn min_blockhash_age(&self, commitment: &CommitmentConfig) -> usize {
+        let lag = self.get_latest_absolute_slot() - self.slot_for_commitment(commitment);
+        lag.saturating_sub(1) as usize
+    }
+
+    /// Returns the newest blockhash visible at `commitment`, or `None` while the
+    /// chain is too short to have one.
+    pub fn blockhash_for_commitment(&self, commitment: &CommitmentConfig) -> Option<Hash> {
+        self.blockhashes_from_tip()
+            .get(self.min_blockhash_age(commitment))
+            .copied()
+    }
+
     /// Computes the fee a message would be charged, base plus prioritization.
     ///
     /// Matches what execution debits: `TransactionConfiguration` supplies the prioritization fee
@@ -3594,14 +3635,6 @@ impl SurfnetSvm {
             block_height: Some(block.block_height),
         };
         Ok(Some(block))
-    }
-
-    /// Returns the blockhash for a given slot, if available.
-    pub fn blockhash_for_slot(&self, slot: Slot) -> Option<Hash> {
-        self.blocks
-            .get(&slot)
-            .unwrap()
-            .and_then(|header| header.hash.parse().ok())
     }
 
     /// Gets all accounts owned by a specific program ID from the account registry.
