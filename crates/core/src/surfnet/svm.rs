@@ -1693,6 +1693,69 @@ impl SurfnetSvm {
             .any(|entry| entry.blockhash == *recent_blockhash)
     }
 
+    /// Returns the slot visible at `commitment`.
+    pub fn slot_for_commitment(&self, commitment: &CommitmentConfig) -> Slot {
+        let slot = self.get_latest_absolute_slot();
+        match commitment.commitment {
+            CommitmentLevel::Processed => slot,
+            CommitmentLevel::Confirmed => slot.saturating_sub(1),
+            CommitmentLevel::Finalized => slot.saturating_sub(FINALIZATION_SLOT_THRESHOLD),
+        }
+    }
+
+    /// Recent blockhashes from the chain tip back, newest first.
+    fn blockhashes_from_tip(&self) -> Vec<Hash> {
+        let tip = self.latest_blockhash();
+        #[allow(deprecated)]
+        let mut blockhashes: Vec<Hash> = self
+            .inner
+            .get_sysvar::<solana_sysvar::recent_blockhashes::RecentBlockhashes>()
+            .iter()
+            .map(|entry| entry.blockhash)
+            .skip_while(|blockhash| *blockhash != tip)
+            .collect();
+        // `reconstruct_sysvars` seeds one blockhash past the tip, which the next block repeats.
+        blockhashes.dedup();
+        blockhashes
+    }
+
+    /// Blocks a blockhash must age before `commitment` can see it. The tip blockhash
+    /// belongs to the last closed slot, one behind the latest slot.
+    fn min_blockhash_age(&self, commitment: &CommitmentConfig) -> usize {
+        let lag = self.get_latest_absolute_slot() - self.slot_for_commitment(commitment);
+        lag.saturating_sub(1) as usize
+    }
+
+    /// Returns the newest blockhash visible at `commitment`, or `None` while the
+    /// chain is too short to have one.
+    pub fn blockhash_for_commitment(&self, commitment: &CommitmentConfig) -> Option<Hash> {
+        self.blockhashes_from_tip()
+            .get(self.min_blockhash_age(commitment))
+            .copied()
+    }
+
+    /// Blocks minted since `blockhash`, or `None` if it is not a recent blockhash.
+    pub fn blockhash_age(&self, blockhash: &Hash) -> Option<u64> {
+        self.blockhashes_from_tip()
+            .iter()
+            .position(|recent| recent == blockhash)
+            .map(|age| age as u64)
+    }
+
+    /// Returns `false` when `blockhash` is a recent blockhash too new for `commitment`.
+    pub fn is_blockhash_visible_at(&self, blockhash: &Hash, commitment: &CommitmentConfig) -> bool {
+        if self.skip_blockhash_check {
+            return true;
+        }
+        let blockhashes = self.blockhashes_from_tip();
+        let min_age = self.min_blockhash_age(commitment);
+        match blockhashes.iter().position(|recent| recent == blockhash) {
+            // Old enough, or minted while `blockhash_for_commitment` still fell back to the tip.
+            Some(age) => age >= min_age || blockhashes.len() - age <= min_age,
+            None => true,
+        }
+    }
+
     /// Computes the fee a message would be charged, base plus prioritization.
     ///
     /// Matches what execution debits: `TransactionConfiguration` supplies the prioritization fee
@@ -3594,14 +3657,6 @@ impl SurfnetSvm {
             block_height: Some(block.block_height),
         };
         Ok(Some(block))
-    }
-
-    /// Returns the blockhash for a given slot, if available.
-    pub fn blockhash_for_slot(&self, slot: Slot) -> Option<Hash> {
-        self.blocks
-            .get(&slot)
-            .unwrap()
-            .and_then(|header| header.hash.parse().ok())
     }
 
     /// Gets all accounts owned by a specific program ID from the account registry.
@@ -5837,6 +5892,35 @@ mod tests {
 
         let profiling_clone = svm.clone_for_profiling();
         assert!(profiling_clone.skip_blockhash_check);
+    }
+
+    #[test]
+    fn test_blockhash_minted_during_finalized_warmup_stays_visible_at_finalized() {
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let finalized = CommitmentConfig::finalized();
+        let confirm_blocks = |svm: &mut SurfnetSvm, count: u64| {
+            for _ in 0..count {
+                svm.confirm_current_block().unwrap();
+            }
+        };
+
+        // The chain is too short for finalized to have its own blockhash, so it hands out the tip.
+        confirm_blocks(&mut svm, FINALIZATION_SLOT_THRESHOLD - 2);
+        assert_eq!(svm.blockhash_for_commitment(&finalized), None);
+        let warmup_blockhash = svm.latest_blockhash();
+        assert!(svm.is_blockhash_visible_at(&warmup_blockhash, &finalized));
+
+        // Still visible once the warmup ends, though it is not old enough yet.
+        confirm_blocks(&mut svm, 1);
+        assert!(svm.blockhash_for_commitment(&finalized).is_some());
+        assert!(svm.is_blockhash_visible_at(&warmup_blockhash, &finalized));
+
+        let fresh_blockhash = svm.latest_blockhash();
+        assert!(svm.is_blockhash_visible_at(&fresh_blockhash, &CommitmentConfig::confirmed()));
+        confirm_blocks(&mut svm, FINALIZATION_SLOT_THRESHOLD - 2);
+        assert!(!svm.is_blockhash_visible_at(&fresh_blockhash, &finalized));
+        confirm_blocks(&mut svm, 1);
+        assert!(svm.is_blockhash_visible_at(&fresh_blockhash, &finalized));
     }
 
     #[test_case(TestType::sqlite(); "with on-disk sqlite db")]

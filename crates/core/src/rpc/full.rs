@@ -1754,6 +1754,40 @@ impl Full for SurfpoolFullRpc {
             .into());
         };
 
+        if !config.base.skip_preflight {
+            let preflight_commitment = CommitmentConfig {
+                commitment: config.base.preflight_commitment.unwrap_or_default(),
+            };
+            let blockhash_visible = ctx.svm_locker.with_svm_reader(|svm_reader| {
+                svm_reader
+                    .is_blockhash_visible_at(tx_message.recent_blockhash(), &preflight_commitment)
+            });
+            if !blockhash_visible {
+                let error = TransactionError::BlockhashNotFound;
+                return Err(Error {
+                    data: Some(
+                        serde_json::to_value(get_simulate_transaction_result(
+                            TransactionMetadata::default(),
+                            None,
+                            Some(error.clone()),
+                            None,
+                            false,
+                            &tx_message,
+                            None,
+                            None,
+                        ))
+                        .map_err(|e| {
+                            Error::invalid_params(format!(
+                                "Failed to serialize simulation result: {e}"
+                            ))
+                        })?,
+                    ),
+                    message: format!("Transaction simulation failed: {error}"),
+                    code: jsonrpc_core::ErrorCode::ServerError(-32002),
+                });
+            }
+        }
+
         let (status_update_tx, status_update_rx) = crossbeam_channel::bounded(1);
         ctx.svm_locker.mark_transaction_pending(signature);
         if ctx
@@ -2458,12 +2492,20 @@ impl Full for SurfpoolFullRpc {
             }
         }
 
-        let blockhash = svm_locker
-            .get_latest_blockhash(&commitment)
-            .unwrap_or_else(|| svm_locker.latest_absolute_blockhash());
-
-        let current_block_height = svm_locker.get_epoch_info().block_height;
-        let last_valid_block_height = current_block_height + MAX_RECENT_BLOCKHASHES_STANDARD as u64;
+        let (blockhash, last_valid_block_height) = svm_locker.with_svm_reader(|svm_reader| {
+            let blockhash = svm_reader
+                .blockhash_for_commitment(&commitment)
+                .unwrap_or_else(|| svm_reader.latest_blockhash());
+            let age = svm_reader.blockhash_age(&blockhash).unwrap_or(0);
+            let minted_at_block_height = svm_reader
+                .latest_epoch_info
+                .block_height
+                .saturating_sub(age);
+            (
+                blockhash,
+                minted_at_block_height + MAX_RECENT_BLOCKHASHES_STANDARD as u64,
+            )
+        });
         Ok(RpcResponse {
             context: RpcResponseContext::new(svm_locker.get_latest_absolute_slot()),
             value: RpcBlockhash {
@@ -4156,7 +4198,7 @@ mod tests {
     fn test_get_latest_blockhash() {
         let setup = TestSetup::new(SurfpoolFullRpc);
 
-        insert_test_blocks(&setup, 100..=150);
+        confirm_blocks(&setup, FINALIZATION_SLOT_THRESHOLD);
 
         // processed commitment
         {
@@ -4245,9 +4287,11 @@ mod tests {
                 .get_latest_blockhash(&commitment)
                 .unwrap();
 
+            // The finalized blockhash is 30 blocks old, so it expires 30 blocks sooner.
             let current_block_height = setup.context.svm_locker.get_epoch_info().block_height;
-            let expected_last_valid_block_height =
-                current_block_height + MAX_RECENT_BLOCKHASHES_STANDARD as u64;
+            let expected_last_valid_block_height = current_block_height
+                - (FINALIZATION_SLOT_THRESHOLD - 1)
+                + MAX_RECENT_BLOCKHASHES_STANDARD as u64;
 
             assert_eq!(
                 res.value.blockhash,
@@ -4259,6 +4303,125 @@ mod tests {
                 "Last valid block height does not match expected value"
             );
         }
+    }
+
+    #[test]
+    fn test_get_latest_blockhash_finalized_trails_the_tip_across_empty_slots() {
+        let setup = TestSetup::new(SurfpoolFullRpc);
+        let latest_blockhash = |commitment: CommitmentConfig| {
+            setup
+                .rpc
+                .get_latest_blockhash(
+                    Some(setup.context.clone()),
+                    Some(RpcContextConfig {
+                        commitment: Some(commitment),
+                        ..Default::default()
+                    }),
+                )
+                .unwrap()
+                .value
+                .blockhash
+        };
+
+        confirm_blocks(&setup, FINALIZATION_SLOT_THRESHOLD);
+        let tip = latest_blockhash(CommitmentConfig::confirmed());
+
+        // No transaction lands, so none of these slots is stored as a block.
+        confirm_blocks(&setup, FINALIZATION_SLOT_THRESHOLD - 2);
+        assert_ne!(latest_blockhash(CommitmentConfig::finalized()), tip);
+        confirm_blocks(&setup, 1);
+        assert_eq!(latest_blockhash(CommitmentConfig::finalized()), tip);
+        assert_ne!(latest_blockhash(CommitmentConfig::confirmed()), tip);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_send_transaction_preflights_blockhash_at_preflight_commitment() {
+        let payer = Keypair::new();
+        let (mempool_tx, mempool_rx) = crossbeam_channel::unbounded();
+        let setup = TestSetup::new_with_mempool(SurfpoolFullRpc, mempool_tx);
+        confirm_blocks(&setup, FINALIZATION_SLOT_THRESHOLD);
+
+        let confirmed_blockhash = setup
+            .rpc
+            .get_latest_blockhash(
+                Some(setup.context.clone()),
+                Some(RpcContextConfig {
+                    commitment: Some(CommitmentConfig::confirmed()),
+                    ..Default::default()
+                }),
+            )
+            .unwrap()
+            .value
+            .blockhash
+            .parse::<Hash>()
+            .unwrap();
+        let tx = build_v0_transaction(
+            &payer.pubkey(),
+            &[&payer.insecure_clone()],
+            &[system_instruction::transfer(
+                &payer.pubkey(),
+                &Pubkey::new_unique(),
+                LAMPORTS_PER_SOL,
+            )],
+            &confirmed_blockhash,
+        );
+        let encoded = bs58::encode(wincode::serialize(&tx).unwrap()).into_string();
+
+        // An unset preflightCommitment is finalized, which cannot see a confirmed blockhash yet.
+        let (setup_clone, encoded_clone) = (setup.clone(), encoded.clone());
+        let rejected = hiro_system_kit::thread_named("send_tx_default_preflight")
+            .spawn(move || {
+                setup_clone
+                    .rpc
+                    .send_transaction(Some(setup_clone.context), encoded_clone, None)
+            })
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !rejected.is_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "sendTransaction should fail preflight instead of waiting on the mempool"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let err = rejected.join().unwrap().unwrap_err();
+        assert_eq!(err.code, jsonrpc_core::ErrorCode::ServerError(-32002));
+        assert_eq!(
+            err.message,
+            "Transaction simulation failed: Blockhash not found"
+        );
+        assert!(
+            mempool_rx.try_recv().is_err(),
+            "a rejected transaction must not be enqueued"
+        );
+
+        let config = SurfpoolRpcSendTransactionConfig {
+            base: RpcSendTransactionConfig {
+                preflight_commitment: Some(CommitmentLevel::Confirmed),
+                ..Default::default()
+            },
+            skip_sig_verify: None,
+        };
+        let setup_clone = setup.clone();
+        let handle = hiro_system_kit::thread_named("send_tx_confirmed_preflight")
+            .spawn(move || {
+                setup_clone
+                    .rpc
+                    .send_transaction(Some(setup_clone.context), encoded, Some(config))
+            })
+            .unwrap();
+        let Ok(SimnetCommand::ProcessTransaction(_, _, status_tx, _, _)) = mempool_rx.recv() else {
+            panic!("the transaction should be enqueued");
+        };
+        status_tx
+            .send(TransactionStatusEvent::Success(
+                TransactionConfirmationStatus::Processed,
+            ))
+            .unwrap();
+        assert_eq!(
+            handle.join().unwrap().unwrap(),
+            tx.signatures[0].to_string()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -4733,6 +4896,14 @@ mod tests {
     }
 
     // helper to insert blocks into the SVM at specific slots
+    fn confirm_blocks(setup: &TestSetup<SurfpoolFullRpc>, count: u64) {
+        setup.context.svm_locker.with_svm_writer(|svm_writer| {
+            for _ in 0..count {
+                svm_writer.confirm_current_block().unwrap();
+            }
+        });
+    }
+
     fn insert_test_blocks<I>(setup: &TestSetup<SurfpoolFullRpc>, slots: I)
     where
         I: IntoIterator<Item = u64>,
