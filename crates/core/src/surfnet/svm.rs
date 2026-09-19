@@ -1734,6 +1734,20 @@ impl SurfnetSvm {
             .copied()
     }
 
+    /// Returns `false` when `blockhash` is a recent blockhash too new for `commitment`.
+    pub fn is_blockhash_visible_at(&self, blockhash: &Hash, commitment: &CommitmentConfig) -> bool {
+        if self.skip_blockhash_check {
+            return true;
+        }
+        let blockhashes = self.blockhashes_from_tip();
+        let min_age = self.min_blockhash_age(commitment);
+        match blockhashes.iter().position(|recent| recent == blockhash) {
+            // Old enough, or minted while `blockhash_for_commitment` still fell back to the tip.
+            Some(age) => age >= min_age || blockhashes.len() - age <= min_age,
+            None => true,
+        }
+    }
+
     /// Computes the fee a message would be charged, base plus prioritization.
     ///
     /// Matches what execution debits: `TransactionConfiguration` supplies the prioritization fee
@@ -5870,6 +5884,35 @@ mod tests {
 
         let profiling_clone = svm.clone_for_profiling();
         assert!(profiling_clone.skip_blockhash_check);
+    }
+
+    #[test]
+    fn test_blockhash_minted_during_finalized_warmup_stays_visible_at_finalized() {
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let finalized = CommitmentConfig::finalized();
+        let confirm_blocks = |svm: &mut SurfnetSvm, count: u64| {
+            for _ in 0..count {
+                svm.confirm_current_block().unwrap();
+            }
+        };
+
+        // The chain is too short for finalized to have its own blockhash, so it hands out the tip.
+        confirm_blocks(&mut svm, FINALIZATION_SLOT_THRESHOLD - 2);
+        assert_eq!(svm.blockhash_for_commitment(&finalized), None);
+        let warmup_blockhash = svm.latest_blockhash();
+        assert!(svm.is_blockhash_visible_at(&warmup_blockhash, &finalized));
+
+        // Still visible once the warmup ends, though it is not old enough yet.
+        confirm_blocks(&mut svm, 1);
+        assert!(svm.blockhash_for_commitment(&finalized).is_some());
+        assert!(svm.is_blockhash_visible_at(&warmup_blockhash, &finalized));
+
+        let fresh_blockhash = svm.latest_blockhash();
+        assert!(svm.is_blockhash_visible_at(&fresh_blockhash, &CommitmentConfig::confirmed()));
+        confirm_blocks(&mut svm, FINALIZATION_SLOT_THRESHOLD - 2);
+        assert!(!svm.is_blockhash_visible_at(&fresh_blockhash, &finalized));
+        confirm_blocks(&mut svm, 1);
+        assert!(svm.is_blockhash_visible_at(&fresh_blockhash, &finalized));
     }
 
     #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
