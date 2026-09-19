@@ -1734,6 +1734,14 @@ impl SurfnetSvm {
             .copied()
     }
 
+    /// Blocks minted since `blockhash`, or `None` if it is not a recent blockhash.
+    pub fn blockhash_age(&self, blockhash: &Hash) -> Option<u64> {
+        self.blockhashes_from_tip()
+            .iter()
+            .position(|recent| recent == blockhash)
+            .map(|age| age as u64)
+    }
+
     /// Returns `false` when `blockhash` is a recent blockhash too new for `commitment`.
     pub fn is_blockhash_visible_at(&self, blockhash: &Hash, commitment: &CommitmentConfig) -> bool {
         if self.skip_blockhash_check {

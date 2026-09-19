@@ -2492,12 +2492,20 @@ impl Full for SurfpoolFullRpc {
             }
         }
 
-        let blockhash = svm_locker
-            .get_latest_blockhash(&commitment)
-            .unwrap_or_else(|| svm_locker.latest_absolute_blockhash());
-
-        let current_block_height = svm_locker.get_epoch_info().block_height;
-        let last_valid_block_height = current_block_height + MAX_RECENT_BLOCKHASHES_STANDARD as u64;
+        let (blockhash, last_valid_block_height) = svm_locker.with_svm_reader(|svm_reader| {
+            let blockhash = svm_reader
+                .blockhash_for_commitment(&commitment)
+                .unwrap_or_else(|| svm_reader.latest_blockhash());
+            let age = svm_reader.blockhash_age(&blockhash).unwrap_or(0);
+            let minted_at_block_height = svm_reader
+                .latest_epoch_info
+                .block_height
+                .saturating_sub(age);
+            (
+                blockhash,
+                minted_at_block_height + MAX_RECENT_BLOCKHASHES_STANDARD as u64,
+            )
+        });
         Ok(RpcResponse {
             context: RpcResponseContext::new(svm_locker.get_latest_absolute_slot()),
             value: RpcBlockhash {
@@ -4279,9 +4287,11 @@ mod tests {
                 .get_latest_blockhash(&commitment)
                 .unwrap();
 
+            // The finalized blockhash is 30 blocks old, so it expires 30 blocks sooner.
             let current_block_height = setup.context.svm_locker.get_epoch_info().block_height;
-            let expected_last_valid_block_height =
-                current_block_height + MAX_RECENT_BLOCKHASHES_STANDARD as u64;
+            let expected_last_valid_block_height = current_block_height
+                - (FINALIZATION_SLOT_THRESHOLD - 1)
+                + MAX_RECENT_BLOCKHASHES_STANDARD as u64;
 
             assert_eq!(
                 res.value.blockhash,
