@@ -7,6 +7,7 @@ export type * from "./CheatcodeControlConfig.js";
 export type * from "./ConfidentialBalanceKeys.js";
 export type * from "./ConfidentialTransferAccountUpdate.js";
 export type * from "./DeriveConfidentialKeysResponse.js";
+export type * from "./EpochStakeEntry.js";
 export type * from "./ExportSnapshotConfig.js";
 export type * from "./ExportSnapshotFilter.js";
 export type * from "./ExportSnapshotScope.js";
