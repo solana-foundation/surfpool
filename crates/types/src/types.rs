@@ -1119,8 +1119,11 @@ pub struct AccountUpdate {
 /// A vote account's stake in the epoch snapshot used by `sol_get_epoch_stake`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(export))]
 pub struct EpochStakeEntry {
     pub vote_account: String,
+    #[cfg_attr(feature = "ts-bindings", ts(type = "number | bigint"))]
     pub stake: u64,
 }
 
