@@ -32,6 +32,7 @@ use crate::{
 /// ```
 pub struct DeployProgram {
     program_id: Pubkey,
+    authority: Option<Pubkey>,
     so_path: Option<PathBuf>,
     so_bytes: Option<Vec<u8>>,
     idl_path: Option<PathBuf>,
@@ -42,10 +43,17 @@ impl DeployProgram {
     pub fn new(program_id: Pubkey) -> Self {
         Self {
             program_id,
+            authority: None,
             so_path: None,
             so_bytes: None,
             idl_path: None,
         }
+    }
+
+    /// Set the upgrade authority recorded on a newly-created ProgramData account.
+    pub fn authority(mut self, authority: Pubkey) -> Self {
+        self.authority = Some(authority);
+        self
     }
 
     /// Create a deployment builder from a Solana keypair file.
@@ -87,6 +95,10 @@ impl DeployProgram {
     /// Return the program id that will be deployed.
     pub(crate) fn program_id(&self) -> Pubkey {
         self.program_id
+    }
+
+    pub(crate) fn upgrade_authority(&self) -> Option<Pubkey> {
+        self.authority
     }
 
     /// Resolve the program bytes from either an explicit path or inline bytes.
