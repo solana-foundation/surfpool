@@ -16,10 +16,10 @@ use solana_system_interface::program as system_program;
 use solana_transaction::versioned::VersionedTransaction;
 use spl_associated_token_account_interface::address::get_associated_token_address_with_program_id;
 use surfpool_types::{
-    AccountSnapshot, CheatcodeControlConfig, CheatcodeFilter, ClockCommand, ExportSnapshotConfig,
-    GetStreamedAccountsResponse, GetSurfnetInfoResponse, Idl, OfflineAccountConfig,
-    ResetAccountConfig, RpcProfileResultConfig, Scenario, SimnetCommand, StreamAccountConfig,
-    StreamAccountsEntry, UiKeyedProfileResult,
+    AccountSnapshot, CheatcodeControlConfig, CheatcodeFilter, ClockCommand, EpochStakeEntry,
+    ExportSnapshotConfig, GetStreamedAccountsResponse, GetSurfnetInfoResponse, Idl,
+    OfflineAccountConfig, ResetAccountConfig, RpcProfileResultConfig, Scenario, SimnetCommand,
+    StreamAccountConfig, StreamAccountsEntry, UiKeyedProfileResult,
     types::{
         AccountUpdate, ConfidentialBalanceKeys, DeriveConfidentialKeysResponse,
         GetConfidentialBalanceResponse, SetSomeAccount, SupplyUpdate, TokenAccountUpdate,
@@ -1356,6 +1356,59 @@ pub trait SurfnetCheatcodes {
         signature: String,
     ) -> Result<RpcResponse<DeriveConfidentialKeysResponse>>;
 
+    /// Replace the epoch-frozen vote-account stake map used by the
+    /// `sol_get_epoch_stake` syscall.
+    ///
+    /// ## Parameters
+    /// - `stakes`: A list of `EpochStakeEntry` objects. Each entry contains a
+    ///   base-58 encoded vote-account public key (`voteAccount`) and its stake
+    ///   in lamports (`stake`).
+    ///
+    /// ## Returns
+    /// An `RpcResponse<()>` indicating whether the epoch-stake snapshot was
+    /// replaced successfully.
+    ///
+    /// ## Example Request
+    /// ```json
+    /// {
+    ///   "jsonrpc": "2.0",
+    ///   "id": 1,
+    ///   "method": "surfnet_setEpochStakes",
+    ///   "params": [
+    ///     [
+    ///       { "voteAccount": "4EXSeLGxVBpAZwq7vm6evLdewpcvE2H56fpqL2pPiLFa", "stake": 11 },
+    ///       { "voteAccount": "7nYBm5mk15oDNewVjNFmEqJ9VgMvT4F74UVoeYDCpScd", "stake": 29 }
+    ///     ]
+    ///   ]
+    /// }
+    /// ```
+    ///
+    /// ## Example Response
+    /// ```json
+    /// {
+    ///   "jsonrpc": "2.0",
+    ///   "result": {
+    ///     "context": {
+    ///       "slot": 123456789,
+    ///       "apiVersion": "2.3.8"
+    ///     },
+    ///     "value": null
+    ///   },
+    ///   "id": 1
+    /// }
+    /// ```
+    ///
+    /// # Notes
+    /// This replaces the entire snapshot; pass an empty list to clear it. The
+    /// snapshot is independent of vote and stake account data, matching the
+    /// epoch-frozen distribution read by the syscall on a cluster.
+    #[rpc(meta, name = "surfnet_setEpochStakes")]
+    fn set_epoch_stakes(
+        &self,
+        meta: Self::Metadata,
+        stakes: Vec<EpochStakeEntry>,
+    ) -> Result<RpcResponse<()>>;
+
     /// A "cheat code" method for developers to write program data at a specified offset in Surfpool.
     ///
     /// This method allows developers to write large Solana programs by sending data in chunks,
@@ -2456,6 +2509,25 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
         Ok(RpcResponse {
             context: RpcResponseContext::new(svm_locker.get_latest_absolute_slot()),
             value: keys,
+        })
+    }
+
+    fn set_epoch_stakes(
+        &self,
+        meta: Self::Metadata,
+        stakes: Vec<EpochStakeEntry>,
+    ) -> Result<RpcResponse<()>> {
+        let svm_locker = meta.get_svm_locker()?;
+        let stakes = stakes
+            .into_iter()
+            .map(|entry| Ok((verify_pubkey(&entry.vote_account)?, entry.stake)))
+            .collect::<Result<Vec<_>>>()?;
+        svm_locker
+            .set_epoch_stakes(stakes)
+            .map_err(|error| Error::invalid_params(error.to_string()))?;
+        Ok(RpcResponse {
+            context: RpcResponseContext::new(svm_locker.get_latest_absolute_slot()),
+            value: (),
         })
     }
 
@@ -3978,6 +4050,36 @@ mod tests {
         );
 
         println!("✅ Both accounts created successfully");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_set_epoch_stakes_replaces_runtime_snapshot() {
+        let client = TestSetup::new(SurfnetCheatcodesRpc::empty());
+        let first = Pubkey::new_unique();
+        let second = Pubkey::new_unique();
+
+        client
+            .rpc
+            .set_epoch_stakes(
+                Some(client.context.clone()),
+                vec![
+                    EpochStakeEntry {
+                        vote_account: first.to_string(),
+                        stake: 11,
+                    },
+                    EpochStakeEntry {
+                        vote_account: second.to_string(),
+                        stake: 29,
+                    },
+                ],
+            )
+            .unwrap();
+
+        client.context.svm_locker.with_svm_reader(|svm| {
+            assert_eq!(svm.inner.svm.epoch_stake(&first), 11);
+            assert_eq!(svm.inner.svm.epoch_stake(&second), 29);
+            assert_eq!(svm.inner.svm.epoch_total_stake(), 40);
+        });
     }
 
     #[tokio::test(flavor = "multi_thread")]

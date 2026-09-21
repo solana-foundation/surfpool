@@ -1116,6 +1116,14 @@ pub struct AccountUpdate {
     pub rent_epoch: Option<Epoch>,
 }
 
+/// A vote account's stake in the epoch snapshot used by `sol_get_epoch_stake`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EpochStakeEntry {
+    pub vote_account: String,
+    pub stake: u64,
+}
+
 #[derive(Debug, Clone)]
 pub enum SetSomeAccount {
     Account(String),
@@ -1783,7 +1791,7 @@ pub enum CheatcodeFilter {
 /// `surfpool-core/src/rpc/surfnet_cheatcodes.rs` asserts it matches the
 /// methods actually registered by the `SurfnetCheatcodes` trait, so adding,
 /// removing, or renaming a cheatcode without updating this list fails CI.
-pub const SURFNET_CHEATCODE_METHODS: [&str; 28] = [
+pub const SURFNET_CHEATCODE_METHODS: [&str; 29] = [
     "surfnet_cloneProgramAccount",
     "surfnet_deriveConfidentialKeys",
     "surfnet_disableCheatcode",
@@ -1805,6 +1813,7 @@ pub const SURFNET_CHEATCODE_METHODS: [&str; 28] = [
     "surfnet_resetNetwork",
     "surfnet_resumeClock",
     "surfnet_setAccount",
+    "surfnet_setEpochStakes",
     "surfnet_setProgramAuthority",
     "surfnet_setSupply",
     "surfnet_setTokenAccount",
