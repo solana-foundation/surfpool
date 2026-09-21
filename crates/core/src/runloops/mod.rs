@@ -14,8 +14,7 @@ use agave_geyser_plugin_interface::geyser_plugin_interface::{
     ReplicaEntryInfoVersions, ReplicaTransactionInfoV3, ReplicaTransactionInfoVersions, SlotStatus,
 };
 use chrono::{Local, Utc};
-use crossbeam::select;
-use crossbeam_channel::{Receiver, Sender, unbounded};
+use crossbeam_channel::{Receiver, Sender, bounded, select, select_biased, unbounded};
 use itertools::Itertools;
 use jsonrpc_core::MetaIoHandler;
 use jsonrpc_http_server::{DomainsValidation, ServerBuilder};
@@ -371,33 +370,14 @@ pub async fn start_block_production_runloop(
         expiry_duration_ms.map(|expiry_val| Utc::now().timestamp_millis() as u64 + expiry_val);
     let global_skip_sig_verify = simnet_config.skip_signature_verification;
     let ix_profiling_initially_enabled = simnet_config.instruction_profiling_enabled;
+    // A queued token asks the next runloop iteration to produce one follow-up
+    // block. Keeping it in the select lets commands submitted in the meantime
+    // join that block instead of waiting for a whole finalization window.
+    let (scheduled_block_tx, scheduled_block_rx) = bounded::<()>(1);
     loop {
         let mut do_produce_block = false;
 
-        select! {
-            recv(clock_event_rx) -> msg => if let Ok(event) = msg {
-                match event {
-                    ClockEvent::Tick => {
-                        if block_production_mode.eq(&BlockProductionMode::Clock) {
-                            do_produce_block = true;
-                        }
-
-                        if let Some(expiry_ms) = expiry_duration_ms {
-                            if let Some(scheduled_time_ref) = &mut next_scheduled_expiry_check {
-                                let now_ms = Utc::now().timestamp_millis() as u64;
-                                if now_ms >= *scheduled_time_ref {
-                                    let svm = svm_locker.0.read().await;
-                                    if svm.updated_at + expiry_ms < now_ms {
-                                        let _ = simnet_commands_tx.send(SimnetCommand::Terminate(None));
-                                    } else {
-                                        *scheduled_time_ref = svm.updated_at + expiry_ms;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            },
+        select_biased! {
             recv(simnet_commands_rx) -> msg => if let Ok(event) = msg {
                 match event {
                     SimnetCommand::SlotForward(_key) => {
@@ -500,6 +480,11 @@ pub async fn start_block_production_runloop(
                     }
                     SimnetCommand::UpdateBlockProductionMode(update) => {
                         block_production_mode = update;
+                        if block_production_mode.eq(&BlockProductionMode::Transaction)
+                            && svm_locker.has_transactions_pending_finalization()
+                        {
+                            let _ = scheduled_block_tx.try_send(());
+                        }
                         continue
                     }
                     SimnetCommand::ProcessTransaction(_key, transaction, status_tx, skip_preflight, skip_sig_verify_override) => {
@@ -623,6 +608,34 @@ pub async fn start_block_production_runloop(
                     }
                 }
             },
+            recv(scheduled_block_rx) -> msg => if msg.is_ok()
+                && block_production_mode.eq(&BlockProductionMode::Transaction)
+            {
+                do_produce_block = true;
+            },
+            recv(clock_event_rx) -> msg => if let Ok(event) = msg {
+                match event {
+                    ClockEvent::Tick => {
+                        if block_production_mode.eq(&BlockProductionMode::Clock) {
+                            do_produce_block = true;
+                        }
+
+                        if let Some(expiry_ms) = expiry_duration_ms {
+                            if let Some(scheduled_time_ref) = &mut next_scheduled_expiry_check {
+                                let now_ms = Utc::now().timestamp_millis() as u64;
+                                if now_ms >= *scheduled_time_ref {
+                                    let svm = svm_locker.0.read().await;
+                                    if svm.updated_at + expiry_ms < now_ms {
+                                        let _ = simnet_commands_tx.send(SimnetCommand::Terminate(None));
+                                    } else {
+                                        *scheduled_time_ref = svm.updated_at + expiry_ms;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            },
         }
 
         {
@@ -630,6 +643,15 @@ pub async fn start_block_production_runloop(
                 svm_locker
                     .confirm_current_block(&remote_client_with_commitment)
                     .await?;
+
+                // Transaction mode has no clock-driven blocks. Schedule the
+                // next one only when finalization still needs to advance, then
+                // return to the command queue before producing it.
+                if block_production_mode.eq(&BlockProductionMode::Transaction)
+                    && svm_locker.has_transactions_pending_finalization()
+                {
+                    let _ = scheduled_block_tx.try_send(());
+                }
             }
         }
     }

@@ -683,6 +683,13 @@ impl SurfnetSvm {
         self.pending_transaction_signatures.contains_key(signature)
     }
 
+    /// Whether a produced block still needs to advance a locally submitted
+    /// transaction from processed through finalization.
+    pub(crate) fn has_transactions_pending_finalization(&self) -> bool {
+        !self.transactions_queued_for_confirmation.is_empty()
+            || !self.transactions_queued_for_finalization.is_empty()
+    }
+
     pub fn default() -> (Self, Receiver<SimnetEvent>, Receiver<GeyserEvent>) {
         Self::new(SurfnetSvmConfig::default()).unwrap()
     }

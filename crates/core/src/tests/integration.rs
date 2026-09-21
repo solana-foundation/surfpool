@@ -4622,6 +4622,111 @@ fn boot_simnet(
     })
 }
 
+// Regression #814: transaction-mode follow-up blocks must return to the
+// command queue, so a transaction submitted during finalization joins the
+// next block instead of waiting for a second finalization window.
+#[tokio::test(flavor = "multi_thread")]
+async fn transaction_mode_interleaves_queued_transactions() {
+    let simnet = boot_simnet(BlockProductionMode::Transaction, Some(1), TestType::no_db())
+        .expect("the simnet should boot");
+    let payer = Keypair::new();
+    simnet.locker.with_svm_writer(|svm| {
+        svm.set_account(
+            &payer.pubkey(),
+            Account {
+                lamports: LAMPORTS_PER_SOL,
+                data: vec![],
+                owner: system_program::id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .expect("payer account should be installed");
+    });
+
+    let blockhash = simnet.locker.latest_absolute_blockhash();
+    let mut first = Transaction::new_unsigned(Message::new(
+        &[system_instruction::transfer(
+            &payer.pubkey(),
+            &Pubkey::new_unique(),
+            1_000_000,
+        )],
+        Some(&payer.pubkey()),
+    ));
+    first
+        .try_sign(&[&payer], blockhash)
+        .expect("first transaction should sign");
+    let first_signature = first.signatures[0];
+
+    let mut second = Transaction::new_unsigned(Message::new(
+        &[system_instruction::transfer(
+            &payer.pubkey(),
+            &Pubkey::new_unique(),
+            2_000_000,
+        )],
+        Some(&payer.pubkey()),
+    ));
+    second
+        .try_sign(&[&payer], blockhash)
+        .expect("second transaction should sign");
+    let second_signature = second.signatures[0];
+
+    let (first_status_tx, _first_status_rx) = crossbeam_unbounded();
+    let (second_status_tx, _second_status_rx) = crossbeam_unbounded();
+    simnet
+        .commands
+        .send(SimnetCommand::ProcessTransaction(
+            None,
+            VersionedTransaction::from(first),
+            first_status_tx,
+            false,
+            None,
+        ))
+        .expect("first transaction should queue");
+    simnet
+        .commands
+        .send(SimnetCommand::ProcessTransaction(
+            None,
+            VersionedTransaction::from(second),
+            second_status_tx,
+            false,
+            None,
+        ))
+        .expect("second transaction should queue before the follow-up block");
+
+    let locker = simnet.locker.clone();
+    let slots = tokio::time::timeout(Duration::from_secs(5), async move {
+        loop {
+            let slots = locker.with_svm_reader(|svm| {
+                [first_signature, second_signature].map(|signature| {
+                    svm.transactions
+                        .get(&signature.to_string())
+                        .expect("transaction lookup should succeed")
+                        .and_then(|transaction| {
+                            transaction
+                                .as_processed()
+                                .map(|(transaction, _)| transaction.slot)
+                        })
+                })
+            });
+            if let [Some(first_slot), Some(second_slot)] = slots
+                && locker.get_latest_absolute_slot() >= second_slot + FINALIZATION_SLOT_THRESHOLD
+            {
+                break (first_slot, second_slot);
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("both transactions should finalize");
+
+    assert_eq!(
+        slots.1,
+        slots.0 + 1,
+        "queued transactions should occupy adjacent blocks rather than separate finalization windows"
+    );
+}
+
 /// A runloop that ends by panicking has finished without having stopped, and
 /// the guard tells the difference. The panic message this prints is the
 /// spawned thread's own, and is expected output.
