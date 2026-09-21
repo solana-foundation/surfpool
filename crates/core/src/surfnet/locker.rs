@@ -1667,6 +1667,12 @@ impl SurfnetSvmLocker {
         self.with_svm_reader(|svm_reader| svm_reader.is_transaction_pending(signature))
     }
 
+    /// Returns whether a transaction-mode runloop must keep producing blocks
+    /// for locally queued transactions to reach finalization.
+    pub(crate) fn has_transactions_pending_finalization(&self) -> bool {
+        self.with_svm_reader(|svm_reader| svm_reader.has_transactions_pending_finalization())
+    }
+
     /// Retrieves a transaction by signature, using local or remote based on context.
     pub async fn get_transaction(
         &self,
