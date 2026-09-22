@@ -1,6 +1,6 @@
 use std::{
     env,
-    net::{IpAddr, Ipv6Addr, ToSocketAddrs},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs},
     str::FromStr,
 };
 
@@ -48,6 +48,17 @@ impl EndpointOverrides {
     }
 
     fn resolve(self, config: &SurfpoolConfig) -> Result<ResolvedEndpoints, String> {
+        self.resolve_with(config, &resolve_host)
+    }
+
+    /// Resolves endpoints with an injectable host lookup so tests can supply a
+    /// fake resolver instead of depending on ambient DNS (unavailable in
+    /// sandboxes such as Nix builds or `unshare -n`).
+    fn resolve_with(
+        self,
+        config: &SurfpoolConfig,
+        lookup: &dyn Fn(&str) -> Result<Vec<IpAddr>, String>,
+    ) -> Result<ResolvedEndpoints, String> {
         let studio_bind = resolve_bind_address(
             self.studio_host.as_deref(),
             &config.studio.bind_host,
@@ -55,7 +66,7 @@ impl EndpointOverrides {
             "SURFPOOL_STUDIO_HOST",
         )?;
 
-        ensure_studio_bind_is_available(&studio_bind, config)?;
+        ensure_studio_bind_is_available(&studio_bind, config, lookup)?;
 
         let public_host = self
             .public_host
@@ -275,6 +286,7 @@ fn url_host(host: &str) -> String {
 fn ensure_studio_bind_is_available(
     studio: &BindAddress,
     config: &SurfpoolConfig,
+    lookup: &dyn Fn(&str) -> Result<Vec<IpAddr>, String>,
 ) -> Result<(), String> {
     for (name, host, port) in [
         ("RPC", config.rpc.bind_host.as_str(), config.rpc.bind_port),
@@ -284,7 +296,7 @@ fn ensure_studio_bind_is_available(
             config.rpc.ws_port,
         ),
     ] {
-        if studio.port == port && hosts_overlap(&studio.host, host)? {
+        if studio.port == port && hosts_overlap(&studio.host, host, lookup)? {
             return Err(format!(
                 "SURFPOOL_STUDIO_HOST resolves to {}, which conflicts with the {name} listener",
                 studio.as_socket_string()
@@ -294,13 +306,17 @@ fn ensure_studio_bind_is_available(
     Ok(())
 }
 
-fn hosts_overlap(left: &str, right: &str) -> Result<bool, String> {
+fn hosts_overlap(
+    left: &str,
+    right: &str,
+    lookup: &dyn Fn(&str) -> Result<Vec<IpAddr>, String>,
+) -> Result<bool, String> {
     if left == right {
         return Ok(true);
     }
 
-    let left_addresses = resolve_host(left)?;
-    let right_addresses = resolve_host(right)?;
+    let left_addresses = lookup(left)?;
+    let right_addresses = lookup(right)?;
     Ok(left_addresses.iter().any(|left| {
         right_addresses
             .iter()
@@ -323,11 +339,35 @@ fn addresses_overlap(left: IpAddr, right: IpAddr) -> bool {
     }
 }
 
-fn resolve_host(host: &str) -> Result<Vec<IpAddr>, String> {
-    let lookup_host = host
-        .strip_prefix('[')
+fn strip_brackets(host: &str) -> &str {
+    host.strip_prefix('[')
         .and_then(|host| host.strip_suffix(']'))
-        .unwrap_or(host);
+        .unwrap_or(host)
+}
+
+/// Resolves hosts that need no DNS lookup: literal IPs (optionally bracketed)
+/// and `localhost`. Shared with the test resolver so production and test
+/// behavior cannot drift apart.
+fn resolve_without_dns(host: &str) -> Option<Vec<IpAddr>> {
+    let lookup_host = strip_brackets(host);
+    if let Ok(addr) = lookup_host.parse::<IpAddr>() {
+        return Some(vec![addr]);
+    }
+    if lookup_host.eq_ignore_ascii_case("localhost") {
+        return Some(vec![
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ]);
+    }
+    None
+}
+
+fn resolve_host(host: &str) -> Result<Vec<IpAddr>, String> {
+    if let Some(addresses) = resolve_without_dns(host) {
+        return Ok(addresses);
+    }
+
+    let lookup_host = strip_brackets(host);
     let socket = if host.contains(':') {
         format!("[{lookup_host}]:0")
     } else {
@@ -342,9 +382,15 @@ fn resolve_host(host: &str) -> Result<Vec<IpAddr>, String> {
 
 #[cfg(test)]
 mod tests {
+    use std::net::IpAddr;
+
     use surfpool_types::SurfpoolConfig;
 
-    use super::EndpointOverrides;
+    use super::{EndpointOverrides, hosts_overlap, resolve_without_dns};
+
+    fn fake_resolver(host: &str) -> Result<Vec<IpAddr>, String> {
+        resolve_without_dns(host).ok_or_else(|| format!("could not resolve listener host {host}"))
+    }
 
     #[test]
     fn studio_bind_override_derives_its_advertised_url() {
@@ -413,10 +459,29 @@ mod tests {
             studio_host: Some("localhost:8899".to_string()),
             ..Default::default()
         }
-        .resolve(&config)
+        .resolve_with(&config, &fake_resolver)
         .unwrap_err();
 
         assert!(error.contains("conflicts with the RPC listener"));
+    }
+
+    #[test]
+    fn hostname_alias_overlap_does_not_require_dns() {
+        assert!(hosts_overlap("localhost", "127.0.0.1", &fake_resolver).unwrap());
+        assert!(!hosts_overlap("localhost", "192.0.2.1", &fake_resolver).unwrap());
+    }
+
+    #[test]
+    fn reports_unresolvable_studio_hosts() {
+        let config = SurfpoolConfig::default();
+        let error = EndpointOverrides {
+            studio_host: Some("studio.invalid:8899".to_string()),
+            ..Default::default()
+        }
+        .resolve_with(&config, &fake_resolver)
+        .unwrap_err();
+
+        assert!(error.contains("could not resolve listener host"));
     }
 
     #[test]
