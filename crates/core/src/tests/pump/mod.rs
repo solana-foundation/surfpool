@@ -157,9 +157,12 @@ async fn real_mainnet_accounts_round_trip_unchanged() {
         let template = registry
             .get(template_id)
             .unwrap_or_else(|| panic!("template {template_id} should exist"));
-
-        let account_def = template
+        let idl = template
             .idl
+            .as_ref()
+            .unwrap_or_else(|| panic!("Pump template {template_id} must carry an IDL"));
+
+        let account_def = idl
             .accounts
             .iter()
             .find(|a| a.name == *account_name)
@@ -171,7 +174,7 @@ async fn real_mainnet_accounts_round_trip_unchanged() {
         );
 
         let forged = surfnet_svm
-            .get_forged_account_data(&pubkey, &account.data, &template.idl, &HashMap::new())
+            .get_forged_account_data(&pubkey, &account.data, idl, &HashMap::new())
             .unwrap_or_else(|e| {
                 panic!(
                     "live mainnet {account_name} {address} failed to decode/re-encode with the \
@@ -226,8 +229,12 @@ async fn override_on_real_account_touches_only_target_bytes() {
         ),
         ("complete".to_string(), serde_json::json!(true)),
     ]);
+    let curve_idl = curve
+        .idl
+        .as_ref()
+        .expect("Pump curve template must carry an IDL");
     let forged = surfnet_svm
-        .get_forged_account_data(&pubkey, curve_data, &curve.idl, &overrides)
+        .get_forged_account_data(&pubkey, curve_data, curve_idl, &overrides)
         .expect("curve override on the live bonding curve");
     assert_eq!(
         forged.len(),
@@ -265,8 +272,12 @@ async fn override_on_real_account_touches_only_target_bytes() {
             serde_json::json!(5_000_000_000i64),
         ),
     ]);
+    let pool_idl = pool
+        .idl
+        .as_ref()
+        .expect("Pump AMM template must carry an IDL");
     let forged = surfnet_svm
-        .get_forged_account_data(&pubkey, pool_data, &pool.idl, &overrides)
+        .get_forged_account_data(&pubkey, pool_data, pool_idl, &overrides)
         .expect("pool override on the live canonical pool");
     assert_eq!(
         forged.len(),

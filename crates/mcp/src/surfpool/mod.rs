@@ -89,6 +89,7 @@ fn compact_template_json(template: &surfpool_types::OverrideTemplate) -> serde_j
         "description": template.description,
         "protocol": template.protocol,
         "accountType": template.account_type,
+        "rawLayout": template.raw_layout,
         "properties": template.properties,
         "address": template.address,
         "constants": constants,
@@ -1047,7 +1048,7 @@ impl Surfpool {
     }
 
     #[tool(
-        description = "Fetches one template's full detail (properties, address, constants summarized as {label, description, optionsCount}, and llmContext). Call after get_override_templates with the id you picked, before create_scenario. Resolve an actual constant option value with search_constant_options."
+        description = "Fetches one template's full detail (properties, address, rawLayout write-path flag, constants summarized as {label, description, optionsCount}, and llmContext). Call after get_override_templates with the id you picked, before create_scenario. Resolve an actual constant option value with search_constant_options."
     )]
     async fn get_override_template(
         &self,
@@ -1413,6 +1414,10 @@ mod tests {
             "detail carries properties"
         );
         assert!(pyth.get("address").is_some(), "detail carries the address");
+        assert_eq!(
+            pyth["rawLayout"], false,
+            "detail identifies the template's write path"
+        );
         assert!(
             pyth.get("llmContext").is_some(),
             "detail carries llmContext"
@@ -1527,6 +1532,18 @@ mod tests {
                 assert!(constant.get("optionsCount").is_some());
             }
         }
+    }
+
+    #[test]
+    fn compact_template_json_exports_the_raw_layout_flag() {
+        let registry = TemplateRegistry::new();
+        let mut template = registry
+            .get("pyth-price-feed-v2")
+            .expect("template exists")
+            .clone();
+        template.raw_layout = true;
+
+        assert_eq!(compact_template_json(&template)["rawLayout"], true);
     }
 
     #[test]

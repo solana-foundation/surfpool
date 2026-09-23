@@ -107,7 +107,7 @@ async fn real_mainnet_accounts_round_trip_unchanged() {
             .unwrap_or_else(|| panic!("template {template_id} should exist"));
 
         let account_def = template
-            .idl
+            .idl()
             .accounts
             .iter()
             .find(|a| a.name == *account_name)
@@ -119,7 +119,7 @@ async fn real_mainnet_accounts_round_trip_unchanged() {
         );
 
         let forged = surfnet_svm
-            .get_forged_account_data(&pubkey, data, &template.idl, &HashMap::new())
+            .get_forged_account_data(&pubkey, data, template.idl(), &HashMap::new())
             .unwrap_or_else(|e| {
                 panic!(
                     "live mainnet {account_name} failed to decode/re-encode with the bundled \
@@ -167,7 +167,7 @@ async fn override_on_real_account_touches_only_target_bytes() {
         .get_forged_account_data(
             &pubkey,
             reserve_data,
-            &reserve.idl,
+            reserve.idl(),
             &HashMap::from([(
                 "config.liquidation_threshold_pct".to_string(),
                 serde_json::json!(50u8),
@@ -201,7 +201,7 @@ async fn override_on_real_account_touches_only_target_bytes() {
         .get_forged_account_data(
             &pubkey,
             scope_data,
-            &scope.idl,
+            scope.idl(),
             &HashMap::from([(
                 format!("prices.{IDX}.price.value"),
                 serde_json::json!(new_value),
@@ -359,7 +359,7 @@ async fn every_template_round_trips_over_a_live_account() {
             .filter(|t| t.account_type == *account_type)
         {
             let identity = surfnet_svm
-                .get_forged_account_data(&pubkey, data, &template.idl, &HashMap::new())
+                .get_forged_account_data(&pubkey, data, template.idl(), &HashMap::new())
                 .unwrap_or_else(|e| {
                     panic!(
                         "identity round-trip failed for {} ({address}): {e}",
@@ -383,7 +383,7 @@ async fn every_template_round_trips_over_a_live_account() {
             let mut overrides: HashMap<String, serde_json::Value> = HashMap::new();
             for property in &template.properties {
                 let ty = surfpool_types::resolve_idl_type(
-                    &template.idl,
+                    template.idl(),
                     &template.account_type,
                     &property.path,
                 )
@@ -397,7 +397,7 @@ async fn every_template_round_trips_over_a_live_account() {
             }
 
             let forged = surfnet_svm
-                .get_forged_account_data(&pubkey, data, &template.idl, &overrides)
+                .get_forged_account_data(&pubkey, data, template.idl(), &overrides)
                 .unwrap_or_else(|e| {
                     panic!(
                         "forge failed for {} with {} scalar override(s): {e}",
@@ -460,7 +460,7 @@ async fn obligation_array_index_and_pubkey_overrides() {
     ]);
 
     let forged = surfnet_svm
-        .get_forged_account_data(&Pubkey::new_unique(), &data, &template.idl, &overrides)
+        .get_forged_account_data(&Pubkey::new_unique(), &data, template.idl(), &overrides)
         .expect("array-index and pubkey overrides should apply");
 
     assert_eq!(forged.len(), data.len(), "account size must be preserved");
@@ -524,7 +524,7 @@ async fn scope_price_override_writes_expected_bytes() {
     ]);
 
     let forged = surfnet_svm
-        .get_forged_account_data(&Pubkey::new_unique(), &data, &template.idl, &overrides)
+        .get_forged_account_data(&Pubkey::new_unique(), &data, template.idl(), &overrides)
         .expect("scope price override should apply");
 
     assert_eq!(forged.len(), data.len(), "account size must be preserved");
@@ -574,7 +574,7 @@ async fn farms_reward_override_writes_both_halves() {
         ),
     ]);
     let forged_farm = surfnet_svm
-        .get_forged_account_data(&pubkey, farm_data, &farm.idl, &farm_overrides)
+        .get_forged_account_data(&pubkey, farm_data, farm.idl(), &farm_overrides)
         .expect("farm accumulator override should apply");
     assert_eq!(forged_farm.len(), farm_data.len());
     assert_ne!(&forged_farm, farm_data);
@@ -601,7 +601,7 @@ async fn farms_reward_override_writes_both_halves() {
         ),
     ]);
     let forged_user = surfnet_svm
-        .get_forged_account_data(&pubkey, user_data, &user.idl, &user_overrides)
+        .get_forged_account_data(&pubkey, user_data, user.idl(), &user_overrides)
         .expect("user reward override should apply");
 
     assert_eq!(forged_user.len(), user_data.len());
@@ -644,7 +644,7 @@ async fn liquidation_setup_writes_durable_inputs() {
         (format!("prices.{IDX}.price.exp"), serde_json::json!(8u64)),
     ]);
     let forged_scope = surfnet_svm
-        .get_forged_account_data(&pubkey, scope_data, &scope.idl, &scope_overrides)
+        .get_forged_account_data(&pubkey, scope_data, scope.idl(), &scope_overrides)
         .expect("scope crash should apply");
 
     let off = SCOPE_PRICES_BASE + IDX * DATED_PRICE_SIZE;
@@ -675,7 +675,7 @@ async fn liquidation_setup_writes_durable_inputs() {
         ),
     ]);
     let forged_reserve = surfnet_svm
-        .get_forged_account_data(&pubkey, reserve_data, &reserve.idl, &reserve_overrides)
+        .get_forged_account_data(&pubkey, reserve_data, reserve.idl(), &reserve_overrides)
         .expect("reserve config override should apply");
 
     assert_eq!(
@@ -709,7 +709,7 @@ async fn withdraw_ticket_and_queue_cursor() {
         .get("kamino-withdraw-ticket")
         .expect("withdraw ticket template");
     let ticket_disc = &ticket
-        .idl
+        .idl()
         .accounts
         .iter()
         .find(|a| a.name == "WithdrawTicket")
@@ -727,7 +727,7 @@ async fn withdraw_ticket_and_queue_cursor() {
         ("invalid".to_string(), serde_json::json!(0u8)),
     ]);
     let forged_ticket = surfnet_svm
-        .get_forged_account_data(&pubkey, &ticket_data, &ticket.idl, &ticket_overrides)
+        .get_forged_account_data(&pubkey, &ticket_data, ticket.idl(), &ticket_overrides)
         .expect("withdraw ticket override should apply");
     assert_eq!(
         u64::from_le_bytes(forged_ticket[8..16].try_into().unwrap()),
@@ -758,7 +758,7 @@ async fn withdraw_ticket_and_queue_cursor() {
         ),
     ]);
     let forged_reserve = surfnet_svm
-        .get_forged_account_data(&pubkey, &reserve_data, &limits.idl, &queue_overrides)
+        .get_forged_account_data(&pubkey, &reserve_data, limits.idl(), &queue_overrides)
         .expect("withdraw queue override should apply");
 
     assert_eq!(forged_reserve.len(), reserve_data.len());

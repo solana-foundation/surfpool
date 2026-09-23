@@ -50,6 +50,34 @@ cargo test -p surfpool-core --features integration-tests kamino
 Set `SURFPOOL_TEST_RPC_URL` to use a private endpoint instead of the public one. The default test
 run needs no network.
 
+### Programs with no IDL
+
+Programs that publish no usable IDL can describe their account bytes directly in an override
+collection:
+
+```yaml
+raw_layout: true
+
+templates:
+  - id: example-market-price
+    properties:
+      - path: price
+        offset: 32
+        encoding: u128
+```
+
+Raw-layout overrides use the same scenario API as IDL-backed templates. Values are encoded as
+little-endian integers and can be written once or repeatedly at a fixed stride. Every write is
+bounds-checked against the account data available at runtime, while the selected account is the
+caller's responsibility. This permits compatible accounts with additional trailing data and layouts
+that remain valid across program upgrades. Large integers that exceed `u64` should be supplied as
+decimal strings so JSON parsing cannot lose precision.
+
+Each collection uses exactly one write model: an IDL-backed collection cannot set
+`raw_layout: true`, and an IDL-less collection must set it. Raw-layout collections are currently
+compiled into Surfpool's built-in template registry; there is no runtime raw-layout registration
+endpoint.
+
 ### Override Templates
 Directly using the `surfnet_registerScenario` endpoint requires building out a map of account keys that are specific to the schema of the account that is being written to.
 This is a cumbersome process in most cases.

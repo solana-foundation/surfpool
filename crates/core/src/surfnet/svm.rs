@@ -63,7 +63,7 @@ use spl_token_2022_interface::extension::{
 use surfpool_types::{
     AccountChange, AccountProfileState, AccountSnapshot, DEFAULT_PROFILING_MAP_CAPACITY,
     DEFAULT_SLOT_TIME_MS, ExportSnapshotConfig, ExportSnapshotScope, FifoMap, Idl,
-    OverrideInstance, ProfileResult, RpcProfileDepth, RpcProfileResultConfig,
+    OverrideInstance, OverrideTemplate, ProfileResult, RpcProfileDepth, RpcProfileResultConfig,
     RunbookExecutionStatusReport, SimnetEvent, SimnetEventsTx, StartupError, SurfnetStartupStatus,
     SurfnetStartupTask, SvmFeatureConfig, TransactionConfirmationStatus, TransactionStatusEvent,
     UiAccountChange, UiAccountProfileState, UiProfileResult, VersionedIdl,
@@ -286,6 +286,34 @@ fn json_integer_digits(json: &serde_json::Value, target: &str) -> SurfpoolResult
             "Expected a number or decimal string for {target}, found {other}"
         ))),
     }
+}
+
+/// The bundled template registry, parsed once and reused.
+fn template_registry() -> &'static crate::scenarios::TemplateRegistry {
+    static REGISTRY: std::sync::OnceLock<crate::scenarios::TemplateRegistry> =
+        std::sync::OnceLock::new();
+    REGISTRY.get_or_init(crate::scenarios::TemplateRegistry::new)
+}
+
+/// Values that represent account fields rather than address/catalog selectors.
+fn account_data_values(
+    instance: &OverrideInstance,
+    template: Option<&OverrideTemplate>,
+) -> (HashMap<String, serde_json::Value>, usize, usize) {
+    let pda_refs = instance.account.get_pda_seed_references();
+    let constant_refs: HashSet<&str> = template
+        .into_iter()
+        .flat_map(|template| template.properties.iter())
+        .filter(|property| property.is_constant_ref())
+        .map(|property| property.path.as_str())
+        .collect();
+    let values = instance
+        .values
+        .iter()
+        .filter(|(key, _)| !pda_refs.contains(key) && !constant_refs.contains(key.as_str()))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    (values, pda_refs.len(), constant_refs.len())
 }
 
 /// Converts JSON into a txtx [`Value`] using the expected IDL type
@@ -832,7 +860,11 @@ impl SurfnetSvm {
     fn register_builtin_template_idls(&mut self) {
         let registry = TemplateRegistry::new();
         for (_, template) in registry.templates.into_iter() {
-            let _ = self.register_idl(template.idl, None);
+            // Templates for programs with no IDL have nothing to register; they write through
+            // `raw_layout` instead.
+            if let Some(idl) = template.idl {
+                let _ = self.register_idl(idl, None);
+            }
         }
     }
 
@@ -3108,29 +3140,28 @@ impl SurfnetSvm {
 
             // Apply the override values to the account data
             if !override_instance.values.is_empty() {
-                // Filter out values that are only used for PDA derivation (not account data)
-                let pda_refs = override_instance.account.get_pda_seed_references();
-                let account_values: HashMap<String, serde_json::Value> = override_instance
-                    .values
-                    .iter()
-                    .filter(|(key, _)| !pda_refs.contains(key))
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect();
+                let override_template = template_registry().get(&override_instance.template_id);
+
+                // PDA references resolve the address above, while constant_ref properties drive
+                // UI/catalog choices; neither is an account field to serialize.
+                let (account_values, pda_ref_count, constant_ref_count) =
+                    account_data_values(override_instance, override_template);
 
                 if account_values.is_empty() {
                     debug!(
-                        "Override {} has no account data modifications (all values are PDA seeds)",
+                        "Override {} has no account data modifications (all values are selectors)",
                         override_instance.id
                     );
                     continue;
                 }
 
                 debug!(
-                    "Override {} applying {} field modification(s) to account {} (filtered {} PDA seed refs)",
+                    "Override {} applying {} field modification(s) to account {} (filtered {} PDA seed refs and {} constant refs)",
                     override_instance.id,
                     account_values.len(),
                     account_pubkey,
-                    pda_refs.len()
+                    pda_ref_count,
+                    constant_ref_count
                 );
 
                 // Get the account from the SVM
@@ -3141,6 +3172,44 @@ impl SurfnetSvm {
                     );
                     continue;
                 };
+
+                // Programs with no usable IDL carry a byte layout instead, and this MUST come
+                // before the IDL lookup below: those programs have no registered IDL at all, so the
+                // lookup would `continue` and silently drop the override.
+                let raw_template = override_template.filter(|template| template.raw_layout);
+                if let Some(template) = raw_template {
+                    match template.materialize_raw_layout(
+                        account.data(),
+                        &account_values,
+                        target_slot,
+                    ) {
+                        Ok(new_data) => {
+                            let modified = Account {
+                                lamports: account.lamports(),
+                                data: new_data,
+                                owner: *account.owner(),
+                                executable: account.executable(),
+                                rent_epoch: account.rent_epoch(),
+                            };
+                            if let Err(e) = self.inner.set_account(account_pubkey, modified) {
+                                warn!("Failed to set raw-layout account {}: {}", account_pubkey, e);
+                            } else {
+                                debug!(
+                                    "Raw-layout override {} applied {} field(s) to {}",
+                                    override_instance.id,
+                                    account_values.len(),
+                                    account_pubkey
+                                );
+                                settled_this_slot.insert(account_pubkey);
+                            }
+                        }
+                        Err(e) => warn!(
+                            "Raw-layout override {} failed on {}: {}",
+                            override_instance.id, account_pubkey, e
+                        ),
+                    }
+                    continue;
+                }
 
                 // Mints fail the token unpack and keep flowing through the IDL path.
                 if is_supported_token_program(account.owner()) {
@@ -4591,6 +4660,31 @@ mod tests {
     use crate::storage::tests::TestType;
 
     #[test]
+    fn account_data_values_exclude_constant_ref_selectors() {
+        let registry = TemplateRegistry::new();
+        let template = registry
+            .get("raydium-amm-custom")
+            .expect("template with a non-PDA constant_ref");
+        let instance = OverrideInstance::new(
+            template.id.clone(),
+            0,
+            surfpool_types::AccountAddress::Pubkey(Pubkey::default().to_string()),
+        )
+        .with_values(HashMap::from([
+            ("market".to_string(), serde_json::json!("selected-market")),
+            ("status".to_string(), serde_json::json!(1)),
+        ]));
+
+        let (values, pda_refs, constant_refs) = account_data_values(&instance, Some(template));
+        assert_eq!(pda_refs, 0);
+        assert_eq!(constant_refs, 1);
+        assert_eq!(
+            values,
+            HashMap::from([("status".to_string(), serde_json::json!(1))])
+        );
+    }
+
+    #[test]
     fn startup_status_subscription_tracks_accepted_transitions() {
         use surfpool_types::SurfnetStartupPhase;
 
@@ -5847,10 +5941,18 @@ mod tests {
         assert!(!epoch_schedule.warmup);
 
         let registry = TemplateRegistry::new();
+        let mut checked = 0usize;
         for (_, template) in registry.templates {
-            let program_id = template.idl.address.clone();
+            // Templates for programs that publish no IDL have nothing to register.
+            let Some(idl) = template.idl else { continue };
+            let program_id = idl.address.clone();
             assert!(svm.registered_idls.get(&program_id).unwrap().is_some());
+            checked += 1;
         }
+        assert!(
+            checked > 0,
+            "no template carried an IDL, so this proved nothing about registration"
+        );
         assert!(svm.skip_blockhash_check);
     }
 
