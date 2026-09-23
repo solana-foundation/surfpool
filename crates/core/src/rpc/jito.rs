@@ -636,6 +636,7 @@ impl Jito for SurfpoolJitoRpc {
                 svm: sandbox_svm,
                 geyser_rx: _geyser_rx, // discarded on drop
                 simnet_rx: _simnet_rx, // discarded on drop
+                ..
             } = bundle_sandbox;
             let sandbox_locker = SurfnetSvmLocker::new(sandbox_svm);
 
@@ -929,6 +930,7 @@ pub(crate) async fn process_bundle(
         svm: sandbox_svm,
         geyser_rx,
         simnet_rx,
+        confirmation_queue_base_len,
     } = bundle_sandbox;
     let sandbox_locker = SurfnetSvmLocker::new(sandbox_svm);
 
@@ -989,6 +991,7 @@ pub(crate) async fn process_bundle(
         svm: sandbox_svm,
         geyser_rx,
         simnet_rx,
+        confirmation_queue_base_len,
     };
     let (bundle_status_tx, _bundle_status_rx) = crossbeam_channel::unbounded();
 
