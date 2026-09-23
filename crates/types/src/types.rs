@@ -770,6 +770,16 @@ pub enum SimnetCommand {
         bool,
         Option<bool>,
     ),
+    /// Executes a Jito bundle as one serialized runloop operation. The reply
+    /// carries either the Jito bundle ID or a client-safe failure message.
+    /// Keeping the full snapshot -> sandbox execution -> commit sequence on
+    /// the runloop prevents a regular transaction from mutating the live SVM
+    /// between the bundle snapshot and its commit.
+    ProcessBundle(
+        Option<(Hash, String)>,
+        Vec<VersionedTransaction>,
+        Sender<Result<String, String>>,
+    ),
     Terminate(Option<(Hash, String)>),
     /// Seals the startup plan. Once sealed, `Ready` is unreachable until
     /// every declared task completes successfully; an unsealed plan can
