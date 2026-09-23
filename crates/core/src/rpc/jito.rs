@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 #[cfg(test)]
 use std::{
@@ -11,6 +11,8 @@ use jsonrpc_derive::rpc;
 use sha2::{Digest, Sha256};
 use solana_account_decoder::{UiAccount, UiAccountEncoding, encode_ui_account};
 use solana_client::{rpc_config::RpcSendTransactionConfig, rpc_custom_error::RpcCustomError};
+use solana_commitment_config::CommitmentConfig;
+use solana_message::VersionedMessage;
 use solana_pubkey::Pubkey;
 use solana_rpc_client_api::response::{Response as RpcResponse, RpcBlockhash, RpcResponseContext};
 use solana_signature::Signature;
@@ -24,8 +26,9 @@ use surfpool_types::{
 
 use super::{RunloopContext, utils::decode_and_deserialize};
 use crate::{
+    error::SurfpoolResult,
     rpc::full::SurfpoolFullRpc,
-    surfnet::{locker::SurfnetSvmLocker, svm::BundleSandbox},
+    surfnet::{locker::SurfnetSvmLocker, remote::SurfnetRemoteClient, svm::BundleSandbox},
 };
 
 /// Maximum number of transactions allowed in a single bundle, matching Jito's limit.
@@ -894,15 +897,22 @@ impl Jito for SurfpoolJitoRpc {
 
 /// Executes decoded Jito bundle transactions atomically.
 ///
-/// Transactions run sequentially against an isolated sandbox. If every
-/// transaction succeeds, the sandbox state and buffered notifications are
-/// committed to the live SVM and the Jito bundle ID is returned. On failure,
-/// the sandbox is discarded and the live SVM is unchanged.
+/// Transactions run sequentially against an isolated sandbox. Required remote
+/// accounts are prefetched into the live SVM in batches before the sandbox is
+/// created. If every transaction succeeds, the sandbox state and buffered
+/// notifications are committed to the live SVM and the Jito bundle ID is
+/// returned. On failure, execution effects are discarded while prefetched
+/// accounts remain cached.
 pub(crate) async fn process_bundle(
     svm_locker: &SurfnetSvmLocker,
+    remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
     decoded_txs: Vec<VersionedTransaction>,
 ) -> std::result::Result<String, String> {
     // -- Phase A: Sandbox execution ---------------------------------------------------------
+    prefetch_bundle_accounts(svm_locker, remote_ctx, &decoded_txs)
+        .await
+        .map_err(|error| error.to_string())?;
+
     let bundle_sandbox =
         svm_locker.with_svm_reader(|svm_reader| svm_reader.clone_for_bundle_sandbox());
 
@@ -922,9 +932,8 @@ pub(crate) async fn process_bundle(
     } = bundle_sandbox;
     let sandbox_locker = SurfnetSvmLocker::new(sandbox_svm);
 
-    // Bundles deliberately use only locally-hydrated state. Do not add a
-    // remote context here without reconsidering the runloop serialization
-    // interval and its timeout policy.
+    // Prefetching above is the only remote interaction. Transactions execute
+    // against the hydrated sandbox, preventing per-transaction RPC requests.
     let remote_ctx = &None;
     let skip_preflight = true;
     let sigverify = true;
@@ -1006,6 +1015,89 @@ pub(crate) async fn process_bundle(
         .map_err(|e| format!("failed to persist Jito bundle: {e}"))?;
 
     Ok(bundle_id)
+}
+
+/// Hydrates accounts needed by a bundle into the live SVM before snapshotting.
+///
+/// Static account keys and lookup-table accounts are fetched together. Once
+/// lookup tables are available locally, their loaded addresses are resolved
+/// and fetched in one further batch. Fetch and lookup-table errors are
+/// returned to the caller.
+async fn prefetch_bundle_accounts(
+    svm_locker: &SurfnetSvmLocker,
+    remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
+    transactions: &[VersionedTransaction],
+) -> SurfpoolResult<()> {
+    if remote_ctx.is_none() {
+        return Ok(());
+    }
+
+    let mut seen = HashSet::new();
+    let mut accounts = Vec::new();
+    for transaction in transactions {
+        for pubkey in svm_locker.get_pubkeys_from_message(&transaction.message, None) {
+            add_unique_bundle_account(&mut accounts, &mut seen, pubkey);
+        }
+        for pubkey in get_address_lookup_table_pubkeys(&transaction.message) {
+            add_unique_bundle_account(&mut accounts, &mut seen, pubkey);
+        }
+    }
+
+    hydrate_bundle_accounts(svm_locker, remote_ctx, &accounts).await?;
+
+    // ALT contents are unavailable until their accounts have been hydrated.
+    // Resolve them locally, then include every loaded address in one second
+    // batch for the bundle (rather than fetching per transaction).
+    let mut loaded_accounts = Vec::new();
+    for transaction in transactions {
+        if let Some(loaded) = svm_locker
+            .get_loaded_addresses(&None, &transaction.message)
+            .await?
+        {
+            for pubkey in loaded.all_loaded_addresses() {
+                add_unique_bundle_account(&mut loaded_accounts, &mut seen, *pubkey);
+            }
+        }
+    }
+
+    hydrate_bundle_accounts(svm_locker, remote_ctx, &loaded_accounts).await
+}
+
+fn add_unique_bundle_account(
+    accounts: &mut Vec<Pubkey>,
+    seen: &mut HashSet<Pubkey>,
+    pubkey: Pubkey,
+) {
+    if seen.insert(pubkey) {
+        accounts.push(pubkey);
+    }
+}
+
+async fn hydrate_bundle_accounts(
+    svm_locker: &SurfnetSvmLocker,
+    remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
+    accounts: &[Pubkey],
+) -> SurfpoolResult<()> {
+    if accounts.is_empty() {
+        return Ok(());
+    }
+
+    svm_locker
+        .get_multiple_accounts(remote_ctx, accounts, None)
+        .await?;
+    Ok(())
+}
+
+/// Returns the account keys of address lookup tables referenced by a message.
+pub fn get_address_lookup_table_pubkeys(message: &VersionedMessage) -> Vec<Pubkey> {
+    match message {
+        VersionedMessage::V0(message) => message
+            .address_table_lookups
+            .iter()
+            .map(|lookup| lookup.account_key)
+            .collect(),
+        VersionedMessage::Legacy(_) | VersionedMessage::V1(_) => Vec::new(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1209,8 +1301,11 @@ mod tests {
                 .expect("bundle command test runtime should start");
             while let Ok(command) = commands_rx.recv() {
                 if let SimnetCommand::ProcessBundle(_, transactions, reply_tx) = command {
-                    let _ =
-                        reply_tx.send(runtime.block_on(process_bundle(&svm_locker, transactions)));
+                    let _ = reply_tx.send(runtime.block_on(process_bundle(
+                        &svm_locker,
+                        &None,
+                        transactions,
+                    )));
                 }
             }
         });
