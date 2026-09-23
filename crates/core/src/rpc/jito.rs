@@ -13,7 +13,7 @@ use solana_transaction_status::{TransactionConfirmationStatus, UiTransactionEnco
 use surfpool_types::{
     JitoBundleStatus, RpcBundleExecutionError, RpcBundleRequest, RpcBundleSimulationSummary,
     RpcSimulateBundleConfig, RpcSimulateBundleResult, RpcSimulateBundleTransactionResult,
-    TransactionStatusEvent,
+    SimnetCommand, TransactionStatusEvent,
 };
 
 use super::{RunloopContext, utils::decode_and_deserialize};
@@ -28,6 +28,7 @@ const MAX_BUNDLE_SIZE: usize = 5;
 /// Maximum number of bundle IDs accepted in a single `getBundleStatuses` request, matching
 /// Jito's documented limit. Larger batches are rejected with `invalid_params`.
 const MAX_BUNDLES_PER_QUERY: usize = 5;
+
 
 /// Jito-specific RPC methods for bundle submission
 #[rpc]
@@ -307,143 +308,28 @@ impl Jito for SurfpoolJitoRpc {
                 decoded_txs.push(tx);
             }
 
-            // -- Phase A: Sandbox execution -------------------------------------------------
-            // Take a brief read lock on the original VM to construct a sandbox whose storages
-            // are overlay-wrapped, whose subscription registries are empty (no live WS leak),
-            // and whose event channels buffer into receivers we hold here.
-            let bundle_sandbox = ctx
-                .svm_locker
-                .with_svm_reader(|svm_reader| svm_reader.clone_for_bundle_sandbox());
-
-            let BundleSandbox {
-                svm: sandbox_svm,
-                geyser_rx,
-                simnet_rx,
-            } = bundle_sandbox;
-
-            let sandbox_locker = SurfnetSvmLocker::new(sandbox_svm);
-
-            let remote_ctx = &None;
-            let skip_preflight = true;
-            let sigverify = true;
-
-            let mut bundle_signatures: Vec<Signature> = Vec::with_capacity(decoded_txs.len());
-            for (idx, tx) in decoded_txs.iter().enumerate() {
-                let (status_tx, status_rx) = crossbeam_channel::bounded(1);
-
-                // Awaiting directly here lets the surrounding JSON-RPC runtime drive the
-                // future. We must NOT use `hiro_system_kit::nestable_block_on` because the
-                // HTTP worker thread is already inside a tokio runtime and `block_on` on the
-                // current handle panics with "Cannot start a runtime from within a runtime".
-                let process_res = sandbox_locker
-                    .process_transaction(
-                        remote_ctx,
-                        tx.clone(),
-                        status_tx,
-                        skip_preflight,
-                        sigverify,
-                    )
-                    .await;
-
-                bundle_signatures.push(tx.signatures[0]);
-
-                if let Err(e) = process_res {
-                    // Dropping `sandbox_locker` discards all overlay state and the cloned
-                    // LiteSVM, so the original VM is byte-identical to its pre-bundle state.
-                    return Err(Error::invalid_params(format!(
-                        "Jito bundle couldn't be executed, failed to process transaction {}: {e}",
-                        idx + 1
-                    )));
-                }
-
-                // `process_transaction` only returns after the sandbox has run the tx and
-                // dispatched a status event, so `try_recv`/`recv_timeout` will not actually
-                // park the worker for any meaningful time; the 2s timeout is a hard ceiling
-                // for an unexpectedly missed status.
-                match status_rx.recv_timeout(std::time::Duration::from_secs(2)) {
-                    Ok(TransactionStatusEvent::Success(_)) => {}
-                    Ok(TransactionStatusEvent::SimulationFailure(other)) => {
-                        return Err(Error::invalid_params(format!(
-                            "Jito bundle couldn't be executed: simulation failed for transaction {}: {:?}",
-                            idx + 1,
-                            other
-                        )));
-                    }
-                    Ok(TransactionStatusEvent::ExecutionFailure(other)) => {
-                        return Err(Error::invalid_params(format!(
-                            "Jito bundle couldn't be executed: Execution failed for transaction {}: {:?}",
-                            idx + 1,
-                            other
-                        )));
-                    }
-                    Ok(TransactionStatusEvent::VerificationFailure(ver_fail_err)) => {
-                        return Err(Error::invalid_params(format!(
-                            "Jito bundle couldn't be executed: Verification failed for transaction {}: {:?}",
-                            idx + 1,
-                            ver_fail_err
-                        )));
-                    }
-                    Err(_) => {
-                        return Err(RpcCustomError::NodeUnhealthy {
-                            num_slots_behind: None,
-                        }
-                        .into());
-                    }
-                }
-            }
-
-            // -- Phase B: Atomic commit -----------------------------------------------------
-            // All bundle transactions succeeded on the sandbox. Extract the sandbox SVM (the
-            // only remaining Arc reference is the local `sandbox_locker`), reassemble the
-            // BundleSandbox and call commit_sandbox under the original VM's writer lock.
-            let sandbox_svm = match Arc::try_unwrap(sandbox_locker.0) {
-                Ok(rwlock) => rwlock.into_inner(),
-                Err(_) => {
-                    // Should never happen: sandbox_locker was constructed locally and never
-                    // shared.
-                    return Err(Error::internal_error());
-                }
-            };
-            let reassembled = BundleSandbox {
-                svm: sandbox_svm,
-                geyser_rx,
-                simnet_rx,
-            };
-
-            // Use a discardable status channel for the bundle. The runloop will use it to
-            // attempt sending Confirmed/Finalized updates; nobody reads it so try_send fails
-            // silently.
-            let (bundle_status_tx, _bundle_status_rx) = crossbeam_channel::unbounded();
-
-            ctx.svm_locker
-                .with_svm_writer(move |original| {
-                    original.commit_sandbox(reassembled, bundle_status_tx)
-                })
-                .map_err(|e| {
-                    Error::invalid_params(format!(
-                        "Jito bundle commit failed after successful sandbox execution: {e}"
-                    ))
+            // Bundles must use the same serialized execution lane as ordinary transactions.
+            // The runloop owns the snapshot -> sandbox execution -> commit sequence, so a
+            // ProcessTransaction command cannot mutate the live VM between snapshot and commit.
+            let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+            ctx.simnet_commands_tx
+                .send(SimnetCommand::ProcessBundle(ctx.id, decoded_txs, reply_tx))
+                .map_err(|_| RpcCustomError::NodeUnhealthy {
+                    num_slots_behind: None,
                 })?;
 
-            // Calculate bundle ID by hashing comma-separated signatures (Jito-compatible)
-            // https://github.com/jito-foundation/jito-solana/blob/master/sdk/src/bundle/mod.rs#L21
-            let concatenated_signatures = bundle_signatures
-                .iter()
-                .map(|sig| sig.to_string())
-                .collect::<Vec<_>>()
-                .join(",");
-            let mut hasher = Sha256::new();
-            hasher.update(concatenated_signatures.as_bytes());
-            let bundle_id = hex::encode(hasher.finalize());
-
-            ctx.svm_locker.store_bundle(
-                bundle_id.clone(),
-                bundle_signatures
-                    .iter()
-                    .map(|sig| sig.to_string())
-                    .collect(),
-            )?;
-            Ok(bundle_id)
+            // The runloop may take the full bundle-execution interval before replying.
+            // Receive on Tokio's blocking pool so this JSON-RPC future never parks a
+            // runtime worker thread.
+            tokio::task::spawn_blocking(move || reply_rx.recv())
+                .await
+                .map_err(|_| RpcCustomError::NodeUnhealthy {
+                    num_slots_behind: None,
+                })?
+                .map_err(|_| RpcCustomError::NodeUnhealthy {
+                    num_slots_behind: None,
+                })?
+                .map_err(Error::invalid_params)
         })
     }
 
@@ -965,6 +851,113 @@ impl Jito for SurfpoolJitoRpc {
             })
         })
     }
+}
+
+/// Executes decoded Jito bundle transactions atomically.
+///
+/// Transactions run sequentially against an isolated sandbox. If every
+/// transaction succeeds, the sandbox state and buffered notifications are
+/// committed to the live SVM and the Jito bundle ID is returned. On failure,
+/// the sandbox is discarded and the live SVM is unchanged.
+pub(crate) async fn process_bundle(
+    svm_locker: &SurfnetSvmLocker,
+    decoded_txs: Vec<VersionedTransaction>,
+) -> std::result::Result<String, String> {
+    // -- Phase A: Sandbox execution ---------------------------------------------------------
+    let bundle_sandbox =
+        svm_locker.with_svm_reader(|svm_reader| svm_reader.clone_for_bundle_sandbox());
+
+    let BundleSandbox {
+        svm: sandbox_svm,
+        geyser_rx,
+        simnet_rx,
+    } = bundle_sandbox;
+    let sandbox_locker = SurfnetSvmLocker::new(sandbox_svm);
+
+    // Bundles deliberately use only locally-hydrated state. Do not add a
+    // remote context here without reconsidering the runloop serialization
+    // interval and its timeout policy.
+    let remote_ctx = &None;
+    let skip_preflight = true;
+    let sigverify = true;
+
+    let mut bundle_signatures = Vec::with_capacity(decoded_txs.len());
+    for (idx, tx) in decoded_txs.iter().enumerate() {
+        let (status_tx, status_rx) = crossbeam_channel::bounded(1);
+        let process_res = sandbox_locker
+            .process_transaction(remote_ctx, tx.clone(), status_tx, skip_preflight, sigverify)
+            .await;
+
+        bundle_signatures.push(tx.signatures[0]);
+        if let Err(e) = process_res {
+            return Err(format!(
+                "Jito bundle couldn't be executed, failed to process transaction {}: {e}",
+                idx + 1
+            ));
+        }
+
+        match status_rx.recv_timeout(std::time::Duration::from_secs(2)) {
+            Ok(TransactionStatusEvent::Success(_)) => {}
+            Ok(TransactionStatusEvent::SimulationFailure(other)) => {
+                return Err(format!(
+                    "Jito bundle couldn't be executed: simulation failed for transaction {}: {other:?}",
+                    idx + 1
+                ));
+            }
+            Ok(TransactionStatusEvent::ExecutionFailure(other)) => {
+                return Err(format!(
+                    "Jito bundle couldn't be executed: Execution failed for transaction {}: {other:?}",
+                    idx + 1
+                ));
+            }
+            Ok(TransactionStatusEvent::VerificationFailure(error)) => {
+                return Err(format!(
+                    "Jito bundle couldn't be executed: Verification failed for transaction {}: {error:?}",
+                    idx + 1
+                ));
+            }
+            Err(_) => {
+                return Err(
+                    "Jito bundle processing did not produce a transaction status".to_string(),
+                );
+            }
+        }
+    }
+
+    // -- Phase B: Atomic commit -------------------------------------------------------------
+    let sandbox_svm = Arc::try_unwrap(sandbox_locker.0)
+        .map_err(|_| "Jito bundle sandbox remained shared after execution".to_string())?
+        .into_inner();
+    let reassembled = BundleSandbox {
+        svm: sandbox_svm,
+        geyser_rx,
+        simnet_rx,
+    };
+    let (bundle_status_tx, _bundle_status_rx) = crossbeam_channel::unbounded();
+
+    svm_locker
+        .with_svm_writer(move |original| original.commit_sandbox(reassembled, bundle_status_tx))
+        .map_err(|e| {
+            format!("Jito bundle commit failed after successful sandbox execution: {e}")
+        })?;
+
+    let concatenated_signatures = bundle_signatures
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut hasher = Sha256::new();
+    hasher.update(concatenated_signatures.as_bytes());
+    let bundle_id = hex::encode(hasher.finalize());
+
+    svm_locker
+        .store_bundle(
+            bundle_id.clone(),
+            bundle_signatures.iter().map(ToString::to_string).collect(),
+        )
+        .map_err(|e| format!("failed to persist Jito bundle: {e}"))?;
+
+    Ok(bundle_id)
 }
 
 // ---------------------------------------------------------------------------
