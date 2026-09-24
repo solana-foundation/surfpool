@@ -1,9 +1,4 @@
 use std::sync::Arc;
-#[cfg(test)]
-use std::{
-    collections::HashMap,
-    sync::{LazyLock, Mutex},
-};
 
 use jsonrpc_core::{BoxFuture, Error, Result};
 use jsonrpc_derive::rpc;
@@ -33,40 +28,6 @@ const MAX_BUNDLE_SIZE: usize = 5;
 /// Maximum number of bundle IDs accepted in a single `getBundleStatuses` request, matching
 /// Jito's documented limit. Larger batches are rejected with `invalid_params`.
 const MAX_BUNDLES_PER_QUERY: usize = 5;
-
-#[cfg(test)]
-type BundleSnapshotPause = (
-    crossbeam_channel::Sender<()>,
-    crossbeam_channel::Receiver<()>,
-);
-
-#[cfg(test)]
-static BUNDLE_SNAPSHOT_PAUSES: LazyLock<Mutex<HashMap<Signature, BundleSnapshotPause>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-#[cfg(test)]
-fn pause_bundle_after_snapshot_for_test(
-    signature: Signature,
-    snapshot_tx: crossbeam_channel::Sender<()>,
-    resume_rx: crossbeam_channel::Receiver<()>,
-) {
-    BUNDLE_SNAPSHOT_PAUSES
-        .lock()
-        .expect("bundle snapshot pause registry should not be poisoned")
-        .insert(signature, (snapshot_tx, resume_rx));
-}
-
-#[cfg(test)]
-fn wait_at_bundle_snapshot_for_test(signature: Signature) {
-    let pause = BUNDLE_SNAPSHOT_PAUSES
-        .lock()
-        .expect("bundle snapshot pause registry should not be poisoned")
-        .remove(&signature);
-    if let Some((snapshot_tx, resume_rx)) = pause {
-        let _ = snapshot_tx.send(());
-        let _ = resume_rx.recv();
-    }
-}
 
 /// Jito-specific RPC methods for bundle submission
 #[rpc]
@@ -905,15 +866,6 @@ pub(crate) async fn process_bundle(
     let bundle_sandbox =
         svm_locker.with_svm_reader(|svm_reader| svm_reader.clone_for_bundle_sandbox());
 
-    #[cfg(test)]
-    if let Some(signature) = decoded_txs
-        .first()
-        .and_then(|tx| tx.signatures.first())
-        .copied()
-    {
-        wait_at_bundle_snapshot_for_test(signature);
-    }
-
     let BundleSandbox {
         svm: sandbox_svm,
         geyser_rx,
@@ -1163,9 +1115,14 @@ fn build_tx_result(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{LazyLock, Mutex};
+
     use sha2::{Digest, Sha256};
     use solana_keypair::Keypair;
     use solana_message::{VersionedMessage, v0::Message as V0Message};
+    use solana_program_runtime::{
+        declare_process_instruction, solana_sbpf::program::BuiltinFunctionDefinition,
+    };
     use solana_pubkey::Pubkey;
     use solana_signer::Signer;
     use solana_system_interface::instruction as system_instruction;
@@ -1177,9 +1134,37 @@ mod tests {
     };
 
     use super::*;
-    use crate::{runloops::start_block_production_runloop, tests::helpers::TestSetup};
+    use crate::{
+        rpc::full::{Full, SurfpoolFullRpc},
+        runloops::start_block_production_runloop,
+        tests::helpers::TestSetup,
+    };
 
     const LAMPORTS_PER_SOL: u64 = 1_000_000_000;
+
+    type BundleExecutionPause = (
+        crossbeam_channel::Sender<()>,
+        crossbeam_channel::Receiver<()>,
+    );
+
+    static BUNDLE_EXECUTION_PAUSE: LazyLock<Mutex<Option<BundleExecutionPause>>> =
+        LazyLock::new(|| Mutex::new(None));
+
+    declare_process_instruction!(PauseBundleBuiltin, 1, |_invoke_context| {
+        let pause = BUNDLE_EXECUTION_PAUSE
+            .lock()
+            .expect("bundle execution pause should not be poisoned")
+            .take();
+        if let Some((snapshot_tx, resume_rx)) = pause {
+            let _ = snapshot_tx.send(());
+            let _ = resume_rx.recv();
+        }
+        Ok(())
+    });
+
+    impl PauseBundleBuiltin {
+        const ID: Pubkey = Pubkey::new_from_array([42; 32]);
+    }
 
     fn build_v0_transaction(
         payer: &Pubkey,
@@ -1359,6 +1344,9 @@ mod tests {
             .svm_locker
             .with_svm_reader(|svm| svm.latest_blockhash());
         setup.context.svm_locker.with_svm_writer(|svm| {
+            svm.inner
+                .svm
+                .add_builtin(PauseBundleBuiltin::ID, PauseBundleBuiltin::register);
             svm.airdrop(&bundle_payer.pubkey(), 2 * LAMPORTS_PER_SOL)
                 .expect("bundle payer airdrop should be accepted")
                 .expect("bundle payer airdrop transaction should succeed");
@@ -1370,11 +1358,18 @@ mod tests {
         let bundle_tx = build_v0_transaction(
             &bundle_payer.pubkey(),
             &[&bundle_payer],
-            &[system_instruction::transfer(
-                &bundle_payer.pubkey(),
-                &bundle_recipient,
-                LAMPORTS_PER_SOL,
-            )],
+            &[
+                solana_instruction::Instruction {
+                    program_id: PauseBundleBuiltin::ID,
+                    accounts: vec![],
+                    data: vec![],
+                },
+                system_instruction::transfer(
+                    &bundle_payer.pubkey(),
+                    &bundle_recipient,
+                    LAMPORTS_PER_SOL,
+                ),
+            ],
             &recent_blockhash,
         );
         let regular_tx = build_v0_transaction(
@@ -1390,7 +1385,10 @@ mod tests {
 
         let (snapshot_tx, snapshot_rx) = crossbeam_channel::bounded(1);
         let (resume_tx, resume_rx) = crossbeam_channel::bounded(1);
-        pause_bundle_after_snapshot_for_test(bundle_tx.signatures[0], snapshot_tx, resume_rx);
+        *BUNDLE_EXECUTION_PAUSE
+            .lock()
+            .expect("bundle execution pause should not be poisoned") =
+            Some((snapshot_tx, resume_rx));
 
         let encoded_bundle_tx = bs58::encode(bincode::serialize(&bundle_tx).unwrap()).into_string();
         let context = setup.context.clone();
