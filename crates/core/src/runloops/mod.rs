@@ -522,6 +522,13 @@ pub async fn start_block_production_runloop(
                         }
                         let _ = reply_tx.send(result);
                     }
+                    SimnetCommand::ProcessSerialVmMutation(task) => {
+                        if task.run().await == surfpool_types::SerialVmMutationResult::ProduceBlock
+                            && block_production_mode.eq(&BlockProductionMode::Transaction)
+                        {
+                            do_produce_block = true;
+                        }
+                    }
                     SimnetCommand::Terminate(_) => {
                         // Explicitly shutdown storage to trigger WAL checkpoint before exiting
                         svm_locker.shutdown();

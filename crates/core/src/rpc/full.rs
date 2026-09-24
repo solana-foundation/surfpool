@@ -33,7 +33,9 @@ use solana_transaction_status::{
     TransactionBinaryEncoding, TransactionConfirmationStatus, TransactionStatus, UiConfirmedBlock,
     UiTransactionEncoding,
 };
-use surfpool_types::{SimnetCommand, TransactionStatusEvent};
+use surfpool_types::{
+    SerialVmMutationResult, SerialVmMutationTask, SimnetCommand, TransactionStatusEvent,
+};
 
 use super::{
     RunloopContext, State, SurfnetRpcContext,
@@ -1720,15 +1722,36 @@ impl Full for SurfpoolFullRpc {
             return Err(SurfpoolError::missing_context().into());
         };
         let svm_locker = ctx.svm_locker;
-        let res = svm_locker
-            .airdrop(&pubkey, lamports)
-            .map_err(Error::from)?
-            .map_err(|err| Error::invalid_params(format!("failed to send transaction: {err:?}")))?;
-        let _ = ctx
-            .simnet_commands_tx
-            .try_send(SimnetCommand::AirdropProcessed);
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        let task = SerialVmMutationTask::new(move || {
+            Box::pin(async move {
+                let result = svm_locker
+                    .airdrop(&pubkey, lamports)
+                    .map_err(Error::from)
+                    .and_then(|result| {
+                        result.map_err(|err| {
+                            Error::invalid_params(format!("failed to send transaction: {err:?}"))
+                        })
+                    })
+                    .map(|result| result.signature.to_string());
+                let should_produce_block = result.is_ok();
+                let _ = reply_tx.send(result);
+                if should_produce_block {
+                    SerialVmMutationResult::ProduceBlock
+                } else {
+                    SerialVmMutationResult::NoBlock
+                }
+            })
+        });
+        ctx.simnet_commands_tx
+            .send(SimnetCommand::ProcessSerialVmMutation(task))
+            .map_err(|_| RpcCustomError::NodeUnhealthy {
+                num_slots_behind: None,
+            })?;
 
-        Ok(res.signature.to_string())
+        reply_rx.recv().map_err(|_| RpcCustomError::NodeUnhealthy {
+            num_slots_behind: None,
+        })?
     }
 
     fn send_transaction(
@@ -3488,7 +3511,7 @@ mod tests {
     fn test_request_airdrop() {
         let pk = Pubkey::new_unique();
         let lamports = 1_000_000;
-        let setup = TestSetup::new(SurfpoolFullRpc);
+        let setup = TestSetup::new_with_serial_vm_executor(SurfpoolFullRpc);
         let res = setup
             .rpc
             .request_airdrop(Some(setup.context.clone()), pk.to_string(), lamports, None)
@@ -3591,7 +3614,7 @@ mod tests {
         let payer = Keypair::new();
         let pk = Pubkey::new_unique();
         let lamports = LAMPORTS_PER_SOL;
-        let setup = TestSetup::new(SurfpoolFullRpc);
+        let setup = TestSetup::new_with_serial_vm_executor(SurfpoolFullRpc);
         let recent_blockhash = setup
             .context
             .svm_locker
@@ -3699,7 +3722,7 @@ mod tests {
         let payer = Keypair::new();
         let pk = Pubkey::new_unique();
         let lamports = LAMPORTS_PER_SOL;
-        let setup = TestSetup::new(SurfpoolFullRpc);
+        let setup = TestSetup::new_with_serial_vm_executor(SurfpoolFullRpc);
         setup
             .context
             .svm_locker
@@ -3769,7 +3792,7 @@ mod tests {
         let payer = Keypair::new();
         let pk = Pubkey::new_unique();
         let lamports = LAMPORTS_PER_SOL;
-        let setup = TestSetup::new(SurfpoolFullRpc);
+        let setup = TestSetup::new_with_serial_vm_executor(SurfpoolFullRpc);
         let recent_blockhash = setup
             .context
             .svm_locker
@@ -3832,7 +3855,7 @@ mod tests {
         let payer = Keypair::new();
         let pk = Pubkey::new_unique();
         let lamports = LAMPORTS_PER_SOL;
-        let setup = TestSetup::new(SurfpoolFullRpc);
+        let setup = TestSetup::new_with_serial_vm_executor(SurfpoolFullRpc);
         let recent_blockhash = setup
             .context
             .svm_locker
@@ -4010,7 +4033,7 @@ mod tests {
         let payer = Keypair::new();
         let pk = Pubkey::new_unique();
         let lamports = LAMPORTS_PER_SOL;
-        let mut setup = TestSetup::new(SurfpoolFullRpc);
+        let mut setup = TestSetup::new_with_serial_vm_executor(SurfpoolFullRpc);
         let recent_blockhash = setup
             .context
             .svm_locker
@@ -4426,8 +4449,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_get_recent_prioritization_fees() {
-        let (mempool_tx, mempool_rx) = crossbeam_channel::unbounded();
-        let setup = TestSetup::new_with_mempool(SurfpoolFullRpc, mempool_tx);
+        let (setup, mempool_rx) =
+            TestSetup::new_with_serial_vm_executor_and_mempool(SurfpoolFullRpc);
 
         let recent_blockhash = setup
             .context
@@ -5742,7 +5765,7 @@ mod tests {
             let payer = Keypair::new();
             let recipient = Pubkey::new_unique();
             let lamports = LAMPORTS_PER_SOL;
-            let setup = TestSetup::new(SurfpoolFullRpc);
+            let setup = TestSetup::new_with_serial_vm_executor(SurfpoolFullRpc);
 
             let _ = setup
                 .rpc
@@ -5794,7 +5817,7 @@ mod tests {
             let payer = Keypair::new();
             let recipient = Pubkey::new_unique();
             let lamports = LAMPORTS_PER_SOL;
-            let setup = TestSetup::new(SurfpoolFullRpc);
+            let setup = TestSetup::new_with_serial_vm_executor(SurfpoolFullRpc);
 
             setup
                 .context

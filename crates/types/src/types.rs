@@ -4,7 +4,9 @@ use std::{
     cmp::Ordering,
     collections::{BTreeMap, HashMap},
     fmt,
+    future::Future,
     path::PathBuf,
+    pin::Pin,
     str::FromStr,
     sync::{Arc, Mutex},
 };
@@ -749,6 +751,36 @@ pub enum TransactionStatusEvent {
     VerificationFailure(String),
 }
 
+/// The outcome of one VM mutation run by the block-production runloop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SerialVmMutationResult {
+    NoBlock,
+    ProduceBlock,
+}
+
+type SerialVmMutationFuture = Pin<Box<dyn Future<Output = SerialVmMutationResult> + Send>>;
+
+/// A single exclusive live-VM operation. The block-production runloop awaits
+/// this task before receiving another [`SimnetCommand`], which prevents a
+/// mutation from landing between a Jito bundle's sandbox snapshot and commit.
+pub struct SerialVmMutationTask(Box<dyn FnOnce() -> SerialVmMutationFuture + Send>);
+
+impl SerialVmMutationTask {
+    pub fn new(task: impl FnOnce() -> SerialVmMutationFuture + Send + 'static) -> Self {
+        Self(Box::new(task))
+    }
+
+    pub async fn run(self) -> SerialVmMutationResult {
+        (self.0)().await
+    }
+}
+
+impl fmt::Debug for SerialVmMutationTask {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SerialVmMutationTask(..)")
+    }
+}
+
 #[derive(Debug)]
 pub enum SimnetCommand {
     SlotForward(Option<Hash>),
@@ -780,6 +812,10 @@ pub enum SimnetCommand {
         Vec<VersionedTransaction>,
         Sender<Result<String, String>>,
     ),
+    /// Runs a state-mutating RPC operation exclusively with transactions and
+    /// bundles. The task sends its operation-specific response through a
+    /// channel captured by the task itself.
+    ProcessSerialVmMutation(SerialVmMutationTask),
     Terminate(Option<(Hash, String)>),
     /// Seals the startup plan. Once sealed, `Ready` is unreachable until
     /// every declared task completes successfully; an unsealed plan can

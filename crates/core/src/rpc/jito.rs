@@ -1339,6 +1339,7 @@ mod tests {
         let bundle_recipient = Pubkey::new_unique();
         let transaction_payer = Keypair::new();
         let transaction_recipient = Pubkey::new_unique();
+        let airdrop_recipient = Pubkey::new_unique();
         let recent_blockhash = setup
             .context
             .svm_locker
@@ -1419,6 +1420,32 @@ mod tests {
             ))
             .expect("regular transaction should be accepted while bundle is executing");
 
+        let airdrop_context = setup.context.clone();
+        let airdrop_task = std::thread::spawn(move || {
+            SurfpoolFullRpc.request_airdrop(
+                Some(airdrop_context),
+                airdrop_recipient.to_string(),
+                LAMPORTS_PER_SOL,
+                None,
+            )
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !airdrop_task.is_finished(),
+            "requestAirdrop must wait for the bundle's serialized execution interval"
+        );
+        let airdrop_balance_during_bundle = setup.context.svm_locker.with_svm_reader(|svm| {
+            svm.get_account(&airdrop_recipient)
+                .expect("airdrop recipient lookup should succeed")
+                .map(|account| account.lamports)
+                .unwrap_or_default()
+        });
+        assert_eq!(
+            airdrop_balance_during_bundle, 0,
+            "requestAirdrop must not mutate the live VM before the bundle commits"
+        );
+
         let status_probe = status_rx.clone();
         let status_arrived_early = tokio::task::spawn_blocking(move || {
             status_probe.recv_timeout(std::time::Duration::from_millis(100))
@@ -1448,8 +1475,12 @@ mod tests {
             transaction_status,
             TransactionStatusEvent::Success(_)
         ));
+        airdrop_task
+            .join()
+            .expect("requestAirdrop task should not panic")
+            .expect("requestAirdrop should succeed after the bundle commits");
 
-        let (bundle_balance, transaction_balance) =
+        let (bundle_balance, transaction_balance, airdrop_balance) =
             setup.context.svm_locker.with_svm_reader(|svm| {
                 let bundle_balance = svm
                     .get_account(&bundle_recipient)
@@ -1461,10 +1492,16 @@ mod tests {
                     .expect("transaction recipient lookup should succeed")
                     .map(|account| account.lamports)
                     .unwrap_or_default();
-                (bundle_balance, transaction_balance)
+                let airdrop_balance = svm
+                    .get_account(&airdrop_recipient)
+                    .expect("airdrop recipient lookup should succeed")
+                    .map(|account| account.lamports)
+                    .unwrap_or_default();
+                (bundle_balance, transaction_balance, airdrop_balance)
             });
         assert_eq!(bundle_balance, LAMPORTS_PER_SOL);
         assert_eq!(transaction_balance, LAMPORTS_PER_SOL);
+        assert_eq!(airdrop_balance, LAMPORTS_PER_SOL);
 
         setup
             .context
