@@ -515,6 +515,13 @@ pub async fn start_block_production_runloop(
                            do_produce_block = true;
                        }
                     }
+                    SimnetCommand::ProcessBundle(_key, transactions, reply_tx) => {
+                        let result = rpc::jito::process_bundle(&svm_locker, transactions).await;
+                        if result.is_ok() && block_production_mode.eq(&BlockProductionMode::Transaction) {
+                            do_produce_block = true;
+                        }
+                        let _ = reply_tx.send(result);
+                    }
                     SimnetCommand::Terminate(_) => {
                         // Explicitly shutdown storage to trigger WAL checkpoint before exiting
                         svm_locker.shutdown();
