@@ -98,6 +98,41 @@ where
         setup
     }
 
+    /// Runs serialized VM mutations as the production runloop would while
+    /// forwarding every other command for the test to handle explicitly.
+    pub fn new_with_serial_vm_executor(rpc: T) -> Self {
+        Self::new_with_serial_vm_executor_and_mempool(rpc).0
+    }
+
+    pub fn new_with_serial_vm_executor_and_mempool(rpc: T) -> (Self, Receiver<SimnetCommand>) {
+        let (simnet_commands_tx, simnet_commands_rx) = crossbeam_channel::unbounded();
+        let (mempool_tx, mempool_rx) = crossbeam_channel::unbounded();
+        let setup = Self::new_with_mempool(rpc, simnet_commands_tx);
+
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .expect("serial VM mutation test runtime should start");
+
+            while let Ok(command) = simnet_commands_rx.recv() {
+                match command {
+                    SimnetCommand::ProcessSerialVmMutation(task) => {
+                        runtime.block_on(task.run());
+                    }
+                    command => {
+                        if mempool_tx.send(command).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        (setup, mempool_rx)
+    }
+
     pub async fn without_blockhash(self) -> Self {
         let mut state_writer = self.context.svm_locker.0.write().await;
         state_writer.skip_blockhash_check = true;
