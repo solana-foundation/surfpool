@@ -266,17 +266,18 @@ impl SurfnetSvmLocker {
             return Ok(());
         };
 
-        let (mut epoch_info, epoch_schedule, some_genesis_hash) = {
+        let (mut epoch_info, epoch_schedule, rent, some_genesis_hash) = {
             let epoch_info = remote_client.get_epoch_info().await?;
             let epoch_schedule = remote_client.get_epoch_schedule().await?;
+            let rent = remote_client.get_rent().await?;
             let some_genesis_hash = remote_client.get_genesis_hash().await.ok();
-            (epoch_info, epoch_schedule, some_genesis_hash)
+            (epoch_info, epoch_schedule, rent, some_genesis_hash)
         };
         epoch_info.transaction_count = None;
 
         self.with_svm_writer(move |svm_writer| {
             svm_writer.cached_genesis_hash = some_genesis_hash;
-            svm_writer.initialize(epoch_info, epoch_schedule);
+            svm_writer.initialize(epoch_info, epoch_schedule, rent);
         });
         Ok(())
     }
@@ -2710,21 +2711,22 @@ impl SurfnetSvmLocker {
         let simnet_events_tx = self.simnet_events_tx();
         simnet_events_tx.info("Resetting network...");
 
-        // Fetch epoch info from remote if available (similar to initialize)
-        let (mut epoch_info, epoch_schedule) = if let Some(remote_client) = remote_ctx {
+        // Fetch epoch info and rent from remote if available (similar to initialize)
+        let (mut epoch_info, epoch_schedule, rent) = if let Some(remote_client) = remote_ctx {
             (
                 remote_client.get_epoch_info().await?,
                 remote_client.get_epoch_schedule().await?,
+                Some(remote_client.get_rent().await?),
             )
         } else {
             let epoch_schedule = SurfnetSvm::default_epoch_schedule();
             let epoch_info = SurfnetSvm::default_epoch_info(&epoch_schedule);
-            (epoch_info, epoch_schedule)
+            (epoch_info, epoch_schedule, None)
         };
         epoch_info.transaction_count = None;
 
         self.with_svm_writer(move |svm_writer| {
-            let _ = svm_writer.reset_network(epoch_info, epoch_schedule);
+            let _ = svm_writer.reset_network(epoch_info, epoch_schedule, rent);
             let _ = svm_writer.offline_accounts.clear();
         });
         Ok(())
@@ -4662,11 +4664,13 @@ mod tests {
     use solana_epoch_schedule::EpochSchedule;
     use solana_keypair::Keypair;
     use solana_message::{Message, VersionedMessage};
+    use solana_program_pack::Pack;
     use solana_rpc_client::rpc_sender::{RpcSender, RpcTransportStats};
     use solana_rpc_client_api::client_error::Result as ClientResult;
     use solana_sdk_ids::system_program;
     use solana_signer::Signer;
     use solana_system_interface::instruction as system_instruction;
+    use solana_sysvar::rent::Rent;
     use solana_transaction::versioned::VersionedTransaction;
     use solana_transaction_status::TransactionStatusMeta;
 
@@ -4678,6 +4682,7 @@ mod tests {
             BlockHeader, SurfnetSvm,
             svm::{SurfnetSvmConfig, apply_override_to_decoded_account},
         },
+        tests::helpers::{REMOTE_TOKEN_ACCOUNT_RESERVE, remote_rent_sysvar_account},
     };
 
     /// A real `PriceUpdateV2` account. Its `VerificationLevel` is the one-byte `Full` variant and
@@ -4697,9 +4702,22 @@ mod tests {
         ]
     }
 
+    /// Answers the requests a surfnet makes while cloning its startup state.
     struct StartupRpcSender {
         genesis_hash: Hash,
+        /// The `getAccountInfo` result served for the Rent sysvar.
+        rent_sysvar: serde_json::Value,
         requests: Arc<AtomicUsize>,
+    }
+
+    impl StartupRpcSender {
+        fn new(requests: Arc<AtomicUsize>) -> Self {
+            Self {
+                genesis_hash: Hash::default(),
+                rent_sysvar: remote_rent_sysvar_account(),
+                requests,
+            }
+        }
     }
 
     #[async_trait]
@@ -4707,7 +4725,7 @@ mod tests {
         async fn send(
             &self,
             request: RpcRequest,
-            _params: serde_json::Value,
+            params: serde_json::Value,
         ) -> ClientResult<serde_json::Value> {
             self.requests.fetch_add(1, Ordering::Relaxed);
 
@@ -4724,6 +4742,14 @@ mod tests {
                     serde_json::to_value(EpochSchedule::without_warmup()).unwrap()
                 }
                 RpcRequest::GetGenesisHash => serde_json::json!(self.genesis_hash.to_string()),
+                RpcRequest::GetAccountInfo => {
+                    assert_eq!(
+                        params[0],
+                        solana_sdk_ids::sysvar::rent::id().to_string(),
+                        "startup should clone no account other than the Rent sysvar"
+                    );
+                    self.rent_sysvar.clone()
+                }
                 _ => panic!("unexpected startup RPC request: {request:?}"),
             })
         }
@@ -4743,17 +4769,10 @@ mod tests {
         let svm_locker = SurfnetSvmLocker::new(surfnet_svm);
         let expected_hash = Hash::new_from_array([8; 32]);
         let requests = Arc::new(AtomicUsize::new(0));
-        let remote_client = SurfnetRemoteClient {
-            client: RpcClient::new_sender(
-                StartupRpcSender {
-                    genesis_hash: expected_hash,
-                    requests: Arc::clone(&requests),
-                },
-                RpcClientConfig::default(),
-            )
-            .into(),
-        };
-        let remote_ctx = Some(remote_client);
+        let remote_ctx = startup_remote(StartupRpcSender {
+            genesis_hash: expected_hash,
+            ..StartupRpcSender::new(Arc::clone(&requests))
+        });
 
         svm_locker
             .initialize(&remote_ctx)
@@ -4776,7 +4795,77 @@ mod tests {
                 .inner,
             expected_hash
         );
-        assert_eq!(requests.load(Ordering::Relaxed), 3);
+        // Epoch info, epoch schedule, rent and genesis hash; later genesis hash reads hit the cache.
+        assert_eq!(requests.load(Ordering::Relaxed), 4);
+    }
+
+    fn startup_remote(sender: StartupRpcSender) -> Option<SurfnetRemoteClient> {
+        Some(SurfnetRemoteClient {
+            client: RpcClient::new_sender(sender, RpcClientConfig::default()).into(),
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn initialize_clones_rent_sysvar_from_remote() {
+        let (mut surfnet_svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+        surfnet_svm
+            .inner
+            .set_sysvar(&Rent::with_lamports_per_byte(6_960));
+        let svm_locker = SurfnetSvmLocker::new(surfnet_svm);
+        let remote_ctx = startup_remote(StartupRpcSender::new(Arc::new(AtomicUsize::new(0))));
+
+        svm_locker
+            .initialize(&remote_ctx)
+            .await
+            .expect("startup RPC calls should succeed");
+
+        let minimum_balance = svm_locker.with_svm_reader(|svm| {
+            svm.inner
+                .minimum_balance_for_rent_exemption(spl_token_interface::state::Account::LEN)
+        });
+        assert_eq!(minimum_balance, REMOTE_TOKEN_ACCOUNT_RESERVE);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reset_network_reclones_rent_sysvar_from_remote() {
+        let (mut surfnet_svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+        surfnet_svm
+            .inner
+            .set_sysvar(&Rent::with_lamports_per_byte(6_960));
+        let svm_locker = SurfnetSvmLocker::new(surfnet_svm);
+        let remote_ctx = startup_remote(StartupRpcSender::new(Arc::new(AtomicUsize::new(0))));
+
+        svm_locker
+            .reset_network(&remote_ctx)
+            .await
+            .expect("reset RPC calls should succeed");
+
+        let minimum_balance = svm_locker.with_svm_reader(|svm| {
+            svm.inner
+                .minimum_balance_for_rent_exemption(spl_token_interface::state::Account::LEN)
+        });
+        assert_eq!(minimum_balance, REMOTE_TOKEN_ACCOUNT_RESERVE);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn initialize_rejects_a_remote_without_a_rent_sysvar() {
+        let (surfnet_svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+        let svm_locker = SurfnetSvmLocker::new(surfnet_svm);
+        let remote_ctx = startup_remote(StartupRpcSender {
+            rent_sysvar: serde_json::json!({ "context": { "slot": 0 }, "value": null }),
+            ..StartupRpcSender::new(Arc::new(AtomicUsize::new(0)))
+        });
+
+        let error = svm_locker
+            .initialize(&remote_ctx)
+            .await
+            .expect_err("a remote without a Rent sysvar cannot seed a surfnet");
+
+        let rent_id = solana_sdk_ids::sysvar::rent::id().to_string();
+        assert!(
+            error.to_string().contains(&rent_id),
+            "the error should name the missing sysvar, got: {error}"
+        );
     }
 
     #[cfg(feature = "sqlite")]

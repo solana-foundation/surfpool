@@ -104,7 +104,7 @@ use crate::{
         FINALIZATION_SLOT_THRESHOLD, GeyserEvent, LocalSignatureStatusOrSubscription,
         PluginCommand, SignatureSubscriptionType, locker::SurfnetSvmLocker, svm::SurfnetSvm,
     },
-    tests::helpers::get_free_port,
+    tests::helpers::{get_free_port, remote_rent_sysvar_account},
     types::{TimeTravelConfig, TransactionLoadedAddresses},
 };
 
@@ -7470,6 +7470,12 @@ async fn test_ws_signature_subscribe_does_not_miss_local_commit_during_remote_lo
                     }),
                     "getTransaction" => serde_json::Value::Null,
                     "getGenesisHash" => serde_json::Value::String(Hash::default().to_string()),
+                    "getAccountInfo"
+                        if request_json["params"][0]
+                            == solana_sdk_ids::sysvar::rent::id().to_string() =>
+                    {
+                        remote_rent_sysvar_account()
+                    }
                     unexpected => panic!("unexpected datasource method: {unexpected}"),
                 };
                 let response = serde_json::json!({

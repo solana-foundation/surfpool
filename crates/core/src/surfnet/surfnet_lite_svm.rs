@@ -14,6 +14,7 @@ use solana_pubkey::Pubkey;
 use solana_slot_hashes::SlotHashes;
 #[allow(deprecated)]
 use solana_sysvar::recent_blockhashes::RecentBlockhashes;
+use solana_sysvar::rent::Rent;
 use solana_transaction::versioned::VersionedTransaction;
 
 use crate::{
@@ -108,9 +109,11 @@ impl SurfnetLiteSvm {
         // - RecentBlockhashes: for blockhash validation
         // - SlotHashes: for ALT resolution
         // - Clock: for time-dependent programs
+        // - Rent: set by surfpool, so LiteSVM's default would be wrong
         let recent_blockhashes = self.svm.get_sysvar::<RecentBlockhashes>();
         let slot_hashes = self.svm.get_sysvar::<SlotHashes>();
         let clock = self.svm.get_sysvar::<Clock>();
+        let rent = self.svm.get_sysvar::<Rent>();
 
         // todo: this is also resetting the log bytes limit and airdrop keypair, would be nice to avoid
         self.svm = Self::litesvm_settings(feature_set);
@@ -121,6 +124,7 @@ impl SurfnetLiteSvm {
         self.svm.set_sysvar(&recent_blockhashes);
         self.svm.set_sysvar(&slot_hashes);
         self.svm.set_sysvar(&clock);
+        self.svm.set_sysvar(&rent);
     }
 
     pub fn set_log_bytes_limit(&mut self, limit: Option<usize>) {
@@ -297,7 +301,6 @@ impl SurfnetLiteSvm {
 
 fn create_native_mint(svm: &mut SurfnetLiteSvm) {
     use solana_program_pack::Pack;
-    use solana_sysvar::rent::Rent;
     use spl_token_interface::state::Mint;
 
     let mut data = vec![0; Mint::LEN];
