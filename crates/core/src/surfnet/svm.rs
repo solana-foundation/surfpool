@@ -50,6 +50,7 @@ use solana_sdk_ids::{bpf_loader, system_program};
 use solana_signature::Signature;
 use solana_slot_hashes::MAX_ENTRIES as MAX_SLOT_HASHES_ENTRIES;
 use solana_system_interface::instruction as system_instruction;
+use solana_sysvar::rent::Rent;
 use solana_transaction::versioned::VersionedTransaction;
 use solana_transaction_error::TransactionError;
 use solana_transaction_status::{
@@ -1288,14 +1289,16 @@ impl SurfnetSvm {
         self.write_version
     }
 
-    /// Initializes the SVM with the provided epoch info and epoch schedule.
+    /// Initializes the SVM with the provided epoch info, epoch schedule and rent.
     ///
     /// This is reserved for remote-derived startup data that is not known until the runloop
     /// is ready to connect to a remote RPC.
     ///
     /// # Arguments
     /// * `epoch_info` - The epoch information to initialize with.
-    pub fn initialize(&mut self, epoch_info: EpochInfo, epoch_schedule: EpochSchedule) {
+    /// * `epoch_schedule` - The remote's epoch schedule.
+    /// * `rent` - The remote's Rent sysvar.
+    pub fn initialize(&mut self, epoch_info: EpochInfo, epoch_schedule: EpochSchedule, rent: Rent) {
         self.chain_tip = self.new_blockhash();
         self.latest_epoch_info = epoch_info.clone();
         // Set genesis_slot to the current slot when initializing (syncing with remote)
@@ -1306,6 +1309,7 @@ impl SurfnetSvm {
         self.genesis_updated_at = self.updated_at;
 
         self.inner.set_sysvar(&epoch_schedule);
+        self.inner.set_sysvar(&rent);
 
         // Reconstruct all sysvars (RecentBlockhashes, SlotHashes, Clock)
         self.reconstruct_sysvars();
@@ -2121,10 +2125,13 @@ impl SurfnetSvm {
         Ok(())
     }
 
+    /// Resets the SVM to a fresh state. `rent` is the remote's Rent sysvar, or `None` to keep
+    /// the default.
     pub fn reset_network(
         &mut self,
         epoch_info: EpochInfo,
         epoch_schedule: EpochSchedule,
+        rent: Option<Rent>,
     ) -> SurfpoolResult<()> {
         self.inner.reset(self.feature_set.clone())?;
 
@@ -2202,6 +2209,9 @@ impl SurfnetSvm {
         let chain_tip_hash = SyntheticBlockhash::new(epoch_info.block_height).to_string();
         self.chain_tip = BlockIdentifier::new(epoch_info.block_height, chain_tip_hash.as_str());
         self.inner.set_sysvar(&epoch_schedule);
+        if let Some(rent) = rent {
+            self.inner.set_sysvar(&rent);
+        }
         // Rebuild sysvars so getLatestBlockhash / sendTransaction stay aligned after reset.
         self.reconstruct_sysvars();
         // Reset checkpoint state to avoid recovering stale chain tips after a reset.
@@ -4588,7 +4598,11 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
-    use crate::storage::tests::TestType;
+    use crate::{
+        storage::tests::TestType,
+        surfnet::surfnet_lite_svm::LAMPORTS_PER_SOL,
+        tests::helpers::{REMOTE_TOKEN_ACCOUNT_RESERVE, remote_rent},
+    };
 
     #[test]
     fn startup_status_subscription_tracks_accepted_transitions() {
@@ -5875,7 +5889,11 @@ mod tests {
             transaction_count: None,
         };
 
-        svm.initialize(epoch_info.clone(), EpochSchedule::without_warmup());
+        svm.initialize(
+            epoch_info.clone(),
+            EpochSchedule::without_warmup(),
+            remote_rent(),
+        );
 
         assert_eq!(svm.slot_time, 321);
         assert!(!svm.instruction_profiling_enabled);
@@ -5883,6 +5901,104 @@ mod tests {
         assert!(!svm.feature_set.is_active(&disable_fees_sysvar::id()));
         assert_eq!(svm.latest_epoch_info, epoch_info);
         assert_eq!(svm.genesis_slot, 777);
+    }
+
+    // Garbage collection only rebuilds the SVM when a database backs it.
+    #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
+    #[test_case(TestType::in_memory(); "with in-memory sqlite db")]
+    #[cfg_attr(feature = "postgres", test_case(TestType::postgres(); "with postgres db"))]
+    fn test_garbage_collect_preserves_rent_sysvar(test_type: TestType) {
+        let (mut svm, _events_rx, _geyser_rx) = test_type.initialize_svm();
+        let rent = Rent::with_lamports_per_byte(1_234);
+        svm.inner.set_sysvar(&rent);
+
+        svm.inner.garbage_collect(svm.feature_set.clone());
+
+        assert_eq!(
+            svm.inner.minimum_balance_for_rent_exemption(0),
+            rent.minimum_balance(0)
+        );
+    }
+
+    /// A WSOL token account holding `amount` on top of the remote's reserve.
+    fn native_token_account(owner: &Pubkey, amount: u64) -> Account {
+        let mut data = [0u8; TokenAccount::LEN];
+        TokenAccount {
+            mint: spl_token_interface::native_mint::ID,
+            owner: *owner,
+            amount,
+            delegate: COption::None,
+            state: AccountState::Initialized,
+            is_native: COption::Some(REMOTE_TOKEN_ACCOUNT_RESERVE),
+            delegated_amount: 0,
+            close_authority: COption::None,
+        }
+        .pack_into_slice(&mut data);
+        Account {
+            lamports: REMOTE_TOKEN_ACCOUNT_RESERVE + amount,
+            data: data.to_vec(),
+            owner: spl_token_interface::id(),
+            executable: false,
+            rent_epoch: 0,
+        }
+    }
+
+    /// Draining a WSOL account created on the remote leaves exactly the remote's reserve.
+    /// At a higher local rate the runtime rejects that as a RentExempt -> RentPaying
+    /// transition, even though every instruction succeeds.
+    #[test]
+    fn test_draining_cloned_wsol_account_succeeds_once_remote_rent_is_applied() {
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        svm.inner.set_sysvar(&Rent::with_lamports_per_byte(6_960));
+        let owner = Keypair::new();
+        let source = Pubkey::new_unique();
+        let destination = Pubkey::new_unique();
+        let amount = 1_000_000;
+        svm.airdrop(&owner.pubkey(), LAMPORTS_PER_SOL)
+            .unwrap()
+            .unwrap();
+        svm.set_account(&source, native_token_account(&owner.pubkey(), amount))
+            .unwrap();
+        svm.set_account(&destination, native_token_account(&owner.pubkey(), 0))
+            .unwrap();
+        let drain = |svm: &mut SurfnetSvm| {
+            let transfer = spl_token_interface::instruction::transfer_checked(
+                &spl_token_interface::id(),
+                &source,
+                &spl_token_interface::native_mint::ID,
+                &destination,
+                &owner.pubkey(),
+                &[],
+                amount,
+                spl_token_interface::native_mint::DECIMALS,
+            )
+            .unwrap();
+            let tx = Transaction::new_signed_with_payer(
+                &[transfer],
+                Some(&owner.pubkey()),
+                &[&owner],
+                svm.latest_blockhash(),
+            );
+            svm.send_transaction(tx.into(), false, false)
+                .map(|_| ())
+                .map_err(|failure| failure.err)
+        };
+
+        let err = drain(&mut svm).expect_err("the higher rate should reject the drain");
+        assert!(
+            matches!(err, TransactionError::InsufficientFundsForRent { .. }),
+            "expected InsufficientFundsForRent, got {err:?}"
+        );
+
+        let epoch_schedule = EpochSchedule::without_warmup();
+        let epoch_info = SurfnetSvm::default_epoch_info(&epoch_schedule);
+        svm.initialize(epoch_info, epoch_schedule, remote_rent());
+
+        drain(&mut svm).unwrap_or_else(|err| {
+            panic!("the drain should succeed at the remote's rent rate: {err:?}")
+        });
+        let drained = svm.get_account(&source).unwrap().unwrap();
+        assert_eq!(drained.lamports, REMOTE_TOKEN_ACCOUNT_RESERVE);
     }
 
     #[test]

@@ -4,6 +4,7 @@ use std::net::TcpListener;
 use crossbeam_channel::{Receiver, Sender};
 use solana_clock::Clock;
 use solana_epoch_info::EpochInfo;
+use solana_sysvar::rent::Rent;
 use solana_transaction::versioned::VersionedTransaction;
 use surfpool_types::{CheatcodeConfig, RpcConfig, SimnetCommand, SimnetEvent};
 
@@ -11,6 +12,29 @@ use crate::{
     rpc::RunloopContext,
     surfnet::{PluginCommand, locker::SurfnetSvmLocker, svm::SurfnetSvm},
 };
+
+/// The Rent sysvar devnet and mainnet serve: 5080 lamports per byte.
+pub fn remote_rent() -> Rent {
+    Rent::with_lamports_per_byte(5_080)
+}
+
+/// The `getAccountInfo` result devnet and mainnet serve for the Rent sysvar.
+pub fn remote_rent_sysvar_account() -> serde_json::Value {
+    serde_json::json!({
+        "context": { "slot": 0 },
+        "value": {
+            "data": ["2BMAAAAAAAAAAAAAAADwPzI=", "base64"],
+            "executable": false,
+            "lamports": 1_009_200,
+            "owner": "Sysvar1111111111111111111111111111111111111",
+            "rentEpoch": u64::MAX,
+            "space": 17,
+        }
+    })
+}
+
+/// Rent-exempt minimum for a token account under [`remote_rent`].
+pub const REMOTE_TOKEN_ACCOUNT_RESERVE: u64 = 1_488_440;
 
 pub fn get_free_port() -> Result<u16, String> {
     let listener =
