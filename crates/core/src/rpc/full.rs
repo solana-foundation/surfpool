@@ -190,6 +190,26 @@ pub struct RpcTransactionsForAddressResult {
     pub pagination_token: Option<String>,
 }
 
+/// The programdata account a loader-v3 program points at, which SIMD-0186 counts with it.
+fn programdata_address(account: &solana_account::Account) -> Option<Pubkey> {
+    if account.owner != solana_sdk_ids::bpf_loader_upgradeable::id() {
+        return None;
+    }
+    match bincode::deserialize(&account.data) {
+        Ok(solana_loader_v3_interface::state::UpgradeableLoaderState::Program {
+            programdata_address,
+        }) => Some(programdata_address),
+        _ => None,
+    }
+}
+
+/// SIMD-0186: the size every loaded account adds on top of its data
+/// (`TRANSACTION_ACCOUNT_BASE_SIZE` in Agave's `svm/src/account_loader.rs`).
+const TRANSACTION_ACCOUNT_BASE_SIZE: u64 = 64;
+/// SIMD-0186: the size every address lookup table adds, the largest table plus its metadata
+/// (`ADDRESS_LOOKUP_TABLE_BASE_SIZE` in Agave's `svm/src/account_loader.rs`).
+const ADDRESS_LOOKUP_TABLE_BASE_SIZE: u64 = 8248;
+
 #[rpc]
 pub trait Full {
     type Metadata;
@@ -1938,6 +1958,10 @@ impl Full for SurfpoolFullRpc {
                 .get_multiple_accounts(&remote_ctx, &transaction_pubkeys, None)
                 .await?;
 
+            let lookup_tables = unsanitized_tx
+                .message
+                .address_table_lookups()
+                .map_or(0, <[_]>::len);
             let mut seen_accounts = std::collections::HashSet::new();
             let mut loaded_accounts_data_size: u64 = 0;
 
@@ -1946,6 +1970,14 @@ impl Full for SurfpoolFullRpc {
                     GetAccountResult::FoundAccount(pubkey, account, _) => {
                         if seen_accounts.insert(*pubkey) {
                             loaded_accounts_data_size += account.data.len() as u64;
+                        }
+                        // A program already on the surfnet is not coupled with its programdata.
+                        if let Some(pd_pubkey) = programdata_address(account)
+                            && let Ok(Some(pd)) =
+                                svm_locker.with_svm_reader(|svm| svm.get_account(&pd_pubkey))
+                            && seen_accounts.insert(pd_pubkey)
+                        {
+                            loaded_accounts_data_size += pd.data.len() as u64;
                         }
                     }
                     // According to SIMD 0186, program data is tracked as well as program accounts
@@ -1987,18 +2019,18 @@ impl Full for SurfpoolFullRpc {
                 track_accounts_data_size(res);
             }
 
+            // SIMD-0186: every account counted above also costs a base size, and every address
+            // lookup table a flat size, whatever it holds.
+            //
+            // Delete this count once LiteSVM reports the size it metered, as
+            // `TransactionMetadata::loaded_accounts_data_size`
+            // (https://github.com/LiteSVM/litesvm/pull/428), and report that instead.
+            let loaded_accounts_data_size = loaded_accounts_data_size
+                + TRANSACTION_ACCOUNT_BASE_SIZE * seen_accounts.len() as u64
+                + ADDRESS_LOOKUP_TABLE_BASE_SIZE * lookup_tables as u64;
+
             // Convert TransactionLoadedAddresses to LoadedAddresses before it gets consumed
             let loaded_addresses_data = loaded_addresses.as_ref().map(|la| la.loaded_addresses());
-
-            if let Some(alt_pubkeys) = loaded_addresses.map(|l| l.alt_addresses()) {
-                let alt_updates = svm_locker
-                    .get_multiple_accounts(&remote_ctx, &alt_pubkeys, None)
-                    .await?
-                    .inner;
-                for res in alt_updates.iter() {
-                    track_accounts_data_size(res);
-                }
-            }
 
             let replacement_blockhash = if config.replace_recent_blockhash {
                 unsanitized_tx
@@ -2792,12 +2824,15 @@ mod tests {
     use base64::{Engine, prelude::BASE64_STANDARD};
     use bincode::Options;
     use crossbeam_channel::Receiver;
+    use solana_account::Account;
     use solana_account_decoder::{UiAccount, UiAccountData, UiAccountEncoding};
+    use solana_address_lookup_table_interface::state::{AddressLookupTable, LookupTableMeta};
     use solana_client::rpc_config::RpcSimulateTransactionAccountsConfig;
     use solana_commitment_config::CommitmentConfig;
     use solana_hash::Hash;
-    use solana_instruction::Instruction;
+    use solana_instruction::{AccountMeta, Instruction};
     use solana_keypair::Keypair;
+    use solana_loader_v3_interface::state::UpgradeableLoaderState;
     use solana_message::{
         AddressLookupTableAccount, MessageHeader,
         legacy::Message as LegacyMessage,
@@ -2805,6 +2840,7 @@ mod tests {
         v1::{MAX_TRANSACTION_SIZE, Message as V1Message, TransactionConfig},
     };
     use solana_pubkey::Pubkey;
+    use solana_sdk_ids::bpf_loader_upgradeable;
     use solana_signer::Signer;
     use solana_system_interface::{
         instruction::{self as system_instruction, transfer},
@@ -3821,6 +3857,110 @@ mod tests {
         assert_eq!(
             simulation_res.value.err,
             Some(TransactionError::SignatureFailure.into())
+        );
+    }
+
+    /// SIMD-0186, as Agave's `load_transaction_accounts` counts it: each loaded account costs 64
+    /// bytes plus its data (nothing if it does not exist), a loader-v3 program also costs its
+    /// programdata, and each address lookup table costs a flat 8248 bytes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_simulate_transaction_loaded_accounts_data_size() {
+        let setup = TestSetup::new(SurfpoolFullRpc);
+        let payer = Keypair::new();
+        let recipient = Pubkey::new_unique();
+        let (program, programdata, table) = (
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        );
+        let program_data = bincode::serialize(&UpgradeableLoaderState::Program {
+            programdata_address: programdata,
+        })
+        .unwrap();
+        let programdata_len = 1_000;
+        let system_program_len = setup.context.svm_locker.with_svm_writer(|svm| {
+            let account = |owner, data| Account {
+                lamports: LAMPORTS_PER_SOL,
+                data,
+                owner,
+                executable: false,
+                rent_epoch: 0,
+            };
+            svm.set_account(&payer.pubkey(), account(system_program::id(), vec![]))
+                .unwrap();
+            // Not executable, so the surfnet does not load it as a program; SIMD-0186 counts
+            // its programdata all the same.
+            svm.set_account(
+                &program,
+                account(bpf_loader_upgradeable::id(), program_data.clone()),
+            )
+            .unwrap();
+            svm.set_account(
+                &programdata,
+                account(bpf_loader_upgradeable::id(), vec![0; programdata_len]),
+            )
+            .unwrap();
+            let lookup_table = AddressLookupTable {
+                meta: LookupTableMeta::default(),
+                addresses: vec![recipient].into(),
+            };
+            svm.set_account(
+                &table,
+                account(
+                    solana_address_lookup_table_interface::program::id(),
+                    lookup_table.serialize_for_tests().unwrap(),
+                ),
+            )
+            .unwrap();
+            svm.get_account(&system_program::id())
+                .unwrap()
+                .unwrap()
+                .data
+                .len()
+        });
+
+        let mut transfer = system_instruction::transfer(&payer.pubkey(), &recipient, 1_000_000);
+        transfer
+            .accounts
+            .push(AccountMeta::new_readonly(program, false));
+        let blockhash = setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm| svm.latest_blockhash());
+        let message = V0Message::try_compile(
+            &payer.pubkey(),
+            &[transfer],
+            &[AddressLookupTableAccount {
+                key: table,
+                addresses: vec![recipient],
+            }],
+            blockhash,
+        )
+        .unwrap();
+        let tx = VersionedTransaction::try_new(VersionedMessage::V0(message), &[&payer]).unwrap();
+
+        let simulation = setup
+            .rpc
+            .simulate_transaction(
+                Some(setup.context),
+                bs58::encode(bincode::serialize(&tx).unwrap()).into_string(),
+                Some(RpcSimulateTransactionConfig {
+                    sig_verify: false,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+
+        // The recipient does not exist, so it costs nothing.
+        let expected = 64 // payer, which holds no data
+            + (64 + system_program_len) // invoked program
+            + (64 + program_data.len()) // loader-v3 program ...
+            + (64 + programdata_len) // ... and its programdata
+            + 8248; // the lookup table
+        assert_eq!(
+            simulation.value.loaded_accounts_data_size,
+            Some(expected as u32)
         );
     }
 

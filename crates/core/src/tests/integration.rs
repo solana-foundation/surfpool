@@ -839,9 +839,12 @@ async fn test_simulate_add_alt_entries_fetching(test_type: TestType) {
         simulation_res.value.loaded_accounts_data_size.is_some(),
         "Expected loaded_accounts_data_size to be present"
     );
+    // SIMD-0186: the lookup table (8248), the payer (64 + 0), the system program (64 + 21), and
+    // the table's first entry, the Token program (64 + 36), with its programdata (64 + 100_357,
+    // the Token program LiteSVM bundles).
     assert_eq!(
         simulation_res.value.loaded_accounts_data_size.unwrap(),
-        140134,
+        108918,
         "Incorrect loaded_accounts_data_size value"
     );
     let simulation_res2 = full_client
