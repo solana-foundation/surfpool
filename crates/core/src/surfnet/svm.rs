@@ -53,8 +53,9 @@ use solana_system_interface::instruction as system_instruction;
 use solana_transaction::versioned::VersionedTransaction;
 use solana_transaction_error::TransactionError;
 use solana_transaction_status::{
+    BlockEncodingOptions, ConfirmedBlock,
     TransactionConfirmationStatus as RpcTransactionConfirmationStatus, TransactionDetails,
-    TransactionStatusMeta, UiConfirmedBlock,
+    TransactionStatusMeta, UiConfirmedBlock, UiTransactionEncoding,
 };
 use spl_token_2022_interface::extension::{
     BaseStateWithExtensions, StateWithExtensions, interest_bearing_mint::InterestBearingConfig,
@@ -1406,7 +1407,8 @@ impl SurfnetSvm {
                             post_token_balances: Some(vec![]),
                             rewards: Some(vec![]),
                             loaded_addresses: LoadedAddresses::default(),
-                            return_data: Some(tx_result.return_data.clone()),
+                            return_data: Some(tx_result.return_data.clone())
+                                .filter(|d| !d.data.is_empty()),
                             compute_units_consumed: Some(tx_result.compute_units_consumed),
                             cost_units: None,
                         },
@@ -3593,69 +3595,43 @@ impl SurfnetSvm {
             return Ok(None);
         };
 
-        let show_rewards = config.rewards.unwrap_or(true);
-        let transaction_details = config
-            .transaction_details
-            .unwrap_or(TransactionDetails::Full);
-
+        let transaction_details = config.transaction_details.unwrap_or_default();
+        // Signatures mode answers from the block header, so a missing tx record
+        // cannot drop a signature and no transaction is loaded.
         let transactions = match transaction_details {
-            TransactionDetails::Full => Some(
-                block
-                    .signatures
-                    .iter()
-                    .filter_map(|sig| self.transactions.get(&sig.to_string()).ok().flatten())
-                    .map(|tx_with_meta| {
-                        let (meta, _) = tx_with_meta.expect_processed();
-                        meta.encode(
-                            config.encoding.unwrap_or(
-                                solana_transaction_status::UiTransactionEncoding::JsonParsed,
-                            ),
-                            config.max_supported_transaction_version,
-                            show_rewards,
-                        )
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(SurfpoolError::from)?,
-            ),
-            TransactionDetails::Signatures => None,
-            TransactionDetails::None => None,
-            TransactionDetails::Accounts => Some(
-                block
-                    .signatures
-                    .iter()
-                    .filter_map(|sig| self.transactions.get(&sig.to_string()).ok().flatten())
-                    .map(|tx_with_meta| {
-                        let (meta, _) = tx_with_meta.expect_processed();
-                        meta.to_json_accounts(
-                            config.max_supported_transaction_version,
-                            show_rewards,
-                        )
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(SurfpoolError::from)?,
-            ),
+            TransactionDetails::None | TransactionDetails::Signatures => vec![],
+            TransactionDetails::Full | TransactionDetails::Accounts => block
+                .signatures
+                .iter()
+                .filter_map(|sig| self.transactions.get(&sig.to_string()).ok().flatten())
+                .filter_map(SurfnetTransactionStatus::as_processed)
+                .map(|(tx, _)| {
+                    solana_transaction_status::TransactionWithStatusMeta::Complete(tx.into())
+                })
+                .collect(),
         };
 
-        let signatures = match transaction_details {
-            TransactionDetails::Signatures => {
-                Some(block.signatures.iter().map(|t| t.to_string()).collect())
-            }
-            TransactionDetails::Full | TransactionDetails::Accounts | TransactionDetails::None => {
-                None
-            }
-        };
-
-        let block = UiConfirmedBlock {
-            previous_blockhash: block.previous_blockhash.clone(),
-            blockhash: block.hash.clone(),
+        let signatures = matches!(transaction_details, TransactionDetails::Signatures)
+            .then(|| block.signatures.iter().map(ToString::to_string).collect());
+        let mut block = ConfirmedBlock {
+            previous_blockhash: block.previous_blockhash,
+            blockhash: block.hash,
             parent_slot: block.parent_slot,
             transactions,
-            signatures,
-            rewards: if show_rewards { Some(vec![]) } else { None },
-            num_reward_partitions: None,
+            rewards: vec![],
+            num_partitions: None,
             block_time: Some(block.block_time),
             block_height: Some(block.block_height),
-        };
+        }
+        .encode_with_options(
+            config.encoding.unwrap_or(UiTransactionEncoding::Json),
+            BlockEncodingOptions {
+                transaction_details,
+                show_rewards: config.rewards.unwrap_or(true),
+                max_supported_transaction_version: config.max_supported_transaction_version,
+            },
+        )?;
+        block.signatures = signatures;
         Ok(Some(block))
     }
 

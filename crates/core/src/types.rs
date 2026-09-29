@@ -1,6 +1,5 @@
 use std::{collections::HashSet, vec};
 
-use agave_reserved_account_keys::ReservedAccountKeys;
 use base64::{Engine, prelude::BASE64_STANDARD};
 use bytemuck::{Pod, Zeroable, bytes_of, from_bytes};
 use chrono::Utc;
@@ -13,31 +12,18 @@ use solana_account_decoder::{
 };
 use solana_clock::{Epoch, Slot};
 use solana_hash::Hash;
-use solana_message::{
-    AccountKeys, VersionedMessage,
-    v0::{LoadedAddresses, LoadedMessage, MessageAddressTableLookup},
-};
+use solana_message::v0::{LoadedAddresses, MessageAddressTableLookup};
 use solana_program_option::COption;
 use solana_program_pack::Pack;
 use solana_pubkey::Pubkey;
 use solana_signature::{SIGNATURE_BYTES, Signature};
-use solana_transaction::{
-    sanitized::SanitizedTransaction,
-    versioned::{TransactionVersion, VersionedTransaction},
-};
+use solana_transaction::{sanitized::SanitizedTransaction, versioned::VersionedTransaction};
 use solana_transaction_context::transaction::TransactionReturnData;
 use solana_transaction_error::TransactionError;
 use solana_transaction_status::{
-    Encodable, EncodableWithMeta, EncodeError, EncodedTransaction,
-    EncodedTransactionWithStatusMeta, InnerInstruction, InnerInstructions, Reward,
-    TransactionBinaryEncoding, TransactionConfirmationStatus, TransactionStatus,
-    TransactionStatusMeta, TransactionTokenBalance, UiAccountsList, UiLoadedAddresses,
-    UiTransaction, UiTransactionEncoding, UiTransactionStatusMeta,
-    option_serializer::OptionSerializer,
-    parse_accounts::{
-        parse_legacy_message_accounts, parse_v0_message_accounts, parse_v1_message_accounts,
-    },
-    parse_ui_inner_instructions,
+    InnerInstructions, Reward, TransactionConfirmationStatus, TransactionStatus,
+    TransactionStatusMeta, TransactionTokenBalance, VersionedTransactionWithStatusMeta,
+    map_inner_instructions,
 };
 use solana_zk_sdk::encryption::{
     auth_encryption::{AeCiphertext, AeKey},
@@ -348,7 +334,7 @@ impl<'de> Deserialize<'de> for TransactionWithStatusMeta {
 #[cfg(test)]
 mod transaction_with_status_meta_tests {
     use solana_keypair::Keypair;
-    use solana_message::{MessageHeader, legacy, v0, v1};
+    use solana_message::{MessageHeader, VersionedMessage, legacy, v0, v1};
     use solana_signature::Signature;
     use solana_signer::Signer;
     use solana_system_interface::instruction::transfer;
@@ -443,6 +429,15 @@ mod transaction_with_status_meta_tests {
     }
 }
 
+impl From<TransactionWithStatusMeta> for VersionedTransactionWithStatusMeta {
+    fn from(tx: TransactionWithStatusMeta) -> Self {
+        Self {
+            transaction: tx.transaction,
+            meta: tx.meta,
+        }
+    }
+}
+
 impl TransactionWithStatusMeta {
     pub fn into_status(&self, current_slot: u64) -> TransactionStatus {
         TransactionStatus {
@@ -486,27 +481,7 @@ impl TransactionWithStatusMeta {
                     .map(|a| a.clone().map(|a| a.lamports).unwrap_or(0))
                     .collect(),
                 inner_instructions: Some(
-                    transaction_meta
-                        .inner_instructions
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(i, ixs)| {
-                            if ixs.is_empty() {
-                                None
-                            } else {
-                                Some(InnerInstructions {
-                                    index: i as u8,
-                                    instructions: ixs
-                                        .iter()
-                                        .map(|ix| InnerInstruction {
-                                            instruction: ix.instruction.clone(),
-                                            stack_height: Some(ix.stack_height as u32),
-                                        })
-                                        .collect(),
-                                })
-                            }
-                        })
-                        .collect(),
+                    map_inner_instructions(transaction_meta.inner_instructions).collect(),
                 ),
                 log_messages: Some(transaction_meta.logs),
                 pre_token_balances: Some(
@@ -555,150 +530,10 @@ impl TransactionWithStatusMeta {
                 ),
                 rewards: Some(vec![]),
                 loaded_addresses,
-                return_data: Some(transaction_meta.return_data),
+                return_data: Some(transaction_meta.return_data).filter(|d| !d.data.is_empty()),
                 compute_units_consumed: Some(transaction_meta.compute_units_consumed),
                 cost_units: None,
             },
-        }
-    }
-
-    pub fn encode(
-        &self,
-        encoding: UiTransactionEncoding,
-        max_supported_transaction_version: Option<u8>,
-        show_rewards: bool,
-    ) -> Result<EncodedTransactionWithStatusMeta, EncodeError> {
-        let version = self.validate_version(max_supported_transaction_version)?;
-        Ok(EncodedTransactionWithStatusMeta {
-            transaction: match encoding {
-                UiTransactionEncoding::Binary => EncodedTransaction::LegacyBinary(
-                    bs58::encode(wincode::serialize(&self.transaction).unwrap()).into_string(),
-                ),
-                UiTransactionEncoding::Base58 => EncodedTransaction::Binary(
-                    bs58::encode(wincode::serialize(&self.transaction).unwrap()).into_string(),
-                    TransactionBinaryEncoding::Base58,
-                ),
-                UiTransactionEncoding::Base64 => EncodedTransaction::Binary(
-                    BASE64_STANDARD.encode(wincode::serialize(&self.transaction).unwrap()),
-                    TransactionBinaryEncoding::Base64,
-                ),
-                UiTransactionEncoding::Json => EncodedTransaction::Json(UiTransaction {
-                    signatures: self
-                        .transaction
-                        .signatures
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect(),
-                    message: match &self.transaction.message {
-                        VersionedMessage::Legacy(message) => {
-                            message.encode(UiTransactionEncoding::Json)
-                        }
-                        VersionedMessage::V0(message) => message.json_encode(),
-                        VersionedMessage::V1(message) => {
-                            message.encode(UiTransactionEncoding::Json)
-                        }
-                    },
-                }),
-                UiTransactionEncoding::JsonParsed => EncodedTransaction::Json(UiTransaction {
-                    signatures: self
-                        .transaction
-                        .signatures
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect(),
-                    message: match &self.transaction.message {
-                        VersionedMessage::Legacy(message) => {
-                            message.encode(UiTransactionEncoding::JsonParsed)
-                        }
-                        VersionedMessage::V0(message) => {
-                            message.encode_with_meta(UiTransactionEncoding::JsonParsed, &self.meta)
-                        }
-                        VersionedMessage::V1(message) => {
-                            message.encode(UiTransactionEncoding::JsonParsed)
-                        }
-                    },
-                }),
-            },
-            meta: Some(match encoding {
-                UiTransactionEncoding::JsonParsed => {
-                    parse_ui_transaction_status_meta_with_account_keys(
-                        self.meta.clone(),
-                        self.transaction.message.static_account_keys(),
-                        show_rewards,
-                    )
-                }
-                _ => {
-                    let mut meta = parse_ui_transaction_status_meta(self.meta.clone());
-                    if !show_rewards {
-                        meta.rewards = OptionSerializer::None;
-                    }
-                    meta
-                }
-            }),
-            version,
-        })
-    }
-
-    pub fn to_json_accounts(
-        &self,
-        max_supported_transaction_version: Option<u8>,
-        show_rewards: bool,
-    ) -> Result<EncodedTransactionWithStatusMeta, EncodeError> {
-        let version = self.validate_version(max_supported_transaction_version)?;
-        let reserved_account_keys = ReservedAccountKeys::new_all_activated();
-
-        let account_keys = match &self.transaction.message {
-            VersionedMessage::Legacy(message) => parse_legacy_message_accounts(message),
-            VersionedMessage::V0(message) => {
-                let loaded_message = LoadedMessage::new_borrowed(
-                    message,
-                    &self.meta.loaded_addresses,
-                    &reserved_account_keys.active,
-                );
-                parse_v0_message_accounts(&loaded_message)
-            }
-            VersionedMessage::V1(message) => parse_v1_message_accounts(message),
-        };
-
-        Ok(EncodedTransactionWithStatusMeta {
-            transaction: EncodedTransaction::Accounts(UiAccountsList {
-                signatures: self
-                    .transaction
-                    .signatures
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect(),
-                account_keys,
-            }),
-            meta: Some(build_simple_ui_transaction_status_meta(
-                self.meta.clone(),
-                show_rewards,
-            )),
-            version,
-        })
-    }
-
-    fn validate_version(
-        &self,
-        max_supported_transaction_version: Option<u8>,
-    ) -> Result<Option<TransactionVersion>, EncodeError> {
-        match (
-            max_supported_transaction_version,
-            self.transaction.version(),
-        ) {
-            // Set to none because old clients can't handle this field
-            (None, TransactionVersion::LEGACY) => Ok(None),
-            (None, TransactionVersion::Number(version)) => {
-                Err(EncodeError::UnsupportedTransactionVersion(version))
-            }
-            (Some(_), TransactionVersion::LEGACY) => Ok(Some(TransactionVersion::LEGACY)),
-            (Some(max_version), TransactionVersion::Number(version)) => {
-                if version <= max_version {
-                    Ok(Some(TransactionVersion::Number(version)))
-                } else {
-                    Err(EncodeError::UnsupportedTransactionVersion(version))
-                }
-            }
         }
     }
 
@@ -753,141 +588,18 @@ impl TransactionWithStatusMeta {
                 pre_balances,
                 post_balances,
                 inner_instructions: Some(
-                    failure
-                        .meta
-                        .inner_instructions
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(i, ixs)| {
-                            if ixs.is_empty() {
-                                None
-                            } else {
-                                Some(InnerInstructions {
-                                    index: i as u8,
-                                    instructions: ixs
-                                        .iter()
-                                        .map(|ix| InnerInstruction {
-                                            instruction: ix.instruction.clone(),
-                                            stack_height: Some(ix.stack_height as u32),
-                                        })
-                                        .collect(),
-                                })
-                            }
-                        })
-                        .collect(),
+                    map_inner_instructions(failure.meta.inner_instructions.clone()).collect(),
                 ),
                 log_messages: Some(failure.meta.logs.clone()),
                 pre_token_balances: Some(balances.clone()),
                 post_token_balances: Some(balances),
                 rewards: Some(vec![]),
                 loaded_addresses,
-                return_data: Some(failure.meta.return_data.clone()),
+                return_data: Some(failure.meta.return_data.clone()).filter(|d| !d.data.is_empty()),
                 compute_units_consumed: Some(failure.meta.compute_units_consumed),
                 cost_units: None,
             },
         }
-    }
-}
-
-fn parse_ui_transaction_status_meta_with_account_keys(
-    meta: TransactionStatusMeta,
-    static_keys: &[Pubkey],
-    show_rewards: bool,
-) -> UiTransactionStatusMeta {
-    let account_keys = AccountKeys::new(static_keys, Some(&meta.loaded_addresses));
-    UiTransactionStatusMeta {
-        err: meta.status.clone().map_err(Into::into).err(),
-        status: meta.status.map_err(Into::into),
-        fee: meta.fee,
-        pre_balances: meta.pre_balances,
-        post_balances: meta.post_balances,
-        inner_instructions: meta
-            .inner_instructions
-            .map(|ixs| {
-                ixs.into_iter()
-                    .map(|ix| parse_ui_inner_instructions(ix, &account_keys))
-                    .collect()
-            })
-            .into(),
-        log_messages: meta.log_messages.into(),
-        pre_token_balances: meta
-            .pre_token_balances
-            .map(|balance| balance.into_iter().map(Into::into).collect())
-            .into(),
-        post_token_balances: meta
-            .post_token_balances
-            .map(|balance| balance.into_iter().map(Into::into).collect())
-            .into(),
-        rewards: if show_rewards { meta.rewards } else { None }.into(),
-        loaded_addresses: OptionSerializer::Skip,
-        return_data: OptionSerializer::or_skip(
-            meta.return_data.map(|return_data| return_data.into()),
-        ),
-        compute_units_consumed: OptionSerializer::or_skip(meta.compute_units_consumed),
-        cost_units: OptionSerializer::or_skip(meta.cost_units),
-    }
-}
-
-// FIXME: use native transform from the solana official crate
-fn parse_ui_transaction_status_meta(meta: TransactionStatusMeta) -> UiTransactionStatusMeta {
-    UiTransactionStatusMeta {
-        err: meta.status.clone().map_err(Into::into).err(),
-        status: meta.status.map_err(Into::into),
-        fee: meta.fee,
-        pre_balances: meta.pre_balances,
-        post_balances: meta.post_balances,
-        inner_instructions: meta
-            .inner_instructions
-            .map(|ixs| ixs.into_iter().map(Into::into).collect())
-            .into(),
-        log_messages: meta.log_messages.into(),
-        pre_token_balances: meta
-            .pre_token_balances
-            .map(|balance| balance.into_iter().map(Into::into).collect())
-            .into(),
-        post_token_balances: meta
-            .post_token_balances
-            .map(|balance| balance.into_iter().map(Into::into).collect())
-            .into(),
-        rewards: meta.rewards.into(),
-        loaded_addresses: Some(UiLoadedAddresses::from(&meta.loaded_addresses)).into(),
-        return_data: OptionSerializer::or_skip(
-            meta.return_data.map(|return_data| return_data.into()),
-        ),
-        compute_units_consumed: OptionSerializer::or_skip(meta.compute_units_consumed),
-        cost_units: OptionSerializer::or_skip(meta.cost_units),
-    }
-}
-
-fn build_simple_ui_transaction_status_meta(
-    meta: TransactionStatusMeta,
-    show_rewards: bool,
-) -> UiTransactionStatusMeta {
-    UiTransactionStatusMeta {
-        err: meta.status.clone().map_err(Into::into).err(),
-        status: meta.status.map_err(Into::into),
-        fee: meta.fee,
-        pre_balances: meta.pre_balances,
-        post_balances: meta.post_balances,
-        inner_instructions: OptionSerializer::Skip,
-        log_messages: OptionSerializer::Skip,
-        pre_token_balances: meta
-            .pre_token_balances
-            .map(|balance| balance.into_iter().map(Into::into).collect())
-            .into(),
-        post_token_balances: meta
-            .post_token_balances
-            .map(|balance| balance.into_iter().map(Into::into).collect())
-            .into(),
-        rewards: if show_rewards {
-            meta.rewards.into()
-        } else {
-            OptionSerializer::Skip
-        },
-        loaded_addresses: OptionSerializer::Skip,
-        return_data: OptionSerializer::Skip,
-        compute_units_consumed: OptionSerializer::Skip,
-        cost_units: OptionSerializer::Skip,
     }
 }
 

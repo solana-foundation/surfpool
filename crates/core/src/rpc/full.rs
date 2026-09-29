@@ -22,7 +22,7 @@ use solana_client::{
 use solana_clock::{Slot, UnixTimestamp};
 use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_compute_budget_interface::ComputeBudgetInstruction;
-use solana_message::{VersionedMessage, compiled_instruction::CompiledInstruction};
+use solana_message::{AccountKeys, VersionedMessage, compiled_instruction::CompiledInstruction};
 use solana_pubkey::Pubkey;
 use solana_rpc_client_api::response::Response as RpcResponse;
 use solana_sdk_ids::compute_budget;
@@ -31,7 +31,7 @@ use solana_transaction_error::TransactionError;
 use solana_transaction_status::{
     EncodedConfirmedTransactionWithStatusMeta, EncodedTransactionWithStatusMeta,
     TransactionBinaryEncoding, TransactionConfirmationStatus, TransactionStatus, UiConfirmedBlock,
-    UiTransactionEncoding,
+    UiTransactionEncoding, map_inner_instructions, parse_ui_inner_instructions,
 };
 use surfpool_types::{
     SerialVmMutationResult, SerialVmMutationTask, SimnetCommand, TransactionStatusEvent,
@@ -39,10 +39,7 @@ use surfpool_types::{
 
 use super::{
     RunloopContext, State, SurfnetRpcContext,
-    utils::{
-        decode_and_deserialize, decode_rpc_versioned_transaction,
-        transform_tx_metadata_to_ui_accounts, verify_pubkey,
-    },
+    utils::{decode_and_deserialize, decode_rpc_versioned_transaction, verify_pubkey},
 };
 use crate::{
     SURFPOOL_IDENTITY_PUBKEY,
@@ -2780,11 +2777,12 @@ fn get_simulate_transaction_result(
         accounts,
         err: error.map(|e| e.into()),
         inner_instructions: if include_inner_instructions {
-            Some(transform_tx_metadata_to_ui_accounts(
-                metadata.clone(),
-                message,
-                loaded_addresses,
-            ))
+            let account_keys = AccountKeys::new(message.static_account_keys(), loaded_addresses);
+            Some(
+                map_inner_instructions(metadata.inner_instructions.clone())
+                    .map(|ix| parse_ui_inner_instructions(ix, &account_keys))
+                    .collect(),
+            )
         } else {
             None
         },
@@ -2839,8 +2837,9 @@ mod tests {
     };
     use solana_transaction_error::TransactionError;
     use solana_transaction_status::{
-        EncodedTransaction, EncodedTransactionWithStatusMeta, UiCompiledInstruction, UiMessage,
-        UiRawMessage, UiTransaction, UiTransactionEncoding,
+        EncodedTransaction, EncodedTransactionWithStatusMeta, TransactionDetails,
+        UiCompiledInstruction, UiMessage, UiRawMessage, UiTransaction, UiTransactionEncoding,
+        option_serializer::OptionSerializer,
     };
     use solana_transaction_status_client_types::UiTransactionConfig;
     use surfpool_types::{
@@ -4737,6 +4736,245 @@ mod tests {
             res.is_empty(),
             "Expected no prioritization fees for random account"
         );
+    }
+
+    /// Airdrops to a payer, then lands one successful and one failed transfer in a
+    /// confirmed block. Returns the airdrop, success and failure signatures and the slot.
+    async fn confirmed_transfers(
+        setup: &mut TestSetup<SurfpoolFullRpc>,
+    ) -> (Signature, Signature, Signature, Slot) {
+        let payer = Keypair::new();
+        let airdrop = setup
+            .rpc
+            .request_airdrop(
+                Some(setup.context.clone()),
+                payer.pubkey().to_string(),
+                2 * LAMPORTS_PER_SOL,
+                None,
+            )
+            .unwrap();
+        let blockhash = setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm_reader| svm_reader.latest_blockhash());
+        let transfer = |lamports| {
+            build_legacy_transaction(
+                &payer.pubkey(),
+                &[&payer.insecure_clone()],
+                &[system_instruction::transfer(
+                    &payer.pubkey(),
+                    &Pubkey::new_unique(),
+                    lamports,
+                )],
+                &blockhash,
+            )
+        };
+        let ok = transfer(LAMPORTS_PER_SOL);
+        let failed = transfer(10 * LAMPORTS_PER_SOL);
+        setup.process_txs(vec![ok.clone(), failed.clone()]).await;
+        setup
+            .context
+            .svm_locker
+            .confirm_current_block(&None)
+            .await
+            .unwrap();
+        let slot = setup.context.svm_locker.with_svm_reader(|svm_reader| {
+            svm_reader
+                .transactions
+                .get(&ok.signatures[0].to_string())
+                .unwrap()
+                .unwrap()
+                .expect_processed()
+                .0
+                .slot
+        });
+        (
+            Signature::from_str(&airdrop).unwrap(),
+            ok.signatures[0],
+            failed.signatures[0],
+            slot,
+        )
+    }
+
+    fn is_json_raw(tx: &EncodedTransactionWithStatusMeta) -> bool {
+        matches!(
+            &tx.transaction,
+            EncodedTransaction::Json(UiTransaction {
+                message: UiMessage::Raw(_),
+                ..
+            })
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_block_defaults_to_json_encoding() {
+        let mut setup = TestSetup::new(SurfpoolFullRpc);
+        let (_, _, _, slot) = confirmed_transfers(&mut setup).await;
+
+        let block = setup
+            .rpc
+            .get_block(
+                Some(setup.context),
+                slot,
+                Some(RpcEncodingConfigWrapper::Current(Some(RpcBlockConfig {
+                    commitment: Some(CommitmentConfig::confirmed()),
+                    max_supported_transaction_version: Some(0),
+                    ..RpcBlockConfig::default()
+                }))),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        let txs = block.transactions.unwrap();
+        assert!(!txs.is_empty());
+        assert!(txs.iter().all(is_json_raw), "{txs:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_transaction_local_defaults_to_json_encoding() {
+        let mut setup = TestSetup::new(SurfpoolFullRpc);
+        let (_, ok, _, _) = confirmed_transfers(&mut setup).await;
+
+        let result = setup
+            .context
+            .svm_locker
+            .get_transaction_local(&ok, &RpcTransactionConfig::default())
+            .unwrap();
+
+        let GetTransactionResult::FoundTransaction(_, tx, _) = result else {
+            panic!("transaction not found");
+        };
+        assert!(is_json_raw(&tx.transaction), "{tx:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_stored_transactions_omit_empty_return_data() {
+        let mut setup = TestSetup::new(SurfpoolFullRpc);
+        let (airdrop, ok, failed, _) = confirmed_transfers(&mut setup).await;
+
+        for signature in [airdrop, ok, failed] {
+            let tx = setup
+                .rpc
+                .get_transaction(
+                    Some(setup.context.clone()),
+                    signature.to_string(),
+                    Some(RpcEncodingConfigWrapper::Current(Some(
+                        get_default_transaction_config(),
+                    ))),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            let meta = tx.transaction.meta.unwrap();
+            assert_eq!(meta.return_data, OptionSerializer::Skip, "{signature}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_block_transaction_details_and_rewards() {
+        let mut setup = TestSetup::new(SurfpoolFullRpc);
+        let (_, ok, failed, slot) = confirmed_transfers(&mut setup).await;
+
+        let get_block = |transaction_details, rewards| {
+            setup.rpc.get_block(
+                Some(setup.context.clone()),
+                slot,
+                Some(RpcEncodingConfigWrapper::Current(Some(RpcBlockConfig {
+                    transaction_details: Some(transaction_details),
+                    rewards,
+                    max_supported_transaction_version: Some(0),
+                    commitment: Some(CommitmentConfig::confirmed()),
+                    ..RpcBlockConfig::default()
+                }))),
+            )
+        };
+
+        let full = get_block(TransactionDetails::Full, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(full.rewards, Some(vec![]));
+        assert_eq!(full.signatures, None);
+        let full_signatures: Vec<String> = full
+            .transactions
+            .unwrap()
+            .into_iter()
+            .map(|tx| match tx.transaction {
+                EncodedTransaction::Json(tx) => tx.signatures[0].clone(),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert!(full_signatures.contains(&ok.to_string()));
+        assert!(full_signatures.contains(&failed.to_string()));
+
+        let signatures = get_block(TransactionDetails::Signatures, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(signatures.transactions, None);
+        assert_eq!(signatures.signatures, Some(full_signatures.clone()));
+
+        let accounts = get_block(TransactionDetails::Accounts, None)
+            .await
+            .unwrap()
+            .unwrap();
+        let accounts = accounts.transactions.unwrap();
+        assert_eq!(accounts.len(), full_signatures.len());
+        assert!(
+            accounts
+                .iter()
+                .all(|tx| matches!(tx.transaction, EncodedTransaction::Accounts(_)))
+        );
+
+        let none = get_block(TransactionDetails::None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((none.transactions, none.signatures), (None, None));
+
+        let no_rewards = get_block(TransactionDetails::Full, Some(false))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(no_rewards.rewards, None);
+        assert!(
+            no_rewards
+                .transactions
+                .unwrap()
+                .iter()
+                .all(|tx| { tx.meta.as_ref().unwrap().rewards == OptionSerializer::None })
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_block_signatures_come_from_block_header() {
+        let setup = TestSetup::new(SurfpoolFullRpc);
+        insert_test_blocks(&setup, 100..=110);
+        // A header signature with no stored transaction record.
+        let signature = Signature::new_unique();
+        setup.context.svm_locker.with_svm_writer(|svm_writer| {
+            let mut header = svm_writer.blocks.get(&100).unwrap().unwrap();
+            header.signatures = vec![signature];
+            svm_writer.blocks.store(100, header).unwrap();
+        });
+
+        let block = setup
+            .rpc
+            .get_block(
+                Some(setup.context.clone()),
+                100,
+                Some(RpcEncodingConfigWrapper::Current(Some(RpcBlockConfig {
+                    transaction_details: Some(TransactionDetails::Signatures),
+                    commitment: Some(CommitmentConfig::confirmed()),
+                    ..RpcBlockConfig::default()
+                }))),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(block.transactions, None);
+        assert_eq!(block.signatures, Some(vec![signature.to_string()]));
     }
 
     #[tokio::test(flavor = "multi_thread")]

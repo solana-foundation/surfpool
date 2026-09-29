@@ -12,17 +12,11 @@ use solana_client::{
 };
 use solana_commitment_config::CommitmentConfig;
 use solana_hash::Hash;
-use solana_message::{
-    AccountKeys, VersionedMessage,
-    v1::{MAX_TRANSACTION_SIZE, V1_PREFIX},
-};
+use solana_message::v1::{MAX_TRANSACTION_SIZE, V1_PREFIX};
 use solana_packet::PACKET_DATA_SIZE;
 use solana_pubkey::{ParsePubkeyError, Pubkey};
 use solana_signature::Signature;
-use solana_transaction_status::{
-    InnerInstruction, InnerInstructions, TransactionBinaryEncoding, UiInnerInstructions,
-    UiTransactionEncoding, parse_ui_inner_instructions,
-};
+use solana_transaction_status::{TransactionBinaryEncoding, UiTransactionEncoding};
 
 use crate::error::{SurfpoolError, SurfpoolResult};
 
@@ -218,43 +212,6 @@ pub fn decode_rpc_versioned_transaction(
     Ok(unsanitized_tx)
 }
 
-pub fn transform_tx_metadata_to_ui_accounts(
-    meta: TransactionMetadata,
-    message: &VersionedMessage,
-    loaded_addresses: Option<&solana_message::v0::LoadedAddresses>,
-) -> Vec<UiInnerInstructions> {
-    // Create AccountKeys from the transaction message with loaded addresses from ALTs
-    let account_keys = AccountKeys::new(message.static_account_keys(), loaded_addresses);
-
-    meta.inner_instructions
-        .into_iter()
-        .enumerate()
-        .filter_map(|(i, ixs)| {
-            let instructions: Vec<InnerInstruction> = ixs
-                .iter()
-                .map(|ix| InnerInstruction {
-                    instruction: ix.instruction.clone(),
-                    stack_height: Some(ix.stack_height as u32),
-                })
-                .collect();
-            if instructions.is_empty() {
-                None
-            } else {
-                // Create InnerInstructions and then parse it into UiInnerInstructions
-                // This will properly convert CompiledInstruction to UiInstruction format
-                let inner_instructions = InnerInstructions {
-                    index: i as u8,
-                    instructions,
-                };
-                Some(parse_ui_inner_instructions(
-                    inner_instructions,
-                    &account_keys,
-                ))
-            }
-        })
-        .collect()
-}
-
 /// Substrings that, when present in a lowercased error message, indicate the
 /// remote RPC method is not supported by the upstream (often a public endpoint
 /// that has gated methods behind a 410 Gone response or a custom refusal).
@@ -306,8 +263,8 @@ pub fn adjust_default_transaction_config(config: &mut RpcTransactionConfig) {
 mod tests {
     use solana_keypair::Keypair;
     use solana_message::{
-        MESSAGE_VERSION_PREFIX, MessageHeader, compiled_instruction::CompiledInstruction, legacy,
-        v0, v1,
+        MESSAGE_VERSION_PREFIX, MessageHeader, VersionedMessage,
+        compiled_instruction::CompiledInstruction, legacy, v0, v1,
     };
     use solana_signer::Signer;
     use solana_transaction::versioned::VersionedTransaction;
