@@ -1924,6 +1924,7 @@ impl SurfnetSvm {
     /// # Returns
     /// `Ok(())` on success, or an error if the operation fails.
     pub fn set_account(&mut self, pubkey: &Pubkey, account: Account) -> SurfpoolResult<()> {
+        let before = self.get_account(pubkey)?;
         self.inner
             .set_account(*pubkey, account.clone())
             .map_err(|e| SurfpoolError::set_account(*pubkey, e))?;
@@ -1932,7 +1933,7 @@ impl SurfnetSvm {
             .insert(*pubkey, self.get_latest_absolute_slot());
 
         // Update the account registries and indexes
-        self.update_account_registries(pubkey, &account)?;
+        self.update_account_registries(pubkey, before.as_ref(), &account)?;
 
         // Notify account subscribers
         self.notify_account_subscribers(pubkey, &account);
@@ -1944,9 +1945,12 @@ impl SurfnetSvm {
         Ok(())
     }
 
+    /// `before` is the account as it was before this update: the inner SVM already holds the new
+    /// state, so it can no longer be read back from there.
     pub fn update_account_registries(
         &mut self,
         pubkey: &Pubkey,
+        before: Option<&Account>,
         account: &Account,
     ) -> SurfpoolResult<()> {
         let is_deleted_account = account == &Account::default();
@@ -1961,27 +1965,23 @@ impl SurfnetSvm {
                 .set_account_in_db(*pubkey, account.clone().into())?;
         }
 
+        // Drop the owner/mint/delegate entries of the prior version of the
+        // account; otherwise a closed account, or the old owner's bucket after
+        // a change of owner, would keep pointing at `pubkey`.
+        if let Some(before) = before {
+            self.remove_from_indexes(pubkey, before)?;
+        }
+
         if is_deleted_account {
             // Record the account as offline so the surfnet does not re-fetch
-            // it from the upstream RPC, then drop any stale index entries
-            // that pointed at its prior on-chain state.
+            // it from the upstream RPC.
             self.offline_accounts.store(
                 pubkey.to_string(),
                 OfflineAccountConfig {
                     include_owned_accounts: false,
                 },
             )?;
-            if let Some(old_account) = self.get_account(pubkey)? {
-                self.remove_from_indexes(pubkey, &old_account)?;
-            }
             return Ok(());
-        }
-
-        // Drop any stale owner/mint/delegate entries for the prior version of
-        // the account before indexing the new one; otherwise a change of
-        // owner would leave the old owner's bucket pointing at `pubkey`.
-        if let Some(old_account) = self.get_account(pubkey)? {
-            self.remove_from_indexes(pubkey, &old_account)?;
         }
 
         let pubkey_str = pubkey.to_string();
@@ -3062,7 +3062,7 @@ impl SurfnetSvm {
                             match self.inner.get_account(&coupled_pubkey) {
                                 Ok(None) => {
                                     if let Err(e) =
-                                        self.inner.set_account(coupled_pubkey, coupled_account)
+                                        self.set_account(&coupled_pubkey, coupled_account)
                                     {
                                         warn!(
                                             "Failed to set coupled account {} from remote: {}",
@@ -3081,7 +3081,7 @@ impl SurfnetSvm {
                         }
 
                         // Set the fresh account data in the SVM
-                        if let Err(e) = self.inner.set_account(account_pubkey, remote_account) {
+                        if let Err(e) = self.set_account(&account_pubkey, remote_account) {
                             warn!(
                                 "Failed to set account {} from remote: {}",
                                 account_pubkey, e
@@ -3145,8 +3145,20 @@ impl SurfnetSvm {
                 // Mints fail the token unpack and keep flowing through the IDL path.
                 if is_supported_token_program(account.owner()) {
                     if let Ok(token_account) = TokenAccount::unpack(account.data()) {
-                        let new_account_data =
-                            forge_token_account_data(&account, token_account, &account_values)?;
+                        let new_account_data = match forge_token_account_data(
+                            &account,
+                            token_account,
+                            &account_values,
+                        ) {
+                            Ok(data) => data,
+                            Err(e) => {
+                                warn!(
+                                    "Failed to forge token account data for {} (override {}): {}",
+                                    account_pubkey, override_instance.id, e
+                                );
+                                continue;
+                            }
+                        };
                         let modified_account = Account {
                             lamports: account.lamports(),
                             data: new_account_data,
@@ -3154,7 +3166,10 @@ impl SurfnetSvm {
                             executable: account.executable(),
                             rent_epoch: account.rent_epoch(),
                         };
-                        self.inner.set_account(account_pubkey, modified_account)?;
+                        if let Err(e) = self.set_account(&account_pubkey, modified_account) {
+                            restore_unprocessed(self, index);
+                            return Err(e);
+                        }
                         continue;
                     }
                 }
@@ -3235,7 +3250,7 @@ impl SurfnetSvm {
                 };
 
                 // Update the account in the SVM
-                if let Err(e) = self.inner.set_account(account_pubkey, modified_account) {
+                if let Err(e) = self.set_account(&account_pubkey, modified_account) {
                     warn!(
                         "Failed to set modified account {} in SVM: {}",
                         account_pubkey, e
@@ -4685,15 +4700,26 @@ mod tests {
         format!("http://{addr}")
     }
 
-    /// A 165-byte SPL token account (state = Initialized), which sends `get_account` down the
-    /// coupled-mint path. The canned server answers the mint lookup with the same body, and the
-    /// account's zeroed mint field makes the coupled mint land on the default pubkey.
-    const CANNED_TOKEN_ACCOUNT: &str = concat!(
-        r#"{"context":{"apiVersion":"2.1.0","slot":1},"value":{"data":[""#,
-        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-        r#"","base64"],"executable":false,"lamports":2039280,"#,
-        r#""owner":"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA","rentEpoch":0,"space":165}}"#
-    );
+    /// A 165-byte SPL token account of `mint` (state = Initialized), which sends `get_account`
+    /// down the coupled-mint path. The canned server answers the mint lookup with the same body.
+    fn canned_token_account(mint: Pubkey) -> &'static str {
+        use base64::Engine;
+
+        let mut data = [0; TokenAccount::LEN];
+        TokenAccount {
+            mint,
+            state: AccountState::Initialized,
+            ..Default::default()
+        }
+        .pack_into_slice(&mut data);
+        let body = format!(
+            r#"{{"context":{{"slot":1}},"value":{{"data":["{}","base64"],"executable":false,"lamports":2039280,"owner":"{}","rentEpoch":0,"space":{}}}}}"#,
+            base64::prelude::BASE64_STANDARD.encode(data),
+            spl_token_interface::id(),
+            data.len()
+        );
+        Box::leak(body.into_boxed_str())
+    }
 
     fn fetch_before_use_scenario(target: Pubkey) -> surfpool_types::Scenario {
         let mut scenario = surfpool_types::Scenario::new(
@@ -4712,14 +4738,15 @@ mod tests {
 
     /// Token and executable accounts return `FoundCoupledAccount`. That arm used to fall through
     /// a catch-all that logged and dropped the account, so the fetch reported success while the
-    /// target was never forked.
+    /// target was never forked. Both accounts are also indexed like any fetched account, so
+    /// `getProgramAccounts` lists them.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_fetch_before_use_materializes_a_coupled_account() {
-        let url = canned_rpc(CANNED_TOKEN_ACCOUNT).await;
+        let (target, mint) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let url = canned_rpc(canned_token_account(mint)).await;
         let remote = (SurfnetRemoteClient::new(url), CommitmentConfig::confirmed());
         let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
         let locker = crate::surfnet::locker::SurfnetSvmLocker::new(svm);
-        let target = Pubkey::new_unique();
 
         locker
             .register_scenario(fetch_before_use_scenario(target), Some(100))
@@ -4729,25 +4756,24 @@ mod tests {
             .await
             .unwrap();
 
-        let fetched = locker
-            .with_svm_reader(|svm_reader| svm_reader.get_account(&target))
-            .unwrap();
-        assert!(
-            fetched.is_some(),
-            "the fetched token account must be forked"
-        );
-        let coupled_mint = locker
-            .with_svm_reader(|svm_reader| svm_reader.get_account(&Pubkey::default()))
-            .unwrap();
-        assert!(
-            coupled_mint.is_some(),
-            "the coupled mint must fill the gap in the fork"
-        );
+        let mut forked = locker.with_svm_reader(|svm| {
+            svm.get_account_owned_by(&spl_token_interface::id())
+                .unwrap()
+                .into_iter()
+                .map(|(pubkey, _)| pubkey)
+                .filter(|pubkey| [target, mint].contains(pubkey))
+                .collect::<Vec<_>>()
+        });
+        forked.sort();
+        let mut expected = vec![target, mint];
+        expected.sort();
+        assert_eq!(forked, expected);
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_fetch_before_use_keeps_a_locally_modified_coupled_account() {
-        let url = canned_rpc(CANNED_TOKEN_ACCOUNT).await;
+        let mint = Pubkey::new_unique();
+        let url = canned_rpc(canned_token_account(mint)).await;
         let remote = (SurfnetRemoteClient::new(url), CommitmentConfig::confirmed());
         let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
         let locker = crate::surfnet::locker::SurfnetSvmLocker::new(svm);
@@ -4757,7 +4783,7 @@ mod tests {
         locker.with_svm_writer(|svm_writer| {
             svm_writer
                 .set_account(
-                    &Pubkey::default(),
+                    &mint,
                     Account {
                         lamports: 1_000_000,
                         data: marker.clone(),
@@ -4778,7 +4804,7 @@ mod tests {
             .unwrap();
 
         let mint = locker
-            .with_svm_reader(|svm_reader| svm_reader.get_account(&Pubkey::default()))
+            .with_svm_reader(|svm_reader| svm_reader.get_account(&mint))
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -6172,7 +6198,7 @@ mod tests {
         assert_eq!(svm.get_account_owned_by(&owner).unwrap().len(), 1);
 
         let empty_account = Account::default();
-        svm.update_account_registries(&account_pubkey, &empty_account)
+        svm.update_account_registries(&account_pubkey, Some(&account), &empty_account)
             .unwrap();
 
         assert!(
@@ -6220,7 +6246,8 @@ mod tests {
             rent_epoch: 0,
         };
 
-        svm.set_account(&token_account_pubkey, account).unwrap();
+        svm.set_account(&token_account_pubkey, account.clone())
+            .unwrap();
 
         assert_eq!(
             svm.get_token_accounts_by_owner(&token_owner).unwrap().len(),
@@ -6234,7 +6261,7 @@ mod tests {
         );
 
         let empty_account = Account::default();
-        svm.update_account_registries(&token_account_pubkey, &empty_account)
+        svm.update_account_registries(&token_account_pubkey, Some(&account), &empty_account)
             .unwrap();
 
         assert!(
@@ -7772,5 +7799,160 @@ mod tests {
             5_678,
             "the second override must apply"
         );
+    }
+
+    /// An account that changes owner is listed only under its new owner.
+    #[test]
+    fn an_account_is_listed_only_under_its_current_owner() {
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let (account, old_owner, new_owner) = (
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        );
+        let owned_by = |owner| Account {
+            lamports: 1_000_000,
+            owner,
+            ..Default::default()
+        };
+
+        svm.set_account(&account, owned_by(old_owner)).unwrap();
+        svm.set_account(&account, owned_by(new_owner)).unwrap();
+
+        let listed = |svm: &SurfnetSvm, owner| {
+            svm.get_account_owned_by(&owner)
+                .unwrap()
+                .into_iter()
+                .map(|(pubkey, _)| pubkey)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            (listed(&svm, old_owner), listed(&svm, new_owner)),
+            (vec![], vec![account])
+        );
+    }
+
+    /// A scenario override writes an account like any other write, so the token index, which
+    /// `getTokenLargestAccounts` reads, holds the amount the override set.
+    #[tokio::test]
+    async fn a_token_amount_override_reaches_the_token_index() {
+        const SLOT: u64 = 500;
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let (mint, token_account) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let mut data = vec![0; TokenAccount::LEN];
+        TokenAccount {
+            mint,
+            owner: Pubkey::new_unique(),
+            state: AccountState::Initialized,
+            ..Default::default()
+        }
+        .pack_into_slice(&mut data);
+        svm.set_account(
+            &token_account,
+            Account {
+                lamports: 2_039_280,
+                data,
+                owner: spl_token_interface::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+        let set_amount = surfpool_types::OverrideInstance::new(
+            "token-amount".to_string(),
+            0,
+            surfpool_types::AccountAddress::Pubkey(token_account.to_string()),
+        )
+        .with_values(HashMap::from([(
+            "amount".to_string(),
+            serde_json::json!(500u64),
+        )]));
+        svm.scheduled_overrides
+            .store(SLOT, vec![set_amount])
+            .unwrap();
+
+        svm.materialize_overrides_for_slot(&None, SLOT)
+            .await
+            .unwrap();
+
+        let amounts = svm
+            .get_token_accounts_by_mint(&mint)
+            .into_iter()
+            .map(|(pubkey, account)| (pubkey, account.amount()))
+            .collect::<Vec<_>>();
+        assert_eq!(amounts, vec![(token_account, 500)]);
+    }
+
+    /// An override whose values cannot be applied is skipped, like an IDL override that fails to
+    /// forge, and the overrides after it in the same slot still apply.
+    #[tokio::test]
+    async fn a_bad_token_override_does_not_drop_the_overrides_after_it() {
+        const SLOT: u64 = 500;
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let (mint, token_account) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let mut data = vec![0; TokenAccount::LEN];
+        TokenAccount {
+            mint,
+            owner: Pubkey::new_unique(),
+            state: AccountState::Initialized,
+            ..Default::default()
+        }
+        .pack_into_slice(&mut data);
+        svm.set_account(
+            &token_account,
+            Account {
+                lamports: 2_039_280,
+                data,
+                owner: spl_token_interface::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+        let set_amount = |amount| {
+            surfpool_types::OverrideInstance::new(
+                "token-amount".to_string(),
+                0,
+                surfpool_types::AccountAddress::Pubkey(token_account.to_string()),
+            )
+            .with_values(HashMap::from([("amount".to_string(), amount)]))
+        };
+        svm.scheduled_overrides
+            .store(
+                SLOT,
+                vec![
+                    set_amount(serde_json::json!("not an amount")),
+                    set_amount(serde_json::json!(500u64)),
+                ],
+            )
+            .unwrap();
+
+        let materialized = svm.materialize_overrides_for_slot(&None, SLOT).await;
+
+        let amount = TokenAccount::unpack(&svm.get_account(&token_account).unwrap().unwrap().data)
+            .unwrap()
+            .amount;
+        assert_eq!((materialized.is_ok(), amount), (true, 500));
+    }
+
+    /// An override that rewrites an account through its IDL notifies the account's subscribers,
+    /// like any other write.
+    #[tokio::test]
+    async fn an_idl_override_notifies_account_subscribers() {
+        const SLOT: u64 = 500;
+        let (mut svm, account_pubkey, instance) = scheduled_override_fixture();
+        let updates =
+            svm.subscribe_for_account_updates(&account_pubkey, Some(UiAccountEncoding::Base64));
+        svm.scheduled_overrides.store(SLOT, vec![instance]).unwrap();
+
+        svm.materialize_overrides_for_slot(&None, SLOT)
+            .await
+            .unwrap();
+
+        let account = svm.get_account(&account_pubkey).unwrap().unwrap();
+        let update = updates
+            .try_recv()
+            .expect("the override must notify the account's subscribers");
+        assert_eq!(update.data.decode(), Some(account.data));
     }
 }

@@ -2279,7 +2279,8 @@ impl SurfnetSvmLocker {
             if before.ne(&after) {
                 self.with_svm_writer(|svm_writer| {
                     if let Some(after) = &after {
-                        let _ = svm_writer.update_account_registries(pubkey, after);
+                        let _ =
+                            svm_writer.update_account_registries(pubkey, before.as_ref(), after);
                         svm_writer.notify_account_subscribers(pubkey, &after);
                         svm_writer.notify_program_subscribers(pubkey, &after);
                     } else {
@@ -2446,7 +2447,7 @@ impl SurfnetSvmLocker {
                 if before.ne(&after) {
                     mutated_account_pubkeys.insert(*pubkey);
                     let after = after.unwrap_or_default();
-                    svm_writer.update_account_registries(pubkey, &after)?;
+                    svm_writer.update_account_registries(pubkey, before.as_ref(), &after)?;
                     let write_version = svm_writer.increment_write_version();
 
                     if let Some(sanitized_transaction) = sanitized_transaction.clone() {
@@ -7223,5 +7224,91 @@ mod tests {
         // `Mint::decimals` is an unvalidated u8; 10^decimals stops fitting a usize well
         // before 255, and the field is Option<f64> so those mints have somewhere to land.
         assert_eq!(format_ui_amount(1, 255), None);
+    }
+
+    /// A token account the transaction closes is not in its post token balances: a validator
+    /// reads them from the accounts after execution, where a closed account no longer exists.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_closed_token_account_has_no_post_token_balance() {
+        use crossbeam_channel::unbounded;
+        use solana_program_pack::Pack;
+        use spl_token_interface::state::{Account as TokenAccount, AccountState, Mint};
+
+        let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let locker = SurfnetSvmLocker::new(svm);
+        let owner = Keypair::new();
+        let (mint, token_account) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let _ = locker
+            .airdrop(&owner.pubkey(), 1_000_000_000)
+            .expect("airdrop should succeed");
+        locker.with_svm_writer(|svm| {
+            let mut account = |pubkey, data: Vec<u8>| {
+                let lamports = svm.inner.minimum_balance_for_rent_exemption(data.len());
+                svm.set_account(
+                    pubkey,
+                    Account {
+                        lamports,
+                        data,
+                        owner: spl_token_interface::ID,
+                        executable: false,
+                        rent_epoch: 0,
+                    },
+                )
+                .unwrap();
+            };
+            let mut mint_data = vec![0; Mint::LEN];
+            Mint {
+                is_initialized: true,
+                ..Default::default()
+            }
+            .pack_into_slice(&mut mint_data);
+            account(&mint, mint_data);
+            let mut token_data = vec![0; TokenAccount::LEN];
+            TokenAccount {
+                mint,
+                owner: owner.pubkey(),
+                state: AccountState::Initialized,
+                ..Default::default()
+            }
+            .pack_into_slice(&mut token_data);
+            account(&token_account, token_data);
+        });
+
+        let close = spl_token_interface::instruction::close_account(
+            &spl_token_interface::ID,
+            &token_account,
+            &owner.pubkey(),
+            &owner.pubkey(),
+            &[],
+        )
+        .unwrap();
+        let message = Message::new_with_blockhash(
+            &[close],
+            Some(&owner.pubkey()),
+            &locker.latest_absolute_blockhash(),
+        );
+        let tx = VersionedTransaction::try_new(VersionedMessage::Legacy(message), &[&owner])
+            .expect("transaction should sign");
+        let signature = tx.signatures[0];
+        let (status_tx, _status_rx) = unbounded();
+        locker
+            .process_transaction(&None, tx, status_tx, true, true)
+            .await
+            .expect("transaction processing should succeed");
+
+        let meta = locker.with_svm_reader(|svm| {
+            let (transaction, _) = svm
+                .transactions
+                .get(&signature.to_string())
+                .unwrap()
+                .unwrap()
+                .expect_processed()
+                .clone();
+            transaction.meta
+        });
+        assert_eq!(
+            (meta.status, meta.post_token_balances),
+            (Ok(()), Some(vec![]))
+        );
     }
 }
