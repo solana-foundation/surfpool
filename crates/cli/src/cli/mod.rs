@@ -32,6 +32,7 @@ use txtx_core::manifest::WorkspaceManifest;
 use txtx_gql::kit::{helpers::fs::FileLocation, types::frontend::LogLevel};
 
 use crate::{cli::update::handle_update_command, runbook::handle_execute_runbook_command};
+mod profile;
 mod simnet;
 mod update;
 
@@ -134,6 +135,13 @@ enum Command {
     /// Update Surfpool to the latest version
     #[clap(name = "update", bin_name = "update")]
     Update(UpdateCommand),
+    #[clap(
+        name = "profile",
+        bin_name = "profile",
+        about = "Re-execute a remote transaction against a local surfnet",
+        long_about = "Re-executes a transaction fetched from the remote against a local surfnet and reports its execution profile.\nNote: Different account states at execution time can lead to completely different transaction results. While profiling can be helpful in transaction debugging and introspection, it is not meant to exactly replicate the remote transaction."
+    )]
+    Profile(ProfileCommand),
 }
 
 const START_AFTER_LONG_HELP: &str = r#"Examples:
@@ -535,6 +543,63 @@ pub enum NetworkType {
     Devnet,
     /// Solana Testnet (https://api.testnet.solana.com)
     Testnet,
+}
+
+const PROFILE_AFTER_LONG_HELP: &str = r#"Examples:
+  Profile a mainnet transaction:
+    surfpool profile <TX_SIGNATURE>
+
+  Profile a transaction from another cluster:
+    surfpool profile <TX_SIGNATURE> --network devnet
+
+  Profile against a custom datasource:
+    surfpool profile <TX_SIGNATURE> --rpc-url https://my-custom-rpc-url.com
+
+  Write the full profile, including account state changes, to a file:
+    surfpool profile <TX_SIGNATURE> --output profile.json
+
+Accounts are read from the datasource at its current slot, not at the slot the transaction
+originally landed in: public RPC nodes do not serve historical account state. The transaction is
+executed with the clock and epoch of its original slot, but against today's accounts. Address
+lookup tables are read the same way, so a table that has been deactivated or closed since the
+transaction cannot be resolved and the run fails before executing anything.
+
+--network takes precedence over --rpc-url, including an --rpc-url read from the
+SURFPOOL_DATASOURCE_RPC_URL environment variable.
+"#;
+
+/// Re-execute a transaction fetched from a remote against a local surfnet.
+#[derive(Parser, PartialEq, Clone, Debug)]
+#[command(after_long_help = PROFILE_AFTER_LONG_HELP)]
+pub struct ProfileCommand {
+    /// Signature of the transaction to fetch and re-execute
+    #[arg(name = "signature")]
+    pub signature: String,
+    // No `conflicts_with = "network"`, clap use a value from the environment as
+    // passed, so it would reject `--network` for anyone who sets SURFPOOL_DATASOURCE_RPC_URL.
+    /// Datasource RPC URL to fetch the transaction and its accounts from (eg. --rpc-url https://my-custom-rpc-url.com)
+    #[arg(long = "rpc-url", short = 'u', env = "SURFPOOL_DATASOURCE_RPC_URL")]
+    pub rpc_url: Option<String>,
+    /// Datasource cluster to fetch the transaction and its accounts from (takes precedence over --rpc-url)
+    #[arg(long = "network", short = 'n', value_enum)]
+    pub network: Option<NetworkType>,
+    /// Write the full profile result, as JSON, to this file
+    #[arg(long = "output", short = 'o')]
+    pub output: Option<String>,
+}
+
+impl ProfileCommand {
+    pub fn datasource_rpc_url(&self) -> String {
+        match self.network {
+            Some(NetworkType::Mainnet) => DEFAULT_MAINNET_RPC_URL.to_string(),
+            Some(NetworkType::Devnet) => DEFAULT_DEVNET_RPC_URL.to_string(),
+            Some(NetworkType::Testnet) => DEFAULT_TESTNET_RPC_URL.to_string(),
+            None => self
+                .rpc_url
+                .clone()
+                .unwrap_or_else(|| DEFAULT_MAINNET_RPC_URL.to_string()),
+        }
+    }
 }
 
 impl StartSimnet {
@@ -1006,6 +1071,9 @@ fn handle_command(opts: Opts, ctx: &Context) -> Result<(), String> {
         Command::List(cmd) => hiro_system_kit::nestable_block_on(handle_list_command(cmd, ctx)),
         Command::Mcp => hiro_system_kit::nestable_block_on(handle_mcp_command(ctx)),
         Command::Update(cmd) => hiro_system_kit::nestable_block_on(handle_update_command(cmd)),
+        Command::Profile(cmd) => {
+            hiro_system_kit::nestable_block_on(profile::handle_profile_command(cmd, ctx))
+        }
     }
 }
 
@@ -1410,5 +1478,43 @@ mod tests {
             err,
             r#"Surfpool RPC returned an invalid JSON-RPC response: {"jsonrpc":"2.0","id":1}"#
         );
+    }
+
+    fn parse_profile(args: &[&str]) -> ProfileCommand {
+        match Opts::try_parse_from(args)
+            .expect("profile args should parse")
+            .command
+        {
+            Command::Profile(cmd) => cmd,
+            command => panic!("expected profile command, got {command:?}"),
+        }
+    }
+
+    #[test]
+    fn a_network_overrides_an_rpc_url_rather_than_conflicting_with_it() {
+        let cmd = parse_profile(&[
+            "surfpool",
+            "profile",
+            "3xSIG",
+            "--rpc-url",
+            "https://my-custom-rpc-url.com",
+            "--network",
+            "devnet",
+        ]);
+
+        assert_eq!(cmd.datasource_rpc_url(), DEFAULT_DEVNET_RPC_URL);
+    }
+
+    #[test]
+    fn an_rpc_url_alone_is_the_datasource() {
+        let cmd = parse_profile(&[
+            "surfpool",
+            "profile",
+            "3xSIG",
+            "--rpc-url",
+            "https://my-custom-rpc-url.com",
+        ]);
+
+        assert_eq!(cmd.datasource_rpc_url(), "https://my-custom-rpc-url.com");
     }
 }
