@@ -1,6 +1,6 @@
 #![allow(clippy::unit_cmp)]
 
-use jsonrpc_core::{BoxFuture, Error as JsonRpcCoreError, ErrorCode, Result};
+use jsonrpc_core::{BoxFuture, Result};
 use jsonrpc_derive::rpc;
 use solana_client::{
     rpc_config::{
@@ -17,7 +17,9 @@ use solana_rpc_client_api::response::Response as RpcResponse;
 
 use super::{
     RunloopContext, State, SurfnetRpcContext,
-    utils::{optimize_filters, verify_filters, verify_pubkey, verify_token_account_filter},
+    utils::{
+        context_slot, optimize_filters, verify_filters, verify_pubkey, verify_token_account_filter,
+    },
 };
 use crate::surfnet::locker::SvmAccessContext;
 
@@ -488,22 +490,13 @@ impl AccountsScan for SurfpoolAccountsScanRpc {
                 verify_filters(filters)?;
                 optimize_filters(filters);
             }
-            let current_slot = svm_locker.get_latest_absolute_slot();
 
             let account_config = config.account_config;
-
-            if let Some(min_context_slot_val) = account_config.min_context_slot.as_ref() {
-                if current_slot < *min_context_slot_val {
-                    return Err(JsonRpcCoreError {
-                        code: ErrorCode::InternalError,
-                        message: format!(
-                            "Node's current slot {} is less than requested minContextSlot {}",
-                            current_slot, min_context_slot_val
-                        ),
-                        data: None,
-                    });
-                }
-            }
+            let slot = context_slot(
+                &svm_locker,
+                account_config.commitment,
+                account_config.min_context_slot,
+            )?;
 
             // Get program-owned accounts from the account registry
             let program_accounts = svm_locker
@@ -518,7 +511,7 @@ impl AccountsScan for SurfpoolAccountsScanRpc {
 
             if config.with_context.unwrap_or(false) {
                 Ok(OptionalContext::Context(RpcResponse {
-                    context: RpcResponseContext::new(current_slot),
+                    context: RpcResponseContext::new(slot),
                     value: program_accounts,
                 }))
             } else {
@@ -649,9 +642,9 @@ impl AccountsScan for SurfpoolAccountsScanRpc {
         };
 
         Box::pin(async move {
+            let slot = context_slot(&svm_locker, config.commitment, config.min_context_slot)?;
             let filter = verify_token_account_filter(token_account_filter)?;
             let SvmAccessContext {
-                slot,
                 inner: token_accounts,
                 ..
             } = svm_locker
@@ -694,9 +687,9 @@ impl AccountsScan for SurfpoolAccountsScanRpc {
         Box::pin(async move {
             let filter = verify_token_account_filter(token_account_filter)?;
 
+            let slot = context_slot(&svm_locker, config.commitment, config.min_context_slot)?;
             let remote_ctx = remote_ctx.map(|(r, _)| r);
             let SvmAccessContext {
-                slot,
                 inner: keyed_accounts,
                 ..
             } = svm_locker
@@ -722,12 +715,13 @@ mod tests {
     use solana_account::Account;
     use solana_client::{
         rpc_config::{
-            RpcLargestAccountsConfig, RpcLargestAccountsFilter, RpcProgramAccountsConfig,
-            RpcSupplyConfig, RpcTokenAccountsFilter,
+            RpcAccountInfoConfig, RpcLargestAccountsConfig, RpcLargestAccountsFilter,
+            RpcProgramAccountsConfig, RpcSupplyConfig, RpcTokenAccountsFilter,
         },
         rpc_filter::{Memcmp, MemcmpEncodedBytes, RpcFilterType},
         rpc_response::OptionalContext,
     };
+    use solana_commitment_config::CommitmentConfig;
     use solana_program_pack::Pack;
     use solana_pubkey::Pubkey;
     use spl_token_interface::state::Account as TokenAccount;
@@ -1886,5 +1880,61 @@ mod tests {
             "Should find 1 token account for mint1"
         );
         assert_eq!(response.value[0].pubkey, token_account1.to_string());
+    }
+
+    /// A `minContextSlot` equal to the slot a read's commitment names is reached, and the read
+    /// answers for that slot. (Refusals are covered in `surfnet::remote`.)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_read_answers_at_exactly_its_min_context_slot() {
+        let setup = TestSetup::new(SurfpoolAccountsScanRpc);
+        let confirmed = setup.context.svm_locker.get_latest_absolute_slot() - 1;
+        let token_program = RpcTokenAccountsFilter::ProgramId(spl_token_interface::ID.to_string());
+        let config = RpcAccountInfoConfig {
+            commitment: Some(CommitmentConfig::confirmed()),
+            min_context_slot: Some(confirmed),
+            ..Default::default()
+        };
+
+        let program_accounts = setup
+            .rpc
+            .get_program_accounts(
+                Some(setup.context.clone()),
+                spl_token_interface::ID.to_string(),
+                Some(RpcProgramAccountsConfig {
+                    account_config: config.clone(),
+                    with_context: Some(true),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .map(|accounts| match accounts {
+                OptionalContext::Context(response) => response.context.slot,
+                OptionalContext::NoContext(_) => panic!("withContext was requested"),
+            });
+        let by_owner = setup
+            .rpc
+            .get_token_accounts_by_owner(
+                Some(setup.context.clone()),
+                Pubkey::new_unique().to_string(),
+                token_program.clone(),
+                Some(config.clone()),
+            )
+            .await
+            .map(|response| response.context.slot);
+        let by_delegate = setup
+            .rpc
+            .get_token_accounts_by_delegate(
+                Some(setup.context.clone()),
+                Pubkey::new_unique().to_string(),
+                token_program,
+                Some(config),
+            )
+            .await
+            .map(|response| response.context.slot);
+
+        assert_eq!(
+            vec![program_accounts, by_owner, by_delegate],
+            vec![Ok(confirmed); 3]
+        );
     }
 }

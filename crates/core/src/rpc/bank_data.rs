@@ -2,7 +2,6 @@ use jsonrpc_core::Result;
 use jsonrpc_derive::rpc;
 use solana_client::{
     rpc_config::{RpcBlockProductionConfig, RpcContextConfig},
-    rpc_custom_error::RpcCustomError,
     rpc_response::{
         RpcBlockProduction, RpcInflationGovernor, RpcInflationRate, RpcResponseContext,
     },
@@ -12,7 +11,7 @@ use solana_commitment_config::CommitmentConfig;
 use solana_epoch_schedule::EpochSchedule;
 use solana_rpc_client_api::response::Response as RpcResponse;
 
-use super::{RunloopContext, State};
+use super::{RunloopContext, State, utils::context_slot};
 use crate::SURFPOOL_IDENTITY_PUBKEY;
 
 #[rpc]
@@ -467,18 +466,7 @@ impl BankData for SurfpoolBankDataRpc {
         let svm_locker = meta.get_svm_locker()?;
         let config = config.unwrap_or_default();
 
-        let committed_slot =
-            svm_locker.get_slot_for_commitment(&config.commitment.unwrap_or_default());
-
-        // validate minContextSlot if provided
-        if let Some(min_context_slot) = config.min_context_slot {
-            if committed_slot < min_context_slot {
-                return Err(RpcCustomError::MinContextSlotNotReached {
-                    context_slot: min_context_slot,
-                }
-                .into());
-            }
-        }
+        context_slot(&svm_locker, config.commitment, config.min_context_slot)?;
 
         Ok(SURFPOOL_IDENTITY_PUBKEY.to_string())
     }

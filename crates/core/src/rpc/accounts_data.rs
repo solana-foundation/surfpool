@@ -17,7 +17,10 @@ use spl_token_2022_interface::extension::StateWithExtensions;
 use super::{RunloopContext, SurfnetRpcContext};
 use crate::{
     error::{SurfpoolError, SurfpoolResult},
-    rpc::{State, utils::verify_pubkey},
+    rpc::{
+        State,
+        utils::{context_slot, verify_pubkey},
+    },
     surfnet::{
         locker::{SvmAccessContext, is_supported_token_program},
         svm::spl_token_additional_data,
@@ -376,8 +379,8 @@ impl AccountsData for SurfpoolAccountsDataRpc {
         };
 
         Box::pin(async move {
+            let slot = context_slot(&svm_locker, config.commitment, config.min_context_slot)?;
             let SvmAccessContext {
-                slot,
                 inner: account_update,
                 ..
             } = svm_locker.get_account(&remote_ctx, &pubkey, None).await?;
@@ -438,8 +441,8 @@ impl AccountsData for SurfpoolAccountsDataRpc {
         let rpc_start = std::time::Instant::now();
 
         Box::pin(async move {
+            let slot = context_slot(&svm_locker, config.commitment, config.min_context_slot)?;
             let SvmAccessContext {
-                slot,
                 inner: account_updates,
                 ..
             } = svm_locker
@@ -662,6 +665,7 @@ mod tests {
     use solana_account_decoder::{
         parse_account_data::SplTokenAdditionalDataV2, parse_token::token_amount_to_ui_amount_v3,
     };
+    use solana_client::rpc_config::RpcContextConfig;
     use solana_keypair::Keypair;
     use solana_program_option::COption;
     use solana_program_pack::Pack;
@@ -681,8 +685,10 @@ mod tests {
 
     use super::*;
     use crate::{
+        rpc::minimal::{Minimal, SurfpoolMinimalRpc},
         surfnet::{
-            AccountSource, GetAccountResult, remote::SurfnetRemoteClient, svm::AccountUpdatePolicy,
+            AccountSource, FINALIZATION_SLOT_THRESHOLD, GetAccountResult,
+            remote::SurfnetRemoteClient, svm::AccountUpdatePolicy,
         },
         tests::helpers::TestSetup,
         types::SyntheticBlockhash,
@@ -1835,5 +1841,72 @@ mod tests {
         );
 
         println!("✅ Account order preserved with remote: [1M lamports, None, 3M lamports]");
+    }
+
+    /// On a validator `getAccountInfo`, `getMultipleAccounts` and `getBalance` report the slot of
+    /// the bank their commitment selects, the same bank `getSlot` reports.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn account_reads_answer_for_the_slot_their_commitment_names() {
+        let setup = TestSetup::new(SurfpoolAccountsDataRpc);
+        let latest = setup.context.svm_locker.get_latest_absolute_slot();
+        let pubkey = Pubkey::new_unique().to_string();
+
+        for (commitment, expected_slot) in [
+            (CommitmentConfig::processed(), latest),
+            (CommitmentConfig::confirmed(), latest - 1),
+            (
+                CommitmentConfig::finalized(),
+                latest - FINALIZATION_SLOT_THRESHOLD,
+            ),
+        ] {
+            let context_config = RpcContextConfig {
+                commitment: Some(commitment),
+                min_context_slot: None,
+            };
+            let account_config = RpcAccountInfoConfig {
+                commitment: Some(commitment),
+                ..Default::default()
+            };
+
+            let slots = [
+                SurfpoolMinimalRpc
+                    .get_slot(Some(setup.context.clone()), Some(context_config))
+                    .unwrap(),
+                setup
+                    .rpc
+                    .get_account_info(
+                        Some(setup.context.clone()),
+                        pubkey.clone(),
+                        Some(account_config.clone()),
+                    )
+                    .await
+                    .unwrap()
+                    .context
+                    .slot,
+                setup
+                    .rpc
+                    .get_multiple_accounts(
+                        Some(setup.context.clone()),
+                        vec![pubkey.clone()],
+                        Some(account_config),
+                    )
+                    .await
+                    .unwrap()
+                    .context
+                    .slot,
+                SurfpoolMinimalRpc
+                    .get_balance(
+                        Some(setup.context.clone()),
+                        pubkey.clone(),
+                        Some(context_config),
+                    )
+                    .await
+                    .unwrap()
+                    .context
+                    .slot,
+            ];
+
+            assert_eq!(slots, [expected_slot; 4], "{commitment:?}");
+        }
     }
 }

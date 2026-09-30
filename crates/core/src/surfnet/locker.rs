@@ -1015,7 +1015,7 @@ fn signatures_for_address_remote_config(
         until: base.until,
         limit: Some(remaining_limit),
         commitment: base.commitment,
-        min_context_slot: base.min_context_slot,
+        min_context_slot: None,
     })
 }
 
@@ -1439,7 +1439,6 @@ impl SurfnetSvmLocker {
         let before = config.and_then(|c| c.before.as_ref());
         let until = config.and_then(|c| c.until.as_ref());
         let limit = config.and_then(|c| c.limit).unwrap_or(1000);
-        let min_context_slot = config.and_then(|c| c.min_context_slot).unwrap_or_default();
 
         self.with_contextualized_svm_reader(move |svm_reader| {
             let current_slot = svm_reader.get_latest_absolute_slot();
@@ -1460,10 +1459,6 @@ impl SurfnetSvmLocker {
                         else {
                             return None;
                         };
-
-                        if slot < min_context_slot {
-                            return None;
-                        }
 
                         if !transaction_involves_address(
                             &transaction,
@@ -6527,6 +6522,24 @@ mod tests {
         assert_eq!(sigs[3], sig_s5_a.to_string());
     }
 
+    /// `minContextSlot` bounds the slot a read answers for, not which signatures it lists.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn min_context_slot_does_not_filter_signatures() {
+        let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let locker = SurfnetSvmLocker::new(svm);
+        let pubkey = Pubkey::new_unique();
+        let sig = Signature::new_unique();
+        seed_signature_history(&locker, &pubkey, &[(5, vec![sig])]);
+
+        let config = RpcSignaturesForAddressConfig {
+            min_context_slot: Some(10),
+            ..Default::default()
+        };
+        let sigs = fetch_signature_strings(&locker, &pubkey, Some(&config));
+
+        assert_eq!(sigs, vec![sig.to_string()]);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn test_get_signatures_for_address_ordering_missing_block_header() {
         let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
@@ -7017,7 +7030,7 @@ mod tests {
         assert_eq!(translated.before.as_deref(), Some(sig_before.as_str()));
         assert_eq!(translated.until.as_deref(), Some(sig_until.as_str()));
         assert_eq!(translated.limit, Some(42));
-        assert_eq!(translated.min_context_slot, Some(7));
+        assert_eq!(translated.min_context_slot, None);
     }
 
     #[test]

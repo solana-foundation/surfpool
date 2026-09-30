@@ -40,7 +40,7 @@ use surfpool_types::{
 use super::{
     RunloopContext, State, SurfnetRpcContext,
     utils::{
-        decode_and_deserialize, decode_rpc_versioned_transaction,
+        context_slot, decode_and_deserialize, decode_rpc_versioned_transaction,
         transform_tx_metadata_to_ui_accounts, verify_and_parse_signatures_for_address_params,
         verify_pubkey,
     },
@@ -50,8 +50,8 @@ use crate::{
     error::{SurfpoolError, SurfpoolResult},
     rpc::utils::{adjust_default_transaction_config, get_default_transaction_config},
     surfnet::{
-        CoupledAccount, FINALIZATION_SLOT_THRESHOLD, GetAccountResult, GetTransactionResult,
-        locker::SvmAccessContext, svm::MAX_RECENT_BLOCKHASHES_STANDARD,
+        CoupledAccount, GetAccountResult, GetTransactionResult, locker::SvmAccessContext,
+        svm::MAX_RECENT_BLOCKHASHES_STANDARD,
     },
     types::{SurfnetTransactionStatus, surfpool_tx_metadata_to_litesvm_tx_metadata},
 };
@@ -1546,14 +1546,11 @@ impl Full for SurfpoolFullRpc {
                 }
             };
 
-            let current_slot = svm_locker.get_epoch_info().absolute_slot;
-            if let Some(slot) = config.as_ref().and_then(|config| config.min_context_slot) {
-                if slot > current_slot {
-                    return Err(Error::invalid_params(
-                        "Minimum context slot has not been reached",
-                    ));
-                }
-            };
+            context_slot(
+                &svm_locker,
+                config.as_ref().and_then(|config| config.commitment),
+                config.as_ref().and_then(|config| config.min_context_slot),
+            )?;
 
             let pubkeys = address_strs
                 .iter()
@@ -1778,10 +1775,20 @@ impl Full for SurfpoolFullRpc {
             .into());
         };
 
+        let preflight_commitment = CommitmentConfig {
+            commitment: if config.base.skip_preflight {
+                CommitmentLevel::Processed
+            } else {
+                config.base.preflight_commitment.unwrap_or_default()
+            },
+        };
+        context_slot(
+            &ctx.svm_locker,
+            Some(preflight_commitment),
+            config.base.min_context_slot,
+        )?;
+
         if !config.base.skip_preflight {
-            let preflight_commitment = CommitmentConfig {
-                commitment: config.base.preflight_commitment.unwrap_or_default(),
-            };
             let blockhash_visible = ctx.svm_locker.with_svm_reader(|svm_reader| {
                 svm_reader
                     .is_blockhash_visible_at(tx_message.recent_blockhash(), &preflight_commitment)
@@ -1945,6 +1952,7 @@ impl Full for SurfpoolFullRpc {
         };
 
         Box::pin(async move {
+            context_slot(&svm_locker, config.commitment, config.min_context_slot)?;
             let loaded_addresses = svm_locker
                 .get_loaded_addresses(&remote_ctx, &unsanitized_tx.message)
                 .await?;
@@ -2217,7 +2225,8 @@ impl Full for SurfpoolFullRpc {
         };
 
         Box::pin(async move {
-            let committed_latest_slot = svm_locker.get_slot_for_commitment(&commitment);
+            let committed_latest_slot =
+                context_slot(&svm_locker, Some(commitment), config.min_context_slot)?;
             let effective_end_slot = end_slot
                 .map(|end| end.min(committed_latest_slot))
                 .unwrap_or(committed_latest_slot);
@@ -2238,15 +2247,6 @@ impl Full for SurfpoolFullRpc {
 
                 (local_min_slot, local_slots, effective_end_slot)
             };
-
-            if let Some(min_context_slot) = config.min_context_slot {
-                if committed_latest_slot < min_context_slot {
-                    return Err(RpcCustomError::MinContextSlotNotReached {
-                        context_slot: min_context_slot,
-                    }
-                    .into());
-                }
-            }
 
             if effective_end_slot.saturating_sub(start_slot) > MAX_SLOT_RANGE {
                 return Err(Error::invalid_params(format!(
@@ -2337,7 +2337,8 @@ impl Full for SurfpoolFullRpc {
         };
 
         Box::pin(async move {
-            let committed_latest_slot = svm_locker.get_slot_for_commitment(&commitment);
+            let committed_latest_slot =
+                context_slot(&svm_locker, Some(commitment), config.min_context_slot)?;
             let genesis_slot = svm_locker.with_svm_reader(|svm| svm.genesis_slot);
 
             // With sparse block storage, all slots from genesis_slot onwards are valid
@@ -2345,15 +2346,6 @@ impl Full for SurfpoolFullRpc {
             let local_min_slot = Some(genesis_slot);
             let local_slots: Vec<Slot> =
                 (start_slot.max(genesis_slot)..=committed_latest_slot).collect();
-
-            if let Some(min_context_slot) = config.min_context_slot {
-                if committed_latest_slot < min_context_slot {
-                    return Err(RpcCustomError::MinContextSlotNotReached {
-                        context_slot: min_context_slot,
-                    }
-                    .into());
-                }
-            }
 
             // fetch remote blocks when needed, using the same logic as get_blocks
             let remote_slots = if let (Some((remote_client, _)), Some(local_min)) =
@@ -2455,6 +2447,11 @@ impl Full for SurfpoolFullRpc {
         };
 
         Box::pin(async move {
+            context_slot(
+                &svm_locker,
+                config.as_ref().and_then(|config| config.commitment),
+                config.as_ref().and_then(|config| config.min_context_slot),
+            )?;
             let signatures = svm_locker
                 .get_signatures_for_address(&remote_ctx, &pubkey, config.as_ref())
                 .await?
@@ -2515,15 +2512,7 @@ impl Full for SurfpoolFullRpc {
         let config = config.unwrap_or_default();
         let commitment = config.commitment.unwrap_or_default();
 
-        let committed_latest_slot = svm_locker.get_slot_for_commitment(&commitment);
-        if let Some(min_context_slot) = config.min_context_slot {
-            if committed_latest_slot < min_context_slot {
-                return Err(RpcCustomError::MinContextSlotNotReached {
-                    context_slot: min_context_slot,
-                }
-                .into());
-            }
-        }
+        let slot = context_slot(&svm_locker, Some(commitment), config.min_context_slot)?;
 
         let (blockhash, last_valid_block_height) = svm_locker.with_svm_reader(|svm_reader| {
             let blockhash = svm_reader
@@ -2540,7 +2529,7 @@ impl Full for SurfpoolFullRpc {
             )
         });
         Ok(RpcResponse {
-            context: RpcResponseContext::new(svm_locker.get_latest_absolute_slot()),
+            context: RpcResponseContext::new(slot),
             value: RpcBlockhash {
                 blockhash: blockhash.to_string(),
                 last_valid_block_height,
@@ -2561,23 +2550,13 @@ impl Full for SurfpoolFullRpc {
 
         let svm_locker = meta.get_svm_locker()?;
 
-        let committed_latest_slot =
-            svm_locker.get_slot_for_commitment(&config.commitment.unwrap_or_default());
+        let slot = context_slot(&svm_locker, config.commitment, config.min_context_slot)?;
 
         let is_valid =
             svm_locker.with_svm_reader(|svm_reader| svm_reader.check_blockhash_is_recent(&hash));
 
-        if let Some(min_context_slot) = config.min_context_slot {
-            if committed_latest_slot < min_context_slot {
-                return Err(RpcCustomError::MinContextSlotNotReached {
-                    context_slot: min_context_slot,
-                }
-                .into());
-            }
-        }
-
         Ok(RpcResponse {
-            context: RpcResponseContext::new(committed_latest_slot),
+            context: RpcResponseContext::new(slot),
             value: is_valid,
         })
     }
@@ -2591,28 +2570,9 @@ impl Full for SurfpoolFullRpc {
         let (_, message) =
             decode_and_deserialize::<VersionedMessage>(encoded, TransactionBinaryEncoding::Base64)?;
 
-        let RpcContextConfig {
-            commitment,
-            min_context_slot,
-        } = config.unwrap_or_default();
-        let min_ctx_slot = min_context_slot.unwrap_or_default();
-
+        let config = config.unwrap_or_default();
         let svm_locker = meta.get_svm_locker()?;
-
-        let slot = if let Some(commitment_config) = commitment {
-            svm_locker.get_slot_for_commitment(&commitment_config)
-        } else {
-            svm_locker.get_latest_absolute_slot()
-        };
-
-        if let Some(min_slot) = min_context_slot
-            && slot < min_slot
-        {
-            return Err(RpcCustomError::MinContextSlotNotReached {
-                context_slot: min_ctx_slot,
-            }
-            .into());
-        }
+        let slot = context_slot(&svm_locker, config.commitment, config.min_context_slot)?;
 
         let fee = svm_locker
             .with_svm_reader(|svm_reader| svm_reader.estimate_fee_for_message(&message))?;
@@ -2633,23 +2593,15 @@ impl Full for SurfpoolFullRpc {
             commitment: CommitmentLevel::Processed,
         });
 
-        meta.with_svm_reader(|svm_reader| {
-            let context_slot = match commitment_config.commitment {
-                CommitmentLevel::Processed => svm_reader.get_latest_absolute_slot(),
-                CommitmentLevel::Confirmed => {
-                    svm_reader.get_latest_absolute_slot().saturating_sub(1)
-                }
-                CommitmentLevel::Finalized => svm_reader
-                    .get_latest_absolute_slot()
-                    .saturating_sub(FINALIZATION_SLOT_THRESHOLD),
-            };
-
-            RpcResponse {
-                context: RpcResponseContext::new(context_slot),
-                value: 0,
-            }
+        let slot = context_slot(
+            &meta.get_svm_locker()?,
+            Some(commitment_config),
+            config.min_context_slot,
+        )?;
+        Ok(RpcResponse {
+            context: RpcResponseContext::new(slot),
+            value: 0,
         })
-        .map_err(Into::into)
     }
 
     fn get_recent_prioritization_fees(
@@ -2863,7 +2815,9 @@ mod tests {
     use super::*;
     use crate::{
         runloops::start_block_production_runloop,
-        surfnet::{BlockHeader, BlockIdentifier, remote::SurfnetRemoteClient},
+        surfnet::{
+            BlockHeader, BlockIdentifier, FINALIZATION_SLOT_THRESHOLD, remote::SurfnetRemoteClient,
+        },
         tests::helpers::TestSetup,
         types::{SyntheticBlockhash, TransactionWithStatusMeta},
     };
@@ -3151,7 +3105,7 @@ mod tests {
 
         let wrong_comm_expected_err: Result<()> = Result::Err(
             RpcCustomError::MinContextSlotNotReached {
-                context_slot: wrong_comm_min_ctx_slot,
+                context_slot: wrong_comm_min_ctx_slot - 10,
             }
             .into(),
         );
@@ -3174,7 +3128,9 @@ mod tests {
 
         let wrong_min_slot_expected_err: Result<()> = Result::Err(
             RpcCustomError::MinContextSlotNotReached {
-                context_slot: wrong_min_slot,
+                context_slot: runloop_context
+                    .svm_locker
+                    .get_slot_for_commitment(&CommitmentConfig::finalized()),
             }
             .into(),
         );
@@ -6080,5 +6036,151 @@ mod tests {
 
             assert_eq!(simulation_res.value.err, None);
         }
+    }
+
+    /// Every method taking `minContextSlot` judges it against the slot its commitment names, and
+    /// reports that slot when it is not reached, as a validator's `get_bank_with_config` does.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn min_context_slot_is_judged_against_the_slot_the_commitment_names() {
+        use crate::rpc::{
+            jito::{Jito, SurfpoolJitoRpc},
+            minimal::{Minimal, SurfpoolMinimalRpc},
+        };
+
+        let setup = TestSetup::new(SurfpoolFullRpc);
+        let ctx = || Some(setup.context.clone());
+        let processed = setup.context.svm_locker.get_latest_absolute_slot();
+        let confirmed = processed - 1;
+        let commitment = Some(CommitmentConfig::confirmed());
+        let min_context_slot = Some(confirmed + 1);
+        let context_config = Some(RpcContextConfig {
+            commitment,
+            min_context_slot,
+        });
+
+        let payer = Keypair::new();
+        let tx = Transaction::new_signed_with_payer(
+            &[transfer(&payer.pubkey(), &Pubkey::new_unique(), 1)],
+            Some(&payer.pubkey()),
+            &[&payer],
+            setup
+                .context
+                .svm_locker
+                .with_svm_reader(|svm| svm.latest_blockhash()),
+        );
+        let message = BASE64_STANDARD.encode(wincode::serialize(&tx.message).unwrap());
+        let tx = BASE64_STANDARD.encode(bincode::serialize(&tx).unwrap());
+        let send_config = RpcSendTransactionConfig {
+            encoding: Some(UiTransactionEncoding::Base64),
+            preflight_commitment: Some(CommitmentLevel::Confirmed),
+            min_context_slot,
+            ..Default::default()
+        };
+
+        let results = vec![
+            SurfpoolMinimalRpc
+                .get_epoch_info(ctx(), context_config)
+                .map(drop),
+            SurfpoolMinimalRpc
+                .get_block_height(ctx(), context_config)
+                .map(drop),
+            SurfpoolMinimalRpc
+                .get_transaction_count(ctx(), context_config)
+                .map(drop),
+            setup
+                .rpc
+                .get_inflation_reward(
+                    ctx(),
+                    vec![],
+                    Some(RpcEpochConfig {
+                        epoch: None,
+                        commitment,
+                        min_context_slot,
+                    }),
+                )
+                .await
+                .map(drop),
+            setup
+                .rpc
+                .send_transaction(
+                    ctx(),
+                    tx.clone(),
+                    Some(SurfpoolRpcSendTransactionConfig {
+                        base: send_config,
+                        skip_sig_verify: None,
+                    }),
+                )
+                .map(drop),
+            setup
+                .rpc
+                .simulate_transaction(
+                    ctx(),
+                    tx.clone(),
+                    Some(RpcSimulateTransactionConfig {
+                        commitment,
+                        min_context_slot,
+                        encoding: Some(UiTransactionEncoding::Base64),
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .map(drop),
+            setup
+                .rpc
+                .get_blocks(ctx(), 0, None, context_config)
+                .await
+                .map(drop),
+            setup
+                .rpc
+                .get_blocks_with_limit(ctx(), 0, 1, context_config)
+                .await
+                .map(drop),
+            setup
+                .rpc
+                .get_signatures_for_address(
+                    ctx(),
+                    Pubkey::new_unique().to_string(),
+                    Some(RpcSignaturesForAddressConfig {
+                        commitment,
+                        min_context_slot,
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .map(drop),
+            setup
+                .rpc
+                .get_latest_blockhash(ctx(), context_config)
+                .map(drop),
+            setup
+                .rpc
+                .is_blockhash_valid(ctx(), Hash::default().to_string(), context_config)
+                .map(drop),
+            setup
+                .rpc
+                .get_fee_for_message(ctx(), message, context_config)
+                .map(drop),
+            setup
+                .rpc
+                .get_stake_minimum_delegation(ctx(), context_config)
+                .map(drop),
+        ];
+        let refused =
+            |context_slot| Err(RpcCustomError::MinContextSlotNotReached { context_slot }.into());
+        assert_eq!(results, vec![refused(confirmed); 13]);
+
+        // Bundles skip preflight, so they are judged against the processed slot.
+        let bundle = SurfpoolJitoRpc
+            .send_bundle(
+                ctx(),
+                vec![tx],
+                Some(RpcSendTransactionConfig {
+                    min_context_slot: Some(processed + 1),
+                    ..send_config
+                }),
+            )
+            .await
+            .map(drop);
+        assert_eq!(bundle, refused(processed));
     }
 }

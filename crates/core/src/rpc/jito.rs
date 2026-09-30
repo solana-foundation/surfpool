@@ -18,7 +18,10 @@ use surfpool_types::{
     SimnetCommand, TransactionStatusEvent,
 };
 
-use super::{RunloopContext, utils::decode_and_deserialize};
+use super::{
+    RunloopContext,
+    utils::{context_slot, decode_and_deserialize},
+};
 use crate::{
     error::SurfpoolResult,
     rpc::full::SurfpoolFullRpc,
@@ -283,6 +286,12 @@ impl Jito for SurfpoolJitoRpc {
             };
 
             let base_config = config.unwrap_or_default();
+            // Bundles skip preflight, so they run against the processed slot.
+            context_slot(
+                &ctx.svm_locker,
+                Some(CommitmentConfig::processed()),
+                base_config.min_context_slot,
+            )?;
 
             // Decode all bundle transactions up front so we can run them against an isolated
             // sandbox.

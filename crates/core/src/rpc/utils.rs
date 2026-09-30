@@ -5,12 +5,14 @@ use jsonrpc_core::{Error, Result};
 use litesvm::types::TransactionMetadata;
 use solana_client::{
     rpc_config::{RpcTokenAccountsFilter, RpcTransactionConfig},
+    rpc_custom_error::RpcCustomError,
     rpc_filter::RpcFilterType,
     rpc_request::{
         MAX_GET_CONFIRMED_SIGNATURES_FOR_ADDRESS2_LIMIT, MAX_GET_PROGRAM_ACCOUNT_FILTERS,
         TokenAccountsFilter,
     },
 };
+use solana_clock::Slot;
 use solana_commitment_config::CommitmentConfig;
 use solana_message::{
     AccountKeys, VersionedMessage,
@@ -24,7 +26,30 @@ use solana_transaction_status::{
     UiTransactionEncoding, parse_ui_inner_instructions,
 };
 
-use crate::error::{SurfpoolError, SurfpoolResult};
+use crate::{
+    error::{SurfpoolError, SurfpoolResult},
+    surfnet::locker::SurfnetSvmLocker,
+};
+
+/// Returns the slot a read at `commitment` answers for, judged before the read.
+///
+/// As with Agave's `get_bank_with_config`, a `min_context_slot` above it is refused before any
+/// work, and this one slot is reported as the response context. The surfnet keeps one account
+/// state, so a value read afterwards reflects every transaction up to this slot, and may already
+/// reflect later ones.
+pub fn context_slot(
+    svm_locker: &SurfnetSvmLocker,
+    commitment: Option<CommitmentConfig>,
+    min_context_slot: Option<Slot>,
+) -> Result<Slot> {
+    let slot = svm_locker.get_slot_for_commitment(&commitment.unwrap_or_default());
+    match min_context_slot {
+        Some(min_context_slot) if slot < min_context_slot => {
+            Err(RpcCustomError::MinContextSlotNotReached { context_slot: slot }.into())
+        }
+        _ => Ok(slot),
+    }
+}
 
 pub fn convert_transaction_metadata_from_canonical(
     transaction_metadata: &TransactionMetadata,

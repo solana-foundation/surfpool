@@ -5,22 +5,23 @@ use solana_client::{
         RpcContextConfig, RpcGetVoteAccountsConfig, RpcLeaderScheduleConfig,
         RpcLeaderScheduleConfigWrapper,
     },
-    rpc_custom_error::RpcCustomError,
     rpc_response::{
         RpcIdentity, RpcLeaderSchedule, RpcResponseContext, RpcSnapshotSlotInfo,
         RpcVoteAccountStatus,
     },
 };
 use solana_clock::Slot;
-use solana_commitment_config::CommitmentLevel;
 use solana_epoch_info::EpochInfo;
 use solana_rpc_client_api::response::Response as RpcResponse;
 
 use super::{RunloopContext, SurfnetRpcContext};
 use crate::{
     SURFPOOL_IDENTITY_PUBKEY,
-    rpc::{State, utils::verify_pubkey},
-    surfnet::{FINALIZATION_SLOT_THRESHOLD, GetAccountResult, locker::SvmAccessContext},
+    rpc::{
+        State,
+        utils::{context_slot, verify_pubkey},
+    },
+    surfnet::{GetAccountResult, locker::SvmAccessContext},
 };
 
 const SURFPOOL_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -595,7 +596,6 @@ impl Minimal for SurfpoolMinimalRpc {
 
         let config = config.unwrap_or_default();
         let commitment_config = config.commitment.unwrap_or_default();
-        let min_ctx_slot = config.min_context_slot;
 
         let SurfnetRpcContext {
             svm_locker,
@@ -609,20 +609,11 @@ impl Minimal for SurfpoolMinimalRpc {
             #[cfg(feature = "prometheus")]
             let rpc_start = std::time::Instant::now();
 
+            let slot = context_slot(&svm_locker, config.commitment, config.min_context_slot)?;
             let SvmAccessContext {
-                slot,
                 inner: account_update,
                 ..
             } = svm_locker.get_account(&remote_ctx, &pubkey, None).await?;
-
-            if let Some(min_slot) = min_ctx_slot
-                && slot < min_slot
-            {
-                return Err(RpcCustomError::MinContextSlotNotReached {
-                    context_slot: min_slot,
-                }
-                .into());
-            }
 
             let balance = match &account_update {
                 GetAccountResult::FoundAccount(_, account, _)
@@ -645,10 +636,12 @@ impl Minimal for SurfpoolMinimalRpc {
     fn get_epoch_info(
         &self,
         meta: Self::Metadata,
-        _config: Option<RpcContextConfig>,
+        config: Option<RpcContextConfig>,
     ) -> Result<EpochInfo> {
-        meta.with_svm_reader(|svm_reader| svm_reader.latest_epoch_info.clone())
-            .map_err(Into::into)
+        let svm_locker = meta.get_svm_locker()?;
+        let config = config.unwrap_or_default();
+        context_slot(&svm_locker, config.commitment, config.min_context_slot)?;
+        Ok(svm_locker.get_epoch_info())
     }
 
     fn get_genesis_hash(&self, meta: Self::Metadata) -> BoxFuture<Result<String>> {
@@ -682,25 +675,11 @@ impl Minimal for SurfpoolMinimalRpc {
 
     fn get_slot(&self, meta: Self::Metadata, config: Option<RpcContextConfig>) -> Result<Slot> {
         let config = config.unwrap_or_default();
-        let latest_absolute_slot = meta
-            .with_svm_reader(|svm_reader| svm_reader.get_latest_absolute_slot())
-            .map_err(Into::<jsonrpc_core::Error>::into)?;
-        let slot = match config.commitment.unwrap_or_default().commitment {
-            CommitmentLevel::Processed => latest_absolute_slot,
-            CommitmentLevel::Confirmed => latest_absolute_slot - 1,
-            CommitmentLevel::Finalized => latest_absolute_slot - FINALIZATION_SLOT_THRESHOLD,
-        };
-
-        if let Some(min_context_slot) = config.min_context_slot {
-            if slot < min_context_slot {
-                return Err(RpcCustomError::MinContextSlotNotReached {
-                    context_slot: min_context_slot,
-                }
-                .into());
-            }
-        }
-
-        Ok(slot)
+        context_slot(
+            &meta.get_svm_locker()?,
+            config.commitment,
+            config.min_context_slot,
+        )
     }
 
     fn get_block_height(
@@ -708,40 +687,16 @@ impl Minimal for SurfpoolMinimalRpc {
         meta: Self::Metadata,
         config: Option<RpcContextConfig>,
     ) -> Result<u64> {
+        let svm_locker = meta.get_svm_locker()?;
         let config = config.unwrap_or_default();
-
-        if let Some(target_slot) = config.min_context_slot {
-            let block_exists =
-                meta.with_svm_reader(|svm_reader| svm_reader.blocks.contains_key(&target_slot))??;
-
-            if !block_exists {
-                return Err(jsonrpc_core::Error::invalid_params(format!(
-                    "Block not found for slot: {}",
-                    target_slot
-                )));
-            }
-        }
-
-        meta.with_svm_reader(|svm_reader| {
-            if let Some(target_slot) = config.min_context_slot {
-                if let Some(block_header) = svm_reader.blocks.get(&target_slot)? {
-                    return Ok(block_header.block_height);
-                }
-            }
-
-            // default behavior: return the latest block height with commitment adjustments
-            let latest_block_height = svm_reader.latest_epoch_info.block_height;
-
-            let block_height = match config.commitment.unwrap_or_default().commitment {
-                CommitmentLevel::Processed => latest_block_height,
-                CommitmentLevel::Confirmed => latest_block_height.saturating_sub(1),
-                CommitmentLevel::Finalized => {
-                    latest_block_height.saturating_sub(FINALIZATION_SLOT_THRESHOLD)
-                }
-            };
-            Ok::<u64, jsonrpc_core::Error>(block_height)
-        })?
-        .map_err(Into::into)
+        let slot = context_slot(&svm_locker, config.commitment, config.min_context_slot)?;
+        Ok(svm_locker.with_svm_reader(|svm_reader| {
+            let blocks_since = svm_reader.get_latest_absolute_slot().saturating_sub(slot);
+            svm_reader
+                .latest_epoch_info
+                .block_height
+                .saturating_sub(blocks_since)
+        }))
     }
 
     fn get_highest_snapshot_slot(&self, _meta: Self::Metadata) -> Result<RpcSnapshotSlotInfo> {
@@ -755,10 +710,12 @@ impl Minimal for SurfpoolMinimalRpc {
     fn get_transaction_count(
         &self,
         meta: Self::Metadata,
-        _config: Option<RpcContextConfig>,
+        config: Option<RpcContextConfig>,
     ) -> Result<u64> {
-        meta.with_svm_reader(|svm_reader| svm_reader.transactions_processed)
-            .map_err(Into::into)
+        let svm_locker = meta.get_svm_locker()?;
+        let config = config.unwrap_or_default();
+        context_slot(&svm_locker, config.commitment, config.min_context_slot)?;
+        Ok(svm_locker.with_svm_reader(|svm_reader| svm_reader.transactions_processed))
     }
 
     fn get_version(&self, _: Self::Metadata) -> Result<SurfpoolRpcVersionInfo> {
@@ -826,14 +783,14 @@ impl Minimal for SurfpoolMinimalRpc {
 #[cfg(test)]
 mod tests {
     use jsonrpc_core::ErrorCode;
-    use solana_client::rpc_config::RpcContextConfig;
+    use solana_client::{rpc_config::RpcContextConfig, rpc_custom_error::RpcCustomError};
     use solana_commitment_config::CommitmentConfig;
     use solana_epoch_info::EpochInfo;
     use solana_genesis_config::GenesisConfig;
     use solana_pubkey::Pubkey;
 
     use super::*;
-    use crate::{tests::helpers::TestSetup, types::SyntheticBlockhash};
+    use crate::{surfnet::FINALIZATION_SLOT_THRESHOLD, tests::helpers::TestSetup};
 
     #[test]
     fn test_get_block_height_processed_commitment() {
@@ -880,110 +837,6 @@ mod tests {
     }
 
     #[test]
-    fn test_get_block_height_with_min_context_slot() {
-        let setup = TestSetup::new(SurfpoolMinimalRpc);
-
-        // create blocks at specific slots with known block heights
-        let test_cases = vec![(100, 50), (200, 150), (300, 275)];
-
-        {
-            let mut svm_writer = setup.context.svm_locker.0.blocking_write();
-            for (slot, block_height) in &test_cases {
-                svm_writer
-                    .blocks
-                    .store(
-                        *slot,
-                        crate::surfnet::BlockHeader {
-                            hash: SyntheticBlockhash::new(*slot).to_string(),
-                            previous_blockhash: SyntheticBlockhash::new(slot - 1).to_string(),
-                            block_time: chrono::Utc::now().timestamp_millis(),
-                            block_height: *block_height,
-                            parent_slot: slot - 1,
-                            signatures: Vec::new(),
-                        },
-                    )
-                    .unwrap();
-            }
-        }
-
-        for (slot, expected_height) in test_cases {
-            let config = RpcContextConfig {
-                commitment: None,
-                min_context_slot: Some(slot),
-            };
-
-            let result = setup
-                .rpc
-                .get_block_height(Some(setup.context.clone()), Some(config));
-            assert!(
-                result.is_ok(),
-                "failed to get block height for slot {}",
-                slot
-            );
-            assert_eq!(
-                result.unwrap(),
-                expected_height,
-                "Wrong block height for slot {}",
-                slot
-            );
-        }
-    }
-
-    #[test]
-    fn test_get_block_height_error_case_slot_not_found() {
-        let setup = TestSetup::new(SurfpoolMinimalRpc);
-
-        {
-            let mut svm_writer = setup.context.svm_locker.0.blocking_write();
-            svm_writer
-                .blocks
-                .store(
-                    100,
-                    crate::surfnet::BlockHeader {
-                        hash: SyntheticBlockhash::new(100).to_string(),
-                        previous_blockhash: SyntheticBlockhash::new(99).to_string(),
-                        block_time: chrono::Utc::now().timestamp_millis(),
-                        block_height: 50,
-                        parent_slot: 99,
-                        signatures: Vec::new(),
-                    },
-                )
-                .unwrap();
-        }
-
-        // slot that definitely doesn't exist
-        let nonexistent_slot = 999;
-        let config = RpcContextConfig {
-            commitment: None,
-            min_context_slot: Some(nonexistent_slot),
-        };
-
-        let result = setup
-            .rpc
-            .get_block_height(Some(setup.context), Some(config));
-
-        assert!(
-            result.is_err(),
-            "Expected error for nonexistent slot {}",
-            nonexistent_slot
-        );
-
-        let error = result.unwrap_err();
-
-        assert_eq!(error.code, jsonrpc_core::types::ErrorCode::InvalidParams);
-        assert!(
-            error.message.contains("Block not found for slot"),
-            "Error message should mention block not found, got: {}",
-            error.message
-        );
-        assert!(
-            error.message.contains(&nonexistent_slot.to_string()),
-            "Error message should include the slot number, got: {}",
-            error.message
-        );
-    }
-
-    #[test]
     fn test_get_health() {
         let setup = TestSetup::new(SurfpoolMinimalRpc);
         let result = setup.rpc.get_health(Some(setup.context));
@@ -1024,7 +877,8 @@ mod tests {
             "Invalid returned lamports for the account"
         );
 
-        let wrong_min_slot = setup.context.svm_locker.get_latest_absolute_slot() + 100;
+        let latest_slot = setup.context.svm_locker.get_latest_absolute_slot();
+        let wrong_min_slot = latest_slot + 100;
 
         let fail_if_latest_slot_lt_min_ctx_slot_result = setup
             .rpc
@@ -1039,8 +893,9 @@ mod tests {
             .await;
 
         let expected_err: Result<()> = Result::Err(
+            // No commitment reads at finalized, and the error names that slot, as on Agave.
             RpcCustomError::MinContextSlotNotReached {
-                context_slot: wrong_min_slot,
+                context_slot: latest_slot - FINALIZATION_SLOT_THRESHOLD,
             }
             .into(),
         );
