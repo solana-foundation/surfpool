@@ -260,6 +260,9 @@ pub enum PropertyKind {
     Field,
     /// A reference to a constant definition (renders as dropdown/combobox in UI)
     ConstantRef,
+    /// Options fetched live from an MCP tool (renders as a dropdown whose entries are
+    /// pulled from a running surfnet, so the catalog is never hardcoded)
+    DynamicRef,
 }
 
 /// Defines a property in a template with full metadata
@@ -286,6 +289,11 @@ pub struct Property {
     /// Raw-layout only: how this field's bytes are produced.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encoding: Option<RawEncoding>,
+    /// For dynamic_ref type: the MCP tool whose result supplies the dropdown options
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_type: Option<anchor_lang_idl::types::IdlType>,
 }
 
 impl Property {
@@ -299,6 +307,8 @@ impl Property {
             constant: None,
             offset: None,
             encoding: None,
+            source: None,
+            value_type: None,
         }
     }
 
@@ -312,6 +322,8 @@ impl Property {
             constant: Some(constant.into()),
             offset: None,
             encoding: None,
+            source: None,
+            value_type: None,
         }
     }
 
@@ -320,9 +332,19 @@ impl Property {
         matches!(self.kind, PropertyKind::ConstantRef)
     }
 
+    /// Check if this is a dynamic reference
+    pub fn is_dynamic_ref(&self) -> bool {
+        matches!(self.kind, PropertyKind::DynamicRef)
+    }
+
     /// Get the constant name if this is a constant reference
     pub fn constant_name(&self) -> Option<&str> {
         self.constant.as_deref()
+    }
+
+    /// Get the source tool name if this is a dynamic reference
+    pub fn source_name(&self) -> Option<&str> {
+        self.source.as_deref()
     }
 
     /// Get the display label (falls back to path if no label set)
@@ -863,7 +885,7 @@ pub enum YamlProperty {
     Full {
         /// The path to the field in the IDL
         path: String,
-        /// The type of property: "field" (default) or "constant_ref"
+        /// The type of property: "field" (default), "constant_ref" or "dynamic_ref"
         #[serde(default, rename = "type")]
         kind: Option<String>,
         /// Human-readable label for the UI (optional)
@@ -881,6 +903,11 @@ pub enum YamlProperty {
         /// Raw-layout only: how this field's bytes are produced
         #[serde(default)]
         encoding: Option<RawEncoding>,
+        /// For dynamic_ref type: the MCP tool whose result supplies the options
+        #[serde(default)]
+        source: Option<String>,
+        #[serde(default)]
+        value_type: Option<anchor_lang_idl::types::IdlType>,
     },
 }
 
@@ -896,9 +923,12 @@ impl From<YamlProperty> for Property {
                 constant,
                 offset,
                 encoding,
+                source,
+                value_type,
             } => {
                 let kind = match kind.as_deref() {
                     Some("constant_ref") => PropertyKind::ConstantRef,
+                    Some("dynamic_ref") => PropertyKind::DynamicRef,
                     _ => PropertyKind::Field,
                 };
                 Property {
@@ -909,6 +939,8 @@ impl From<YamlProperty> for Property {
                     constant,
                     offset,
                     encoding,
+                    source,
+                    value_type,
                 }
             }
         }

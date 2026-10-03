@@ -23,6 +23,37 @@ pub fn get_free_port() -> Result<u16, String> {
     Ok(port)
 }
 
+/// Minimal JSON-RPC stand-in that answers every request with one canned `result` body, so
+/// the remote-fetch branches can be exercised without a network.
+pub async fn canned_rpc(result_json: impl Into<String>) -> String {
+    let result_json = result_json.into();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind canned rpc");
+    let addr = listener.local_addr().expect("local addr");
+
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let result_json = result_json.clone();
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = vec![0u8; 16 * 1024];
+                let _ = stream.read(&mut buf).await;
+                let body = format!(r#"{{"jsonrpc":"2.0","result":{result_json},"id":1}}"#);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.flush().await;
+            });
+        }
+    });
+
+    format!("http://{addr}")
+}
+
 #[derive(Clone)]
 pub struct TestSetup<T>
 where

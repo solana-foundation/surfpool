@@ -115,6 +115,7 @@ opentelemetry_sdk = { version = "0.28", default-features = false, features = ["r
 opentelemetry-prometheus = { version = "0.28", default-features = false, optional = true }
 prometheus = { version = "0.13", default-features = false, optional = true }
 axum = { version = "0.8", default-features = false, features = ["tokio", "http1"], optional = true }
+phoenix-rise-accounts = { workspace = true }
 
 [dev-dependencies]
 ed25519-dalek = "1.0.1"

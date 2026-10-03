@@ -1213,6 +1213,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "az"
+version = "1.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "be5eb007b7cacc6c660343e96f650fedf4b5a77512399eb952ca6642cf8d13f7"
+
+[[package]]
 name = "base16ct"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3211,6 +3217,18 @@ name = "five8_core"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "059c31d7d36c43fe39d89e55711858b4da8be7eb6dabac23c7289b1a19489406"
+
+[[package]]
+name = "fixed"
+version = "1.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "707070ccf8c4173548210893a0186e29c266901b71ed20cd9e2ca0193dfe95c3"
+dependencies = [
+ "az",
+ "bytemuck",
+ "half",
+ "typenum",
+]
 
 [[package]]
 name = "fixed-hash"
@@ -5992,6 +6010,12 @@ checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
 name = "pastey"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "35fb2e5f958ec131621fdd531e9fc186ed768cbe395337403ae56c17a74c68ec"
+
+[[package]]
+name = "pastey"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
@@ -6108,6 +6132,35 @@ dependencies = [
  "hashbrown 0.15.5",
  "indexmap 2.14.0",
  "serde",
+]
+
+[[package]]
+name = "phoenix-rise-accounts"
+version = "0.6.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5935fbffbb20cc6f168a11bfca4519797f65ad34fa027fd80c3e2ee00bc7866e"
+dependencies = [
+ "borsh 1.7.0",
+ "bytemuck",
+ "phoenix-rise-math",
+ "sha2-const-stable",
+ "solana-pubkey 4.2.0",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "phoenix-rise-math"
+version = "0.6.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3c26875c5a22a98b4b085ee9cb0d045dc60f0ad0f2bbd1f9fbd2228c2e0d760"
+dependencies = [
+ "borsh 1.7.0",
+ "bytemuck",
+ "fixed",
+ "pastey 0.1.1",
+ "rust_decimal",
+ "sha2-const-stable",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -7034,6 +7087,23 @@ checksum = "42ffa149f6aa81b58a5b3011d01a857c4ed12c7a732d2c51947a4c7c692185f0"
 dependencies = [
  "sha2 0.11.0",
  "walkdir",
+]
+
+[[package]]
+name = "rust_decimal"
+version = "1.43.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7653272e75dcac41dc199fbea6f5797633994fafd339943c06c9af16bf29cd3a"
+dependencies = [
+ "arrayvec",
+ "borsh 1.7.0",
+ "bytes 1.12.1",
+ "num-traits",
+ "rand 0.8.6",
+ "rand 0.9.4",
+ "serde",
+ "serde_json",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -12124,6 +12194,7 @@ dependencies = [
  "opentelemetry-prometheus",
  "opentelemetry_sdk 0.28.0",
  "p256",
+ "phoenix-rise-accounts",
  "prometheus",
  "reqwest 0.12.28",
  "scheduled-thread-pool",
@@ -13452,6 +13523,7 @@ dependencies = [
  "cfg-if 1.0.4",
  "once_cell",
  "rustversion",
+ "serde",
  "wasm-bindgen-macro",
  "wasm-bindgen-shared",
 ]
@@ -13624,7 +13696,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "66d967db7705dc29120bb6e8ce5b5a2e27734ed5976d1c904e95bd238d1c3c5a"
 dependencies = [
  "bv",
- "pastey",
+ "pastey 0.2.3",
  "proc-macro2",
  "quote",
  "thiserror 2.0.20",

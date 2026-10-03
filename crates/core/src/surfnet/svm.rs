@@ -92,7 +92,10 @@ use super::{
 use crate::{
     error::{AirdropError, SurfpoolError, SurfpoolResult},
     rpc::utils::convert_transaction_metadata_from_canonical,
-    scenarios::{TemplateRegistry, account_data_values, template_registry},
+    scenarios::{
+        TemplateRegistry, account_data_values,
+        protocols::phoenix_eternal::v1::state_builder::prepare_phoenix_override, template_registry,
+    },
     storage::{OverlayStorage, Storage, StorageBackend},
     surfnet::{
         LogsSubscriptionData, locker::is_supported_token_program, surfnet_lite_svm::SurfnetLiteSvm,
@@ -3203,11 +3206,58 @@ impl SurfnetSvm {
                     continue;
                 }
 
+                // A bad value in one override is that override's failure, never the batch's:
+                // an error returned from this loop aborts block production.
+                match prepare_phoenix_override(
+                    self,
+                    &account_pubkey,
+                    &account,
+                    &account_values,
+                    remote_ctx,
+                    override_instance.fetch_before_use,
+                )
+                .await
+                {
+                    Ok(Some(writes)) => {
+                        for (pubkey, written) in writes {
+                            if let Err(e) = self.set_account(&pubkey, written) {
+                                warn!(
+                                    "Failed to set {} for override {}: {}",
+                                    pubkey, override_instance.id, e
+                                );
+                                break;
+                            }
+                            settled_this_slot.insert(pubkey);
+                        }
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        warn!(
+                            "Skipping override {} for {}: {}",
+                            override_instance.id, account_pubkey, e
+                        );
+                        continue;
+                    }
+                }
+
                 // Mints fail the token unpack and keep flowing through the IDL path.
                 if is_supported_token_program(account.owner()) {
                     if let Ok(token_account) = TokenAccount::unpack(account.data()) {
-                        let new_account_data =
-                            forge_token_account_data(&account, token_account, &account_values)?;
+                        let new_account_data = match forge_token_account_data(
+                            &account,
+                            token_account,
+                            &account_values,
+                        ) {
+                            Ok(data) => data,
+                            Err(e) => {
+                                warn!(
+                                    "Skipping override {} for {}: {}",
+                                    override_instance.id, account_pubkey, e
+                                );
+                                continue;
+                            }
+                        };
                         let modified_account = Account {
                             lamports: account.lamports(),
                             data: new_account_data,
@@ -3215,7 +3265,12 @@ impl SurfnetSvm {
                             executable: account.executable(),
                             rent_epoch: account.rent_epoch(),
                         };
-                        self.inner.set_account(account_pubkey, modified_account)?;
+                        if let Err(e) = self.inner.set_account(account_pubkey, modified_account) {
+                            warn!(
+                                "Failed to set modified account {} in SVM: {}",
+                                account_pubkey, e
+                            );
+                        }
                         continue;
                     }
                 }
@@ -3367,16 +3422,26 @@ impl SurfnetSvm {
                 ))
             })?;
 
-        // Find the corresponding type definition
+        let encoded =
+            Self::get_forged_idl_type_data(serialized_data, idl, &account_def.name, overrides)?;
+        let mut result = discriminator.to_vec();
+        result.extend_from_slice(&encoded);
+        Ok(result)
+    }
+
+    pub(crate) fn get_forged_idl_type_data(
+        serialized_data: &[u8],
+        idl: &Idl,
+        type_name: &str,
+        overrides: &HashMap<String, serde_json::Value>,
+    ) -> SurfpoolResult<Vec<u8>> {
+        // A type can also describe a record embedded in a dynamically addressed account.
         let account_type = idl
             .types
             .iter()
-            .find(|t| t.name == account_def.name)
+            .find(|t| t.name == type_name)
             .ok_or_else(|| {
-                SurfpoolError::internal(format!(
-                    "Type definition for account '{}' not found in IDL",
-                    account_def.name
-                ))
+                SurfpoolError::internal(format!("Type definition '{}' not found in IDL", type_name))
             })?;
 
         // Set up generics for parsing
@@ -3436,10 +3501,8 @@ impl SurfnetSvm {
                     ))
                 })?;
 
-        // Reconstruct the account data with discriminator and preserve any trailing bytes
-        let mut new_account_data =
-            Vec::with_capacity(8 + re_encoded_data.len() + leftover_bytes.len());
-        new_account_data.extend_from_slice(discriminator);
+        // Preserve trailing data outside the IDL type.
+        let mut new_account_data = Vec::with_capacity(re_encoded_data.len() + leftover_bytes.len());
         new_account_data.extend_from_slice(&re_encoded_data);
         new_account_data.extend_from_slice(leftover_bytes);
 
@@ -4647,7 +4710,9 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
-    use crate::{storage::tests::TestType, surfnet::locker::SurfnetSvmLocker};
+    use crate::{
+        storage::tests::TestType, surfnet::locker::SurfnetSvmLocker, tests::helpers::canned_rpc,
+    };
 
     #[test]
     fn startup_status_subscription_tracks_accepted_transitions() {
@@ -4800,33 +4865,64 @@ mod tests {
         assert_eq!(&patched[72..], &account.data[72..]);
     }
 
-    /// Minimal JSON-RPC stand-in that answers every request with one canned `result` body, so
-    /// the remote-fetch branches can be exercised without a network.
-    async fn canned_rpc(result_json: &'static str) -> String {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    #[tokio::test]
+    async fn test_rejected_token_override_does_not_stop_the_slot() {
+        const SLOT: u64 = 500;
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let mut token_account = crate::types::TokenAccount::new(
+            &spl_token_interface::id(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            None,
+        );
+        token_account.set_amount(10);
+        let account = Account {
+            lamports: 2_039_280,
+            data: token_account.pack_into_vec(),
+            owner: spl_token_interface::id(),
+            executable: false,
+            rent_epoch: 0,
+        };
+        let (rejected, applied) = (Pubkey::new_unique(), Pubkey::new_unique());
+        for pubkey in [rejected, applied] {
+            svm.inner.set_account(pubkey, account.clone()).unwrap();
+        }
+        let balance_override = |pubkey: Pubkey, amount: serde_json::Value| {
+            surfpool_types::OverrideInstance::new(
+                "spl-token-account-balance".to_string(),
+                0,
+                surfpool_types::AccountAddress::Pubkey(pubkey.to_string()),
+            )
+            .with_values(HashMap::from([("amount".to_string(), amount)]))
+        };
+        svm.scheduled_overrides
+            .store(
+                SLOT,
+                vec![
+                    balance_override(rejected, serde_json::json!(-1)),
+                    balance_override(applied, serde_json::json!("42")),
+                ],
+            )
+            .unwrap();
+
+        svm.materialize_overrides_for_slot(&None, SLOT)
             .await
-            .expect("bind canned rpc");
-        let addr = listener.local_addr().expect("local addr");
+            .expect("a rejected override must not fail the slot");
 
-        tokio::spawn(async move {
-            while let Ok((mut stream, _)) = listener.accept().await {
-                tokio::spawn(async move {
-                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut buf = vec![0u8; 16 * 1024];
-                    let _ = stream.read(&mut buf).await;
-                    let body = format!(r#"{{"jsonrpc":"2.0","result":{result_json},"id":1}}"#);
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                    let _ = stream.write_all(response.as_bytes()).await;
-                    let _ = stream.flush().await;
-                });
-            }
-        });
-
-        format!("http://{addr}")
+        let amount = |pubkey: &Pubkey| {
+            let data = svm.inner.get_account(pubkey).unwrap().unwrap().data;
+            u64::from_le_bytes(data[64..72].try_into().unwrap())
+        };
+        assert_eq!(
+            amount(&rejected),
+            10,
+            "the rejected override leaves its account as it was"
+        );
+        assert_eq!(
+            amount(&applied),
+            42,
+            "the override scheduled after it still applies"
+        );
     }
 
     /// A 165-byte SPL token account (state = Initialized), which sends `get_account` down the

@@ -19,8 +19,13 @@ use start_surfnet::StartSurfnetResponse;
 use surfpool_core::{
     scenarios::{
         TemplateRegistry,
-        protocols::pump::v1::graduation_builder::{
-            build_pump_graduation_scenario, pump_graduation_addresses,
+        protocols::{
+            phoenix_eternal::v1::state_builder::{
+                PHOENIX_PERP_ASSET_MAP, build_phoenix_collateral_scenario, phoenix_markets,
+            },
+            pump::v1::graduation_builder::{
+                build_pump_graduation_scenario, pump_graduation_addresses,
+            },
         },
     },
     solana_account::Account,
@@ -150,6 +155,26 @@ pub struct GetTemplateParams {
         description = "Template id from get_override_templates (e.g., \"pyth-price-feed-v2\")."
     )]
     pub template_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CreatePhoenixCollateralScenarioParams {
+    #[schemars(description = "Phoenix Eternal Trader account pubkey.")]
+    pub trader: String,
+    #[schemars(
+        description = "Exact signed collateral target in quote lots, encoded as a decimal string."
+    )]
+    pub target_quote_lots: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ListPhoenixMarketsParams {
+    #[schemars(
+        description = "The port of the target running local surfnet instance (e.g., 8899, 18899, 28899, etc.). Omit to use the default port, 8899."
+    )]
+    pub surfnet_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -401,15 +426,24 @@ impl TokenAddressResponse {
 }
 
 impl Surfpool {
-    /// Reads through the surfnet's own RPC: local state wins, only missing
-    /// accounts fall back to its remote source.
     async fn fetch_surfnet_accounts(
         &self,
         surfnet_port: Option<u16>,
         pubkeys: &[Pubkey],
     ) -> Result<Vec<Option<Account>>, String> {
         let port = surfnet_port.unwrap_or(DEFAULT_RPC_PORT);
-        let client = SurfnetRemoteClient::new(format!("http://127.0.0.1:{port}"));
+        self.fetch_accounts_at(&format!("http://127.0.0.1:{port}"), pubkeys)
+            .await
+    }
+
+    /// Reads through the surfnet's own RPC: local state wins, only missing
+    /// accounts fall back to its remote source.
+    async fn fetch_accounts_at(
+        &self,
+        rpc_url: &str,
+        pubkeys: &[Pubkey],
+    ) -> Result<Vec<Option<Account>>, String> {
+        let client = SurfnetRemoteClient::new(rpc_url);
         let accounts = client
             .get_multiple_accounts(pubkeys, CommitmentConfig::confirmed())
             .await
@@ -419,6 +453,42 @@ impl Surfpool {
             .into_iter()
             .map(|result| result.map_account().ok())
             .collect())
+    }
+
+    /// The RPC URL Studio plays scenarios on, from the same `/config` its pages read.
+    async fn studio_rpc_url(&self, studio_url: &str) -> Result<String, String> {
+        let endpoint = format!("{studio_url}/config");
+        let config = async {
+            reqwest::get(&endpoint)
+                .await?
+                .error_for_status()?
+                .json::<Value>()
+                .await
+        }
+        .await
+        .map_err(|error| format!("Failed to read Studio's config at {endpoint}: {error}"))?;
+        config
+            .get("rpc_url")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| format!("Studio's config at {endpoint} has no rpc_url"))
+    }
+
+    async fn build_phoenix_collateral_scenario_from_surfnet(
+        &self,
+        studio_url: &str,
+        params: &CreatePhoenixCollateralScenarioParams,
+    ) -> Result<Scenario, String> {
+        let trader = Pubkey::from_str(params.trader.trim())
+            .map_err(|error| format!("Invalid Trader pubkey: {error}"))?;
+        // Studio plays the scenario on its own surfnet, so the Trader is checked there.
+        let rpc_url = self.studio_rpc_url(studio_url).await?;
+        let accounts = self.fetch_accounts_at(&rpc_url, &[trader]).await?;
+        let trader_account = accounts[0]
+            .as_ref()
+            .ok_or_else(|| format!("Phoenix Trader account {trader} was not found"))?;
+        build_phoenix_collateral_scenario(trader, trader_account, &params.target_quote_lots)
+            .map_err(|error| error.to_string())
     }
 
     async fn stage_scenario(&self, scenario: Scenario) -> Result<CallToolResult, McpError> {
@@ -760,6 +830,7 @@ impl Surfpool {
         2. `values` keys MUST be from the template's `properties` array
         3. For PDA addresses, DO NOT provide `account` - it will be generated from template + values
         4. For constant_ref properties (like feed_id), the value MUST come from search_constant_options results
+        5. For dynamic_ref properties, the value MUST come from the tool named in the property's `source` (e.g. list_phoenix_markets)
 
         CORRECT JSON STRUCTURE FOR PYTH PRICE FEED:
         {
@@ -793,7 +864,7 @@ impl Surfpool {
         // Validate all templateIds exist in the registry
         // The registry lock must not be held across the HTTP await below, so the
         // validation runs in its own scope and only its outcome escapes
-        let validation_error: Option<String> = {
+        let (validation_error, phoenix_symbols) = {
             let registry = self.template_registry.read().map_err(|_| {
                 use std::borrow::Cow;
                 McpError {
@@ -805,6 +876,7 @@ impl Surfpool {
 
             let mut invalid_templates: Vec<String> = Vec::new();
             let mut validation_errors: Vec<String> = Vec::new();
+            let mut phoenix_symbols: Vec<(String, String)> = Vec::new();
 
             for override_instance in &mut scenario.overrides {
                 // Check if template exists
@@ -865,6 +937,34 @@ impl Surfpool {
 
                     // Validate constant_ref values against template constants
                     for prop in &template.properties {
+                        if prop.is_dynamic_ref() {
+                            let value = override_instance
+                                .values
+                                .get(&prop.path)
+                                .and_then(|value| value.as_str())
+                                .filter(|value| !value.is_empty());
+                            if let Some(symbol) = value
+                                && prop.source_name() == Some("list_phoenix_markets")
+                            {
+                                phoenix_symbols.push((
+                                    format!(
+                                        "Override '{}' (template '{}')",
+                                        override_instance.id, override_instance.template_id
+                                    ),
+                                    symbol.to_string(),
+                                ));
+                            }
+                            if value.is_none() {
+                                validation_errors.push(format!(
+                                    "Override '{}' (template '{}'): Missing required value for '{}'. Resolve it with the `{}` tool and pass it as a non-empty string.",
+                                    override_instance.id,
+                                    override_instance.template_id,
+                                    prop.path,
+                                    prop.source_name().unwrap_or("source")
+                                ));
+                            }
+                            continue;
+                        }
                         if prop.is_constant_ref() {
                             if let Some(constant_name) = prop.constant_name() {
                                 if let Some(constant_def) = template.constants.get(constant_name) {
@@ -938,7 +1038,7 @@ impl Surfpool {
                 }
             }
 
-            if !invalid_templates.is_empty() {
+            let validation_error = if !invalid_templates.is_empty() {
                 let valid_ids: Vec<String> = registry.list_ids();
                 Some(format!(
                     "Invalid templateId(s): {:?}. You MUST use templateIds from get_override_templates. Valid IDs are: {:?}",
@@ -951,7 +1051,34 @@ impl Surfpool {
                 ))
             } else {
                 None
+            };
+            (validation_error, phoenix_symbols)
+        };
+
+        // Play only warns about an unknown market symbol, so check it while the caller can fix it,
+        // on the surfnet Studio plays the scenario on. If the market list cannot be read, the
+        // scenario is staged unchecked.
+        let validation_error = match validation_error {
+            None if !phoenix_symbols.is_empty() => {
+                let studio_url = format!(
+                    "http://127.0.0.1:{}",
+                    CHANGE_TO_DEFAULT_STUDIO_PORT_ONCE_SUPERVISOR_MERGED
+                );
+                let listing = async {
+                    let rpc_url = self.studio_rpc_url(&studio_url).await?;
+                    self.list_phoenix_markets_at(&rpc_url).await
+                }
+                .await;
+                match listing {
+                    Ok(listing) => {
+                        let errors = unlisted_phoenix_symbols(&listing, &phoenix_symbols);
+                        (!errors.is_empty())
+                            .then(|| format!("Validation errors:\n{}", errors.join("\n")))
+                    }
+                    Err(_) => None,
+                }
             }
+            validation_error => validation_error,
         };
 
         if let Some(message) = validation_error {
@@ -1025,7 +1152,79 @@ impl Surfpool {
     }
 
     #[tool(
-        description = "Lists all override templates as a light index: {id, name, description, protocol, accountType, tags, hasLlmContext}. Call this first to pick a templateId, then get_override_template for that one template's full detail (properties, address, llmContext). Constants are resolved with search_constant_options."
+        description = "Creates an editable Phoenix Eternal Trader collateral-stress scenario. Requires a Trader pubkey and exact signed quote lots as a decimal string. The Trader is read from the surfnet Studio plays scenarios on. Only lowers collateral: Play skips a target above the trader's current quoteLotCollateral with a warning, since raising it needs a real deposit. quoteLotCollateral excludes the unrealized PnL and funding Phoenix adds for effective collateral, so lowering it by N quote lots lowers effective collateral by N. Makes a single-override scenario; build a multi-slot cascade with create_scenario instead. This prepares risk state; it does not execute liquidation."
+    )]
+    async fn create_phoenix_collateral_scenario(
+        &self,
+        Parameters(params): Parameters<CreatePhoenixCollateralScenarioParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let studio_url = format!(
+            "http://127.0.0.1:{}",
+            CHANGE_TO_DEFAULT_STUDIO_PORT_ONCE_SUPERVISOR_MERGED
+        );
+        let scenario = match self
+            .build_phoenix_collateral_scenario_from_surfnet(&studio_url, &params)
+            .await
+        {
+            Ok(scenario) => scenario,
+            Err(error) => return Ok(scenario_tool_error(error)),
+        };
+
+        self.stage_scenario(scenario).await
+    }
+
+    async fn list_phoenix_markets_at(&self, rpc_url: &str) -> Result<serde_json::Value, String> {
+        let perp_asset_map = PHOENIX_PERP_ASSET_MAP;
+        let maps = self.fetch_accounts_at(rpc_url, &[perp_asset_map]).await?;
+        let map_account = maps[0].as_ref().ok_or_else(|| {
+            format!("Phoenix PerpAssetMap account {perp_asset_map} was not found on the surfnet")
+        })?;
+        let markets =
+            phoenix_markets(perp_asset_map, map_account).map_err(|error| error.to_string())?;
+        Ok(serde_json::json!({
+            "perpAssetMap": perp_asset_map.to_string(),
+            "count": markets.len(),
+            "symbols": markets.iter().map(|market| &market.symbol).collect::<Vec<_>>(),
+            "markets": markets
+                .iter()
+                .map(|market| {
+                    serde_json::json!({
+                        "symbol": market.symbol,
+                        "orderbook": market.orderbook.to_string(),
+                        "markTicks": market.mark_ticks,
+                        "tickSize": market.tick_size,
+                        "baseLotDecimals": market.base_lot_decimals,
+                        "maintenanceRiskFactorBps": market.maintenance_risk_factor_bps,
+                        "backstopRiskFactorBps": market.backstop_risk_factor_bps,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        }))
+    }
+
+    #[tool(
+        description = "Lists the Phoenix Eternal perp markets currently listed on the live PerpAssetMap. Reads the fork's PerpAssetMap, so the catalog reflects live state rather than a hardcoded snapshot. Each market comes with its symbol, its orderbook account address, its current mark price in ticks (markTicks), its tick size in quote lots per base lot (tickSize), its signed base lot decimals (baseLotDecimals), its maintenance risk factor (maintenanceRiskFactorBps) and the backstop risk factor a maintenance factor must stay above (backstopRiskFactorBps). Use it to resolve a market given by symbol or by orderbook address to the symbol the Phoenix templates take, and compute relative changes (such as a 40% mark drop) from markTicks. USD per base unit = markTicks * tickSize * 10^(baseLotDecimals - 6). Never read or decode the PerpAssetMap account yourself: it is 1.6 MB."
+    )]
+    async fn list_phoenix_markets(
+        &self,
+        Parameters(params): Parameters<ListPhoenixMarketsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        match self
+            .list_phoenix_markets_at(&format!(
+                "http://127.0.0.1:{}",
+                params.surfnet_port.unwrap_or(DEFAULT_RPC_PORT)
+            ))
+            .await
+        {
+            Ok(payload) => Ok(CallToolResult::success(vec![Content::text(
+                payload.to_string(),
+            )])),
+            Err(error) => Ok(scenario_tool_error(error)),
+        }
+    }
+
+    #[tool(
+        description = "Lists all override templates as a light index: {id, name, description, protocol, accountType, tags, hasLlmContext}. Call this first to pick a templateId, then get_override_template for that one template's full detail (properties, address, llmContext). Constants are resolved with search_constant_options; dynamic_ref properties with the tool named in their source."
     )]
     async fn get_override_templates(&self) -> Result<CallToolResult, McpError> {
         let registry = self.template_registry.read().map_err(|_| {
@@ -1048,7 +1247,7 @@ impl Surfpool {
     }
 
     #[tool(
-        description = "Fetches one template's full detail (properties, address, rawLayout write-path flag, constants summarized as {label, description, optionsCount}, and llmContext). Call after get_override_templates with the id you picked, before create_scenario. Resolve an actual constant option value with search_constant_options."
+        description = "Fetches one template's full detail (properties, address, rawLayout write-path flag, constants summarized as {label, description, optionsCount}, and llmContext). Call after get_override_templates with the id you picked, before create_scenario. Resolve an actual constant option value with search_constant_options, and a dynamic_ref value with the tool named in its source."
     )]
     async fn get_override_template(
         &self,
@@ -1300,6 +1499,33 @@ impl ServerHandler for Surfpool {
     ) -> Result<InitializeResult, McpError> {
         Ok(self.get_info())
     }
+}
+
+fn unlisted_phoenix_symbols(
+    listing: &serde_json::Value,
+    symbols: &[(String, String)],
+) -> Vec<String> {
+    let listed: Vec<&str> = listing["symbols"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|symbol| symbol.as_str())
+        .collect();
+    symbols
+        .iter()
+        .filter(|(_, symbol)| !listed.contains(&symbol.as_str()))
+        .map(|(owner, symbol)| {
+            let hint = listed
+                .iter()
+                .find(|listed| listed.eq_ignore_ascii_case(symbol))
+                .map(|listed| format!(" Did you mean '{listed}'?"))
+                .unwrap_or_default();
+            format!(
+                "{owner}: '{symbol}' is not a listed Phoenix market (symbols are \
+                 case-sensitive).{hint} Resolve it with the `list_phoenix_markets` tool."
+            )
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1687,6 +1913,56 @@ mod tests {
                 "{mint} must not be offered for a bonding curve"
             );
         }
+    }
+
+    #[test]
+    fn unlisted_phoenix_symbols_names_each_miss_and_the_listed_spelling() {
+        let listing = serde_json::json!({ "symbols": ["SOL", "BNB", "kBONK"] });
+        let pairs = |symbols: &[&str]| -> Vec<(String, String)> {
+            symbols
+                .iter()
+                .map(|symbol| ("Override 'o'".to_string(), symbol.to_string()))
+                .collect()
+        };
+
+        assert!(unlisted_phoenix_symbols(&listing, &pairs(&["SOL", "kBONK"])).is_empty());
+
+        let errors = unlisted_phoenix_symbols(&listing, &pairs(&["sol", "SOL-PERP", "BONK"]));
+        assert_eq!(errors.len(), 3, "{errors:?}");
+        assert!(errors[0].contains("'sol'") && errors[0].contains("Did you mean 'SOL'?"));
+        assert!(errors[1].contains("'SOL-PERP'") && !errors[1].contains("Did you mean"));
+        assert!(errors[2].contains("'BONK'") && errors[2].contains("list_phoenix_markets"));
+    }
+
+    #[tokio::test]
+    async fn create_scenario_rejects_a_missing_dynamic_ref_value() {
+        let surfpool = Surfpool::new();
+        let template = TemplateRegistry::new()
+            .get("phoenix-direct-mark-risk-shock")
+            .expect("template")
+            .clone();
+        let mut scenario = surfpool_types::Scenario::new(
+            "no symbol".to_string(),
+            "a dynamic_ref without a value must be rejected".to_string(),
+        );
+        scenario.add_override(
+            surfpool_types::OverrideInstance::new(template.id.clone(), 0, template.address)
+                .with_values(HashMap::from([(
+                    "target_ticks".to_string(),
+                    serde_json::json!("1"),
+                )])),
+        );
+        let result = surfpool
+            .create_scenario(Parameters(scenario))
+            .await
+            .unwrap();
+        let text = &result.content[0].as_text().expect("text").text;
+        assert!(
+            text.contains("Missing required value")
+                && text.contains("symbol")
+                && text.contains("list_phoenix_markets"),
+            "the missing symbol and the tool that resolves it must be named, got: {text}"
+        );
     }
 
     #[tokio::test]

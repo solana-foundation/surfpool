@@ -1,0 +1,294 @@
+protocol: Phoenix Eternal
+version: v1
+account_type: Trader
+idl_file_path: idl.json
+
+tags:
+  - perpetuals
+  - collateral
+  - risk
+
+templates:
+  - id: phoenix-trader-collateral-stress
+    name: Phoenix Trader Collateral Stress
+    description: >-
+      Set exact signed quote-lot collateral on a Phoenix Trader and its live GlobalTraderIndex
+      entry when hot.
+    idl_account_name: Trader
+    properties:
+      - path: traderState.quoteLotCollateral
+        label: Target Collateral in Quote Lots
+        description: Exact signed quote-lot collateral encoded as a decimal string
+    llm_context: |
+      This prepares collateral stress state. It does not execute liquidation.
+      Only lower collateral; raising it needs a real deposit into the global vault.
+      The target is quoteLotCollateral, which excludes the unrealized PnL and funding Phoenix adds
+      for effective collateral: lowering it by N quote lots lowers effective collateral by N.
+      For a liquidation cascade, put this override at slot 0 and phoenix-direct-mark-risk-shock at
+      slot 1 in one create_scenario call.
+      Set fetchBeforeUse: true so the live Trader is forked first; an override on a Trader that is
+      not on the fork yet is skipped.
+      Keep override labels short. Pass traderState.quoteLotCollateral as a decimal string.
+      Before sending Phoenix transactions, surfnet_setAccount the mainnet LastRestartSlot sysvar
+      (SysvarLastRestartS1ot1111111111111111111111) and an empty system account at
+      GdxfTLSsdSY37G6fZoYtdGDSfgFnbT2EmRpuePZxWShS.
+    address:
+      type: pubkey
+
+  - id: phoenix-direct-mark-risk-shock
+    name: Phoenix Direct Mark Risk Shock
+    description: >-
+      Set exact mark-price ticks for one market in a validated Phoenix Eternal PerpAssetMap.
+    idl_account_name: PerpAssetMap
+    properties:
+      - path: symbol
+        value_type: string
+        type: dynamic_ref
+        label: Market Symbol
+        source: list_phoenix_markets
+        description: Exact Phoenix market symbol
+      - path: target_ticks
+        value_type: string
+        label: Target Mark Ticks
+        description: Exact mark-price ticks, at least 1, encoded as a decimal string
+    llm_context: |
+      This directly changes Phoenix risk state, setting the mark ticks and stamping the mark slot
+      with the current slot. The market's spot and perp oracle readings get the same ticks and
+      slot. The orderbook and spline are not moved: trades still fill at the book's real prices,
+      and a mark Phoenix rebuilds after a trade can move back toward the book;
+      list_phoenix_markets shows the mark the fork holds.
+      Pass target_ticks as a decimal string.
+      The account is the singleton PerpAssetMap, so this template carries its address.
+      Resolve the market with list_phoenix_markets: a market named by its orderbook address takes
+      the symbol listed with that address, and a relative move (such as a 40% drop) is computed
+      from its markTicks there.
+      Set fetchBeforeUse: true so the live asset map is forked first; use false only for a later
+      override that builds on state an earlier one prepared in the same scenario.
+      Before sending Phoenix transactions, surfnet_setAccount the mainnet LastRestartSlot sysvar
+      (SysvarLastRestartS1ot1111111111111111111111) and an empty system account at
+      GdxfTLSsdSY37G6fZoYtdGDSfgFnbT2EmRpuePZxWShS.
+    address:
+      type: pubkey
+      value: 2nHGAaEw3D5dd4hVueaUNoygkQFmoeKqRQWnSPqSMFUC
+
+  - id: phoenix-maintenance-margin-stress
+    name: Phoenix Maintenance Margin Stress
+    description: >-
+      Set the maintenance margin risk factor for one market in the Phoenix Eternal PerpAssetMap.
+    idl_account_name: PerpAssetMap
+    properties:
+      - path: symbol
+        value_type: string
+        type: dynamic_ref
+        label: Market Symbol
+        source: list_phoenix_markets
+        description: Exact Phoenix market symbol
+      - path: maintenance_risk_factor_bps
+        value_type: string
+        label: Maintenance Risk Factor (bps)
+        description: >-
+          Maintenance margin risk factor in basis points, above the market's backstop factor and at
+          most 10000, encoded as a decimal string
+    llm_context: |
+      This changes how much collateral positions in one market need to stay healthy.
+      It does not change prices, collateral or positions, and does not execute liquidation.
+      The maintenance margin scales linearly with the factor.
+      Live markets use 5000, so 10000 doubles the requirement, the most it can be raised: Phoenix
+      reads a factor above 10000 as 10000.
+      A factor at or below the market's backstop factor is refused, since it would leave no
+      Liquidatable tier.
+      Pass the factor as a decimal string.
+      The account is the singleton PerpAssetMap, so this template carries its address.
+      Resolve the market with list_phoenix_markets: a market named by its orderbook address takes
+      the symbol listed with that address, and its current and backstop factors are
+      maintenanceRiskFactorBps and backstopRiskFactorBps there.
+      Set fetchBeforeUse: true so the live asset map is forked first; use false only for a later
+      override that builds on state an earlier one prepared in the same scenario.
+      Before sending Phoenix transactions, surfnet_setAccount the mainnet LastRestartSlot sysvar
+      (SysvarLastRestartS1ot1111111111111111111111) and an empty system account at
+      GdxfTLSsdSY37G6fZoYtdGDSfgFnbT2EmRpuePZxWShS.
+    address:
+      type: pubkey
+      value: 2nHGAaEw3D5dd4hVueaUNoygkQFmoeKqRQWnSPqSMFUC
+
+  - id: phoenix-market-fees
+    name: Phoenix Market Fees
+    description: >-
+      Set one market's default taker and maker fees on its Phoenix Eternal orderbook.
+    idl_account_name: OrderbookHeader
+    properties:
+      - path: defaultTakerFeeMicro
+        label: Taker fee (micro)
+        description: >-
+          Taker fee in millionths of the filled notional. Live markets use 350 (0.035%).
+          Example: 1000
+      - path: defaultMakerFeeMicro
+        label: Maker fee (micro)
+        description: >-
+          Maker fee in millionths of the filled notional; negative is a rebate. Live markets use 50.
+          Example: -50
+    llm_context: |
+      This changes the fees a market charges on every fill, for example a fee hike or a maker
+      rebate. It does not change per-trader fee overrides, prices or orders.
+      The account is the market's orderbook: resolve the market with list_phoenix_markets and put
+      its orderbook address in account.pubkey.
+      Pass both fees as JSON numbers in millionths of the notional: 350 is 0.035%, 1000 is 0.1%.
+      defaultMakerFeeMicro may be negative (a rebate); keep it below the taker fee.
+      Set fetchBeforeUse: true so the live orderbook is forked first.
+      Before sending Phoenix transactions, surfnet_setAccount the mainnet LastRestartSlot sysvar
+      (SysvarLastRestartS1ot1111111111111111111111) and an empty system account at
+      GdxfTLSsdSY37G6fZoYtdGDSfgFnbT2EmRpuePZxWShS.
+    address:
+      type: pubkey
+
+  - id: phoenix-withdraw-limits
+    name: Phoenix Withdraw Limits
+    description: >-
+      Set the exchange-wide withdrawal budget and the withdrawal and queueing fees.
+    idl_account_name: WithdrawQueueHeader
+    properties:
+      - path: withdrawThrottle.maxBudget.inner
+        label: Max withdraw budget
+        description: >-
+          Most quote lots withdrawable before requests queue (1000000 = 1 PhUSD).
+          Live: 2000000000000. Example: 1000000000
+      - path: withdrawThrottle.remainingBudget.inner
+        label: Remaining withdraw budget
+        description: >-
+          Quote lots still withdrawable right now; 0 sends every withdrawal to the queue.
+          Example: 0
+      - path: withdrawThrottle.replenishAmountPerSlot.inner
+        label: Budget refill per slot
+        description: >-
+          Quote lots added back to the budget each slot. Live: 450000000 (450 PhUSD). Example: 0
+      - path: withdrawalFee.inner
+        label: Withdrawal fee
+        description: >-
+          Quote lots charged per withdrawal. Live: 500000 (0.5 PhUSD). Example: 2000000
+      - path: enqueueingFee.inner
+        label: Queueing fee
+        description: >-
+          Quote lots charged when a withdrawal is queued. Live: 500000 (0.5 PhUSD). Example: 2000000
+    llm_context: |
+      This throttles withdrawals for every trader, for example a bank run where withdrawals queue
+      instead of paying out. It does not move collateral or cancel queued requests.
+      Withdrawals larger than the remaining budget are queued and paid later by the permissionless
+      ConsumeWithdrawQueue crank; the budget refills by replenishAmountPerSlot each slot.
+      Amounts are quote lots of PhUSD with 6 decimals: 1000000 is 1 PhUSD. Pass them as JSON
+      numbers. Keep remainingBudget at or below maxBudget, and set replenishAmountPerSlot to 0 to
+      keep the budget empty while you test.
+      The account is the singleton WithdrawQueue, so this template carries its address.
+      Set fetchBeforeUse: true so the live queue is forked first.
+      Before sending Phoenix transactions, surfnet_setAccount the mainnet LastRestartSlot sysvar
+      (SysvarLastRestartS1ot1111111111111111111111) and an empty system account at
+      GdxfTLSsdSY37G6fZoYtdGDSfgFnbT2EmRpuePZxWShS.
+    address:
+      type: pubkey
+      value: 3c3NTwpg7yW91FxijkHBXwVH1xUifun3Z8TC5eW5Si3K
+
+  - id: phoenix-trader-capabilities
+    name: Phoenix Trader Capabilities
+    description: >-
+      Set what a cold Phoenix Trader may do: activate a fresh trader, make it reduce-only or freeze
+      it.
+    idl_account_name: Trader
+    properties:
+      - path: traderState.flags
+        label: Capability bits
+        description: >-
+          1 hot, 2 limit, 4 market, 8 risk increase, 16 deposit, 32 withdraw. Active cold trader:
+          62. Example: 62
+    llm_context: |
+      This changes a trader's capability bits, for example to activate a freshly registered trader
+      on the fork so a bot can deposit and trade, or to make a trader reduce-only or frozen.
+      It does not change collateral or positions.
+      Bits: 1 hot, 2 place limit, 4 place market, 8 increase risk, 16 deposit, 32 withdraw.
+      A freshly registered trader is frozen with 6 until Phoenix activates it; 62 activates it as
+      a cold trader. 54 = 2 + 4 + 16 + 32 is reduce-only (no risk increase) and 6 is frozen.
+      Never change the hot bit (1). Limit orders need a hot trader, so a cold trader places market
+      orders only.
+      Only cold traders are supported: a hot trader keeps these bits in the GlobalTraderIndex, and
+      Play skips this override for a hot trader with a warning.
+      Pass traderState.flags as a JSON number.
+      The account is the Trader PDA ["trader", authority, [pda index, subaccount index]], usually
+      [0, 0] for the main account.
+      Set fetchBeforeUse: true so the live trader is forked first.
+      Before sending Phoenix transactions, surfnet_setAccount the mainnet LastRestartSlot sysvar
+      (SysvarLastRestartS1ot1111111111111111111111) and an empty system account at
+      GdxfTLSsdSY37G6fZoYtdGDSfgFnbT2EmRpuePZxWShS.
+    address:
+      type: pubkey
+
+  - id: phoenix-stop-loss-trigger
+    name: Phoenix Stop-Loss Trigger
+    description: >-
+      Move the trigger and execution prices of a trader's existing stop loss on one market.
+    idl_account_name: StopLosses
+    properties:
+      - path: stopLosses.0.triggerPrice.inner
+        label: Upper trigger (ticks)
+        description: >-
+          Price in ticks at or above which slot 0 fires (the greater-than trigger). Example: 12000
+      - path: stopLosses.0.executionPrice.inner
+        label: Upper execution limit (ticks)
+        description: >-
+          Worst price in ticks the slot 0 order may fill at once it fires. Example: 12000
+      - path: stopLosses.1.triggerPrice.inner
+        label: Lower trigger (ticks)
+        description: >-
+          Price in ticks at or below which slot 1 fires (the less-than trigger). Example: 11500
+      - path: stopLosses.1.executionPrice.inner
+        label: Lower execution limit (ticks)
+        description: >-
+          Worst price in ticks the slot 1 order may fill at once it fires. Example: 11500
+    llm_context: |
+      This arms or disarms a stop loss a trader already placed, for example moving its trigger next
+      to the current mark so a keeper bot's ExecuteStopLoss can be tested without waiting for the
+      market. It does not place a new stop loss, change its size or execute it.
+      Slot 0 is the greater-than trigger and slot 1 the less-than trigger. Each slot has a flags
+      byte, at account byte 49 for slot 0 and 129 for slot 1: bit 0 active, bit 2 buy, otherwise
+      sell. Only an active slot fires, so edit only active slots.
+      A sell's execution price is at or below its trigger and a buy's at or above it; most live
+      orders use either the trigger itself or a gap of about 10%.
+      Prices are mark ticks: read the market's markTicks from list_phoenix_markets.
+      Pass prices as JSON numbers. Do not touch positionSequenceNumber: it must keep matching the
+      live position or the stop loss no longer applies.
+      The account is the trader's StopLosses PDA for the market: ["stoploss", trader account,
+      asset id as u64 little-endian]. To find it, call getProgramAccounts on the Phoenix program
+      with dataSize 328 and a memcmp of the trader account at offset 224; assetId is the u32 at 256.
+      Set fetchBeforeUse: true so the live stop loss is forked first.
+      Before sending Phoenix transactions, surfnet_setAccount the mainnet LastRestartSlot sysvar
+      (SysvarLastRestartS1ot1111111111111111111111) and an empty system account at
+      GdxfTLSsdSY37G6fZoYtdGDSfgFnbT2EmRpuePZxWShS.
+    address:
+      type: pubkey
+
+  - id: phoenix-permission-limits
+    name: Phoenix Delegated Permission Limits
+    description: >-
+      Expire a delegated Phoenix permission or use up its remaining signer actions.
+    idl_account_name: PermissionAccount
+    properties:
+      - path: expiresAtTimestamp
+        label: Expires at (unix seconds)
+        description: >-
+          Unix time after which the permission stops working; 0 never expires. Example: 1
+      - path: numSignerActionsRemaining
+        label: Signer actions remaining
+        description: >-
+          Actions the delegate may still sign; 0 means none are left. Example: 0
+    llm_context: |
+      This tests a bot that trades under a delegated permission when the permission runs out,
+      either by expiry or by using up its signer actions. It does not change which actions the
+      permission grants.
+      expiresAtTimestamp is unix seconds: 0 never expires, any past time expires it now.
+      numSignerActionsRemaining at 0 leaves the delegate no actions. Pass both as JSON numbers.
+      The account is the PermissionAccount PDA ["permission", authority, delegated key]. To find
+      it, call getProgramAccounts on the Phoenix program with dataSize 168 and a memcmp of the
+      authority at offset 8 or of the delegated key at offset 40.
+      Set fetchBeforeUse: true so the live permission is forked first.
+      Before sending Phoenix transactions, surfnet_setAccount the mainnet LastRestartSlot sysvar
+      (SysvarLastRestartS1ot1111111111111111111111) and an empty system account at
+      GdxfTLSsdSY37G6fZoYtdGDSfgFnbT2EmRpuePZxWShS.
+    address:
+      type: pubkey
