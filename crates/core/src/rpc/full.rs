@@ -2179,13 +2179,8 @@ impl Full for SurfpoolFullRpc {
         wrapper: Option<RpcBlocksConfigWrapper>,
         config: Option<RpcContextConfig>,
     ) -> BoxFuture<Result<Vec<Slot>>> {
-        let end_slot = match wrapper {
-            Some(RpcBlocksConfigWrapper::EndSlotOnly(end_slot)) => end_slot,
-            Some(RpcBlocksConfigWrapper::ConfigOnly(_)) => None,
-            None => None,
-        };
-
-        let config = config.unwrap_or_default();
+        let (end_slot, wrapper_config) = wrapper.map(|wrapper| wrapper.unzip()).unwrap_or_default();
+        let config = config.or(wrapper_config).unwrap_or_default();
         // get blocks should default to processed rather than finalized to default to the most recent
         let commitment = config.commitment.unwrap_or(CommitmentConfig {
             commitment: CommitmentLevel::Processed,
@@ -5121,6 +5116,43 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(finalized_result, vec![65, 66, 67, 68, 69]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_blocks_config_in_place_of_end_slot() {
+        let setup = TestSetup::new(SurfpoolFullRpc);
+
+        insert_test_blocks(&setup, 50..=100);
+
+        // `[start_slot, config]`, as clients send it when there is no end slot
+        let result = setup
+            .rpc
+            .get_blocks(
+                Some(setup.context.clone()),
+                65,
+                Some(RpcBlocksConfigWrapper::ConfigOnly(Some(RpcContextConfig {
+                    commitment: Some(CommitmentConfig::finalized()),
+                    min_context_slot: None,
+                }))),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result, vec![65, 66, 67, 68, 69]);
+
+        let result = setup
+            .rpc
+            .get_blocks(
+                Some(setup.context.clone()),
+                65,
+                Some(RpcBlocksConfigWrapper::ConfigOnly(Some(RpcContextConfig {
+                    commitment: Some(CommitmentConfig::processed()),
+                    min_context_slot: Some(101),
+                }))),
+                None,
+            )
+            .await;
+        assert!(result.is_err());
     }
 
     #[tokio::test(flavor = "multi_thread")]
