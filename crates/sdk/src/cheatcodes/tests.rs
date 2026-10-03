@@ -100,6 +100,19 @@ async fn set_account_executes_against_surfnet() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn set_epoch_stakes_executes_against_surfnet() {
+    let _guard = test_lock();
+    let surfnet = Surfnet::start().await.unwrap();
+    let cheats = surfnet.cheatcodes();
+    let first = Pubkey::new_unique();
+    let second = Pubkey::new_unique();
+
+    cheats
+        .set_epoch_stakes(&[(first, 11), (second, 29)])
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn set_account_builder_executes_against_surfnet() {
     let _guard = test_lock();
     let surfnet = Surfnet::start().await.unwrap();
@@ -336,6 +349,32 @@ async fn deploy_program_builder_executes_against_surfnet() {
 
     let account = client.get_account(&program_id).unwrap();
     assert!(account.executable);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn deploy_program_builder_sets_upgrade_authority() {
+    let _guard = test_lock();
+    let surfnet = Surfnet::start().await.unwrap();
+    let cheats = surfnet.cheatcodes();
+    let client = rpc_client(&cheats);
+    let program_id = Pubkey::new_unique();
+    let authority = Pubkey::new_unique();
+
+    cheats
+        .deploy(
+            DeployProgram::new(program_id)
+                .authority(authority)
+                .so_bytes(vec![1, 2, 3, 4]),
+        )
+        .unwrap();
+
+    let (program_data, _) = Pubkey::find_program_address(
+        &[program_id.as_ref()],
+        &solana_sdk_ids::bpf_loader_upgradeable::ID,
+    );
+    let account = client.get_account(&program_data).unwrap();
+    assert_eq!(account.data.get(12), Some(&1));
+    assert_eq!(&account.data[13..45], authority.as_ref());
 }
 
 #[tokio::test(flavor = "multi_thread")]

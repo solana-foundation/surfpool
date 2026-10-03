@@ -15,6 +15,9 @@ void (async () => {
     client.surfnet.stop();
     void client.payer.address;
     void client.cheatcodes.pauseClock();
+    void client.cheatcodes.setEpochStakes([
+        { stake: 1_000_000_000n, voteAccount: '11111111111111111111111111111111' as Address },
+    ]);
     void client.rpc.getSlot();
     void client.sendTransactions;
 });

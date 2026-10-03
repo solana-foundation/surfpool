@@ -10,6 +10,7 @@ use solana_pubkey::Pubkey;
 use solana_rpc_client::rpc_client::RpcClient;
 use solana_signer::Signer;
 use spl_associated_token_account_interface::address::get_associated_token_address_with_program_id;
+use surfpool_types::EpochStakeEntry;
 
 use crate::error::{SurfnetError, SurfnetResult};
 pub mod builders;
@@ -300,6 +301,22 @@ impl<'a> Cheatcodes<'a> {
         self.time_travel(serde_json::json!([{ "absoluteTimestamp": timestamp }]))
     }
 
+    /// Replace the epoch-stake map used by the `sol_get_epoch_stake` syscall.
+    ///
+    /// Account creation and stake-account data are intentionally separate from
+    /// this runtime snapshot, matching how the syscall reads an epoch-frozen
+    /// stake distribution on a real cluster.
+    pub fn set_epoch_stakes(&self, stakes: &[(Pubkey, u64)]) -> SurfnetResult<()> {
+        let stakes: Vec<EpochStakeEntry> = stakes
+            .iter()
+            .map(|(vote_account, stake)| EpochStakeEntry {
+                vote_account: vote_account.to_string(),
+                stake: *stake,
+            })
+            .collect();
+        self.call_cheatcode("surfnet_setEpochStakes", serde_json::json!([stakes]))
+    }
+
     /// Deploy a program from local workspace artifacts.
     ///
     /// This looks for:
@@ -362,8 +379,9 @@ impl<'a> Cheatcodes<'a> {
     /// ```
     pub fn deploy(&self, builder: DeployProgram) -> SurfnetResult<Pubkey> {
         let program_id = builder.program_id();
+        let authority = builder.upgrade_authority();
         let program_bytes = builder.load_so_bytes()?;
-        self.write_program(&program_id, &program_bytes)?;
+        self.write_program(&program_id, &program_bytes, authority.as_ref())?;
 
         if let Some(mut idl) = builder.load_idl()? {
             idl.address = program_id.to_string();
@@ -404,12 +422,22 @@ impl<'a> Cheatcodes<'a> {
             .map_err(|e| SurfnetError::Cheatcode(format!("surfnet_timeTravel: {e}")))
     }
 
-    fn write_program(&self, program_id: &Pubkey, data: &[u8]) -> SurfnetResult<()> {
+    fn write_program(
+        &self,
+        program_id: &Pubkey,
+        data: &[u8],
+        authority: Option<&Pubkey>,
+    ) -> SurfnetResult<()> {
         const PROGRAM_CHUNK_BYTES: usize = 15 * 1024 * 1024;
 
         for (index, chunk) in data.chunks(PROGRAM_CHUNK_BYTES).enumerate() {
             let offset = index * PROGRAM_CHUNK_BYTES;
-            let params = serde_json::json!([program_id.to_string(), hex::encode(chunk), offset,]);
+            let params = serde_json::json!([
+                program_id.to_string(),
+                hex::encode(chunk),
+                offset,
+                authority.map(ToString::to_string),
+            ]);
             self.call_cheatcode("surfnet_writeProgram", params)?;
         }
 
