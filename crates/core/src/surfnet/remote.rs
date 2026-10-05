@@ -119,6 +119,21 @@ fn is_unknown_mint(filter: &TokenAccountsFilter, error: &ClientError) -> bool {
     matches!(filter, TokenAccountsFilter::Mint(_)) && is_unknown_mint_error(error)
 }
 
+/// Drops the URL a transport error carries. `reqwest::Error` prints its URL in
+/// full, query and userinfo included, and every caller turns the error into a
+/// string that reaches a client through JSON-RPC error data.
+fn without_datasource_url(error: ClientError) -> ClientError {
+    let ClientError { request, kind } = error;
+    let kind = match *kind {
+        ClientErrorKind::Reqwest(error) => ClientErrorKind::Reqwest(error.without_url()),
+        kind => kind,
+    };
+    ClientError {
+        request,
+        kind: Box::new(kind),
+    }
+}
+
 /// Bounds how long the sender it wraps may take, so a datasource that stops
 /// answering surfaces as an error rather than as a surfnet that appears stuck.
 struct DeadlineSender<S> {
@@ -140,7 +155,7 @@ impl<S: RpcSender + Send + Sync> RpcSender for DeadlineSender<S> {
         params: serde_json::Value,
     ) -> ClientResult<serde_json::Value> {
         match tokio::time::timeout(self.deadline, self.inner.send(request, params)).await {
-            Ok(response) => response,
+            Ok(response) => response.map_err(without_datasource_url),
             // Scheme and host only. This message reaches a client through
             // JSON-RPC error data, and a datasource URL carries credentials in
             // its query, its path, and its userinfo. A URL that will not parse
@@ -1115,6 +1130,31 @@ mod tests {
             assert!(
                 message.contains("rpc.example.com"),
                 "the failure should still name the host: {message}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_transport_failure_does_not_disclose_the_datasource_credentials() {
+        // Port 9 (discard) has no listener, so every request fails to connect.
+        let secrets = [
+            "http://127.0.0.1:9/?api-key=SUPERSECRET",
+            "http://127.0.0.1:9/SUPERSECRET",
+            "http://user:SUPERSECRET@127.0.0.1:9",
+        ];
+
+        for url in secrets {
+            let sender = DeadlineSender::new(HttpSender::new(url), Duration::from_secs(5));
+
+            let message = sender
+                .send(RpcRequest::GetSlot, serde_json::Value::Null)
+                .await
+                .expect_err("a datasource with no listener should not succeed")
+                .to_string();
+
+            assert!(
+                !message.contains("SUPERSECRET"),
+                "the failure disclosed the datasource credential: {message}"
             );
         }
     }
