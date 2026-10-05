@@ -1136,22 +1136,32 @@ mod tests {
 
     #[tokio::test]
     async fn a_transport_failure_does_not_disclose_the_datasource_credentials() {
-        // Port 9 (discard) has no listener, so every request fails to connect.
+        // Bind an OS-assigned port and release it, so nothing listens there and
+        // every request fails to connect.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("a local port should be free")
+            .local_addr()
+            .expect("the listener should have a local address")
+            .port();
         let secrets = [
-            "http://127.0.0.1:9/?api-key=SUPERSECRET",
-            "http://127.0.0.1:9/SUPERSECRET",
-            "http://user:SUPERSECRET@127.0.0.1:9",
+            format!("http://127.0.0.1:{port}/?api-key=SUPERSECRET"),
+            format!("http://127.0.0.1:{port}/SUPERSECRET"),
+            format!("http://user:SUPERSECRET@127.0.0.1:{port}"),
         ];
 
         for url in secrets {
             let sender = DeadlineSender::new(HttpSender::new(url), Duration::from_secs(5));
 
-            let message = sender
+            let error = sender
                 .send(RpcRequest::GetSlot, serde_json::Value::Null)
                 .await
-                .expect_err("a datasource with no listener should not succeed")
-                .to_string();
+                .expect_err("a datasource with no listener should not succeed");
 
+            assert!(
+                matches!(error.kind(), ClientErrorKind::Reqwest(error) if error.is_connect()),
+                "the failure should come from the transport, not the deadline: {error}"
+            );
+            let message = error.to_string();
             assert!(
                 !message.contains("SUPERSECRET"),
                 "the failure disclosed the datasource credential: {message}"
