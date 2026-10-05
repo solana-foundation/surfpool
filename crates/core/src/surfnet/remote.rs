@@ -119,9 +119,7 @@ fn is_unknown_mint(filter: &TokenAccountsFilter, error: &ClientError) -> bool {
     matches!(filter, TokenAccountsFilter::Mint(_)) && is_unknown_mint_error(error)
 }
 
-/// Drops the URL a transport error carries. `reqwest::Error` prints its URL in
-/// full, query and userinfo included, and every caller turns the error into a
-/// string that reaches a client through JSON-RPC error data.
+/// Drops the URL a transport error carries.
 fn without_datasource_url(error: ClientError) -> ClientError {
     let ClientError { request, kind } = error;
     let kind = match *kind {
