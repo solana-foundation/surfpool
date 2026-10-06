@@ -671,7 +671,7 @@ pub trait Full {
         meta: Self::Metadata,
         data: String,
         config: Option<SurfpoolRpcSendTransactionConfig>,
-    ) -> Result<String>;
+    ) -> BoxFuture<Result<String>>;
 
     /// Simulates a transaction without sending it to the network.
     ///
@@ -1776,173 +1776,195 @@ impl Full for SurfpoolFullRpc {
         meta: Self::Metadata,
         data: String,
         config: Option<SurfpoolRpcSendTransactionConfig>,
-    ) -> Result<String> {
-        #[cfg(feature = "prometheus")]
-        let rpc_start = std::time::Instant::now();
+    ) -> BoxFuture<Result<String>> {
+        Box::pin(async move {
+            #[cfg(feature = "prometheus")]
+            let rpc_start = std::time::Instant::now();
 
-        let config = config.unwrap_or_default();
-        let unsanitized_tx = decode_rpc_versioned_transaction(data, config.base.encoding)?;
-        let signatures = unsanitized_tx.signatures.clone();
-        let signature = signatures[0];
-        // Clone the message before moving the transaction, as we'll need it for error reporting
-        let tx_message = unsanitized_tx.message.clone();
+            let config = config.unwrap_or_default();
+            let unsanitized_tx = decode_rpc_versioned_transaction(data, config.base.encoding)?;
+            let signatures = unsanitized_tx.signatures.clone();
+            let signature = signatures[0];
+            // Clone the message before moving the transaction, as we'll need it for error reporting
+            let tx_message = unsanitized_tx.message.clone();
 
-        let Some(ctx) = meta else {
-            return Err(RpcCustomError::NodeUnhealthy {
-                num_slots_behind: None,
-            }
-            .into());
-        };
+            let Some(ctx) = meta else {
+                return Err(RpcCustomError::NodeUnhealthy {
+                    num_slots_behind: None,
+                }
+                .into());
+            };
 
-        let preflight_commitment = CommitmentConfig {
-            commitment: if config.base.skip_preflight {
-                CommitmentLevel::Processed
-            } else {
-                config.base.preflight_commitment.unwrap_or_default()
-            },
-        };
-        context_slot(
-            &ctx.svm_locker,
-            Some(preflight_commitment),
-            config.base.min_context_slot,
-        )?;
+            let preflight_commitment = CommitmentConfig {
+                commitment: if config.base.skip_preflight {
+                    CommitmentLevel::Processed
+                } else {
+                    config.base.preflight_commitment.unwrap_or_default()
+                },
+            };
+            context_slot(
+                &ctx.svm_locker,
+                Some(preflight_commitment),
+                config.base.min_context_slot,
+            )?;
 
-        if !config.base.skip_preflight {
-            let blockhash_visible = ctx.svm_locker.with_svm_reader(|svm_reader| {
-                svm_reader
-                    .is_blockhash_visible_at(tx_message.recent_blockhash(), &preflight_commitment)
-            });
-            if !blockhash_visible {
-                let error = TransactionError::BlockhashNotFound;
-                return Err(Error {
-                    data: Some(
-                        serde_json::to_value(get_simulate_transaction_result(
-                            TransactionMetadata::default(),
-                            None,
-                            Some(error.clone()),
-                            None,
-                            false,
-                            &tx_message,
-                            None,
-                            None,
-                        ))
-                        .map_err(|e| {
-                            Error::invalid_params(format!(
-                                "Failed to serialize simulation result: {e}"
+            if !config.base.skip_preflight {
+                let blockhash_visible = ctx.svm_locker.with_svm_reader(|svm_reader| {
+                    svm_reader.is_blockhash_visible_at(
+                        tx_message.recent_blockhash(),
+                        &preflight_commitment,
+                    )
+                });
+                if !blockhash_visible {
+                    let error = TransactionError::BlockhashNotFound;
+                    return Err(Error {
+                        data: Some(
+                            serde_json::to_value(get_simulate_transaction_result(
+                                TransactionMetadata::default(),
+                                None,
+                                Some(error.clone()),
+                                None,
+                                false,
+                                &tx_message,
+                                None,
+                                None,
                             ))
-                        })?,
-                    ),
-                    message: format!("Transaction simulation failed: {error}"),
-                    code: jsonrpc_core::ErrorCode::ServerError(-32002),
-                });
+                            .map_err(|e| {
+                                Error::invalid_params(format!(
+                                    "Failed to serialize simulation result: {e}"
+                                ))
+                            })?,
+                        ),
+                        message: format!("Transaction simulation failed: {error}"),
+                        code: jsonrpc_core::ErrorCode::ServerError(-32002),
+                    });
+                }
             }
-        }
 
-        let (status_update_tx, status_update_rx) = crossbeam_channel::bounded(1);
-        ctx.svm_locker.mark_transaction_pending(signature);
-        if ctx
-            .simnet_commands_tx
-            .send(SimnetCommand::ProcessTransaction(
-                ctx.id,
-                unsanitized_tx,
-                status_update_tx,
-                config.base.skip_preflight,
-                config.skip_sig_verify,
-            ))
-            .is_err()
-        {
-            ctx.svm_locker.mark_transaction_complete(&signature);
-            return Err(RpcCustomError::NodeUnhealthy {
-                num_slots_behind: None,
+            let (status_update_tx, status_update_rx) = crossbeam_channel::bounded(1);
+            ctx.svm_locker.mark_transaction_pending(signature);
+            if ctx
+                .simnet_commands_tx
+                .send(SimnetCommand::ProcessTransaction(
+                    ctx.id,
+                    unsanitized_tx,
+                    status_update_tx,
+                    config.base.skip_preflight,
+                    config.skip_sig_verify,
+                ))
+                .is_err()
+            {
+                ctx.svm_locker.mark_transaction_complete(&signature);
+                return Err(RpcCustomError::NodeUnhealthy {
+                    num_slots_behind: None,
+                }
+                .into());
             }
-            .into());
-        }
 
-        match status_update_rx.recv() {
-            Ok(TransactionStatusEvent::SimulationFailure((error, metadata))) => {
-                #[cfg(feature = "prometheus")]
-                if let Some(m) = crate::telemetry::metrics() {
-                    m.record_transaction(false, rpc_start.elapsed().as_millis() as u64);
-                    m.record_rpc_request("sendTransaction", rpc_start.elapsed().as_millis() as u64);
-                }
-                return Err(Error {
-                    data: Some(
-                        serde_json::to_value(get_simulate_transaction_result(
-                            surfpool_tx_metadata_to_litesvm_tx_metadata(&metadata),
-                            None,
-                            Some(error.clone()),
-                            None,
-                            false,
-                            &tx_message,
-                            None, // No loaded addresses available in error reporting context
-                            None,
-                        ))
-                        .map_err(|e| {
-                            Error::invalid_params(format!(
-                                "Failed to serialize simulation result: {e}"
-                            ))
-                        })?,
-                    ),
-                    message: format!(
-                        "Transaction simulation failed: {}{}",
-                        error,
-                        if metadata.logs.is_empty() {
-                            String::new()
-                        } else {
-                            format!(
-                                ": {} log messages:\n{}",
-                                metadata.logs.len(),
-                                metadata.logs.iter().map(|l| l.to_string()).join("\n")
-                            )
-                        }
-                    ),
-                    code: jsonrpc_core::ErrorCode::ServerError(-32002),
-                });
-            }
-            Ok(TransactionStatusEvent::ExecutionFailure(_)) => {
-                #[cfg(feature = "prometheus")]
-                if let Some(m) = crate::telemetry::metrics() {
-                    m.record_transaction(false, rpc_start.elapsed().as_millis() as u64);
-                }
-            }
-            Ok(TransactionStatusEvent::VerificationFailure(signature)) => {
-                #[cfg(feature = "prometheus")]
-                if let Some(m) = crate::telemetry::metrics() {
-                    m.record_transaction(false, rpc_start.elapsed().as_millis() as u64);
-                    m.record_rpc_request("sendTransaction", rpc_start.elapsed().as_millis() as u64);
-                }
-                return Err(Error {
-                    data: None,
-                    message: format!("Transaction verification failed for transaction {signature}"),
-                    code: jsonrpc_core::ErrorCode::ServerError(-32002),
-                });
-            }
-            Err(e) => {
-                #[cfg(feature = "prometheus")]
-                if let Some(m) = crate::telemetry::metrics() {
-                    m.record_transaction(false, rpc_start.elapsed().as_millis() as u64);
-                    m.record_rpc_request("sendTransaction", rpc_start.elapsed().as_millis() as u64);
-                }
-                return Err(Error {
+            let status_update = tokio::task::spawn_blocking(move || status_update_rx.recv())
+                .await
+                .map_err(|e| Error {
                     data: None,
                     message: format!("Failed to process transaction: {e}"),
                     code: jsonrpc_core::ErrorCode::ServerError(-32002),
-                });
-            }
-            Ok(TransactionStatusEvent::Success(_)) =>
-            {
-                #[cfg(feature = "prometheus")]
-                if let Some(m) = crate::telemetry::metrics() {
-                    m.record_transaction(true, rpc_start.elapsed().as_millis() as u64);
+                })?;
+
+            match status_update {
+                Ok(TransactionStatusEvent::SimulationFailure((error, metadata))) => {
+                    #[cfg(feature = "prometheus")]
+                    if let Some(m) = crate::telemetry::metrics() {
+                        m.record_transaction(false, rpc_start.elapsed().as_millis() as u64);
+                        m.record_rpc_request(
+                            "sendTransaction",
+                            rpc_start.elapsed().as_millis() as u64,
+                        );
+                    }
+                    return Err(Error {
+                        data: Some(
+                            serde_json::to_value(get_simulate_transaction_result(
+                                surfpool_tx_metadata_to_litesvm_tx_metadata(&metadata),
+                                None,
+                                Some(error.clone()),
+                                None,
+                                false,
+                                &tx_message,
+                                None, // No loaded addresses available in error reporting context
+                                None,
+                            ))
+                            .map_err(|e| {
+                                Error::invalid_params(format!(
+                                    "Failed to serialize simulation result: {e}"
+                                ))
+                            })?,
+                        ),
+                        message: format!(
+                            "Transaction simulation failed: {}{}",
+                            error,
+                            if metadata.logs.is_empty() {
+                                String::new()
+                            } else {
+                                format!(
+                                    ": {} log messages:\n{}",
+                                    metadata.logs.len(),
+                                    metadata.logs.iter().map(|l| l.to_string()).join("\n")
+                                )
+                            }
+                        ),
+                        code: jsonrpc_core::ErrorCode::ServerError(-32002),
+                    });
+                }
+                Ok(TransactionStatusEvent::ExecutionFailure(_)) => {
+                    #[cfg(feature = "prometheus")]
+                    if let Some(m) = crate::telemetry::metrics() {
+                        m.record_transaction(false, rpc_start.elapsed().as_millis() as u64);
+                    }
+                }
+                Ok(TransactionStatusEvent::VerificationFailure(signature)) => {
+                    #[cfg(feature = "prometheus")]
+                    if let Some(m) = crate::telemetry::metrics() {
+                        m.record_transaction(false, rpc_start.elapsed().as_millis() as u64);
+                        m.record_rpc_request(
+                            "sendTransaction",
+                            rpc_start.elapsed().as_millis() as u64,
+                        );
+                    }
+                    return Err(Error {
+                        data: None,
+                        message: format!(
+                            "Transaction verification failed for transaction {signature}"
+                        ),
+                        code: jsonrpc_core::ErrorCode::ServerError(-32002),
+                    });
+                }
+                Err(e) => {
+                    #[cfg(feature = "prometheus")]
+                    if let Some(m) = crate::telemetry::metrics() {
+                        m.record_transaction(false, rpc_start.elapsed().as_millis() as u64);
+                        m.record_rpc_request(
+                            "sendTransaction",
+                            rpc_start.elapsed().as_millis() as u64,
+                        );
+                    }
+                    return Err(Error {
+                        data: None,
+                        message: format!("Failed to process transaction: {e}"),
+                        code: jsonrpc_core::ErrorCode::ServerError(-32002),
+                    });
+                }
+                Ok(TransactionStatusEvent::Success(_)) => {
+                    #[cfg(feature = "prometheus")]
+                    if let Some(m) = crate::telemetry::metrics() {
+                        m.record_transaction(true, rpc_start.elapsed().as_millis() as u64);
+                    }
                 }
             }
-        }
 
-        #[cfg(feature = "prometheus")]
-        if let Some(m) = crate::telemetry::metrics() {
-            m.record_rpc_request("sendTransaction", rpc_start.elapsed().as_millis() as u64);
-        }
-        Ok(signature.to_string())
+            #[cfg(feature = "prometheus")]
+            if let Some(m) = crate::telemetry::metrics() {
+                m.record_rpc_request("sendTransaction", rpc_start.elapsed().as_millis() as u64);
+            }
+            Ok(signature.to_string())
+        })
     }
 
     fn simulate_transaction(
@@ -3010,14 +3032,12 @@ mod tests {
         let setup_clone = setup.clone();
         let handle = hiro_system_kit::thread_named("send_tx")
             .spawn(move || {
-                let res = setup_clone
-                    .rpc
-                    .send_transaction(
-                        Some(setup_clone.context),
-                        bs58::encode(wincode::serialize(&tx).unwrap()).into_string(),
-                        None,
-                    )
-                    .unwrap();
+                let res = hiro_system_kit::nestable_block_on(setup_clone.rpc.send_transaction(
+                    Some(setup_clone.context),
+                    bs58::encode(wincode::serialize(&tx).unwrap()).into_string(),
+                    None,
+                ))
+                .unwrap();
 
                 res
             })
@@ -3615,11 +3635,11 @@ mod tests {
             build_legacy_transaction(&payer.pubkey(), &[&payer], &[], &recent_blockhash);
         let signature = transaction.signatures[0];
 
-        let result = setup.rpc.send_transaction(
+        let result = hiro_system_kit::nestable_block_on(setup.rpc.send_transaction(
             Some(setup.context.clone()),
             bs58::encode(bincode::serialize(&transaction).unwrap()).into_string(),
             None,
-        );
+        ));
 
         assert!(result.is_err());
         assert!(!setup.context.svm_locker.is_transaction_pending(&signature));
@@ -4754,9 +4774,11 @@ mod tests {
         let (setup_clone, encoded_clone) = (setup.clone(), encoded.clone());
         let rejected = hiro_system_kit::thread_named("send_tx_default_preflight")
             .spawn(move || {
-                setup_clone
-                    .rpc
-                    .send_transaction(Some(setup_clone.context), encoded_clone, None)
+                hiro_system_kit::nestable_block_on(setup_clone.rpc.send_transaction(
+                    Some(setup_clone.context),
+                    encoded_clone,
+                    None,
+                ))
             })
             .unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -4788,9 +4810,11 @@ mod tests {
         let setup_clone = setup.clone();
         let handle = hiro_system_kit::thread_named("send_tx_confirmed_preflight")
             .spawn(move || {
-                setup_clone
-                    .rpc
-                    .send_transaction(Some(setup_clone.context), encoded, Some(config))
+                hiro_system_kit::nestable_block_on(setup_clone.rpc.send_transaction(
+                    Some(setup_clone.context),
+                    encoded,
+                    Some(config),
+                ))
             })
             .unwrap();
         let Ok(SimnetCommand::ProcessTransaction(_, _, status_tx, _, _)) = mempool_rx.recv() else {
@@ -6260,11 +6284,11 @@ mod tests {
             let setup_clone = setup.clone();
             let handle = hiro_system_kit::thread_named("send_tx_skip_verify")
                 .spawn(move || {
-                    setup_clone.rpc.send_transaction(
+                    hiro_system_kit::nestable_block_on(setup_clone.rpc.send_transaction(
                         Some(setup_clone.context),
                         tx_encoded,
                         Some(config),
-                    )
+                    ))
                 })
                 .unwrap();
 
@@ -6575,6 +6599,7 @@ mod tests {
                         skip_sig_verify: None,
                     }),
                 )
+                .await
                 .map(drop),
             setup
                 .rpc
