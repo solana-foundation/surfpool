@@ -102,7 +102,7 @@ use crate::{
         LogsSubscriptionData, locker::is_supported_token_program, surfnet_lite_svm::SurfnetLiteSvm,
     },
     types::{
-        MintAccount, OfflineAccountConfig, SerializableAccountAdditionalData,
+        GeyserAccountUpdate, MintAccount, OfflineAccountConfig, SerializableAccountAdditionalData,
         SurfnetTransactionStatus, SyntheticBlockhash, TokenAccount, TransactionWithStatusMeta,
     },
 };
@@ -1994,6 +1994,28 @@ impl SurfnetSvm {
         Ok(())
     }
 
+    /// Applies an account mutation forged by a scenario and publishes it to subscribers.
+    /// Upstream account hydration deliberately uses a different path and remains silent.
+    fn set_scenario_override_account(
+        &mut self,
+        pubkey: &Pubkey,
+        account: Account,
+        slot: Slot,
+    ) -> SurfpoolResult<()> {
+        if self.inner.get_account_no_db(pubkey).as_ref() == Some(&account) {
+            return Ok(());
+        }
+
+        self.set_account(pubkey, account.clone())?;
+        self.account_update_slots.insert(*pubkey, slot);
+
+        let write_version = self.increment_write_version();
+        let _ = self.geyser_events_tx.send(GeyserEvent::UpdateAccount(
+            GeyserAccountUpdate::block_update(*pubkey, account, slot, write_version),
+        ));
+        Ok(())
+    }
+
     /// `before` is the account as it was before this update: the inner SVM already holds the new
     /// state, so it can no longer be read back from there.
     pub fn update_account_registries(
@@ -3194,7 +3216,11 @@ impl SurfnetSvm {
                                 executable: account.executable(),
                                 rent_epoch: account.rent_epoch(),
                             };
-                            if let Err(e) = self.inner.set_account(account_pubkey, modified) {
+                            if let Err(e) = self.set_scenario_override_account(
+                                &account_pubkey,
+                                modified,
+                                target_slot,
+                            ) {
                                 warn!("Failed to set raw-layout account {}: {}", account_pubkey, e);
                             } else {
                                 debug!(
@@ -3227,7 +3253,9 @@ impl SurfnetSvm {
                 {
                     Ok(Some(writes)) => {
                         for (pubkey, written) in writes {
-                            if let Err(e) = self.set_account(&pubkey, written) {
+                            if let Err(e) =
+                                self.set_scenario_override_account(&pubkey, written, target_slot)
+                            {
                                 warn!(
                                     "Failed to set {} for override {}: {}",
                                     pubkey, override_instance.id, e
@@ -3274,7 +3302,11 @@ impl SurfnetSvm {
                             executable: account.executable(),
                             rent_epoch: account.rent_epoch(),
                         };
-                        if let Err(e) = self.set_account(&account_pubkey, modified_account) {
+                        if let Err(e) = self.set_scenario_override_account(
+                            &account_pubkey,
+                            modified_account,
+                            target_slot,
+                        ) {
                             restore_unprocessed(self, index);
                             return Err(e);
                         }
@@ -3358,7 +3390,11 @@ impl SurfnetSvm {
                 };
 
                 // Update the account in the SVM
-                if let Err(e) = self.set_account(&account_pubkey, modified_account) {
+                if let Err(e) = self.set_scenario_override_account(
+                    &account_pubkey,
+                    modified_account,
+                    target_slot,
+                ) {
                     warn!(
                         "Failed to set modified account {} in SVM: {}",
                         account_pubkey, e
@@ -4891,8 +4927,15 @@ mod tests {
         let (target, mint) = (Pubkey::new_unique(), Pubkey::new_unique());
         let url = canned_rpc(canned_token_account(mint)).await;
         let remote = (SurfnetRemoteClient::new(url), CommitmentConfig::confirmed());
-        let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let (svm, _events_rx, geyser_rx) = SurfnetSvm::default();
         let locker = crate::surfnet::locker::SurfnetSvmLocker::new(svm);
+        let (target_updates, coupled_updates, program_updates) = locker.with_svm_writer(|svm| {
+            (
+                svm.subscribe_for_account_updates(&target, None),
+                svm.subscribe_for_account_updates(&Pubkey::default(), None),
+                svm.subscribe_for_program_updates(&spl_token_interface::id(), None, None),
+            )
+        });
 
         locker
             .register_scenario(fetch_before_use_scenario(target), Some(100))
@@ -4914,6 +4957,24 @@ mod tests {
         let mut expected = vec![target, mint];
         expected.sort();
         assert_eq!(forked, expected);
+        let fetched = locker
+            .with_svm_reader(|svm_reader| svm_reader.get_account(&target))
+            .unwrap();
+        assert!(
+            fetched.is_some(),
+            "the fetched token account must be forked"
+        );
+        let coupled_mint = locker
+            .with_svm_reader(|svm_reader| svm_reader.get_account(&Pubkey::default()))
+            .unwrap();
+        assert!(
+            coupled_mint.is_some(),
+            "the coupled mint must fill the gap in the fork"
+        );
+        assert!(target_updates.try_recv().is_err());
+        assert!(coupled_updates.try_recv().is_err());
+        assert!(program_updates.try_recv().is_err());
+        assert!(geyser_rx.try_iter().next().is_none());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -8005,8 +8066,13 @@ mod tests {
 
     /// A zeroed Kamino `Obligation` owned by klend. `SurfnetSvm::default()` already registers
     /// the bundled template IDLs, so klend's is resolvable by owner program.
-    fn scheduled_override_fixture() -> (SurfnetSvm, Pubkey, surfpool_types::OverrideInstance) {
-        let (mut surfnet_svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+    fn scheduled_override_fixture() -> (
+        SurfnetSvm,
+        Pubkey,
+        surfpool_types::OverrideInstance,
+        Receiver<GeyserEvent>,
+    ) {
+        let (mut surfnet_svm, _simnet_events_rx, geyser_events_rx) = SurfnetSvm::default();
 
         let klend = Pubkey::from_str_const("KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD");
         let idl: Idl = serde_json::from_str(crate::scenarios::registry::KAMINO_V1_IDL_CONTENT)
@@ -8045,12 +8111,12 @@ mod tests {
             "unhealthy_borrow_value_sf".to_string(),
             serde_json::json!(1_234u64),
         )]));
-        (surfnet_svm, account_pubkey, instance)
+        (surfnet_svm, account_pubkey, instance, geyser_events_rx)
     }
 
     #[tokio::test]
     async fn test_scenario_relative_slot_overflow_is_an_error_not_a_wrap() {
-        let (mut svm, account_pubkey, _instance) = scheduled_override_fixture();
+        let (mut svm, account_pubkey, _instance, _geyser_events_rx) = scheduled_override_fixture();
 
         let mut far = surfpool_types::OverrideInstance::new(
             "kamino-obligation-health".to_string(),
@@ -8072,6 +8138,60 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn forged_scenario_override_notifies_subscribers_and_geyser_once() {
+        const SLOT: u64 = 500;
+        let (mut svm, account_pubkey, instance, geyser_events_rx) = scheduled_override_fixture();
+        let account_updates = svm.subscribe_for_account_updates(&account_pubkey, None);
+        let program_updates = svm.subscribe_for_program_updates(
+            &Pubkey::from_str_const("KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD"),
+            None,
+            None,
+        );
+
+        svm.scheduled_overrides
+            .store(SLOT, vec![instance.clone()])
+            .expect("schedule override");
+        svm.materialize_overrides_for_slot(&None, SLOT)
+            .await
+            .expect("materialize override");
+
+        account_updates
+            .try_recv()
+            .expect("forged account should notify its account subscriber");
+        program_updates
+            .try_recv()
+            .expect("forged account should notify its program subscriber");
+        let updates = geyser_events_rx
+            .try_iter()
+            .filter_map(|event| match event {
+                GeyserEvent::UpdateAccount(update) => Some(update),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(updates.len(), 1, "emit one Geyser account update");
+        let update = updates.into_iter().next().expect("one update was checked");
+        assert_eq!(update.pubkey, account_pubkey);
+        assert_eq!(update.slot, SLOT);
+        assert!(update.write_version > 0);
+        assert!(update.sanitized_transaction.is_none());
+        assert_eq!(
+            &update.account.data[UNHEALTHY_OFFSET..UNHEALTHY_OFFSET + 16],
+            &1_234u128.to_le_bytes()
+        );
+
+        // Reapplying the same value is not an account mutation and should stay silent.
+        svm.scheduled_overrides
+            .store(SLOT, vec![instance])
+            .expect("reschedule unchanged override");
+        svm.materialize_overrides_for_slot(&None, SLOT)
+            .await
+            .expect("materialize unchanged override");
+        assert!(account_updates.try_recv().is_err());
+        assert!(program_updates.try_recv().is_err());
+        assert!(geyser_events_rx.try_iter().next().is_none());
+    }
+
     /// Guards the ordering invariant only. The re-fetch that used to clobber the first override
     /// needs a remote client, so `remote_ctx: &None` cannot reproduce it here - that path is
     /// covered against a live fork.
@@ -8081,7 +8201,7 @@ mod tests {
         // immediately precedes unhealthy_borrow_value_sf in the Obligation layout
         const ALLOWED_OFFSET: usize = UNHEALTHY_OFFSET - 16;
 
-        let (mut svm, account_pubkey, first) = scheduled_override_fixture();
+        let (mut svm, account_pubkey, first, _geyser_events_rx) = scheduled_override_fixture();
         let mut first = first;
         first.fetch_before_use = true;
 
