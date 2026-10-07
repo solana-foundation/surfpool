@@ -2018,7 +2018,7 @@ impl SurfnetSvm {
         account: Account,
         slot: Slot,
     ) -> SurfpoolResult<()> {
-        if self.inner.get_account_no_db(pubkey).as_ref() == Some(&account) {
+        if self.get_account(pubkey)?.as_ref() == Some(&account) {
             return Ok(());
         }
 
