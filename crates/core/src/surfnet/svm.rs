@@ -1973,6 +1973,20 @@ impl SurfnetSvm {
     /// # Returns
     /// `Ok(())` on success, or an error if the operation fails.
     pub fn set_account(&mut self, pubkey: &Pubkey, account: Account) -> SurfpoolResult<()> {
+        self.set_account_inner(pubkey, account, true)
+    }
+
+    /// Inserts an upstream account into the fork without publishing a local account update.
+    fn set_account_silently(&mut self, pubkey: &Pubkey, account: Account) -> SurfpoolResult<()> {
+        self.set_account_inner(pubkey, account, false)
+    }
+
+    fn set_account_inner(
+        &mut self,
+        pubkey: &Pubkey,
+        account: Account,
+        notify_subscribers: bool,
+    ) -> SurfpoolResult<()> {
         let before = self.get_account(pubkey)?;
         self.inner
             .set_account(*pubkey, account.clone())
@@ -1984,13 +1998,15 @@ impl SurfnetSvm {
         // Update the account registries and indexes
         self.update_account_registries(pubkey, before.as_ref(), &account)?;
 
-        // Notify account subscribers
-        self.notify_account_subscribers(pubkey, &account);
+        if notify_subscribers {
+            // Notify account subscribers
+            self.notify_account_subscribers(pubkey, &account);
 
-        // Notify program subscribers
-        self.notify_program_subscribers(pubkey, &account);
+            // Notify program subscribers
+            self.notify_program_subscribers(pubkey, &account);
 
-        let _ = self.simnet_events_tx.account_update(*pubkey);
+            let _ = self.simnet_events_tx.account_update(*pubkey);
+        }
         Ok(())
     }
 
@@ -3119,7 +3135,7 @@ impl SurfnetSvm {
                             match self.inner.get_account(&coupled_pubkey) {
                                 Ok(None) => {
                                     if let Err(e) =
-                                        self.set_account(&coupled_pubkey, coupled_account)
+                                        self.set_account_silently(&coupled_pubkey, coupled_account)
                                     {
                                         warn!(
                                             "Failed to set coupled account {} from remote: {}",
@@ -3138,7 +3154,7 @@ impl SurfnetSvm {
                         }
 
                         // Set the fresh account data in the SVM
-                        if let Err(e) = self.set_account(&account_pubkey, remote_account) {
+                        if let Err(e) = self.set_account_silently(&account_pubkey, remote_account) {
                             warn!(
                                 "Failed to set account {} from remote: {}",
                                 account_pubkey, e
@@ -8497,7 +8513,7 @@ mod tests {
     #[tokio::test]
     async fn an_idl_override_notifies_account_subscribers() {
         const SLOT: u64 = 500;
-        let (mut svm, account_pubkey, instance) = scheduled_override_fixture();
+        let (mut svm, account_pubkey, instance, _geyser_events_rx) = scheduled_override_fixture();
         let updates =
             svm.subscribe_for_account_updates(&account_pubkey, Some(UiAccountEncoding::Base64));
         svm.scheduled_overrides.store(SLOT, vec![instance]).unwrap();

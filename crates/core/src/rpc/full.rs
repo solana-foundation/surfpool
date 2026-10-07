@@ -2919,7 +2919,7 @@ mod tests {
     use super::*;
     use crate::{
         runloops::start_block_production_runloop,
-        surfnet::{BlockHeader, BlockIdentifier, remote::SurfnetRemoteClient},
+        surfnet::{BlockHeader, remote::SurfnetRemoteClient},
         tests::helpers::TestSetup,
         types::{SyntheticBlockhash, TransactionWithStatusMeta},
     };
