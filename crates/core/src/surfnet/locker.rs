@@ -1,5 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
+    future::Future,
+    pin::Pin,
     sync::Arc,
     time::SystemTime,
 };
@@ -249,6 +251,18 @@ impl SurfnetSvmLocker {
             write_guard.bump_state_revision();
             result
         })
+    }
+
+    /// Executes an async write operation while holding the SVM write lock.
+    /// The state revision advances after the operation, including on error.
+    pub async fn with_svm_writer_async<T, F>(&self, writer: F) -> T
+    where
+        F: for<'a> FnOnce(&'a mut SurfnetSvm) -> Pin<Box<dyn Future<Output = T> + Send + 'a>>,
+    {
+        let mut write_guard = self.0.write().await;
+        let result = writer(&mut write_guard).await;
+        write_guard.bump_state_revision();
+        result
     }
 }
 
@@ -2819,6 +2833,42 @@ impl SurfnetSvmLocker {
         self.with_svm_writer(move |svm_writer| svm_writer.register_scenario(scenario, slot))
     }
 
+    pub async fn register_and_materialize_scenario(
+        &self,
+        scenario: surfpool_types::Scenario,
+        slot: Slot,
+        capture: Option<surfpool_types::ScenarioSnapshotCaptureRequest>,
+        remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
+    ) -> SurfpoolResult<()> {
+        let remote_ctx = remote_ctx.clone();
+        self.with_svm_writer_async(move |svm_writer| {
+            Box::pin(async move {
+                svm_writer.register_scenario_with_capture(scenario, Some(slot), capture)?;
+                svm_writer
+                    .materialize_overrides_for_slot(&remote_ctx, slot)
+                    .await
+            })
+        })
+        .await
+    }
+
+    pub fn get_scenario_snapshot_series(
+        &self,
+        capture_id: &str,
+        config: surfpool_types::ScenarioSnapshotRetrievalConfig,
+    ) -> SurfpoolResult<surfpool_types::ScenarioSnapshotSeries> {
+        self.with_svm_writer(|svm_writer| {
+            svm_writer.get_scenario_snapshot_series(capture_id, config)
+        })
+    }
+
+    pub fn apply_scenario_snapshot_series(
+        &self,
+        series: surfpool_types::ScenarioSnapshotSeries,
+    ) -> SurfpoolResult<()> {
+        self.with_svm_writer(|svm_writer| svm_writer.apply_scenario_snapshot_series(series))
+    }
+
     /// Materializes overrides for a specific slot (not necessarily the current slot)
     pub async fn materialize_overrides_for_slot(
         &self,
@@ -3938,9 +3988,8 @@ impl SurfnetSvmLocker {
         // Wait for confirmation with timeout
         let updated_epoch_info = response_rx
             .recv_timeout(std::time::Duration::from_secs(2))
-            .map_err(|e| {
-                SurfpoolError::internal(format!("Failed to confirm clock update: {}", e))
-            })?;
+            .map_err(|e| SurfpoolError::internal(format!("Failed to confirm clock update: {}", e)))?
+            .map_err(SurfpoolError::internal)?;
 
         self.simnet_events_tx().info(format!(
             "Time travel to {} successful (epoch {} / slot {})",

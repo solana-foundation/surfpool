@@ -787,7 +787,11 @@ pub enum SimnetCommand {
     SlotBackward(Option<Hash>),
     CommandClock(Option<(Hash, String)>, ClockCommand),
     UpdateInternalClock(Option<(Hash, String)>, Clock),
-    UpdateInternalClockWithConfirmation(Option<(Hash, String)>, Clock, Sender<EpochInfo>),
+    UpdateInternalClockWithConfirmation(
+        Option<(Hash, String)>,
+        Clock,
+        Sender<Result<EpochInfo, String>>,
+    ),
     UpdateBlockProductionMode(BlockProductionMode),
     /// Executes a transaction. `sendTransaction` enqueues this on the same
     /// channel as the startup commands below, so channel order decides which
@@ -1073,6 +1077,8 @@ impl CloudSurfnetRpcGating {
                 "surfnet_resetAccount".into(),
                 "surfnet_resetNetwork".into(),
                 "surfnet_exportSnapshot".into(),
+                "surfnet_getScenarioSnapshotSeries".into(),
+                "surfnet_applyScenarioSnapshotSeries".into(),
                 "surfnet_offlineAccount".into(),
                 "surfnet_streamAccount".into(),
                 "surfnet_streamAccounts".into(),
@@ -1829,7 +1835,8 @@ pub enum CheatcodeFilter {
 /// `surfpool-core/src/rpc/surfnet_cheatcodes.rs` asserts it matches the
 /// methods actually registered by the `SurfnetCheatcodes` trait, so adding,
 /// removing, or renaming a cheatcode without updating this list fails CI.
-pub const SURFNET_CHEATCODE_METHODS: [&str; 28] = [
+pub const SURFNET_CHEATCODE_METHODS: [&str; 30] = [
+    "surfnet_applyScenarioSnapshotSeries",
     "surfnet_cloneProgramAccount",
     "surfnet_deriveConfidentialKeys",
     "surfnet_disableCheatcode",
@@ -1839,6 +1846,7 @@ pub const SURFNET_CHEATCODE_METHODS: [&str; 28] = [
     "surfnet_getConfidentialBalance",
     "surfnet_getLocalSignatures",
     "surfnet_getProfileResultsByTag",
+    "surfnet_getScenarioSnapshotSeries",
     "surfnet_getStreamedAccounts",
     "surfnet_getSurfnetInfo",
     "surfnet_getTransactionProfile",
