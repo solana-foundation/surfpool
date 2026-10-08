@@ -592,6 +592,7 @@ mod tests {
                 &values,
                 &remote,
                 fetch_before_use,
+                100,
             )
             .await;
             if !fetch_before_use {
@@ -682,6 +683,7 @@ mod tests {
                     &HashMap::from([(field.to_string(), value.clone())]),
                     &remote,
                     fetch_before_use,
+                    100,
                 )
                 .await;
                 assert_eq!(result.is_ok(), applied, "{field} = {value}");
@@ -779,7 +781,8 @@ mod tests {
             )]);
 
             let result =
-                prepare_phoenix_override(&mut svm, &trader, &account, &values, &remote, true).await;
+                prepare_phoenix_override(&mut svm, &trader, &account, &values, &remote, true, 100)
+                    .await;
 
             assert_eq!(result.is_ok(), applied, "{case}");
             if let Ok(Some(writes)) = result {

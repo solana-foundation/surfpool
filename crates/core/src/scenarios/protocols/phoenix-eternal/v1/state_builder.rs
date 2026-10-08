@@ -315,7 +315,8 @@ fn forge_phoenix_override(
 
 /// The writes a Phoenix override needs, or `None` when the account takes the generic IDL path.
 /// Every Phoenix override also leaves the local PerpAssetMap's markets usable for the rest of the
-/// session; see `keep_oracle_readings_usable`.
+/// session; see `keep_oracle_readings_usable`. `target_slot` is the slot being materialized, which
+/// the override's writes are published at.
 pub async fn prepare_phoenix_override(
     svm: &mut SurfnetSvm,
     account_pubkey: &Pubkey,
@@ -323,6 +324,7 @@ pub async fn prepare_phoenix_override(
     values: &HashMap<String, serde_json::Value>,
     remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
     fetch_before_use: bool,
+    target_slot: u64,
 ) -> SurfpoolResult<Option<Vec<(Pubkey, Account)>>> {
     if account.owner != PHOENIX_ETERNAL_PROGRAM_ID {
         return Ok(None);
@@ -350,7 +352,7 @@ pub async fn prepare_phoenix_override(
             )]))
         }
         kind => {
-            keep_oracle_readings_usable(svm, remote_ctx).await;
+            keep_oracle_readings_usable(svm, remote_ctx, target_slot).await;
             match kind {
                 Some(PhoenixAccount::Trader) => prepare_trader_override(
                     svm,
@@ -378,13 +380,18 @@ pub async fn prepare_phoenix_override(
 async fn keep_oracle_readings_usable(
     svm: &mut SurfnetSvm,
     remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
+    target_slot: u64,
 ) {
     let kept = async {
         let map = phoenix_dependency(svm, &PHOENIX_PERP_ASSET_MAP, remote_ctx).await?;
         let Some(data) = raise_stale_thresholds(&PHOENIX_PERP_ASSET_MAP, &map.data)? else {
             return Ok(());
         };
-        svm.set_account(&PHOENIX_PERP_ASSET_MAP, Account { data, ..map })
+        svm.set_scenario_override_account(
+            &PHOENIX_PERP_ASSET_MAP,
+            Account { data, ..map },
+            target_slot,
+        )
     }
     .await;
     if let Err(e) = kept {
@@ -1240,9 +1247,11 @@ mod tests {
 
     #[tokio::test]
     async fn any_phoenix_override_leaves_the_local_map_usable() {
+        use crate::surfnet::GeyserEvent;
+
         let trader = Pubkey::new_unique();
         let funded = trader_account_for(trader, 500);
-        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let (mut svm, _events_rx, geyser_rx) = SurfnetSvm::default();
         svm.set_account(&PHOENIX_PERP_ASSET_MAP, perp_asset_map_account())
             .unwrap();
         svm.set_account(&trader, funded.clone()).unwrap();
@@ -1257,6 +1266,16 @@ mod tests {
         assert_eq!(stressed.data[COLLATERAL_BYTE_RANGE], 100_i64.to_le_bytes());
         let map = svm.get_account(&PHOENIX_PERP_ASSET_MAP).unwrap().unwrap();
         assert_eq!(oracle_thresholds(&map.data, "SOL"), RAISED_THRESHOLDS);
+        assert!(
+            geyser_rx.try_iter().any(|event| matches!(
+                event,
+                GeyserEvent::UpdateAccount(update)
+                    if update.pubkey == PHOENIX_PERP_ASSET_MAP
+                        && update.account == map
+                        && update.slot == 100
+            )),
+            "Geyser plugins receive the raised map at the materialized slot"
+        );
     }
 
     #[tokio::test]

@@ -2027,7 +2027,7 @@ impl SurfnetSvm {
 
     /// Applies an account mutation forged by a scenario and publishes it to subscribers.
     /// Upstream account hydration deliberately uses a different path and remains silent.
-    fn set_scenario_override_account(
+    pub(crate) fn set_scenario_override_account(
         &mut self,
         pubkey: &Pubkey,
         account: Account,
@@ -3359,6 +3359,7 @@ impl SurfnetSvm {
                     remote_ctx,
                     // Only an account core has just refetched counts as fresh.
                     fetch_from_upstream && settled_this_slot.contains(&account_pubkey),
+                    target_slot,
                 )
                 .await
                 {
