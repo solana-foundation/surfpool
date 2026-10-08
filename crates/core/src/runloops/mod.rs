@@ -468,6 +468,11 @@ pub async fn start_block_production_runloop(
                             svm_writer.inner.set_sysvar(&clock);
                             svm_writer.updated_at = clock.unix_timestamp as u64 * 1_000;
                             svm_writer.set_latest_absolute_slot(clock.slot);
+                            if let Err(error) = svm_writer.apply_due_scenario_snapshot_checkpoints() {
+                                let _ = svm_writer.simnet_events_tx.error(format!(
+                                    "Failed to apply scenario snapshot after time travel: {error}"
+                                ));
+                            }
                             svm_writer.simnet_events_tx.system_clock_updated(clock);
                         });
                     }
@@ -483,8 +488,10 @@ pub async fn start_block_production_runloop(
                             svm_writer.inner.set_sysvar(&clock);
                             svm_writer.updated_at = clock.unix_timestamp as u64 * 1_000;
                             svm_writer.set_latest_absolute_slot(clock.slot);
+                            svm_writer.apply_due_scenario_snapshot_checkpoints()
+                                .map_err(|error| format!("Failed to apply scenario snapshot after time travel: {error}"))?;
                             svm_writer.simnet_events_tx.system_clock_updated(clock);
-                            svm_writer.latest_epoch_info.clone()
+                            Ok(svm_writer.latest_epoch_info.clone())
                         });
 
                         // Send confirmation back
@@ -1128,7 +1135,8 @@ fn start_http_rpc_server_runloop(
         ServerBuilder::new(io)
             .cors(DomainsValidation::Disabled)
             .threads(6)
-            .max_request_body_size(15 * 1024 * 1024)
+            // A complete scenario snapshot series is uploaded in one request.
+            .max_request_body_size(128 * 1024 * 1024)
             .start_http(&server_bind)
             .map_err(|e| format!("{:?}", e))
     })
