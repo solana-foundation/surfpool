@@ -41,6 +41,12 @@ test("embedded surfpool() boots a Surfnet and wires the full kit client", async 
   assert.equal(info.value.owner, owner);
   assert.equal(info.value.data[0], Buffer.from("aabbcc", "hex").toString("base64"));
 
+  // Epoch stakes use the typed cheatcodes RPC and accept bigint stake amounts.
+  const epochStakeResult = await client.cheatcodes
+    .setEpochStakes([{ stake: 1_000_000_000n, voteAccount: Surfnet.newKeypair().publicKey }])
+    .send();
+  assert.equal(epochStakeResult, null);
+
   // Cheatcode access control roundtrip.
   await client.cheatcodes.disableCheatcode(["surfnet_pauseClock"]).send();
   await assert.rejects(client.cheatcodes.pauseClock().send(), /Surfnet RPC error/);
