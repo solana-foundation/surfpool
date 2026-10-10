@@ -1,0 +1,350 @@
+protocol: BisonFi
+# The pool-account version this layout describes, and the only one supported. BisonFi ships no
+# program semver, so these offsets were derived and tested against v3 accounts.
+version: v3
+account_type: PoolStat
+
+# BisonFi publishes no IDL and none is reconstructed here. Properties are written using their byte
+# offsets and encodings.
+raw_layout: true
+
+tags:
+  - pmm
+  - prop-amm
+  - swap
+
+templates:
+  - id: bisonfi-fair-value
+    name: Override Fair Value
+    description: >-
+      Set the maker's mid price. For a swap in a later slot, also add Keep Quote Live to that slot.
+    idl_account_name: PoolStat
+    address:
+      type: pubkey
+    properties:
+      - path: fair_value
+        offset: 832
+        encoding: u128
+        label: Fair value
+        description: >-
+          Mid price as a fixed-point integer scaled by 2^88. Pass it as a decimal string.
+          Example: $75.45 is "23350643991020486314894032896"
+    llm_context: |
+      PRECONDITION - THE QUOTE MUST BE FRESH. Once the venue's allowed publication age is exceeded,
+      this override is silently ignored: the swap returns zero and the transaction still SUCCEEDS,
+      with your value sitting correctly in the account. That tolerance is maker policy and can vary
+      between markets or deployments. Because the local VM does not republish the mid, refresh
+      last_update_slot with bisonfi-freshness in every slot where a multi-slot scenario needs a
+      usable quote. Set fetchBeforeUse: false on later freshness-only overrides so they do not erase
+      this value. If a later upstream fetch is required, reapply this override after it in that slot.
+
+      FINDING A MARKET WHEN THE USER NAMES A PAIR OR HAS NOT PROVIDED AN ADDRESS:
+      1. Call Solana JSON-RPC getProgramAccounts for program
+         BiSoNHVpsVZW2F7rx2eQ59yQwKxzU5NvBcmKshCSUypi with encoding base64 and two memcmp filters:
+         offset 0 bytes "ES78ZeanFtP" and offset 8 bytes "W723RTUpoZ". These filters select POOLSTAT
+         version-3 accounts without assuming a fixed account size, so compatible extended layouts
+         remain discoverable after an upgrade.
+      2. Decode each returned account. Bytes 256..288 are its null-terminated ASCII market name;
+         184..216 are the base mint and 216..248 the quote mint. Public keys are raw 32-byte values
+         encoded as base58. Match both mints, not only the name.
+      3. Prefer a usable pool: last_update_slot is the little-endian u64 at offset 72 and should be
+         close to getSlot. Base and quote vault pubkeys are at 120..152 and 152..184; query their
+         token balances and prefer non-empty liquidity. This avoids old pools with attractive-looking
+         balances but a publication slot millions of slots behind.
+      4. Put the chosen getProgramAccounts result pubkey in the override's account as
+         {"pubkey":"<pool address>"}. The pool address is not a value/property field. Set
+         fetchBeforeUse: true only on the first override for this pool. If no matching v3 pool has a
+         recent last_update_slot and funded vaults, say so instead of guessing.
+
+      This is the only price lever. The reserves control depth, not price: BisonFi quotes around a mid
+      the operator publishes, so changing vault balances will not move the quote.
+
+      HOW TO USE:
+      1. Multiply the price by 2^88 (309485009821345068724781056)
+      2. Pass the result as a decimal STRING, since it exceeds what a JSON number holds exactly
+      3. Set fetchBeforeUse: true only if this is the pool's first override
+
+      MID-FLIGHT VARIANT: schedule two steps on this field a couple of slots apart, and a caller
+      prices on one mid and executes against another. A reprice is caught by the caller's own
+      minimum-output bound, so the transaction reverts rather than filling at the worse price.
+
+      CROSS-VENUE ARBITRAGE: moving this away from an AMM's price on the same pair creates an
+      executable arbitrage, with both legs in one transaction. Two practical notes: use an
+      exact-OUTPUT swap on the AMM leg, because instruction amounts are fixed when the transaction is
+      built and the second leg needs a known size; and expect the undislocated round trip to LOSE
+      money, since the taker pays a fee on both venues. A control run showing a profit at the true mid
+      is measuring something other than a round trip.
+
+      EXAMPLE - "SOL is worth $50":
+      fair_value: "15474250491067253436239052800"
+  - id: bisonfi-depth
+    name: Override Depth
+    description: >-
+      Make large trades move the price. For a swap in a later slot, also add Keep Quote Live to that
+      slot.
+    idl_account_name: PoolStat
+    address:
+      type: pubkey
+    properties:
+      - path: base_reserve
+        offset: 48
+        encoding: u64
+        label: Base reserve
+        description: >-
+          Base tokens the pool can pay out, in the mint's smallest unit. Constrains a BUY of the base
+          token. Example: 204479526927
+      - path: quote_reserve
+        offset: 56
+        encoding: u64
+        label: Quote reserve
+        description: >-
+          Quote tokens the pool can pay out, in the mint's smallest unit. Constrains a SELL of the base
+          token. Example: 22008930770
+    llm_context: |
+      PRECONDITION - THE QUOTE MUST BE FRESH. Once the venue's allowed publication age is exceeded,
+      this override is silently ignored: the swap returns zero and the transaction still SUCCEEDS,
+      with your value sitting correctly in the account. That tolerance is maker policy and can vary
+      between markets or deployments. Because the local VM does not republish the mid, refresh
+      last_update_slot with bisonfi-freshness in every slot where a multi-slot scenario needs a
+      usable quote. Set fetchBeforeUse: false on later freshness-only overrides so they do not erase
+      this depth. If a later upstream fetch is required, reapply this override after it in that slot.
+
+      FINDING A MARKET WHEN THE USER NAMES A PAIR OR HAS NOT PROVIDED AN ADDRESS:
+      1. Call Solana JSON-RPC getProgramAccounts for program
+         BiSoNHVpsVZW2F7rx2eQ59yQwKxzU5NvBcmKshCSUypi with encoding base64 and two memcmp filters:
+         offset 0 bytes "ES78ZeanFtP" and offset 8 bytes "W723RTUpoZ". These filters select POOLSTAT
+         version-3 accounts without assuming a fixed account size, so compatible extended layouts
+         remain discoverable after an upgrade.
+      2. Decode each returned account. Bytes 256..288 are its null-terminated ASCII market name;
+         184..216 are the base mint and 216..248 the quote mint. Public keys are raw 32-byte values
+         encoded as base58. Match both mints, not only the name.
+      3. Prefer a usable pool: last_update_slot is the little-endian u64 at offset 72 and should be
+         close to getSlot. Base and quote vault pubkeys are at 120..152 and 152..184; query their
+         token balances and prefer non-empty liquidity. This avoids old pools with attractive-looking
+         balances but a publication slot millions of slots behind.
+      4. Put the chosen getProgramAccounts result pubkey in the override's account as
+         {"pubkey":"<pool address>"}. The pool address is not a value/property field. Set
+         fetchBeforeUse: true only on the first override for this pool. If no matching v3 pool has a
+         recent last_update_slot and funded vaults, say so instead of guessing.
+
+      The depth lever: how far a trade moves the price. For how wide the venue quotes around its mid,
+      use bisonfi-spread instead.
+
+      WHICH FIELD TO SET: the pool pays out of one side, and that side's reserve constrains the trade.
+      To make SELLING the base token expensive, lower quote_reserve. To make BUYING it expensive,
+      lower base_reserve. Set both if the scenario does not fix a direction.
+
+      REACH FOR AN ORDER OF MAGNITUDE. The response is not linear: a trade worth a couple of percent
+      of a reserve barely notices that reserve being quartered. A large reduction produces slippage; a
+      very large one produces an outright "insufficient liquidity" refusal, which is useful in itself
+      for testing how a router handles a venue that cannot fill.
+
+      LOWER, DO NOT RAISE. These fields mirror the balances of the token accounts named by base_vault
+      and quote_vault, which this template does not touch. Lowering is safe: the pool quotes and pays
+      out less than it really holds. Raising one above the vault's real balance makes the program
+      compute a payout the vault cannot cover, and the swap fails when it settles.
+
+      The two directions are largely but not perfectly independent. Treat them as independent for
+      slippage-scale testing; do not assert that one is untouched to the byte.
+
+      EXAMPLE - "BisonFi is thin, selling SOL into it slips badly":
+      quote_reserve: 1100446538524
+  - id: bisonfi-spread
+    name: Override Spread
+    description: >-
+      Widen or tighten the quote. For a swap in a later slot, also add Keep Quote Live to that slot.
+    idl_account_name: PoolStat
+    address:
+      type: pubkey
+    properties:
+      - path: working_levels.0.tick_offset
+        offset: 300
+        encoding:
+          i32_strided:
+            count: 4
+            stride: 16
+        label: Bid spread, working book
+        description: >-
+          Sell-side offset, outer levels excluded. Units of 1/2,560,000 of the mid, NEGATIVE. -25600 is 1% below mid.
+      - path: working_levels.4.tick_offset
+        offset: 364
+        encoding:
+          i32_strided:
+            count: 4
+            stride: 16
+        label: Ask spread, working book
+        description: >-
+          Buy-side offset, outer levels excluded. POSITIVE. 25600 is 1% above mid.
+      - path: configured_levels.0.tick_offset
+        offset: 540
+        encoding:
+          i32_strided:
+            count: 4
+            stride: 16
+        label: Bid spread, source book
+        description: >-
+          Companion bid run. Set it to the same value as the working bid spread.
+      - path: configured_levels.4.tick_offset
+        offset: 604
+        encoding:
+          i32_strided:
+            count: 4
+            stride: 16
+        label: Ask spread, source book
+        description: >-
+          Companion ask run. Set it to the same value as the working ask spread.
+      - path: continuation_levels.0.tick_offset
+        offset: 1048
+        encoding:
+          i32_strided:
+            count: 5
+            stride: 16
+        label: Bid spread, working outer book
+        description: >-
+          Sell-side offset for the outer levels. NEGATIVE.
+      - path: continuation_levels.5.tick_offset
+        offset: 1128
+        encoding:
+          i32_strided:
+            count: 5
+            stride: 16
+        label: Ask spread, working outer book
+        description: >-
+          Buy-side offset for the outer levels. POSITIVE.
+      - path: continuation_source_levels.0.tick_offset
+        offset: 1208
+        encoding:
+          i32_strided:
+            count: 5
+            stride: 16
+        label: Bid spread, source outer book
+        description: >-
+          Companion outer bid run. Same value as the working outer bid spread.
+      - path: continuation_source_levels.5.tick_offset
+        offset: 1288
+        encoding:
+          i32_strided:
+            count: 5
+            stride: 16
+        label: Ask spread, source outer book
+        description: >-
+          Companion outer ask run. Same value as the working outer ask spread.
+    llm_context: |
+      PRECONDITION - THE QUOTE MUST BE FRESH. Once the venue's allowed publication age is exceeded,
+      this override is silently ignored: the swap returns zero and the transaction still SUCCEEDS,
+      with your value sitting correctly in the account. That tolerance is maker policy and can vary
+      between markets or deployments. Because the local VM does not republish the mid, refresh
+      last_update_slot with bisonfi-freshness in every slot where a multi-slot scenario needs a
+      usable quote. Set fetchBeforeUse: false on later freshness-only overrides so they do not erase
+      this spread. If a later upstream fetch is required, reapply this override after it in that slot.
+
+      FINDING A MARKET WHEN THE USER NAMES A PAIR OR HAS NOT PROVIDED AN ADDRESS:
+      1. Call Solana JSON-RPC getProgramAccounts for program
+         BiSoNHVpsVZW2F7rx2eQ59yQwKxzU5NvBcmKshCSUypi with encoding base64 and two memcmp filters:
+         offset 0 bytes "ES78ZeanFtP" and offset 8 bytes "W723RTUpoZ". These filters select POOLSTAT
+         version-3 accounts without assuming a fixed account size, so compatible extended layouts
+         remain discoverable after an upgrade.
+      2. Decode each returned account. Bytes 256..288 are its null-terminated ASCII market name;
+         184..216 are the base mint and 216..248 the quote mint. Public keys are raw 32-byte values
+         encoded as base58. Match both mints, not only the name.
+      3. Prefer a usable pool: last_update_slot is the little-endian u64 at offset 72 and should be
+         close to getSlot. Base and quote vault pubkeys are at 120..152 and 152..184; query their
+         token balances and prefer non-empty liquidity. This avoids old pools with attractive-looking
+         balances but a publication slot millions of slots behind.
+      4. Put the chosen getProgramAccounts result pubkey in the override's account as
+         {"pubkey":"<pool address>"}. The pool address is not a value/property field. Set
+         fetchBeforeUse: true only on the first override for this pool. If no matching v3 pool has a
+         recent last_update_slot and funded vaults, say so instead of guessing.
+
+      The spread lever: how wide the venue quotes around its mid, independently of how much inventory
+      it holds. Use bisonfi-depth to make a venue THIN and this one to make it EXPENSIVE.
+
+      THE UNIT IS 1/2,560,000 OF THE MID. So 25600 is 1%, 2560 is 10 bps and 256 is 100 ppm. To
+      convert a target spread: ticks = percent * 25600.
+
+      SET ALL FOUR BID PROPERTIES TO THE SAME VALUE, or all four ask properties, or all eight. Each
+      property writes one run of the book and they have to agree; setting only some of them produces a
+      spread that varies with timing.
+
+      SIGNS MATTER. Bid offsets are negative and price SELLS of the base token. Ask offsets are
+      positive and price BUYS.
+
+      DO NOT SET A TICK TO ZERO to mean "no offset" - use a small magnitude instead.
+
+      TRADE SIZE MATTERS. Very small trades do not consult the ladder at all, and very large ones stop
+      paying the full spread. Size a test trade at a percent or so of the pool's base_reserve, and try
+      a few sizes before concluding the lever did nothing.
+
+      EXAMPLE - "BisonFi is quoting 1% wide on the sell side":
+      working_levels.0.tick_offset: -25600
+      configured_levels.0.tick_offset: -25600
+      continuation_levels.0.tick_offset: -25600
+      continuation_source_levels.0.tick_offset: -25600
+  - id: bisonfi-freshness
+    name: Keep Quote Live
+    description: >-
+      Keep the maker quoting in this slot. Set Slots behind the chain to 0, and add this action to
+      every later slot containing a swap.
+    idl_account_name: PoolStat
+    address:
+      type: pubkey
+    properties:
+      - path: last_update_slot
+        offset: 72
+        encoding:
+          slot:
+            lead: 0
+        label: Slots behind the chain
+        description: >-
+          Set this to 0 in every slot containing a swap to keep the quote live. It is a signed offset
+          from that slot; a large negative value models a maker that stopped publishing.
+    llm_context: |
+      This field is the venue's liveness signal.
+
+      FINDING A MARKET WHEN THE USER NAMES A PAIR OR HAS NOT PROVIDED AN ADDRESS:
+      1. Call Solana JSON-RPC getProgramAccounts for program
+         BiSoNHVpsVZW2F7rx2eQ59yQwKxzU5NvBcmKshCSUypi with encoding base64 and two memcmp filters:
+         offset 0 bytes "ES78ZeanFtP" and offset 8 bytes "W723RTUpoZ". These filters select POOLSTAT
+         version-3 accounts without assuming a fixed account size, so compatible extended layouts
+         remain discoverable after an upgrade.
+      2. Decode each returned account. Bytes 256..288 are its null-terminated ASCII market name;
+         184..216 are the base mint and 216..248 the quote mint. Public keys are raw 32-byte values
+         encoded as base58. Match both mints, not only the name.
+      3. Prefer a usable pool: last_update_slot is the little-endian u64 at offset 72 and should be
+         close to getSlot. Base and quote vault pubkeys are at 120..152 and 152..184; query their
+         token balances and prefer non-empty liquidity. This avoids old pools with attractive-looking
+         balances but a publication slot millions of slots behind.
+      4. Put the chosen getProgramAccounts result pubkey in the override's account as
+         {"pubkey":"<pool address>"}. The pool address is not a value/property field. Set
+         fetchBeforeUse: true only on the first override for this pool. If no matching v3 pool has a
+         recent last_update_slot and funded vaults, say so instead of guessing.
+
+      A POOL LOADED INTO THE LOCAL VM GOES STALE BY ITSELF. Surfpool loads the account from the
+      upstream datasource once, and the local VM does not republish the mid. Once the maker's allowed
+      publication age is exceeded, the venue stops quoting and stays that way. The exact tolerance
+      is maker policy and can vary between markets or deployments. From then on the price, depth and
+      spread overrides are silently ignored: the swap returns zero and the transaction still
+      SUCCEEDS. That makes this template the precondition for the other three in any scenario that
+      spans multiple slots.
+
+      THE VALUE IS AN OFFSET, NOT A SLOT NUMBER. It is resolved against the slot the override
+      materializes at, so 0 means "published this slot". Do not pass the chain's absolute slot: the
+      encoder would treat it as a positive offset and add it to the materialization slot.
+
+      HOW TO USE THIS TEMPLATE:
+      1. Set last_update_slot to 0. The venue resumes quoting the price it already held - a fresh
+         timestamp is enough, no new price is needed
+      2. If the scenario spans enough slots for the quote to become stale again, schedule another
+         freshness override in every slot where the quote must be usable with fetchBeforeUse: false.
+         If a later upstream fetch is required, reapply the scenario's fair-value, depth and spread
+         overrides after that fetch in the same slot
+
+      A scenario that executes immediately after the account is loaded may not need this. A
+      multi-slot scenario should keep the publication fresh explicitly rather than depending on the
+      current tolerance.
+
+      EXAMPLE - "keep the maker quoting for the whole run":
+      Add last_update_slot: 0 at each slot where a transaction needs a live quote.
+
+      EXAMPLE - "the maker stopped publishing long ago":
+      last_update_slot: -1000000

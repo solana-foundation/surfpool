@@ -12,6 +12,16 @@ use crate::{
     surfnet::{PluginCommand, locker::SurfnetSvmLocker, svm::SurfnetSvm},
 };
 
+/// Returns the byte indices whose values differ between two buffers.
+pub(super) fn diff_indices(left: &[u8], right: &[u8]) -> Vec<usize> {
+    left.iter()
+        .zip(right.iter())
+        .enumerate()
+        .filter(|(_, (left, right))| left != right)
+        .map(|(index, _)| index)
+        .collect()
+}
+
 pub fn get_free_port() -> Result<u16, String> {
     let listener =
         TcpListener::bind("127.0.0.1:0").map_err(|e| format!("Failed to bind to port 0: {}", e))?;
