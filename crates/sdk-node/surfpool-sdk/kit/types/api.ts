@@ -181,8 +181,48 @@ export type SurfnetExportSnapshotApi = {
 };
 
 // Scenario
+/** Capture limits and program-account policy for scenario registration. */
+export type ScenarioSnapshotCaptureConfig = Readonly<{
+    captureId?: string;
+    programAccounts?: 'exclude' | 'include';
+    maxBytes?: number | bigint;
+    maxOperations?: number | bigint;
+}>;
+
+/** A replayable operation in a scenario checkpoint. */
+export type ScenarioSnapshotAccountOperation =
+    | Readonly<{ type: 'upsert'; pubkey: Address; account: AccountSnapshot; notification: 'silent' | 'accountUpdate' }>
+    | Readonly<{ type: 'delete'; pubkey: Address; notification: 'silent' | 'accountUpdate' }>;
+
+/** Baseline or slot delta produced by a scenario capture. */
+export type ScenarioSnapshotCheckpoint = Readonly<{
+    formatVersion: number;
+    captureId: string;
+    sequence: number;
+    position: Readonly<{ kind: 'baseline' | 'afterOverrides'; slot: number | bigint }>;
+    operations: readonly ScenarioSnapshotAccountOperation[];
+}>;
+
+/** Portable scenario capture and its sealed checkpoints. */
+export type ScenarioSnapshotSeries = Readonly<{
+    formatVersion: number;
+    captureId: string;
+    complete: boolean;
+    scenario: Scenario;
+    baseSlot: number | bigint;
+    runtime: Readonly<{ surfpoolVersion: string; genesisSlot: number | bigint; slotTimeMs: number | bigint }>;
+    capture: Readonly<Omit<ScenarioSnapshotCaptureConfig, 'captureId'>>;
+    checkpoints: readonly ScenarioSnapshotCheckpoint[];
+}>;
+
 export type SurfnetRegisterScenarioApi = {
-    registerScenario(scenario: Scenario, slot?: number | bigint): null;
+    registerScenario(scenario: Scenario, slot?: number | bigint, captureConfig?: ScenarioSnapshotCaptureConfig): null;
+};
+export type SurfnetGetScenarioSnapshotSeriesApi = {
+    getScenarioSnapshotSeries(captureId: string, config?: Readonly<{ flush?: boolean }>): ScenarioSnapshotSeries;
+};
+export type SurfnetApplyScenarioSnapshotSeriesApi = {
+    applyScenarioSnapshotSeries(series: ScenarioSnapshotSeries): null;
 };
 
 // Local
@@ -197,6 +237,7 @@ export type SurfnetGetLocalSignaturesApi = {
  * (it is re-added on the wire by the request transformer).
  */
 export type SurfnetCheatcodesApi = SurfnetCloneProgramAccountApi &
+    SurfnetApplyScenarioSnapshotSeriesApi &
     SurfnetDeriveConfidentialKeysApi &
     SurfnetDisableCheatcodeApi &
     SurfnetEnableCheatcodeApi &
@@ -205,6 +246,7 @@ export type SurfnetCheatcodesApi = SurfnetCloneProgramAccountApi &
     SurfnetGetConfidentialBalanceApi &
     SurfnetGetLocalSignaturesApi &
     SurfnetGetProfileResultsByTagApi &
+    SurfnetGetScenarioSnapshotSeriesApi &
     SurfnetGetStreamedAccountsApi &
     SurfnetGetSurfnetInfoApi &
     SurfnetGetTransactionProfileApi &

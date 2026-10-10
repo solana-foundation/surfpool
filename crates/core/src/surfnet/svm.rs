@@ -65,9 +65,12 @@ use surfpool_types::{
     AccountChange, AccountProfileState, AccountSnapshot, DEFAULT_PROFILING_MAP_CAPACITY,
     DEFAULT_SLOT_TIME_MS, ExportSnapshotConfig, ExportSnapshotScope, FifoMap, Idl,
     OverrideInstance, ProfileResult, RpcProfileDepth, RpcProfileResultConfig,
-    RunbookExecutionStatusReport, SimnetEvent, SimnetEventsTx, StartupError, SurfnetStartupStatus,
-    SurfnetStartupTask, SvmFeatureConfig, TransactionConfirmationStatus, TransactionStatusEvent,
-    UiAccountChange, UiAccountProfileState, UiProfileResult, VersionedIdl,
+    RunbookExecutionStatusReport, SCENARIO_SNAPSHOT_FORMAT_VERSION, Scenario,
+    ScenarioSnapshotAccountOperation, ScenarioSnapshotCaptureRequest, ScenarioSnapshotCheckpoint,
+    ScenarioSnapshotNotification, ScenarioSnapshotPosition, ScenarioSnapshotRetrievalConfig,
+    ScenarioSnapshotRuntime, ScenarioSnapshotSeries, SimnetEvent, SimnetEventsTx, StartupError,
+    SurfnetStartupStatus, SurfnetStartupTask, SvmFeatureConfig, TransactionConfirmationStatus,
+    TransactionStatusEvent, UiAccountChange, UiAccountProfileState, UiProfileResult, VersionedIdl,
     types::{
         ComputeUnitsEstimationResult, KeyedProfileResult, UiKeyedProfileResult, UuidOrSignature,
     },
@@ -99,7 +102,13 @@ use crate::{
     },
     storage::{OverlayStorage, Storage, StorageBackend},
     surfnet::{
-        LogsSubscriptionData, locker::is_supported_token_program, surfnet_lite_svm::SurfnetLiteSvm,
+        LogsSubscriptionData,
+        locker::is_supported_token_program,
+        scenario_snapshot::{
+            ScenarioSnapshotCaptureState, ScenarioSnapshotReplayCheckpoint,
+            ScenarioSnapshotReplayOperation, ScenarioSnapshotReplayState,
+        },
+        surfnet_lite_svm::SurfnetLiteSvm,
     },
     types::{
         GeyserAccountUpdate, MintAccount, OfflineAccountConfig, SerializableAccountAdditionalData,
@@ -535,6 +544,8 @@ pub struct SurfnetSvm {
     pub streamed_accounts: Box<dyn Storage<String, bool>>,
     pub recent_blockhashes: VecDeque<(SyntheticBlockhash, i64)>,
     pub scheduled_overrides: Box<dyn Storage<u64, Vec<OverrideInstance>>>,
+    active_scenario_snapshot_capture: Option<ScenarioSnapshotCaptureState>,
+    scenario_snapshot_replay: Option<ScenarioSnapshotReplayState>,
     /// Tracks accounts that should not be downloaded from the remote RPC.
     /// This includes accounts explicitly closed locally and accounts marked offline via cheatcodes.
     /// The key is the account pubkey as a string. If `include_owned_accounts` is true,
@@ -803,6 +814,8 @@ impl SurfnetSvm {
             registered_idls: OverlayStorage::wrap(self.registered_idls.clone_box()),
             streamed_accounts: OverlayStorage::wrap(self.streamed_accounts.clone_box()),
             scheduled_overrides: OverlayStorage::wrap(self.scheduled_overrides.clone_box()),
+            active_scenario_snapshot_capture: None,
+            scenario_snapshot_replay: None,
 
             // Clone non-storage fields normally
             transactions_queued_for_confirmation: self.transactions_queued_for_confirmation.clone(),
@@ -1324,6 +1337,8 @@ impl SurfnetSvm {
             streamed_accounts: streamed_accounts_db,
             recent_blockhashes: VecDeque::new(),
             scheduled_overrides: scheduled_overrides_db,
+            active_scenario_snapshot_capture: None,
+            scenario_snapshot_replay: None,
             offline_accounts: offline_accounts_db,
             genesis_slot: default_genesis_slot,
             genesis_updated_at: updated_at,
@@ -2029,13 +2044,69 @@ impl SurfnetSvm {
             return Ok(());
         }
 
+        self.check_scenario_account_operation(
+            pubkey,
+            &account,
+            ScenarioSnapshotNotification::AccountUpdate,
+        )?;
         self.set_account(pubkey, account.clone())?;
+        self.record_scenario_account_operation(
+            pubkey,
+            &account,
+            ScenarioSnapshotNotification::AccountUpdate,
+        )?;
         self.account_update_slots.insert(*pubkey, slot);
 
         let write_version = self.increment_write_version();
         let _ = self.geyser_events_tx.send(GeyserEvent::UpdateAccount(
             GeyserAccountUpdate::block_update(*pubkey, account, slot, write_version),
         ));
+        Ok(())
+    }
+
+    fn record_scenario_account_operation(
+        &mut self,
+        pubkey: &Pubkey,
+        account: &Account,
+        notification: ScenarioSnapshotNotification,
+    ) -> SurfpoolResult<()> {
+        if let Some(capture) = self.active_scenario_snapshot_capture.as_mut() {
+            capture.record_account(pubkey, account, notification)?;
+        }
+        Ok(())
+    }
+
+    fn check_scenario_account_operation(
+        &self,
+        pubkey: &Pubkey,
+        account: &Account,
+        notification: ScenarioSnapshotNotification,
+    ) -> SurfpoolResult<()> {
+        if let Some(capture) = self.active_scenario_snapshot_capture.as_ref() {
+            capture.check_account_capacity(pubkey, account, notification)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn hydrate_scenario_account(
+        &mut self,
+        pubkey: &Pubkey,
+        account: Account,
+    ) -> SurfpoolResult<()> {
+        if self.get_account(pubkey)?.as_ref() == Some(&account) {
+            return Ok(());
+        }
+        self.check_scenario_account_operation(
+            pubkey,
+            &account,
+            ScenarioSnapshotNotification::Silent,
+        )?;
+        self.set_account_silently(pubkey, account.clone())?;
+        self.record_scenario_account_operation(
+            pubkey,
+            &account,
+            ScenarioSnapshotNotification::Silent,
+        )?;
         Ok(())
     }
 
@@ -2264,6 +2335,8 @@ impl SurfnetSvm {
         self.runbook_executions.clear();
         self.streamed_accounts.clear()?;
         self.scheduled_overrides.clear()?;
+        self.active_scenario_snapshot_capture = None;
+        self.scenario_snapshot_replay = None;
 
         let current_time = chrono::Utc::now().timestamp_millis() as u64;
         self.updated_at = current_time;
@@ -2991,6 +3064,7 @@ impl SurfnetSvm {
             self.reset_account(&pubkey, include_owned_accounts)?;
         }
 
+        self.apply_due_scenario_snapshot_checkpoints()?;
         Ok(())
     }
 
@@ -3023,6 +3097,13 @@ impl SurfnetSvm {
             // No overrides for this slot
             return Ok(());
         };
+
+        if let Some(capture) = self.active_scenario_snapshot_capture.as_mut() {
+            if capture.pending_slot != target_slot {
+                capture.seal()?;
+                capture.pending_slot = target_slot;
+            }
+        }
 
         debug!(
             "Materializing {} override(s) for slot {}",
@@ -3141,9 +3222,13 @@ impl SurfnetSvm {
                         if let Some((coupled_pubkey, coupled_account)) = coupled {
                             match self.inner.get_account(&coupled_pubkey) {
                                 Ok(None) => {
-                                    if let Err(e) =
-                                        self.set_account_silently(&coupled_pubkey, coupled_account)
+                                    if let Err(e) = self
+                                        .hydrate_scenario_account(&coupled_pubkey, coupled_account)
                                     {
+                                        if self.active_scenario_snapshot_capture.is_some() {
+                                            restore_unprocessed(self, index);
+                                            return Err(e);
+                                        }
                                         warn!(
                                             "Failed to set coupled account {} from remote: {}",
                                             coupled_pubkey, e
@@ -3161,7 +3246,13 @@ impl SurfnetSvm {
                         }
 
                         // Set the fresh account data in the SVM
-                        if let Err(e) = self.set_account_silently(&account_pubkey, remote_account) {
+                        if let Err(e) =
+                            self.hydrate_scenario_account(&account_pubkey, remote_account)
+                        {
+                            if self.active_scenario_snapshot_capture.is_some() {
+                                restore_unprocessed(self, index);
+                                return Err(e);
+                            }
                             warn!(
                                 "Failed to set account {} from remote: {}",
                                 account_pubkey, e
@@ -3244,6 +3335,10 @@ impl SurfnetSvm {
                                 modified,
                                 target_slot,
                             ) {
+                                if self.active_scenario_snapshot_capture.is_some() {
+                                    restore_unprocessed(self, index);
+                                    return Err(e);
+                                }
                                 warn!("Failed to set raw-layout account {}: {}", account_pubkey, e);
                             } else {
                                 debug!(
@@ -3280,6 +3375,10 @@ impl SurfnetSvm {
                             if let Err(e) =
                                 self.set_scenario_override_account(&pubkey, written, target_slot)
                             {
+                                if self.active_scenario_snapshot_capture.is_some() {
+                                    restore_unprocessed(self, index);
+                                    return Err(e);
+                                }
                                 warn!(
                                     "Failed to set {} for override {}: {}",
                                     pubkey, override_instance.id, e
@@ -3292,6 +3391,10 @@ impl SurfnetSvm {
                     }
                     Ok(None) => {}
                     Err(e) => {
+                        if self.active_scenario_snapshot_capture.is_some() {
+                            restore_unprocessed(self, index);
+                            return Err(e);
+                        }
                         warn!(
                             "Skipping override {} for {}: {}",
                             override_instance.id, account_pubkey, e
@@ -3331,8 +3434,14 @@ impl SurfnetSvm {
                             modified_account,
                             target_slot,
                         ) {
-                            restore_unprocessed(self, index);
-                            return Err(e);
+                            if self.active_scenario_snapshot_capture.is_some() {
+                                restore_unprocessed(self, index);
+                                return Err(e);
+                            }
+                            warn!(
+                                "Failed to set modified account {} in SVM: {}",
+                                account_pubkey, e
+                            );
                         }
                         continue;
                     }
@@ -3419,6 +3528,10 @@ impl SurfnetSvm {
                     modified_account,
                     target_slot,
                 ) {
+                    if self.active_scenario_snapshot_capture.is_some() {
+                        restore_unprocessed(self, index);
+                        return Err(e);
+                    }
                     warn!(
                         "Failed to set modified account {} in SVM: {}",
                         account_pubkey, e
@@ -4684,6 +4797,11 @@ impl SurfnetSvm {
         scenario: surfpool_types::Scenario,
         slot: Option<Slot>,
     ) -> SurfpoolResult<()> {
+        if self.active_scenario_snapshot_capture.is_some() {
+            return Err(SurfpoolError::internal(
+                "cannot register another scenario during snapshot capture",
+            ));
+        }
         // Use provided slot or current slot as the base for relative slot heights
         let base_slot = slot.unwrap_or(self.latest_epoch_info.absolute_slot);
 
@@ -4720,6 +4838,289 @@ impl SurfnetSvm {
                 .store(absolute_slot, slot_overrides)?;
         }
 
+        Ok(())
+    }
+
+    pub fn register_scenario_with_capture(
+        &mut self,
+        scenario: Scenario,
+        slot: Option<Slot>,
+        request: Option<ScenarioSnapshotCaptureRequest>,
+    ) -> SurfpoolResult<()> {
+        let base_slot = slot.unwrap_or(self.latest_epoch_info.absolute_slot);
+        if let Some(request) = request {
+            if self.active_scenario_snapshot_capture.is_some() {
+                return Err(SurfpoolError::internal(
+                    "a scenario snapshot capture is already active",
+                ));
+            }
+            for override_instance in &scenario.overrides {
+                base_slot
+                    .checked_add(override_instance.scenario_relative_slot)
+                    .ok_or_else(|| {
+                        SurfpoolError::internal("scenario override slot overflows u64")
+                    })?;
+            }
+            let capture_id = request.capture_id.unwrap_or_else(|| scenario.id.clone());
+            if capture_id.is_empty() {
+                return Err(SurfpoolError::internal(
+                    "scenario snapshot capture ID is empty",
+                ));
+            }
+            let mut capture = ScenarioSnapshotCaptureState {
+                series: ScenarioSnapshotSeries {
+                    format_version: SCENARIO_SNAPSHOT_FORMAT_VERSION,
+                    capture_id: capture_id.clone(),
+                    complete: false,
+                    scenario: scenario.clone(),
+                    base_slot,
+                    runtime: ScenarioSnapshotRuntime {
+                        surfpool_version: env!("CARGO_PKG_VERSION").to_string(),
+                        genesis_slot: self.genesis_slot,
+                        slot_time_ms: self.slot_time,
+                    },
+                    capture: request.config,
+                    checkpoints: Vec::new(),
+                },
+                pending_slot: base_slot,
+                pending_operations: Vec::new(),
+                bytes: 0,
+                operations: 0,
+            };
+            let mut accounts = self.get_all_accounts()?;
+            accounts.sort_by_key(|(pubkey, data)| {
+                let account: Account = data.clone().into();
+                let priority = if account.owner == solana_sdk_ids::bpf_loader_upgradeable::id() {
+                    if account.executable { 2 } else { 0 }
+                } else {
+                    1
+                };
+                (priority, *pubkey)
+            });
+            for (pubkey, data) in accounts {
+                let account: Account = data.into();
+                capture.record_account(&pubkey, &account, ScenarioSnapshotNotification::Silent)?;
+            }
+            let baseline_operations = std::mem::take(&mut capture.pending_operations);
+            capture.series.checkpoints.push(ScenarioSnapshotCheckpoint {
+                format_version: SCENARIO_SNAPSHOT_FORMAT_VERSION,
+                capture_id,
+                sequence: 0,
+                position: ScenarioSnapshotPosition::Baseline { slot: base_slot },
+                operations: baseline_operations,
+            });
+            self.register_scenario(scenario, Some(base_slot))?;
+            self.active_scenario_snapshot_capture = Some(capture);
+        } else {
+            self.register_scenario(scenario, Some(base_slot))?;
+        }
+        Ok(())
+    }
+
+    pub fn get_scenario_snapshot_series(
+        &mut self,
+        capture_id: &str,
+        config: ScenarioSnapshotRetrievalConfig,
+    ) -> SurfpoolResult<ScenarioSnapshotSeries> {
+        let capture = self
+            .active_scenario_snapshot_capture
+            .as_ref()
+            .ok_or_else(|| SurfpoolError::internal("no active scenario snapshot capture"))?;
+        if capture.series.capture_id != capture_id {
+            return Err(SurfpoolError::internal(
+                "scenario snapshot capture ID does not match",
+            ));
+        }
+        if !config.flush {
+            return Ok(capture.series.clone());
+        }
+        if self
+            .scheduled_overrides
+            .keys()?
+            .into_iter()
+            .any(|slot| slot >= capture.pending_slot)
+        {
+            return Err(SurfpoolError::internal(
+                "scenario snapshot capture has future scheduled overrides",
+            ));
+        }
+        let mut capture = self.active_scenario_snapshot_capture.take().unwrap();
+        capture.seal()?;
+        capture.series.complete = true;
+        Ok(capture.series)
+    }
+
+    /// Imports a complete capture, applying its baseline and scheduling slot deltas
+    /// relative to the current local slot. Offset-zero deltas run immediately.
+    pub fn apply_scenario_snapshot_series(
+        &mut self,
+        series: ScenarioSnapshotSeries,
+    ) -> SurfpoolResult<()> {
+        if self.scenario_snapshot_replay.is_some() {
+            return Err(SurfpoolError::internal(
+                "a scenario snapshot series is already replaying",
+            ));
+        }
+        if self.active_scenario_snapshot_capture.is_some() {
+            return Err(SurfpoolError::internal(
+                "cannot replay a scenario snapshot during capture",
+            ));
+        }
+        if !series.complete {
+            return Err(SurfpoolError::internal(
+                "scenario snapshot series must be flushed before replay",
+            ));
+        }
+        if series.format_version != SCENARIO_SNAPSHOT_FORMAT_VERSION {
+            return Err(SurfpoolError::internal(
+                "unsupported scenario snapshot format version",
+            ));
+        }
+        if series.capture_id.is_empty() || series.checkpoints.is_empty() {
+            return Err(SurfpoolError::internal(
+                "scenario snapshot series requires a capture ID and baseline",
+            ));
+        }
+
+        let start_slot = self.get_latest_absolute_slot();
+        let mut previous_captured_slot = series.base_slot;
+        let mut pending = VecDeque::with_capacity(series.checkpoints.len());
+        for (index, checkpoint) in series.checkpoints.iter().enumerate() {
+            let sequence = u32::try_from(index)
+                .map_err(|_| SurfpoolError::internal("too many scenario snapshot checkpoints"))?;
+            if checkpoint.format_version != SCENARIO_SNAPSHOT_FORMAT_VERSION
+                || checkpoint.capture_id != series.capture_id
+                || checkpoint.sequence != sequence
+            {
+                return Err(SurfpoolError::internal(
+                    "scenario snapshot checkpoint version, capture ID, or sequence is invalid",
+                ));
+            }
+            let captured_slot = match checkpoint.position {
+                ScenarioSnapshotPosition::Baseline { slot }
+                    if index == 0 && slot == series.base_slot =>
+                {
+                    slot
+                }
+                ScenarioSnapshotPosition::AfterOverrides { slot }
+                    if index > 0 && slot >= previous_captured_slot =>
+                {
+                    slot
+                }
+                _ => {
+                    return Err(SurfpoolError::internal(
+                        "scenario snapshot checkpoint position is invalid",
+                    ));
+                }
+            };
+            previous_captured_slot = captured_slot;
+            let replay_slot = start_slot
+                .checked_add(captured_slot - series.base_slot)
+                .ok_or_else(|| {
+                    SurfpoolError::internal("scenario snapshot replay slot overflows u64")
+                })?;
+
+            let mut operations = Vec::with_capacity(checkpoint.operations.len());
+            for operation in &checkpoint.operations {
+                let (pubkey, account, notification) = match operation {
+                    ScenarioSnapshotAccountOperation::Upsert {
+                        pubkey,
+                        account,
+                        notification,
+                    } => {
+                        let key = Pubkey::from_str(pubkey)
+                            .map_err(|e| SurfpoolError::invalid_pubkey(pubkey, e.to_string()))?;
+                        let account = account.to_account().map_err(SurfpoolError::internal)?;
+                        (key, account, *notification)
+                    }
+                    ScenarioSnapshotAccountOperation::Delete {
+                        pubkey,
+                        notification,
+                    } => {
+                        let key = Pubkey::from_str(pubkey)
+                            .map_err(|e| SurfpoolError::invalid_pubkey(pubkey, e.to_string()))?;
+                        (key, Account::default(), *notification)
+                    }
+                };
+                if index == 0 && notification != ScenarioSnapshotNotification::Silent {
+                    return Err(SurfpoolError::internal(
+                        "baseline operations must be silent",
+                    ));
+                }
+                operations.push(ScenarioSnapshotReplayOperation {
+                    pubkey,
+                    account,
+                    notification,
+                });
+            }
+            pending.push_back(ScenarioSnapshotReplayCheckpoint {
+                slot: replay_slot,
+                operations,
+            });
+        }
+
+        let baseline = pending.pop_front().expect("validated baseline exists");
+        self.apply_scenario_snapshot_operations(baseline)?;
+        self.scenario_snapshot_replay = Some(ScenarioSnapshotReplayState { pending });
+        self.apply_due_scenario_snapshot_checkpoints()
+    }
+
+    /// Applies all queued checkpoints whose relative slot has been reached.
+    pub(crate) fn apply_due_scenario_snapshot_checkpoints(&mut self) -> SurfpoolResult<()> {
+        loop {
+            let current_slot = self.get_latest_absolute_slot();
+            let Some(replay) = self.scenario_snapshot_replay.as_mut() else {
+                return Ok(());
+            };
+            let Some(next) = replay.pending.front() else {
+                self.scenario_snapshot_replay = None;
+                return Ok(());
+            };
+            if next.slot > current_slot {
+                return Ok(());
+            }
+            let checkpoint = replay
+                .pending
+                .pop_front()
+                .expect("checked pending checkpoint");
+            if let Err(error) = self.apply_scenario_snapshot_operations(checkpoint) {
+                self.scenario_snapshot_replay = None;
+                return Err(error);
+            }
+        }
+    }
+
+    fn apply_scenario_snapshot_operations(
+        &mut self,
+        checkpoint: ScenarioSnapshotReplayCheckpoint,
+    ) -> SurfpoolResult<()> {
+        for ScenarioSnapshotReplayOperation {
+            pubkey,
+            account,
+            notification,
+        } in checkpoint.operations
+        {
+            let before = self.get_account(&pubkey)?;
+            self.inner
+                .set_account(pubkey, account.clone())
+                .map_err(|e| SurfpoolError::set_account(pubkey, e))?;
+            self.account_update_slots.insert(pubkey, checkpoint.slot);
+            self.update_account_registries(&pubkey, before.as_ref(), &account)?;
+            if notification == ScenarioSnapshotNotification::AccountUpdate {
+                self.notify_account_subscribers(&pubkey, &account);
+                self.notify_program_subscribers(&pubkey, &account);
+                let _ = self.simnet_events_tx.account_update(pubkey);
+                let write_version = self.increment_write_version();
+                let _ = self.geyser_events_tx.send(GeyserEvent::UpdateAccount(
+                    GeyserAccountUpdate::block_update(
+                        pubkey,
+                        account,
+                        checkpoint.slot,
+                        write_version,
+                    ),
+                ));
+            }
+        }
         Ok(())
     }
 }

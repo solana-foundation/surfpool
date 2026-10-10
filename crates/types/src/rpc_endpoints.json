@@ -871,9 +871,31 @@
               "name": "slot",
               "type": "Option<u64>",
               "description": "The base slot from which relative slot offsets are calculated. If omitted, uses the current slot."
+            },
+            {
+              "name": "captureConfig",
+              "type": "Option<ScenarioSnapshotCaptureRequest>",
+              "description": "Optional in-memory capture. Fields: captureId, programAccounts (exclude by default), maxBytes, maxOperations."
             }
           ],
           "returns": "A `RpcResponse<()>` indicating whether the write was successful."
+        },
+        {
+          "method": "surfnet_getScenarioSnapshotSeries",
+          "description": "Returns sealed scenario checkpoints. Set config.flush to true to seal the last slot and complete capture.",
+          "params": [
+            { "name": "captureId", "type": "String", "description": "The effective capture ID." },
+            { "name": "config", "type": "Option<ScenarioSnapshotRetrievalConfig>", "description": "Optional {flush: boolean}; defaults to false." }
+          ],
+          "returns": "RpcResponse<ScenarioSnapshotSeries>"
+        },
+        {
+          "method": "surfnet_applyScenarioSnapshotSeries",
+          "description": "Imports a complete scenario snapshot series, applies its baseline immediately, and schedules account updates at slots relative to the current slot.",
+          "params": [
+            { "name": "series", "type": "ScenarioSnapshotSeries", "description": "A completed series returned by surfnet_getScenarioSnapshotSeries with flush set to true." }
+          ],
+          "returns": "RpcResponse<()>"
         }
       ]
     },

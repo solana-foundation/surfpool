@@ -19,10 +19,7 @@ use super::collateral::{
 };
 use crate::{
     error::{SurfpoolError, SurfpoolResult},
-    surfnet::{
-        remote::SurfnetRemoteClient,
-        svm::{AccountUpdatePolicy, SurfnetSvm},
-    },
+    surfnet::{remote::SurfnetRemoteClient, svm::SurfnetSvm},
 };
 
 pub const PHOENIX_ETERNAL_PROGRAM_ID: Pubkey =
@@ -593,7 +590,7 @@ async fn phoenix_dependency(
     // Fetch the dependency once instead of per override, the way any read from the upstream
     // datasource does: the account is also indexed by owner, so getProgramAccounts serves the
     // local copy the override then patches.
-    svm.apply_account_update(fetched, AccountUpdatePolicy::HydrateIfAbsent)?;
+    svm.hydrate_scenario_account(address, account.clone())?;
     Ok(account)
 }
 
