@@ -215,7 +215,8 @@ pub struct RemoteTransaction {
     pub transaction: VersionedTransaction,
     pub slot: Slot,
     pub block_time: Option<i64>,
-    pub error: Option<String>,
+    /// How the transaction ended on the remote, or [None] if the remote returned no status for it.
+    pub outcome: Option<Result<(), String>>,
     pub compute_units_consumed: Option<u64>,
 }
 
@@ -586,9 +587,10 @@ impl SurfnetRemoteClient {
         let slot = encoded.slot;
         let block_time = encoded.block_time;
         let meta = encoded.transaction.meta;
-        let error = meta
-            .as_ref()
-            .and_then(|meta| meta.err.as_ref().map(|e| e.to_string()));
+        let outcome = meta.as_ref().map(|meta| match &meta.err {
+            Some(error) => Err(error.to_string()),
+            None => Ok(()),
+        });
         let compute_units_consumed =
             meta.and_then(|meta| Option::<u64>::from(meta.compute_units_consumed));
         let transaction = encoded.transaction.transaction.decode().ok_or_else(|| {
@@ -602,7 +604,7 @@ impl SurfnetRemoteClient {
             transaction,
             slot,
             block_time,
-            error,
+            outcome,
             compute_units_consumed,
         })
     }
@@ -1342,6 +1344,39 @@ mod tests {
             message.contains("not found"),
             "a null result should read as a missing transaction: {message}"
         );
+    }
+
+    /// A datasource can return a transaction without its status. That is an unknown outcome,
+    /// not a success.
+    #[tokio::test]
+    async fn a_transaction_without_meta_has_an_unknown_outcome() {
+        let transaction =
+            solana_transaction::Transaction::new_with_payer(&[], Some(&Pubkey::new_unique()));
+        let encoded = EncodedConfirmedTransactionWithStatusMeta {
+            slot: 1,
+            transaction: solana_transaction_status::EncodedTransactionWithStatusMeta {
+                transaction: solana_transaction_status::EncodedTransaction::Binary(
+                    base64::Engine::encode(
+                        &base64::prelude::BASE64_STANDARD,
+                        bincode::serialize(&transaction).unwrap(),
+                    ),
+                    solana_transaction_status::TransactionBinaryEncoding::Base64,
+                ),
+                meta: None,
+                version: None,
+            },
+            block_time: None,
+            transaction_index: None,
+        };
+        let client = client_from(Answers(serde_json::to_value(encoded).unwrap()));
+
+        let remote = client
+            .get_versioned_transaction(Signature::default())
+            .await
+            .expect("a transaction without meta should still be returned");
+
+        assert_eq!(remote.outcome, None);
+        assert_eq!(remote.compute_units_consumed, None);
     }
 
     /// A transaction is finalized about half a minute after it is confirmed. Asking for a

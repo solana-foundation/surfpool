@@ -53,7 +53,7 @@ pub async fn handle_profile_command(cmd: ProfileCommand, _ctx: &Context) -> Resu
         transaction,
         slot,
         block_time,
-        error: remote_error,
+        outcome: remote_outcome,
         compute_units_consumed: remote_compute_units,
     } = remote_client
         .get_versioned_transaction(signature)
@@ -136,7 +136,7 @@ pub async fn handle_profile_command(cmd: ProfileCommand, _ctx: &Context) -> Resu
         .map_err(|e| format!("Failed to read back the profile of {}: {}", signature, e))?
         .ok_or_else(|| format!("No profile was recorded for {}", signature))?;
 
-    print_profile(&profile, remote_error.as_deref(), remote_compute_units);
+    print_profile(&profile, remote_outcome.as_ref(), remote_compute_units);
 
     if let Some(output) = &cmd.output {
         let json = serde_json::to_string_pretty(&ProfileOutput {
@@ -170,7 +170,7 @@ fn epoch_info_at_slot(slot: u64, epoch_schedule: &EpochSchedule) -> EpochInfo {
 
 fn print_profile(
     profile: &UiKeyedProfileResult,
-    remote_error: Option<&str>,
+    remote_outcome: Option<&Result<(), String>>,
     remote_compute_units: Option<u64>,
 ) {
     let result = &profile.transaction_profile;
@@ -178,22 +178,28 @@ fn print_profile(
     let local_error = result.error_message.as_deref();
 
     println!();
-    if outcome_diverges(result, remote_error) {
-        println!(
-            "{}\n",
-            yellow!(
-                "This run reached a different outcome than the remote. What follows describes \
-                 this run, not the transaction as the chain ran it."
-            )
-        );
-        println!("Status         {}", describe_status(local_error));
-        println!("Remote status  {}", describe_status(remote_error));
-    } else {
-        println!(
+    match remote_outcome.map(|outcome| outcome.as_ref().err().map(String::as_str)) {
+        None => println!(
+            "Status         {}  {}",
+            describe_status(local_error),
+            black!("(remote status unknown)")
+        ),
+        Some(remote_error) if outcome_diverges(result, remote_error) => {
+            println!(
+                "{}\n",
+                yellow!(
+                    "This run reached a different outcome than the remote. What follows describes \
+                     this run, not the transaction as the chain ran it."
+                )
+            );
+            println!("Status         {}", describe_status(local_error));
+            println!("Remote status  {}", describe_status(remote_error));
+        }
+        Some(_) => println!(
             "Status         {}  {}",
             describe_status(local_error),
             black!("(matches the remote)")
-        );
+        ),
     }
 
     let cost_note = match remote_compute_units {
