@@ -2922,11 +2922,10 @@ mod tests {
         clock_events_tx: Sender<ClockEvent>,
         runloop: JoinHandle<std::result::Result<(), String>>,
     ) {
-        setup
+        let _ = setup
             .context
             .simnet_commands_tx
-            .send(SimnetCommand::Terminate(None))
-            .expect("runloop should accept termination");
+            .send(SimnetCommand::Terminate(None));
         drop(clock_events_tx);
         runloop
             .join()
@@ -3671,7 +3670,7 @@ mod tests {
             .blocking_read()
             .latest_epoch_info
             .absolute_slot;
-        transaction_setup
+        let airdrop_signature = transaction_setup
             .rpc
             .request_airdrop(
                 Some(transaction_setup.context.clone()),
@@ -3680,10 +3679,42 @@ mod tests {
                 None,
             )
             .expect("successful requestAirdrop should succeed");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let finalized = loop {
+            if !transaction_setup
+                .context
+                .svm_locker
+                .has_transactions_pending_finalization()
+            {
+                break true;
+            }
+            if transaction_runloop.is_finished() || std::time::Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
         stop_airdrop_runloop(
             &transaction_setup,
             transaction_clock_tx,
             transaction_runloop,
+        );
+        assert!(
+            finalized,
+            "a successful airdrop should finalize in transaction mode"
+        );
+        let airdrop_block = transaction_setup
+            .context
+            .svm_locker
+            .0
+            .blocking_read()
+            .blocks
+            .get(&transaction_start_slot)
+            .unwrap()
+            .expect("the airdrop should be confirmed in the first produced block");
+        assert_eq!(
+            airdrop_block.signatures,
+            vec![Signature::from_str(&airdrop_signature).unwrap()],
+            "the first produced block should contain only the airdrop"
         );
         assert_eq!(
             transaction_setup
@@ -3693,8 +3724,8 @@ mod tests {
                 .blocking_read()
                 .latest_epoch_info
                 .absolute_slot,
-            transaction_start_slot + 1,
-            "a successful airdrop should confirm a block in transaction mode"
+            transaction_start_slot + FINALIZATION_SLOT_THRESHOLD,
+            "a successful airdrop should produce blocks through finalization in transaction mode"
         );
 
         let (rejected_setup, rejected_clock_tx, rejected_runloop) =
