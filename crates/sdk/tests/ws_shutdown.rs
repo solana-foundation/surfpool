@@ -54,3 +54,30 @@ async fn stop_closes_websockets_with_a_normal_close_frame() {
 
     stop.await.unwrap().expect("surfnet should stop cleanly");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stop_does_not_wait_forever_on_unanswered_close_frames() {
+    let mut surfnet = Surfnet::start().await.expect("surfnet should start");
+    let mut stream = open_websocket(surfnet.ws_url());
+
+    let stop = tokio::task::spawn_blocking(move || surfnet.stop());
+
+    let mut frame = [0u8; 4];
+    stream
+        .read_exact(&mut frame)
+        .expect("the server should send a close frame before dropping the socket");
+    assert_eq!(frame, SERVER_NORMAL_CLOSE);
+
+    tokio::time::timeout(Duration::from_secs(4), stop)
+        .await
+        .expect("stop should give up on the close handshake after the grace period")
+        .unwrap()
+        .expect("surfnet should stop cleanly");
+
+    let mut rest = Vec::new();
+    stream.read_to_end(&mut rest).unwrap();
+    assert!(
+        rest.is_empty(),
+        "the server should drop the socket after the grace period"
+    );
+}
