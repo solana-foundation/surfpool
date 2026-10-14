@@ -4,9 +4,9 @@ use std::{
     collections::{HashMap, HashSet},
     net::SocketAddr,
     path::PathBuf,
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, RwLock},
     thread::{JoinHandle, sleep},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use agave_geyser_plugin_interface::geyser_plugin_interface::{
@@ -19,7 +19,9 @@ use itertools::Itertools;
 use jsonrpc_core::MetaIoHandler;
 use jsonrpc_http_server::{DomainsValidation, ServerBuilder};
 use jsonrpc_pubsub::{PubSubHandler, Session};
-use jsonrpc_ws_server::{RequestContext, ServerBuilder as WsServerBuilder};
+use jsonrpc_ws_server::{
+    RequestContext, ServerBuilder as WsServerBuilder, SessionId, SessionStats, ws::CloseCode,
+};
 use libloading::{Library, Symbol};
 use serde::Serialize;
 use solana_commitment_config::CommitmentConfig;
@@ -998,16 +1000,54 @@ impl RpcServer for jsonrpc_http_server::Server {
 /// contexts, where they panic.
 struct WsServerWithRuntime {
     server: jsonrpc_ws_server::Server,
+    sessions: WsSessions,
     _runtime: tokio::runtime::Runtime,
 }
 
 impl RpcServer for WsServerWithRuntime {
-    type CloseHandle = jsonrpc_ws_server::CloseHandle;
+    type CloseHandle = WsCloseHandle;
     fn close_handle(&self) -> Self::CloseHandle {
-        self.server.close_handle()
+        WsCloseHandle {
+            server: self.server.close_handle(),
+            sessions: self.sessions.clone(),
+        }
     }
     fn wait(self) -> Result<(), String> {
         self.server.wait().map_err(|e| format!("{:?}", e))
+    }
+}
+
+const WS_CLOSE_GRACE: Duration = Duration::from_secs(1);
+
+type WsSessionCloser = Arc<dyn Fn() + Send + Sync>;
+
+#[derive(Clone, Default)]
+struct WsSessions(Arc<Mutex<HashMap<SessionId, WsSessionCloser>>>);
+
+impl SessionStats for WsSessions {
+    fn open_session(&self, _id: SessionId) {}
+    fn close_session(&self, id: SessionId) {
+        self.0.lock().unwrap().remove(&id);
+    }
+}
+
+/// parity-ws drops its queued close frames on shutdown, so each session is closed first.
+struct WsCloseHandle {
+    server: jsonrpc_ws_server::CloseHandle,
+    sessions: WsSessions,
+}
+
+impl WsCloseHandle {
+    fn close(self) {
+        let closers: Vec<_> = self.sessions.0.lock().unwrap().values().cloned().collect();
+        for close_session in closers {
+            close_session();
+        }
+        let deadline = Instant::now() + WS_CLOSE_GRACE;
+        while !self.sessions.0.lock().unwrap().is_empty() && Instant::now() < deadline {
+            sleep(Duration::from_millis(10));
+        }
+        self.server.close();
     }
 }
 
@@ -1159,7 +1199,7 @@ fn start_ws_rpc_server_runloop(
     config: &SurfpoolConfig,
     middleware: SurfpoolMiddleware,
     simnet_events_tx: SimnetEventsTx,
-) -> Result<(JoinHandle<()>, jsonrpc_ws_server::CloseHandle), String> {
+) -> Result<(JoinHandle<()>, WsCloseHandle), String> {
     let ws_server_bind: SocketAddr = config
         .rpc
         .get_ws_base_url()
@@ -1192,8 +1232,17 @@ fn start_ws_rpc_server_runloop(
             .to_delegate(),
         );
 
+        let sessions = WsSessions::default();
+        let tracked_sessions = sessions.clone();
         let server = WsServerBuilder::new(rpc_io)
             .session_meta_extractor(move |ctx: &RequestContext| {
+                let out = ctx.out.clone();
+                tracked_sessions.0.lock().unwrap().insert(
+                    ctx.session_id,
+                    Arc::new(move || {
+                        let _ = out.close(CloseCode::Normal);
+                    }),
+                );
                 let runloop_context = RunloopContext {
                     id: None,
                     svm_locker: middleware.surfnet_svm.clone(),
@@ -1215,11 +1264,13 @@ fn start_ws_rpc_server_runloop(
             // shared handle removes that runtime (and its worker threads)
             // entirely.
             .event_loop_executor(tokio_handle)
+            .session_stats(sessions.clone())
             .start(&ws_server_bind)
             .map_err(|e| format!("{:?}", e))?;
 
         Ok(WsServerWithRuntime {
             server,
+            sessions,
             _runtime: runtime,
         })
     })
