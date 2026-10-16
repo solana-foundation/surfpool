@@ -32,6 +32,7 @@ use crate::{
 pub mod locker;
 pub mod noop_program;
 pub mod remote;
+mod scenario_snapshot;
 pub mod surfnet_lite_svm;
 pub mod svm;
 
