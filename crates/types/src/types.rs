@@ -1281,6 +1281,68 @@ pub struct ConfidentialTransferAccountUpdate {
     pub maximum_pending_balance_credit_counter: Option<u64>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(
+    feature = "ts-bindings",
+    derive(ts_rs::TS),
+    ts(export, optional_fields)
+)]
+pub struct MintUpdate {
+    /// providing this value sets the number of decimals of the mint
+    pub decimals: Option<u8>,
+    /// providing this value sets the mint authority: a base58 pubkey, or the
+    /// literal string "null" to clear the authority
+    #[cfg_attr(feature = "ts-bindings", ts(optional, type = "string"))]
+    pub mint_authority: Option<SetSomeAccount>,
+    /// providing this value sets the total supply of the mint
+    #[cfg_attr(feature = "ts-bindings", ts(optional, type = "number | bigint"))]
+    pub supply: Option<u64>,
+    /// providing this value writes the Token-2022 confidential-transfer mint
+    /// extension (Token-2022 only)
+    pub confidential: Option<ConfidentialTransferMintUpdate>,
+}
+
+/// Writes the Token-2022 `ConfidentialTransferMint` extension on a mint created
+/// via `surfnet_setMint`.
+///
+/// This is a test-only cheatcode: it writes the extension directly, bypassing
+/// the real on-chain `ConfidentialTransferInitializeMint` instruction, so a mint
+/// with a chosen auditor can be created without forking one from mainnet.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(
+    feature = "ts-bindings",
+    derive(ts_rs::TS),
+    ts(export, optional_fields)
+)]
+pub struct ConfidentialTransferMintUpdate {
+    /// The authority that approves new confidential accounts and updates this
+    /// config (base58). Omitted keeps the current value, null when first written;
+    /// an explicit null removes the authority.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "serde_with::rust::double_option"
+    )]
+    #[cfg_attr(feature = "ts-bindings", ts(optional, type = "string | null"))]
+    pub authority: Option<Option<String>>,
+    /// The auditor's ElGamal public key (base58 or base64, 32 bytes), which every
+    /// confidential transfer on this mint also encrypts its amount to. Omitted
+    /// keeps the current value, null (no auditor) when first written; an explicit
+    /// null removes the auditor.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "serde_with::rust::double_option"
+    )]
+    #[cfg_attr(feature = "ts-bindings", ts(optional, type = "string | null"))]
+    pub auditor_elgamal_pubkey: Option<Option<String>>,
+    /// Whether new confidential accounts are approved on creation. Omitted keeps
+    /// the current value, true when first written.
+    pub auto_approve_new_accounts: Option<bool>,
+}
+
 /// The owner's confidential-transfer secrets, passed to
 /// `surfnet_getConfidentialBalance` so it can decrypt the account.
 ///
@@ -1829,7 +1891,7 @@ pub enum CheatcodeFilter {
 /// `surfpool-core/src/rpc/surfnet_cheatcodes.rs` asserts it matches the
 /// methods actually registered by the `SurfnetCheatcodes` trait, so adding,
 /// removing, or renaming a cheatcode without updating this list fails CI.
-pub const SURFNET_CHEATCODE_METHODS: [&str; 28] = [
+pub const SURFNET_CHEATCODE_METHODS: [&str; 29] = [
     "surfnet_cloneProgramAccount",
     "surfnet_deriveConfidentialKeys",
     "surfnet_disableCheatcode",
@@ -1851,6 +1913,7 @@ pub const SURFNET_CHEATCODE_METHODS: [&str; 28] = [
     "surfnet_resetNetwork",
     "surfnet_resumeClock",
     "surfnet_setAccount",
+    "surfnet_setMint",
     "surfnet_setProgramAuthority",
     "surfnet_setSupply",
     "surfnet_setTokenAccount",
