@@ -1,6 +1,7 @@
 use std::{fmt::Display, future::Future, pin::Pin};
 
 use crossbeam_channel::TrySendError;
+use itertools::Itertools;
 use jsonrpc_core::{Error, Result};
 use litesvm::error::LiteSVMError;
 use serde::Serialize;
@@ -248,13 +249,14 @@ impl SurfpoolError {
         Self(error)
     }
 
-    pub fn get_multiple_accounts<T>(e: T) -> Self
+    pub fn get_multiple_accounts<T>(pubkeys: &[Pubkey], e: T) -> Self
     where
         T: ToString,
     {
         let mut error = Error::internal_error();
         error.data = Some(json!(format!(
-            "Failed to fetch accounts from remote: {}",
+            "Failed to fetch accounts [{}] from remote: {}",
+            pubkeys.iter().join(", "),
             e.to_string()
         )));
         Self(error)

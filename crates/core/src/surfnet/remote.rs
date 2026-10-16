@@ -339,7 +339,12 @@ impl SurfnetRemoteClient {
                         .get_multiple_accounts_with_commitment(chunk, commitment_config)
                         .await
                         .map(|response| response.value)
-                        .map_err(SurfpoolError::get_multiple_accounts)
+                        .map_err(|error| {
+                            SurfpoolError::get_multiple_accounts(
+                                chunk,
+                                sanitized_client_error(&error, &self.client.url()),
+                            )
+                        })
                 }),
         )
         .await?;
