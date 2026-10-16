@@ -49,7 +49,7 @@ use crate::{
         GetAccountResult, locker::SurfnetSvmLocker, remote::SurfnetRemoteClient, svm::SurfnetSvm,
     },
     tests::{
-        helpers::get_free_port,
+        helpers::{diff_indices, get_free_port},
         integration::{RunloopGuard, spawn_runloop, wait_for_ready_and_connected},
     },
 };
@@ -122,16 +122,6 @@ async fn fetch(addresses: &[Pubkey]) -> Vec<Account> {
                 panic!("{address} no longer exists on mainnet; the test needs a new address")
             }
         })
-        .collect()
-}
-
-/// Byte indices at which two buffers differ.
-fn diff_indices(a: &[u8], b: &[u8]) -> Vec<usize> {
-    a.iter()
-        .zip(b.iter())
-        .enumerate()
-        .filter(|(_, (x, y))| x != y)
-        .map(|(i, _)| i)
         .collect()
 }
 
