@@ -5701,9 +5701,16 @@ mod tests {
             .context
             .svm_locker
             .with_svm_writer(|svm| svm.send_transaction(transaction.into(), false, false));
-        assert!(
-            change_owner_result.is_err(),
-            "a Token-2022 ATA must reject owner changes, but got {change_owner_result:?}"
+        assert_eq!(
+            change_owner_result
+                .expect_err("a Token-2022 ATA must reject owner changes")
+                .err,
+            solana_transaction_error::TransactionError::InstructionError(
+                0,
+                solana_instruction::error::InstructionError::Custom(
+                    spl_token_2022_interface::error::TokenError::ImmutableOwner as u32,
+                ),
+            )
         );
     }
 
