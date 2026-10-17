@@ -191,8 +191,15 @@ jobs:
           npm install "./$(basename "${{ steps.pack.outputs.platform_pack }}")"
           npm install "./$(basename "${{ steps.pack.outputs.root_pack }}")"
           # The kit peers are optional and not auto-installed; installing them
-          # here validates the documented opt-in flow.
-          npm install "@solana/kit@^8.0.0" "@solana/kit-plugin-rpc@^0.18.0" "@solana/kit-plugin-signer@^0.18.0"
+          # here validates the documented opt-in flow. Both the oldest and the
+          # newest peer versions accepted by the package's peer ranges are
+          # exercised so a stale floor or a breaking upstream minor fails CI.
+          for PEERS in \
+            "@solana/kit@8.0.0 @solana/kit-plugin-rpc@0.18.0 @solana/kit-plugin-signer@0.18.0" \
+            "@solana/kit@^8 @solana/kit-plugin-rpc@<1 @solana/kit-plugin-signer@<1"; do
+          echo "::group::kit peers: ${PEERS}"
+          # shellcheck disable=SC2086
+          npm install ${PEERS}
           node - <<'EOF'
           const assert = require("node:assert/strict");
           const { createClient } = require("@solana/kit");
@@ -215,3 +222,5 @@ jobs:
           assert.equal(typeof surfpool, "function");
           assert.equal(typeof createSurfnetCheatcodesRpc, "function");
           EOF
+          echo "::endgroup::"
+          done
