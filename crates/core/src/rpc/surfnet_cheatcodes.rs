@@ -1785,45 +1785,47 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
             let mint_has_transfer_fee = confidential.is_some()
                 && !get_mint_result.is_none()
                 && mint_has_transfer_fee_config(get_mint_result.expected_data());
-            let minimum_rent = svm_locker.with_svm_reader(|svm_reader| {
-                svm_reader.inner.minimum_balance_for_rent_exemption(
-                    TokenAccount::get_packed_len_for_token_program_id(&token_program_id),
-                )
-            });
-
-            let (rent_exempt_reserve, initial_lamports) = if is_native_mint {
-                // For native mint, we need to allocate enough lamports to cover the wrapped SOL amount
-                (Some(minimum_rent), minimum_rent + token_amount) // 1 SOL wrapped
-            } else {
-                (None, minimum_rent)
-            };
-
             let SvmAccessContext {
                 slot,
                 inner: mut token_account,
                 ..
             } = svm_locker
-                .get_account(
-                    &remote_ctx,
-                    &associated_token_account,
-                    Some(Box::new(move |_| {
-                        let default =
-                            TokenAccount::new(&token_program_id, owner, mint, rent_exempt_reserve);
-                        let data = default.pack_into_vec();
-                        GetAccountResult::FoundAccount(
-                            associated_token_account,
-                            Account {
-                                lamports: initial_lamports,
-                                owner: token_program_id,
-                                executable: false,
-                                rent_epoch: 0,
-                                data,
-                            },
-                            AccountSource::Generated,
-                        )
-                    })),
-                )
+                .get_account(&remote_ctx, &associated_token_account, None)
                 .await?;
+
+            if token_account.is_none() {
+                let mut default = TokenAccount::new(&token_program_id, owner, mint, None);
+                let mint_data = (!get_mint_result.is_none())
+                    .then(|| get_mint_result.expected_data().as_slice());
+                let mut data = default.pack_associated_account(mint_data).map_err(|e| {
+                    Error::invalid_params(format!("Failed to initialize token account: {e}"))
+                })?;
+                let minimum_rent = svm_locker.with_svm_reader(|svm_reader| {
+                    svm_reader
+                        .inner
+                        .minimum_balance_for_rent_exemption(data.len())
+                });
+                let lamports = if is_native_mint {
+                    default = TokenAccount::new(&token_program_id, owner, mint, Some(minimum_rent));
+                    data = default.pack_into_preserving_extensions(&data)?;
+                    minimum_rent.checked_add(token_amount).ok_or_else(|| {
+                        Error::invalid_params("Native token balance overflows lamports")
+                    })?
+                } else {
+                    minimum_rent
+                };
+                token_account = GetAccountResult::FoundAccount(
+                    associated_token_account,
+                    Account {
+                        lamports,
+                        owner: token_program_id,
+                        executable: false,
+                        rent_epoch: 0,
+                        data,
+                    },
+                    AccountSource::Generated,
+                );
+            }
 
             let mut token_account_data = TokenAccount::unpack(token_account.expected_data())
                 .map_err(|e| {
@@ -5477,6 +5479,232 @@ mod tests {
         assert_eq!(state.base.amount, 42);
         assert_eq!(state.base.is_native, COption::Some(extended_rent));
         assert!(state.get_extension::<ImmutableOwner>().is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_set_token_2022_fee_mint_supports_real_transfer() {
+        use spl_token_2022_interface::{
+            extension::{
+                BaseStateWithExtensionsMut, ExtensionType, StateWithExtensionsMut,
+                transfer_fee::TransferFeeConfig,
+            },
+            state::Mint as Token2022Mint,
+        };
+
+        let client = TestSetup::new(SurfnetCheatcodesRpc::empty());
+        let source_owner = Keypair::new();
+        let destination_owner = Keypair::new();
+        let mint = Pubkey::new_unique();
+        let token_program = spl_token_2022_interface::id();
+        let mint_len = ExtensionType::try_calculate_account_len::<Token2022Mint>(&[
+            ExtensionType::TransferFeeConfig,
+        ])
+        .unwrap();
+        let mut mint_data = vec![0; mint_len];
+        {
+            let mut state =
+                StateWithExtensionsMut::<Token2022Mint>::unpack_uninitialized(&mut mint_data)
+                    .unwrap();
+            let config = state.init_extension::<TransferFeeConfig>(true).unwrap();
+            for fee in [
+                &mut config.older_transfer_fee,
+                &mut config.newer_transfer_fee,
+            ] {
+                fee.transfer_fee_basis_points = 100.into();
+                fee.maximum_fee = 100.into();
+            }
+            state.base = Token2022Mint {
+                supply: 500,
+                decimals: 0,
+                is_initialized: true,
+                ..Default::default()
+            };
+            state.pack_base();
+            state.init_account_type().unwrap();
+        }
+        let mint_rent = client.context.svm_locker.with_svm_reader(|svm| {
+            svm.inner
+                .minimum_balance_for_rent_exemption(mint_data.len())
+        });
+        set_account(
+            &client,
+            &mint,
+            &Account {
+                lamports: mint_rent,
+                data: mint_data,
+                owner: token_program,
+                executable: false,
+                rent_epoch: 0,
+            },
+        );
+        client
+            .context
+            .svm_locker
+            .airdrop(&source_owner.pubkey(), 1_000_000_000)
+            .unwrap()
+            .unwrap();
+
+        for (owner, amount) in [(&source_owner, 500), (&destination_owner, 0)] {
+            client
+                .rpc
+                .set_token_account(
+                    Some(client.context.clone()),
+                    owner.pubkey().to_string(),
+                    mint.to_string(),
+                    TokenAccountUpdate {
+                        amount: Some(amount),
+                        ..Default::default()
+                    },
+                    Some(token_program.to_string()),
+                )
+                .await
+                .unwrap();
+        }
+
+        let source_ata = get_associated_token_address_with_program_id(
+            &source_owner.pubkey(),
+            &mint,
+            &token_program,
+        );
+        let destination_ata = get_associated_token_address_with_program_id(
+            &destination_owner.pubkey(),
+            &mint,
+            &token_program,
+        );
+        let instruction = transfer_checked(
+            &token_program,
+            &source_ata,
+            &mint,
+            &destination_ata,
+            &source_owner.pubkey(),
+            &[&source_owner.pubkey()],
+            100,
+            0,
+        )
+        .unwrap();
+        let blockhash = client
+            .context
+            .svm_locker
+            .with_svm_reader(|svm| svm.latest_blockhash());
+        let transaction = Transaction::new_signed_with_payer(
+            &[instruction],
+            Some(&source_owner.pubkey()),
+            &[&source_owner],
+            blockhash,
+        );
+        let transfer_result = client
+            .context
+            .svm_locker
+            .with_svm_writer(|svm| svm.send_transaction(transaction.into(), false, false));
+        assert!(
+            transfer_result.is_ok(),
+            "a funded Token-2022 transfer-fee ATA should support a real transfer: {transfer_result:?}"
+        );
+        client.context.svm_locker.with_svm_reader(|svm| {
+            use spl_token_2022_interface::{
+                extension::{
+                    BaseStateWithExtensions, StateWithExtensions, immutable_owner::ImmutableOwner,
+                    transfer_fee::TransferFeeAmount,
+                },
+                state::Account as Token2022Account,
+            };
+            for (address, expected_amount) in [(source_ata, 400), (destination_ata, 99)] {
+                let account = svm.get_account(&address).unwrap().unwrap();
+                let state = StateWithExtensions::<Token2022Account>::unpack(&account.data).unwrap();
+                assert_eq!(state.base.amount, expected_amount);
+                assert!(state.get_extension::<ImmutableOwner>().is_ok());
+                assert!(
+                    account.lamports
+                        >= svm
+                            .inner
+                            .minimum_balance_for_rent_exemption(account.data.len())
+                );
+                let fee = state.get_extension::<TransferFeeAmount>().unwrap();
+                assert_eq!(
+                    u64::from(fee.withheld_amount),
+                    if address == destination_ata { 1 } else { 0 }
+                );
+            }
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_set_token_2022_ata_preserves_immutable_owner_rule() {
+        use spl_token_2022_interface::instruction::{AuthorityType, set_authority};
+
+        let client = TestSetup::new(SurfnetCheatcodesRpc::empty());
+        let owner = Keypair::new();
+        let new_owner = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let token_program = spl_token_2022_interface::id();
+        let mut mint_data = [0u8; spl_token_2022_interface::state::Mint::LEN];
+        spl_token_2022_interface::state::Mint {
+            decimals: 0,
+            is_initialized: true,
+            ..Default::default()
+        }
+        .pack_into_slice(&mut mint_data);
+        set_account(
+            &client,
+            &mint,
+            &Account {
+                lamports: 1_461_600,
+                data: mint_data.to_vec(),
+                owner: token_program,
+                executable: false,
+                rent_epoch: 0,
+            },
+        );
+        client
+            .context
+            .svm_locker
+            .airdrop(&owner.pubkey(), 1_000_000_000)
+            .unwrap()
+            .unwrap();
+        client
+            .rpc
+            .set_token_account(
+                Some(client.context.clone()),
+                owner.pubkey().to_string(),
+                mint.to_string(),
+                TokenAccountUpdate {
+                    amount: Some(100),
+                    ..Default::default()
+                },
+                Some(token_program.to_string()),
+            )
+            .await
+            .unwrap();
+
+        let ata =
+            get_associated_token_address_with_program_id(&owner.pubkey(), &mint, &token_program);
+        let instruction = set_authority(
+            &token_program,
+            &ata,
+            Some(&new_owner),
+            AuthorityType::AccountOwner,
+            &owner.pubkey(),
+            &[],
+        )
+        .unwrap();
+        let blockhash = client
+            .context
+            .svm_locker
+            .with_svm_reader(|svm| svm.latest_blockhash());
+        let transaction = Transaction::new_signed_with_payer(
+            &[instruction],
+            Some(&owner.pubkey()),
+            &[&owner],
+            blockhash,
+        );
+        let change_owner_result = client
+            .context
+            .svm_locker
+            .with_svm_writer(|svm| svm.send_transaction(transaction.into(), false, false));
+        assert!(
+            change_owner_result.is_err(),
+            "a Token-2022 ATA must reject owner changes, but got {change_owner_result:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
