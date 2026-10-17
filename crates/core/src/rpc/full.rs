@@ -4,7 +4,11 @@ use itertools::Itertools;
 use jsonrpc_core::{BoxFuture, Error, Result};
 use jsonrpc_derive::rpc;
 use litesvm::types::TransactionMetadata;
-use solana_account_decoder::UiAccount;
+use solana_account::Account;
+use solana_account_decoder::{
+    UiAccount, parse_account_data::SplTokenAdditionalDataV2,
+    parse_token::token_amount_to_ui_amount_v3,
+};
 use solana_client::{
     rpc_config::{
         RpcAccountInfoConfig, RpcBlockConfig, RpcBlocksConfigWrapper, RpcContextConfig,
@@ -30,8 +34,9 @@ use solana_signature::Signature;
 use solana_transaction_error::TransactionError;
 use solana_transaction_status::{
     EncodedConfirmedTransactionWithStatusMeta, EncodedTransactionWithStatusMeta,
-    TransactionBinaryEncoding, TransactionConfirmationStatus, TransactionStatus, UiConfirmedBlock,
-    UiTransactionEncoding, map_inner_instructions, parse_ui_inner_instructions,
+    TransactionBinaryEncoding, TransactionConfirmationStatus, TransactionStatus,
+    TransactionTokenBalance, UiConfirmedBlock, UiLoadedAddresses, UiTransactionEncoding,
+    UiTransactionTokenBalance, map_inner_instructions, parse_ui_inner_instructions,
 };
 use surfpool_types::{
     SerialVmMutationResult, SerialVmMutationTask, SimnetCommand, TransactionStatusEvent,
@@ -49,10 +54,14 @@ use crate::{
     error::{SurfpoolError, SurfpoolResult},
     rpc::utils::{adjust_default_transaction_config, get_default_transaction_config},
     surfnet::{
-        CoupledAccount, GetAccountResult, GetTransactionResult, locker::SvmAccessContext,
-        svm::MAX_RECENT_BLOCKHASHES_STANDARD,
+        CoupledAccount, GetAccountResult, GetTransactionResult,
+        locker::SvmAccessContext,
+        svm::{MAX_RECENT_BLOCKHASHES_STANDARD, SurfnetSvm},
     },
-    types::{SurfnetTransactionStatus, surfpool_tx_metadata_to_litesvm_tx_metadata},
+    types::{
+        MintAccount, SurfnetTransactionStatus, TokenAccount,
+        surfpool_tx_metadata_to_litesvm_tx_metadata,
+    },
 };
 
 const MAX_PRIORITIZATION_FEE_BLOCKS_CACHE: usize = 150;
@@ -2080,7 +2089,56 @@ impl Full for SurfpoolFullRpc {
             // Clone the message before moving the transaction for later use in result formatting
             let tx_message = unsanitized_tx.message.clone();
 
-            let value = match svm_locker.simulate_transaction(unsanitized_tx, config.sig_verify) {
+            // Capture balances and execute against the same read-locked state. A concurrent
+            // transaction must not change the accounts between the snapshot and simulation.
+            let (simulation, balances) = svm_locker.with_svm_reader(|svm| {
+                let before = transaction_pubkeys
+                    .iter()
+                    .map(|pubkey| svm.get_account(pubkey))
+                    .collect::<SurfpoolResult<Vec<_>>>()?;
+                let simulation = svm.simulate_transaction(unsanitized_tx, config.sig_verify);
+                let balances = simulation
+                    .as_ref()
+                    .ok()
+                    .map(|info| {
+                        let mut after = before.clone();
+                        for (pubkey, account) in &info.post_accounts {
+                            if let Some(index) =
+                                transaction_pubkeys.iter().position(|key| key == pubkey)
+                            {
+                                after[index] = Some(account.clone().into());
+                            }
+                        }
+                        Ok::<_, SurfpoolError>(SimulationBalances {
+                            pre: before
+                                .iter()
+                                .map(|account| {
+                                    account.as_ref().map_or(0, |account| account.lamports)
+                                })
+                                .collect(),
+                            post: after
+                                .iter()
+                                .map(|account| {
+                                    account.as_ref().map_or(0, |account| account.lamports)
+                                })
+                                .collect(),
+                            pre_tokens: simulation_token_balances(
+                                svm,
+                                &transaction_pubkeys,
+                                &before,
+                            )?,
+                            post_tokens: simulation_token_balances(
+                                svm,
+                                &transaction_pubkeys,
+                                &after,
+                            )?,
+                        })
+                    })
+                    .transpose()?;
+                Ok::<_, SurfpoolError>((simulation, balances))
+            })?;
+
+            let mut value = match simulation {
                 Ok(tx_info) => {
                     let mut accounts = None;
                     if let Some(observed_accounts) = config.accounts {
@@ -2127,6 +2185,13 @@ impl Full for SurfpoolFullRpc {
                     Some(loaded_accounts_data_size as u32),
                 ),
             };
+
+            if let Some(balances) = balances {
+                value.pre_balances = Some(balances.pre);
+                value.post_balances = Some(balances.post);
+                value.pre_token_balances = Some(balances.pre_tokens);
+                value.post_token_balances = Some(balances.post_tokens);
+            }
 
             Ok(RpcResponse {
                 context: RpcResponseContext::new(slot),
@@ -2767,6 +2832,58 @@ impl Full for SurfpoolFullRpc {
     }
 }
 
+struct SimulationBalances {
+    pre: Vec<u64>,
+    post: Vec<u64>,
+    pre_tokens: Vec<UiTransactionTokenBalance>,
+    post_tokens: Vec<UiTransactionTokenBalance>,
+}
+
+fn simulation_token_balances(
+    svm: &SurfnetSvm,
+    pubkeys: &[Pubkey],
+    accounts: &[Option<Account>],
+) -> SurfpoolResult<Vec<UiTransactionTokenBalance>> {
+    let mut balances = vec![];
+    for (index, account) in accounts.iter().enumerate() {
+        let Some(account) = account else { continue };
+        if account.lamports == 0
+            || (account.owner != spl_token_interface::id()
+                && account.owner != spl_token_2022_interface::id())
+        {
+            continue;
+        }
+        let Ok(token_account) = TokenAccount::unpack(&account.data) else {
+            continue;
+        };
+        let mint_key = token_account.mint();
+        // A mint may itself be created by this simulation. Prefer this snapshot
+        // over the live SVM, which deliberately contains none of its effects.
+        let mint = match pubkeys.iter().position(|key| *key == mint_key) {
+            Some(index) => accounts[index].clone(),
+            None => svm.get_account(&mint_key)?,
+        };
+        let Some(mint) = mint else { continue };
+        let Ok(mint) = MintAccount::unpack(&mint.data) else {
+            continue;
+        };
+        balances.push(
+            TransactionTokenBalance {
+                account_index: index as u8,
+                mint: mint_key.to_string(),
+                ui_token_amount: token_amount_to_ui_amount_v3(
+                    token_account.amount(),
+                    &SplTokenAdditionalDataV2::with_decimals(mint.decimals()),
+                ),
+                owner: token_account.owner().to_string(),
+                program_id: account.owner.to_string(),
+            }
+            .into(),
+        );
+    }
+    Ok(balances)
+}
+
 fn get_simulate_transaction_result(
     metadata: TransactionMetadata,
     accounts: Option<Vec<Option<UiAccount>>>,
@@ -2779,6 +2896,10 @@ fn get_simulate_transaction_result(
 ) -> RpcSimulateTransactionResult {
     RpcSimulateTransactionResult {
         accounts,
+        fee: error.is_none().then_some(metadata.fee),
+        loaded_addresses: Some(UiLoadedAddresses::from(
+            &loaded_addresses.cloned().unwrap_or_default(),
+        )),
         err: error.map(|e| e.into()),
         inner_instructions: if include_inner_instructions {
             let account_keys = AccountKeys::new(message.static_account_keys(), loaded_addresses);
@@ -2799,12 +2920,10 @@ fn get_simulate_transaction_result(
         },
         units_consumed: Some(metadata.compute_units_consumed),
         loaded_accounts_data_size,
-        fee: None,
         pre_balances: None,
         post_balances: None,
         pre_token_balances: None,
         post_token_balances: None,
-        loaded_addresses: None,
     }
 }
 
@@ -3902,6 +4021,17 @@ mod tests {
             _ => unimplemented!(),
         };
 
+        let locker = setup.context.svm_locker.clone();
+        let keys = tx.message.static_account_keys().to_vec();
+        let before = locker.with_svm_reader(|svm| {
+            keys.iter()
+                .map(|key| {
+                    svm.get_account(key)
+                        .unwrap()
+                        .map_or(0, |account| account.lamports)
+                })
+                .collect::<Vec<_>>()
+        });
         let simulation_res = setup
             .rpc
             .simulate_transaction(
@@ -3939,6 +4069,39 @@ mod tests {
             })]),
             "Wrong account content"
         );
+        let result = &simulation_res.value;
+        assert_eq!(result.fee, Some(5_000));
+        assert_eq!(result.pre_balances.as_ref(), Some(&before));
+        assert_eq!(result.pre_token_balances, Some(vec![]));
+        assert_eq!(result.post_token_balances, Some(vec![]));
+        assert_eq!(result.loaded_addresses, Some(UiLoadedAddresses::default()));
+        let live_after_simulation = locker.with_svm_reader(|svm| {
+            keys.iter()
+                .map(|key| {
+                    svm.get_account(key)
+                        .unwrap()
+                        .map_or(0, |account| account.lamports)
+                })
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            live_after_simulation, before,
+            "simulation must not commit balances"
+        );
+        let execution = locker
+            .with_svm_writer(|svm| svm.send_transaction(tx, false, false))
+            .unwrap();
+        let live_after_execution = locker.with_svm_reader(|svm| {
+            keys.iter()
+                .map(|key| {
+                    svm.get_account(key)
+                        .unwrap()
+                        .map_or(0, |account| account.lamports)
+                })
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(result.fee, Some(execution.fee));
+        assert_eq!(result.post_balances.as_ref(), Some(&live_after_execution));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -4095,6 +4258,343 @@ mod tests {
             simulation_res.value.err,
             Some(TransactionError::SignatureFailure.into())
         );
+    }
+
+    #[test_case(spl_token_interface::id(); "legacy token")]
+    #[test_case(spl_token_2022_interface::id(); "Token-2022")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_simulation_metadata_alt_token_balances(token_program: Pubkey) {
+        use solana_program_pack::Pack;
+
+        let setup = TestSetup::new(SurfpoolFullRpc);
+        let payer = Keypair::new();
+        let mint = Pubkey::new_unique();
+        let source = Pubkey::new_unique();
+        let destination = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+        let table = Pubkey::new_unique();
+        let clock = solana_sdk_ids::sysvar::clock::id();
+        let addresses = vec![source, destination, mint, clock];
+        let mut mint_data = vec![0; spl_token_interface::state::Mint::LEN];
+        spl_token_interface::state::Mint {
+            supply: 3_000_000,
+            decimals: 6,
+            is_initialized: true,
+            ..Default::default()
+        }
+        .pack_into_slice(&mut mint_data);
+        let locker = setup.context.svm_locker.clone();
+        locker.with_svm_writer(|svm| {
+            let account = |owner, data| Account {
+                lamports: LAMPORTS_PER_SOL,
+                data,
+                owner,
+                executable: false,
+                rent_epoch: 0,
+            };
+            svm.set_account(&payer.pubkey(), account(system_program::id(), vec![]))
+                .unwrap();
+            svm.set_account(&mint, account(token_program, mint_data))
+                .unwrap();
+            for (key, owner, amount) in [
+                (source, payer.pubkey(), 2_000_000),
+                (destination, recipient, 1_000_000),
+            ] {
+                let mut token = TokenAccount::new(&token_program, owner, mint, None);
+                token.set_amount(amount);
+                svm.set_account(&key, account(token_program, token.pack_into_vec()))
+                    .unwrap();
+            }
+            let lookup = AddressLookupTable {
+                meta: LookupTableMeta::default(),
+                addresses: addresses.clone().into(),
+            };
+            svm.set_account(
+                &table,
+                account(
+                    solana_address_lookup_table_interface::program::id(),
+                    lookup.serialize_for_tests().unwrap(),
+                ),
+            )
+            .unwrap();
+        });
+        let mut transfer = spl_token_2022_interface::instruction::transfer_checked(
+            &token_program,
+            &source,
+            &mint,
+            &destination,
+            &payer.pubkey(),
+            &[],
+            100_000,
+            6,
+        )
+        .unwrap();
+        transfer
+            .accounts
+            .push(AccountMeta::new_readonly(clock, false));
+        let blockhash = locker.with_svm_reader(|svm| svm.latest_blockhash());
+        let message = V0Message::try_compile(
+            &payer.pubkey(),
+            &[transfer],
+            &[AddressLookupTableAccount {
+                key: table,
+                addresses: addresses.clone(),
+            }],
+            blockhash,
+        )
+        .unwrap();
+        let static_len = message.account_keys.len();
+        let tx = VersionedTransaction::try_new(VersionedMessage::V0(message), &[&payer]).unwrap();
+        let simulation = setup
+            .rpc
+            .simulate_transaction(
+                Some(setup.context.clone()),
+                bs58::encode(wincode::serialize(&tx).unwrap()).into_string(),
+                None,
+            )
+            .await
+            .unwrap()
+            .value;
+        assert_eq!(simulation.err, None);
+        assert_eq!(simulation.fee, Some(5_000));
+        assert_eq!(
+            simulation.loaded_addresses,
+            Some(UiLoadedAddresses {
+                writable: vec![source.to_string(), destination.to_string()],
+                readonly: vec![mint.to_string(), clock.to_string()],
+            })
+        );
+        let pre = simulation.pre_token_balances.as_ref().unwrap();
+        let post = simulation.post_token_balances.as_ref().unwrap();
+        assert_eq!(pre.len(), 2);
+        assert_eq!(post.len(), 2);
+        for (balance, index, amount, owner) in [
+            (&pre[0], static_len, "2000000", payer.pubkey()),
+            (&pre[1], static_len + 1, "1000000", recipient),
+            (&post[0], static_len, "1900000", payer.pubkey()),
+            (&post[1], static_len + 1, "1100000", recipient),
+        ] {
+            assert_eq!(balance.account_index, index as u8);
+            assert_eq!(balance.mint, mint.to_string());
+            assert_eq!(balance.ui_token_amount.amount, amount);
+            assert_eq!(balance.ui_token_amount.decimals, 6);
+            assert_eq!(balance.owner, OptionSerializer::Some(owner.to_string()));
+            assert_eq!(
+                balance.program_id,
+                OptionSerializer::Some(token_program.to_string())
+            );
+        }
+        let read_amount = |key: &Pubkey| {
+            locker.with_svm_reader(|svm| {
+                TokenAccount::unpack(&svm.get_account(key).unwrap().unwrap().data)
+                    .unwrap()
+                    .amount()
+            })
+        };
+        assert_eq!(read_amount(&source), 2_000_000);
+        assert_eq!(read_amount(&destination), 1_000_000);
+        locker
+            .with_svm_writer(|svm| svm.send_transaction(tx, false, false))
+            .unwrap();
+        assert_eq!(read_amount(&source), 1_900_000);
+        assert_eq!(read_amount(&destination), 1_100_000);
+
+        // Closing an account must remove its post-token entry, rather than pairing
+        // the remaining accounts with pre-token mints by vector position.
+        let cleanup = build_legacy_transaction(
+            &payer.pubkey(),
+            &[&payer],
+            &[
+                spl_token_2022_interface::instruction::burn(
+                    &token_program,
+                    &source,
+                    &mint,
+                    &payer.pubkey(),
+                    &[],
+                    1_900_000,
+                )
+                .unwrap(),
+                spl_token_2022_interface::instruction::close_account(
+                    &token_program,
+                    &source,
+                    &payer.pubkey(),
+                    &payer.pubkey(),
+                    &[],
+                )
+                .unwrap(),
+            ],
+            &blockhash,
+        );
+        let cleanup_result = setup
+            .rpc
+            .simulate_transaction(
+                Some(setup.context),
+                bs58::encode(wincode::serialize(&cleanup).unwrap()).into_string(),
+                None,
+            )
+            .await
+            .unwrap()
+            .value;
+        assert_eq!(cleanup_result.err, None);
+        assert_eq!(cleanup_result.pre_token_balances.as_ref().unwrap().len(), 1);
+        assert_eq!(cleanup_result.post_token_balances, Some(vec![]));
+        assert_eq!(read_amount(&source), 1_900_000);
+    }
+
+    #[test_case(spl_token_interface::id(); "legacy token")]
+    #[test_case(spl_token_2022_interface::id(); "Token-2022")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_simulation_metadata_new_mint_and_account(token_program: Pubkey) {
+        use solana_program_pack::Pack;
+        let setup = TestSetup::new(SurfpoolFullRpc);
+        let payer = Keypair::new();
+        let mint = Keypair::new();
+        let token = Keypair::new();
+        let locker = setup.context.svm_locker.clone();
+        locker
+            .airdrop(&payer.pubkey(), 10 * LAMPORTS_PER_SOL)
+            .unwrap()
+            .unwrap();
+        let (mint_rent, account_rent, blockhash) = locker.with_svm_reader(|svm| {
+            (
+                svm.inner
+                    .minimum_balance_for_rent_exemption(spl_token_interface::state::Mint::LEN),
+                svm.inner
+                    .minimum_balance_for_rent_exemption(spl_token_interface::state::Account::LEN),
+                svm.latest_blockhash(),
+            )
+        });
+        let tx = build_legacy_transaction(
+            &payer.pubkey(),
+            &[&payer, &mint, &token],
+            &[
+                system_instruction::create_account(
+                    &payer.pubkey(),
+                    &mint.pubkey(),
+                    mint_rent,
+                    spl_token_interface::state::Mint::LEN as u64,
+                    &token_program,
+                ),
+                spl_token_2022_interface::instruction::initialize_mint2(
+                    &token_program,
+                    &mint.pubkey(),
+                    &payer.pubkey(),
+                    None,
+                    6,
+                )
+                .unwrap(),
+                system_instruction::create_account(
+                    &payer.pubkey(),
+                    &token.pubkey(),
+                    account_rent,
+                    spl_token_interface::state::Account::LEN as u64,
+                    &token_program,
+                ),
+                spl_token_2022_interface::instruction::initialize_account3(
+                    &token_program,
+                    &token.pubkey(),
+                    &mint.pubkey(),
+                    &payer.pubkey(),
+                )
+                .unwrap(),
+                spl_token_2022_interface::instruction::mint_to(
+                    &token_program,
+                    &mint.pubkey(),
+                    &token.pubkey(),
+                    &payer.pubkey(),
+                    &[],
+                    123_456,
+                )
+                .unwrap(),
+            ],
+            &blockhash,
+        );
+        let keys = tx.message.static_account_keys();
+        let token_index = keys.iter().position(|key| *key == token.pubkey()).unwrap();
+        let result = setup
+            .rpc
+            .simulate_transaction(
+                Some(setup.context),
+                bs58::encode(wincode::serialize(&tx).unwrap()).into_string(),
+                None,
+            )
+            .await
+            .unwrap()
+            .value;
+        assert_eq!(result.err, None);
+        assert_eq!(result.fee, Some(15_000));
+        assert_eq!(result.pre_token_balances, Some(vec![]));
+        let tokens = result.post_token_balances.unwrap();
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].account_index, token_index as u8);
+        assert_eq!(tokens[0].mint, mint.pubkey().to_string());
+        assert_eq!(tokens[0].ui_token_amount.amount, "123456");
+        assert_eq!(tokens[0].ui_token_amount.decimals, 6);
+        assert_eq!(tokens[0].ui_token_amount.ui_amount_string, "0.123456");
+        locker.with_svm_reader(|svm| {
+            assert!(svm.get_account(&mint.pubkey()).unwrap().is_none());
+            assert!(svm.get_account(&token.pubkey()).unwrap().is_none());
+        });
+    }
+
+    #[test_case(false; "instruction failure")]
+    #[test_case(true; "expired blockhash")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_simulation_metadata_failure_has_no_invented_post_state(expired: bool) {
+        let setup = TestSetup::new(SurfpoolFullRpc);
+        let payer = Keypair::new();
+        let recipient = Pubkey::new_unique();
+        let locker = setup.context.svm_locker.clone();
+        locker
+            .airdrop(&payer.pubkey(), LAMPORTS_PER_SOL)
+            .unwrap()
+            .unwrap();
+        let blockhash = if expired {
+            Hash::new_unique()
+        } else {
+            locker.with_svm_reader(|svm| svm.latest_blockhash())
+        };
+        let tx = build_legacy_transaction(
+            &payer.pubkey(),
+            &[&payer],
+            &[
+                system_instruction::transfer(&payer.pubkey(), &recipient, 1_000_000),
+                system_instruction::transfer(&payer.pubkey(), &recipient, 2 * LAMPORTS_PER_SOL),
+            ],
+            &blockhash,
+        );
+        let before = locker
+            .with_svm_reader(|svm| svm.get_account(&payer.pubkey()).unwrap().unwrap().lamports);
+        let result = setup
+            .rpc
+            .simulate_transaction(
+                Some(setup.context),
+                bs58::encode(wincode::serialize(&tx).unwrap()).into_string(),
+                None,
+            )
+            .await
+            .unwrap()
+            .value;
+        if expired {
+            assert_eq!(result.err, Some(TransactionError::BlockhashNotFound.into()));
+        } else {
+            assert!(result.err.is_some());
+        }
+        // LiteSVM's failure result has no post-accounts. Keep that distinction
+        // instead of deriving a successful transfer or fee debit from the input.
+        assert_eq!(result.fee, None);
+        assert_eq!(result.pre_balances, None);
+        assert_eq!(result.post_balances, None);
+        assert_eq!(result.pre_token_balances, None);
+        assert_eq!(result.post_token_balances, None);
+        assert_eq!(result.loaded_addresses, Some(UiLoadedAddresses::default()));
+        locker.with_svm_reader(|svm| {
+            assert_eq!(
+                svm.get_account(&payer.pubkey()).unwrap().unwrap().lamports,
+                before
+            );
+            assert!(svm.get_account(&recipient).unwrap().is_none());
+        });
     }
 
     /// SIMD-0186, as Agave's `load_transaction_accounts` counts it: each loaded account costs 64
