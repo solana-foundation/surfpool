@@ -812,7 +812,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     use solana_client::{
         rpc_config::{RpcContextConfig, RpcProgramAccountsConfig, RpcTokenAccountsFilter},
@@ -1325,7 +1328,9 @@ mod tests {
     /// out the HTTP timeout, and the blocked handler waits with it.
     #[test]
     fn a_blocked_rpc_worker_does_not_stall_datasource_reads_from_the_runloop() {
-        let client = SurfnetRemoteClient::new(serve_slot_with_keep_alive());
+        let server = tokio::runtime::Runtime::new().expect("server runtime should build");
+        let (url, connections) = serve_slot_with_keep_alive(&server);
+        let client = SurfnetRemoteClient::new(url);
         let worker = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
@@ -1357,34 +1362,44 @@ mod tests {
 
         let slot = answer.expect("the runloop's read should not wait on the blocked worker");
         assert_eq!(slot.expect("the runloop's read should answer"), 7);
+        assert_eq!(
+            connections.load(Ordering::SeqCst),
+            1,
+            "the runloop's read should reuse the connection the worker opened"
+        );
     }
 
-    /// A datasource that answers every JSON-RPC request with slot 7 and keeps
-    /// each connection open for the next request, as providers do.
-    fn serve_slot_with_keep_alive() -> String {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("test server should bind");
+    /// A datasource on `runtime` that answers every JSON-RPC request with slot 7
+    /// and keeps each connection open for the next request, as providers do.
+    /// Returns its URL and the number of connections it has accepted; it stops
+    /// with `runtime`.
+    fn serve_slot_with_keep_alive(runtime: &tokio::runtime::Runtime) -> (String, Arc<AtomicUsize>) {
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .expect("test server should bind");
         let address = listener
             .local_addr()
             .expect("test server should have a local address");
-        std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                let stream = stream.expect("test server should accept");
-                std::thread::spawn(move || answer_until_closed(stream));
+        let connections = Arc::new(AtomicUsize::new(0));
+        let accepted = Arc::clone(&connections);
+        runtime.spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                accepted.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(answer_until_closed(stream));
             }
         });
-        format!("http://{address}")
+        (format!("http://{address}"), connections)
     }
 
-    fn answer_until_closed(stream: std::net::TcpStream) {
-        use std::io::{BufRead, BufReader, Read, Write};
+    async fn answer_until_closed(stream: tokio::net::TcpStream) {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
-        let mut writer = stream.try_clone().expect("test stream should clone");
-        let mut reader = BufReader::new(stream);
+        let mut stream = BufReader::new(stream);
         loop {
             let mut content_length = 0;
             loop {
                 let mut line = String::new();
-                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                if stream.read_line(&mut line).await.unwrap_or(0) == 0 {
                     return;
                 }
                 if line == "\r\n" {
@@ -1396,18 +1411,20 @@ mod tests {
                     content_length = value.trim().parse().expect("content length should parse");
                 }
             }
-            let mut body = vec![0; content_length];
-            reader
-                .read_exact(&mut body)
-                .expect("test server should read the body");
-            let response = br#"{"jsonrpc":"2.0","result":7,"id":1}"#;
-            write!(
-                writer,
+            let mut request = vec![0; content_length];
+            stream
+                .read_exact(&mut request)
+                .await
+                .expect("test server should read the request");
+            let body = br#"{"jsonrpc":"2.0","result":7,"id":1}"#;
+            let head = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
-                response.len()
-            )
-            .and_then(|()| writer.write_all(response))
-            .expect("test server should answer");
+                body.len()
+            );
+            stream
+                .write_all(&[head.as_bytes(), body].concat())
+                .await
+                .expect("test server should answer");
         }
     }
 
