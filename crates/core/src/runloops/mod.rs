@@ -300,6 +300,8 @@ pub async fn start_local_surfnet_runloop(
                         compute_units_consumed: tx_meta.meta.compute_units_consumed.unwrap_or(0),
                         return_data: tx_meta.meta.return_data.clone().unwrap_or_default(),
                         fee: tx_meta.meta.fee,
+                        // Stored Solana transaction status does not include this measurement.
+                        loaded_accounts_data_size: 0,
                     };
 
                     events.push((

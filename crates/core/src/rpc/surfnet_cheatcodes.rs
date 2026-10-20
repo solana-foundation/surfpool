@@ -3002,7 +3002,7 @@ mod tests {
                     UiAccountChange::Update(before, after) => {
                         assert_eq!(
                             after.lamports,
-                            before.lamports - 2074080,
+                            before.lamports - 1_513_840,
                             "Payer account should be original balance minus rent"
                         );
                     }
@@ -3036,7 +3036,7 @@ mod tests {
                 match source_ata_change {
                     UiAccountChange::Create(new) => {
                         assert_eq!(
-                            new.lamports, 2074080,
+                            new.lamports, 1_513_840,
                             "Source ATA should have the correct lamports after creation"
                         );
                         assert_eq!(
@@ -3111,7 +3111,7 @@ mod tests {
                     UiAccountChange::Update(before, after) => {
                         assert_eq!(
                             after.lamports,
-                            before.lamports - 2074080,
+                            before.lamports - 1_513_840,
                             "Payer account should be original balance minus rent"
                         );
                     }
@@ -3145,7 +3145,7 @@ mod tests {
                 match destination_ata_change {
                     UiAccountChange::Create(new) => {
                         assert_eq!(
-                            new.lamports, 2074080,
+                            new.lamports, 1_513_840,
                             "Source ATA should have the correct lamports after creation"
                         );
                         assert_eq!(

@@ -1883,7 +1883,7 @@ impl SurfnetSvm {
             &sanitized_message,
             self.lamports_per_signature(),
             configuration.priority_fee_lamports,
-            FeeFeatures::from(&self.feature_set),
+            FeeFeatures {},
         ))
     }
 

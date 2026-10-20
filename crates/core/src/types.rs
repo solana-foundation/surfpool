@@ -598,6 +598,7 @@ pub fn surfpool_tx_metadata_to_litesvm_tx_metadata(
         inner_instructions: metadata.inner_instructions.clone(),
         signature: metadata.signature,
         fee: metadata.fee,
+        loaded_accounts_data_size: metadata.loaded_accounts_data_size,
     }
 }
 

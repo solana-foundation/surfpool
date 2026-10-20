@@ -49,8 +49,7 @@ use crate::{
     error::{SurfpoolError, SurfpoolResult},
     rpc::utils::{adjust_default_transaction_config, get_default_transaction_config},
     surfnet::{
-        CoupledAccount, GetAccountResult, GetTransactionResult, locker::SvmAccessContext,
-        svm::MAX_RECENT_BLOCKHASHES_STANDARD,
+        GetTransactionResult, locker::SvmAccessContext, svm::MAX_RECENT_BLOCKHASHES_STANDARD,
     },
     types::{SurfnetTransactionStatus, surfpool_tx_metadata_to_litesvm_tx_metadata},
 };
@@ -191,26 +190,6 @@ pub struct RpcTransactionsForAddressResult {
     pub data: Vec<RpcTransactionForAddressEntry>,
     pub pagination_token: Option<String>,
 }
-
-/// The programdata account a loader-v3 program points at, which SIMD-0186 counts with it.
-fn programdata_address(account: &solana_account::Account) -> Option<Pubkey> {
-    if account.owner != solana_sdk_ids::bpf_loader_upgradeable::id() {
-        return None;
-    }
-    match bincode::deserialize(&account.data) {
-        Ok(solana_loader_v3_interface::state::UpgradeableLoaderState::Program {
-            programdata_address,
-        }) => Some(programdata_address),
-        _ => None,
-    }
-}
-
-/// SIMD-0186: the size every loaded account adds on top of its data
-/// (`TRANSACTION_ACCOUNT_BASE_SIZE` in Agave's `svm/src/account_loader.rs`).
-const TRANSACTION_ACCOUNT_BASE_SIZE: u64 = 64;
-/// SIMD-0186: the size every address lookup table adds, the largest table plus its metadata
-/// (`ADDRESS_LOOKUP_TABLE_BASE_SIZE` in Agave's `svm/src/account_loader.rs`).
-const ADDRESS_LOOKUP_TABLE_BASE_SIZE: u64 = 8248;
 
 #[rpc]
 pub trait Full {
@@ -1889,7 +1868,7 @@ impl Full for SurfpoolFullRpc {
                                 false,
                                 &tx_message,
                                 None, // No loaded addresses available in error reporting context
-                                None,
+                                Some(metadata.loaded_accounts_data_size),
                             ))
                             .map_err(|e| {
                                 Error::invalid_params(format!(
@@ -2004,83 +1983,12 @@ impl Full for SurfpoolFullRpc {
 
             let SvmAccessContext {
                 slot,
-                inner: account_updates,
+                inner: _,
                 latest_blockhash,
                 latest_epoch_info,
             } = svm_locker
                 .get_multiple_accounts(&remote_ctx, &transaction_pubkeys, None)
                 .await?;
-
-            let lookup_tables = unsanitized_tx
-                .message
-                .address_table_lookups()
-                .map_or(0, <[_]>::len);
-            let mut seen_accounts = std::collections::HashSet::new();
-            let mut loaded_accounts_data_size: u64 = 0;
-
-            let mut track_accounts_data_size =
-                |account_update: &GetAccountResult| match account_update {
-                    GetAccountResult::FoundAccount(pubkey, account, _) => {
-                        if seen_accounts.insert(*pubkey) {
-                            loaded_accounts_data_size += account.data.len() as u64;
-                        }
-                        // A program already on the surfnet is not coupled with its programdata.
-                        if let Some(pd_pubkey) = programdata_address(account)
-                            && let Ok(Some(pd)) =
-                                svm_locker.with_svm_reader(|svm| svm.get_account(&pd_pubkey))
-                            && seen_accounts.insert(pd_pubkey)
-                        {
-                            loaded_accounts_data_size += pd.data.len() as u64;
-                        }
-                    }
-                    // According to SIMD 0186, program data is tracked as well as program accounts
-                    GetAccountResult::FoundCoupledAccount(
-                        (pubkey, account),
-                        CoupledAccount::ProgramData(pd_pubkey, pd_account),
-                        _,
-                    ) => {
-                        if seen_accounts.insert(*pubkey) {
-                            loaded_accounts_data_size += account.data.len() as u64;
-                        }
-                        if let Some(pd) = pd_account {
-                            if seen_accounts.insert(*pd_pubkey) {
-                                loaded_accounts_data_size += pd.data.len() as u64;
-                            }
-                        }
-                    }
-                    GetAccountResult::FoundCoupledAccount(
-                        (pubkey, account),
-                        CoupledAccount::Mint(td_pubkey, td_account),
-                        _,
-                    ) => {
-                        if seen_accounts.insert(*pubkey) {
-                            loaded_accounts_data_size += account.data.len() as u64;
-                        }
-                        if let Some(td) = td_account {
-                            let td_key_in_tx_pubkeys =
-                                transaction_pubkeys.iter().find(|k| **k == *td_pubkey);
-                            // Only count token data accounts that are explicitly loaded by the transaction
-                            if td_key_in_tx_pubkeys.is_some() && seen_accounts.insert(*td_pubkey) {
-                                loaded_accounts_data_size += td.data.len() as u64;
-                            }
-                        }
-                    }
-                    GetAccountResult::None(_) => {}
-                };
-
-            for res in account_updates.iter() {
-                track_accounts_data_size(res);
-            }
-
-            // SIMD-0186: every account counted above also costs a base size, and every address
-            // lookup table a flat size, whatever it holds.
-            //
-            // Delete this count once LiteSVM reports the size it metered, as
-            // `TransactionMetadata::loaded_accounts_data_size`
-            // (https://github.com/LiteSVM/litesvm/pull/428), and report that instead.
-            let loaded_accounts_data_size = loaded_accounts_data_size
-                + TRANSACTION_ACCOUNT_BASE_SIZE * seen_accounts.len() as u64
-                + ADDRESS_LOOKUP_TABLE_BASE_SIZE * lookup_tables as u64;
 
             // Convert TransactionLoadedAddresses to LoadedAddresses before it gets consumed
             let loaded_addresses_data = loaded_addresses.as_ref().map(|la| la.loaded_addresses());
@@ -2102,7 +2010,12 @@ impl Full for SurfpoolFullRpc {
             // Clone the message before moving the transaction for later use in result formatting
             let tx_message = unsanitized_tx.message.clone();
 
-            let value = match svm_locker.simulate_transaction(unsanitized_tx, config.sig_verify) {
+            let simulation = svm_locker.simulate_transaction(unsanitized_tx, config.sig_verify);
+            let loaded_accounts_data_size = match &simulation {
+                Ok(info) => info.meta.loaded_accounts_data_size,
+                Err(info) => info.meta.loaded_accounts_data_size,
+            };
+            let value = match simulation {
                 Ok(tx_info) => {
                     let mut accounts = None;
                     if let Some(observed_accounts) = config.accounts {
@@ -2135,7 +2048,7 @@ impl Full for SurfpoolFullRpc {
                         config.inner_instructions,
                         &tx_message,
                         loaded_addresses_data.as_ref(),
-                        Some(loaded_accounts_data_size as u32),
+                        Some(loaded_accounts_data_size),
                     )
                 }
                 Err(tx_info) => get_simulate_transaction_result(
@@ -2146,7 +2059,7 @@ impl Full for SurfpoolFullRpc {
                     config.inner_instructions,
                     &tx_message,
                     loaded_addresses_data.as_ref(),
-                    Some(loaded_accounts_data_size as u32),
+                    Some(loaded_accounts_data_size),
                 ),
             };
 

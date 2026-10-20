@@ -49,6 +49,8 @@ pub struct TransactionMetadata {
     pub compute_units_consumed: u64,
     pub return_data: TransactionReturnData,
     pub fee: u64,
+    #[serde(default)]
+    pub loaded_accounts_data_size: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

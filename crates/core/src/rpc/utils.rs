@@ -55,6 +55,7 @@ pub fn convert_transaction_metadata_from_canonical(
         compute_units_consumed: transaction_metadata.compute_units_consumed,
         return_data: transaction_metadata.return_data.clone(),
         fee: transaction_metadata.fee,
+        loaded_accounts_data_size: transaction_metadata.loaded_accounts_data_size,
     }
 }
 

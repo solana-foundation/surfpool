@@ -3358,7 +3358,7 @@ async fn test_profile_transaction_token_transfer(test_type: TestType) {
                 UiAccountChange::Update(before, after) => {
                     assert_eq!(
                         after.lamports,
-                        before.lamports - 2074080,
+                        before.lamports - 1_513_840,
                         "Payer account should be original balance minus rent"
                     );
                 }
@@ -3392,7 +3392,7 @@ async fn test_profile_transaction_token_transfer(test_type: TestType) {
             match source_ata_change {
                 UiAccountChange::Create(new) => {
                     assert_eq!(
-                        new.lamports, 2074080,
+                        new.lamports, 1_513_840,
                         "Source ATA should have the correct lamports after creation"
                     );
                     assert_eq!(

@@ -670,7 +670,7 @@ mod tests {
             .get_minimum_balance_for_rent_exemption(Some(setup.context), 0, None)
             .unwrap();
 
-        assert_eq!(rent, 890880)
+        assert_eq!(rent, 650_240);
     }
 
     #[tokio::test(flavor = "multi_thread")]
