@@ -952,6 +952,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_remote_transaction_failure_does_not_disclose_datasource_credentials() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("test server should bind");
@@ -959,22 +961,17 @@ mod tests {
             .local_addr()
             .expect("test server should have a local address");
         let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("test server should accept");
+            let (mut stream, _) = listener.accept().await.expect("test server should accept");
             let mut request = [0u8; 4096];
-            stream
-                .readable()
+            let bytes_read = stream
+                .read(&mut request)
                 .await
-                .expect("request stream should become readable");
-            stream
-                .try_read(&mut request)
                 .expect("test server should read the request");
+            assert!(bytes_read > 0, "test server should receive a request");
             let response = b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n";
             stream
-                .writable()
+                .write_all(response)
                 .await
-                .expect("response stream should become writable");
-            stream
-                .try_write(response)
                 .expect("test server should write the response");
         });
         let datasource =
