@@ -22,6 +22,7 @@ export const SURFNET_CHEATCODE_METHODS = [
   "surfnet_resetNetwork",
   "surfnet_resumeClock",
   "surfnet_setAccount",
+  "surfnet_setMint",
   "surfnet_setProgramAuthority",
   "surfnet_setSupply",
   "surfnet_setTokenAccount",
