@@ -57,7 +57,7 @@ function assertNpmVersionMatchesCi() {
   if (major !== 11 || minor < 10) {
     throw new Error(
       `Expected npm 11.10.x or newer to match CI, found ${npmVersion}. ` +
-        "Run `nvm use 22.14.0 && npm install -g npm@^11.10.0` first.",
+        "Run `nvm use 24.22.1 && npm install -g npm@^11.10.0` first.",
     );
   }
 }
