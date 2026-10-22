@@ -85,8 +85,8 @@ use uuid::Uuid;
 
 use super::{
     AccountSource, AccountSubscriptionData, BlockHeader, BlockIdentifier, CoupledAccount,
-    FINALIZATION_SLOT_THRESHOLD, GetAccountResult, GeyserBlockMetadata, GeyserEntryInfo,
-    GeyserEvent, GeyserSlotStatus, GeyserTransactionEvent, LocalSignatureStatus,
+    GetAccountResult, GeyserBlockMetadata, GeyserEntryInfo, GeyserEvent, GeyserSlotStatus,
+    GeyserTransactionEvent, INITIAL_SLOT, LEGACY_FINALIZATION_SLOT_THRESHOLD, LocalSignatureStatus,
     LocalSignatureStatusOrSubscription, ProgramSubscriptionData, SignatureSubscriptionData,
     SignatureSubscriptionType, SlotsUpdatesSubscriptionData, remote::SurfnetRemoteClient,
 };
@@ -867,14 +867,13 @@ impl SurfnetSvm {
     }
 
     pub(crate) fn default_epoch_info(epoch_schedule: &EpochSchedule) -> EpochInfo {
-        let (epoch, slot_index) =
-            epoch_schedule.get_epoch_and_slot_index(FINALIZATION_SLOT_THRESHOLD);
+        let (epoch, slot_index) = epoch_schedule.get_epoch_and_slot_index(INITIAL_SLOT);
         EpochInfo {
             epoch,
             slot_index,
             slots_in_epoch: epoch_schedule.get_slots_in_epoch(epoch),
-            absolute_slot: FINALIZATION_SLOT_THRESHOLD,
-            block_height: FINALIZATION_SLOT_THRESHOLD,
+            absolute_slot: INITIAL_SLOT,
+            block_height: INITIAL_SLOT,
             transaction_count: None,
         }
     }
@@ -1668,7 +1667,7 @@ impl SurfnetSvm {
 
         // 2. Reconstruct SlotHashes - maps absolute slots to blockhashes.
         // The local ledger starts at genesis_slot, but finalized commitment is
-        // reported as current_slot - FINALIZATION_SLOT_THRESHOLD. During the
+        // reported using the active finalization depth. During the
         // initial warmup this points before genesis_slot, so seed those
         // synthetic slots into SlotHashes while preserving the local hash
         // mapping for genesis_slot and later.
@@ -1676,7 +1675,7 @@ impl SurfnetSvm {
             current_index.saturating_sub(MAX_SLOT_HASHES_ENTRIES as u64 - 1);
         let local_start_absolute_slot = slot_hash_start_index + self.genesis_slot;
         let finalized_start_absolute_slot =
-            current_absolute_slot.saturating_sub(FINALIZATION_SLOT_THRESHOLD);
+            current_absolute_slot.saturating_sub(self.finalization_slot_threshold());
         let earliest_retained_slot =
             current_absolute_slot.saturating_sub(MAX_SLOT_HASHES_ENTRIES as u64 - 1);
         let start_absolute_slot = local_start_absolute_slot
@@ -1781,13 +1780,25 @@ impl SurfnetSvm {
             .any(|entry| entry.blockhash == *recent_blockhash)
     }
 
+    /// Returns the finalization depth: one slot with Alpenglow, otherwise 31 slots.
+    pub fn finalization_slot_threshold(&self) -> u64 {
+        if self
+            .feature_set
+            .is_active(&agave_feature_set::alpenglow::id())
+        {
+            1
+        } else {
+            LEGACY_FINALIZATION_SLOT_THRESHOLD
+        }
+    }
+
     /// Returns the slot visible at `commitment`.
     pub fn slot_for_commitment(&self, commitment: &CommitmentConfig) -> Slot {
         let slot = self.get_latest_absolute_slot();
         match commitment.commitment {
             CommitmentLevel::Processed => slot,
             CommitmentLevel::Confirmed => slot.saturating_sub(1),
-            CommitmentLevel::Finalized => slot.saturating_sub(FINALIZATION_SLOT_THRESHOLD),
+            CommitmentLevel::Finalized => slot.saturating_sub(self.finalization_slot_threshold()),
         }
     }
 
@@ -2555,7 +2566,8 @@ impl SurfnetSvm {
                 TransactionConfirmationStatus::Confirmed,
             ));
             let signature = tx.signatures[0];
-            let finalized_at = self.latest_epoch_info.absolute_slot + FINALIZATION_SLOT_THRESHOLD;
+            let finalized_at =
+                self.latest_epoch_info.absolute_slot + self.finalization_slot_threshold();
             self.transactions_queued_for_finalization.push_back((
                 finalized_at,
                 tx,
@@ -2871,7 +2883,7 @@ impl SurfnetSvm {
 
         let parent_slot = self.latest_epoch_info.absolute_slot.saturating_sub(1);
         let new_slot = self.latest_epoch_info.absolute_slot;
-        let root = new_slot.saturating_sub(FINALIZATION_SLOT_THRESHOLD);
+        let root = new_slot.saturating_sub(self.finalization_slot_threshold());
         self.notify_slot_subscribers(new_slot, parent_slot, root);
 
         // Emit `slotsUpdatesNotification` events for the lifecycle transition
@@ -3614,7 +3626,7 @@ impl SurfnetSvm {
         {
             let (transaction, _) = transaction.as_ref();
             let confirmation_status =
-                if current_slot >= transaction.slot + FINALIZATION_SLOT_THRESHOLD {
+                if current_slot >= transaction.slot + self.finalization_slot_threshold() {
                     RpcTransactionConfirmationStatus::Finalized
                 } else if current_slot > transaction.slot {
                     RpcTransactionConfirmationStatus::Confirmed
@@ -5987,9 +5999,7 @@ mod tests {
         let checkpoint_slot = {
             let (mut svm, _events_rx, _geyser_rx) =
                 SurfnetSvm::new_with_db(Some(database_url), config.clone()).unwrap();
-            let target_slot = svm
-                .checkpoint_interval_slots()
-                .max(FINALIZATION_SLOT_THRESHOLD);
+            let target_slot = svm.checkpoint_interval_slots().max(INITIAL_SLOT);
             while svm.get_latest_absolute_slot() <= target_slot {
                 svm.confirm_current_block().unwrap();
             }
@@ -6047,7 +6057,7 @@ mod tests {
                 SurfnetSvm::new_with_db(Some(database_url), config.clone()).unwrap();
             let block_slot = svm
                 .checkpoint_interval_slots()
-                .max(FINALIZATION_SLOT_THRESHOLD)
+                .max(INITIAL_SLOT)
                 .saturating_add(7);
             svm.blocks
                 .store(
@@ -6095,11 +6105,8 @@ mod tests {
         assert_eq!(svm.slot_time, 123);
         assert!(!svm.instruction_profiling_enabled);
         assert_eq!(svm.max_profiles, 17);
-        assert_eq!(
-            svm.latest_epoch_info.absolute_slot,
-            FINALIZATION_SLOT_THRESHOLD
-        );
-        assert_eq!(svm.genesis_slot, FINALIZATION_SLOT_THRESHOLD);
+        assert_eq!(svm.latest_epoch_info.absolute_slot, INITIAL_SLOT);
+        assert_eq!(svm.genesis_slot, INITIAL_SLOT);
         assert!(!svm.feature_set.is_active(&disable_fees_sysvar::id()));
 
         let epoch_schedule = svm.inner.get_sysvar::<EpochSchedule>();
@@ -6163,7 +6170,9 @@ mod tests {
 
     #[test]
     fn test_blockhash_minted_during_finalized_warmup_stays_visible_at_finalized() {
-        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let (mut svm, _events_rx, _geyser_rx) = TestType::no_db().initialize_svm_with_features(
+            SvmFeatureConfig::new().disable(agave_feature_set::alpenglow::id()),
+        );
         let finalized = CommitmentConfig::finalized();
         let confirm_blocks = |svm: &mut SurfnetSvm, count: u64| {
             for _ in 0..count {
@@ -6172,7 +6181,7 @@ mod tests {
         };
 
         // The chain is too short for finalized to have its own blockhash, so it hands out the tip.
-        confirm_blocks(&mut svm, FINALIZATION_SLOT_THRESHOLD - 2);
+        confirm_blocks(&mut svm, LEGACY_FINALIZATION_SLOT_THRESHOLD - 2);
         assert_eq!(svm.blockhash_for_commitment(&finalized), None);
         let warmup_blockhash = svm.latest_blockhash();
         assert!(svm.is_blockhash_visible_at(&warmup_blockhash, &finalized));
@@ -6184,7 +6193,7 @@ mod tests {
 
         let fresh_blockhash = svm.latest_blockhash();
         assert!(svm.is_blockhash_visible_at(&fresh_blockhash, &CommitmentConfig::confirmed()));
-        confirm_blocks(&mut svm, FINALIZATION_SLOT_THRESHOLD - 2);
+        confirm_blocks(&mut svm, LEGACY_FINALIZATION_SLOT_THRESHOLD - 2);
         assert!(!svm.is_blockhash_visible_at(&fresh_blockhash, &finalized));
         confirm_blocks(&mut svm, 1);
         assert!(svm.is_blockhash_visible_at(&fresh_blockhash, &finalized));
@@ -6397,12 +6406,12 @@ mod tests {
     #[test_case(TestType::no_db(); "with no db")]
     #[cfg_attr(feature = "postgres", test_case(TestType::postgres(); "with postgres db"))]
     fn test_feature_set_empty_config_uses_mainnet_baseline(test_type: TestType) {
-        // An empty `SvmFeatureConfig` should yield exactly the mainnet baseline:
-        // features active on mainnet are active; features not active on mainnet
-        // are inactive.
         let (svm, _events_rx, _geyser_rx) =
             test_type.initialize_svm_with_features(SvmFeatureConfig::new());
 
+        let baseline = LiteSVM::mainnet_feature_set();
+        assert_eq!(svm.feature_set.active(), baseline.active());
+        assert_eq!(svm.feature_set.inactive(), baseline.inactive());
         assert!(svm.feature_set.is_active(&disable_fees_sysvar::id()));
         assert!(!svm.feature_set.is_active(&enable_loader_v4::id()));
     }
@@ -6440,8 +6449,6 @@ mod tests {
     #[test_case(TestType::no_db(); "with no db")]
     #[cfg_attr(feature = "postgres", test_case(TestType::postgres(); "with postgres db"))]
     fn test_feature_set_mainnet_baseline(test_type: TestType) {
-        // Default config → exact mainnet baseline. Spot-check a representative
-        // sample of features on each side of the mainnet activation line.
         let (svm, _events_rx, _geyser_rx) =
             test_type.initialize_svm_with_features(SvmFeatureConfig::default());
 
@@ -6897,7 +6904,9 @@ mod tests {
     fn test_reconstruct_sysvars_slot_hashes(test_type: TestType) {
         use solana_slot_hashes::SlotHashes;
 
-        let (mut svm, _events_rx, _geyser_rx) = test_type.initialize_svm();
+        let (mut svm, _events_rx, _geyser_rx) = test_type.initialize_svm_with_features(
+            SvmFeatureConfig::new().disable(agave_feature_set::alpenglow::id()),
+        );
 
         // Set up: chain_tip.index = 5, genesis_slot = 100 (absolute slot = 105)
         svm.chain_tip = BlockIdentifier::new(5, "test_hash");
@@ -6945,10 +6954,12 @@ mod tests {
     fn test_reconstruct_sysvars_slot_hashes_cover_finalized_warmup(test_type: TestType) {
         use solana_slot_hashes::SlotHashes;
 
-        let (mut svm, _events_rx, _geyser_rx) = test_type.initialize_svm();
+        let (mut svm, _events_rx, _geyser_rx) = test_type.initialize_svm_with_features(
+            SvmFeatureConfig::new().disable(agave_feature_set::alpenglow::id()),
+        );
 
         svm.chain_tip = BlockIdentifier::new(9, "test_hash");
-        svm.genesis_slot = FINALIZATION_SLOT_THRESHOLD;
+        svm.genesis_slot = INITIAL_SLOT;
         svm.latest_epoch_info.absolute_slot = 40;
 
         svm.reconstruct_sysvars();
@@ -6957,7 +6968,7 @@ mod tests {
 
         assert_eq!(
             slot_hashes.len(),
-            (FINALIZATION_SLOT_THRESHOLD + 1) as usize
+            (LEGACY_FINALIZATION_SLOT_THRESHOLD + 1) as usize
         );
         assert!(
             slot_hashes.get(&9).is_some(),

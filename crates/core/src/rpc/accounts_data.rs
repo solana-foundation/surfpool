@@ -687,8 +687,7 @@ mod tests {
     use crate::{
         rpc::minimal::{Minimal, SurfpoolMinimalRpc},
         surfnet::{
-            AccountSource, FINALIZATION_SLOT_THRESHOLD, GetAccountResult,
-            remote::SurfnetRemoteClient, svm::AccountUpdatePolicy,
+            AccountSource, GetAccountResult, remote::SurfnetRemoteClient, svm::AccountUpdatePolicy,
         },
         tests::helpers::TestSetup,
         types::SyntheticBlockhash,
@@ -1849,15 +1848,16 @@ mod tests {
     async fn account_reads_answer_for_the_slot_their_commitment_names() {
         let setup = TestSetup::new(SurfpoolAccountsDataRpc);
         let latest = setup.context.svm_locker.get_latest_absolute_slot();
+        let depth = setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm| svm.finalization_slot_threshold());
         let pubkey = Pubkey::new_unique().to_string();
 
         for (commitment, expected_slot) in [
             (CommitmentConfig::processed(), latest),
             (CommitmentConfig::confirmed(), latest - 1),
-            (
-                CommitmentConfig::finalized(),
-                latest - FINALIZATION_SLOT_THRESHOLD,
-            ),
+            (CommitmentConfig::finalized(), latest - depth),
         ] {
             let context_config = RpcContextConfig {
                 commitment: Some(commitment),

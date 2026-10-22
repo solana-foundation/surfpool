@@ -5,11 +5,15 @@ use crossbeam_channel::{Receiver, Sender};
 use solana_clock::Clock;
 use solana_epoch_info::EpochInfo;
 use solana_transaction::versioned::VersionedTransaction;
-use surfpool_types::{CheatcodeConfig, RpcConfig, SimnetCommand, SimnetEvent};
+use surfpool_types::{CheatcodeConfig, RpcConfig, SimnetCommand, SimnetEvent, SvmFeatureConfig};
 
 use crate::{
     rpc::RunloopContext,
-    surfnet::{PluginCommand, locker::SurfnetSvmLocker, svm::SurfnetSvm},
+    surfnet::{
+        PluginCommand,
+        locker::SurfnetSvmLocker,
+        svm::{SurfnetSvm, SurfnetSvmConfig},
+    },
 };
 
 pub fn get_free_port() -> Result<u16, String> {
@@ -74,9 +78,24 @@ where
     /// The same setup, keeping the event receiver, for tests that read what
     /// the surfnet emitted rather than only what it returned.
     pub fn new_with_events(rpc: T) -> (Self, Receiver<SimnetEvent>) {
+        Self::new_with_events_and_features(rpc, SvmFeatureConfig::default())
+    }
+
+    pub fn new_with_features(rpc: T, features: SvmFeatureConfig) -> Self {
+        Self::new_with_events_and_features(rpc, features).0
+    }
+
+    fn new_with_events_and_features(
+        rpc: T,
+        feature_config: SvmFeatureConfig,
+    ) -> (Self, Receiver<SimnetEvent>) {
         let (simnet_commands_tx, _rx) = crossbeam_channel::unbounded();
 
-        let (mut surfnet_svm, simnet_events_rx, _) = SurfnetSvm::default();
+        let (mut surfnet_svm, simnet_events_rx, _) = SurfnetSvm::new(SurfnetSvmConfig {
+            feature_config,
+            ..SurfnetSvmConfig::default()
+        })
+        .unwrap();
         let clock = Clock {
             slot: 123,
             epoch_start_timestamp: 123,
