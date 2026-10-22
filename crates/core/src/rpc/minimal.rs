@@ -790,7 +790,7 @@ mod tests {
     use solana_pubkey::Pubkey;
 
     use super::*;
-    use crate::{surfnet::FINALIZATION_SLOT_THRESHOLD, tests::helpers::TestSetup};
+    use crate::tests::helpers::TestSetup;
 
     #[test]
     fn test_get_block_height_processed_commitment() {
@@ -895,7 +895,11 @@ mod tests {
         let expected_err: Result<()> = Result::Err(
             // No commitment reads at finalized, and the error names that slot, as on Agave.
             RpcCustomError::MinContextSlotNotReached {
-                context_slot: latest_slot - FINALIZATION_SLOT_THRESHOLD,
+                context_slot: latest_slot
+                    - setup
+                        .context
+                        .svm_locker
+                        .with_svm_reader(|svm| svm.finalization_slot_threshold()),
             }
             .into(),
         );
@@ -940,8 +944,11 @@ mod tests {
     #[test]
     fn test_get_slot() {
         let setup = TestSetup::new(SurfpoolMinimalRpc);
+        let expected_slot = setup.context.svm_locker.with_svm_reader(|svm| {
+            svm.get_latest_absolute_slot() - svm.finalization_slot_threshold()
+        });
         let result = setup.rpc.get_slot(Some(setup.context), None).unwrap();
-        assert_eq!(result, 92);
+        assert_eq!(result, expected_slot);
     }
 
     #[test]

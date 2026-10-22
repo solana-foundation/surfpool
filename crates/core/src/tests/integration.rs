@@ -77,8 +77,8 @@ use surfpool_types::{
     AccountSnapshot, CheatcodeConfig, CheatcodeControlConfig, CheatcodeFilter,
     DEFAULT_SLOT_TIME_MS, Idl, RpcProfileDepth, RpcProfileResultConfig, SimnetCommand, SimnetEvent,
     StartupPlanner, SurfnetStartupPhase, SurfnetStartupStatus, SurfnetStartupTask,
-    SurfnetStartupTaskState, SurfpoolConfig, UiAccountChange, UiAccountProfileState,
-    UiKeyedProfileResult,
+    SurfnetStartupTaskState, SurfpoolConfig, SvmFeatureConfig, UiAccountChange,
+    UiAccountProfileState, UiKeyedProfileResult,
     types::{
         BlockProductionMode, RpcConfig, SimnetConfig, SubgraphConfig, TransactionStatusEvent,
         UuidOrSignature,
@@ -101,8 +101,9 @@ use crate::{
     runloops::start_local_surfnet_runloop,
     storage::tests::TestType,
     surfnet::{
-        FINALIZATION_SLOT_THRESHOLD, GeyserEvent, LocalSignatureStatusOrSubscription,
-        PluginCommand, SignatureSubscriptionType, locker::SurfnetSvmLocker, svm::SurfnetSvm,
+        GeyserEvent, INITIAL_SLOT, LEGACY_FINALIZATION_SLOT_THRESHOLD,
+        LocalSignatureStatusOrSubscription, PluginCommand, SignatureSubscriptionType,
+        locker::SurfnetSvmLocker, svm::SurfnetSvm,
     },
     tests::helpers::get_free_port,
     types::{TimeTravelConfig, TransactionLoadedAddresses},
@@ -4580,6 +4581,20 @@ fn boot_simnet(
     slot_time: Option<u64>,
     test_type: TestType,
 ) -> Result<BootedSimnet, RunloopError> {
+    boot_simnet_with_features(
+        block_production_mode,
+        slot_time,
+        test_type,
+        SvmFeatureConfig::default(),
+    )
+}
+
+fn boot_simnet_with_features(
+    block_production_mode: BlockProductionMode,
+    slot_time: Option<u64>,
+    test_type: TestType,
+    feature_config: SvmFeatureConfig,
+) -> Result<BootedSimnet, RunloopError> {
     let bind_host = "127.0.0.1";
     let bind_port = get_free_port().map_err(RunloopError::NoFreePort)?;
     let ws_port = get_free_port().map_err(RunloopError::NoFreePort)?;
@@ -4604,7 +4619,8 @@ fn boot_simnet(
         ..SurfpoolConfig::default()
     };
 
-    let (mut surfnet_svm, simnet_events_rx, geyser_events_rx) = test_type.initialize_svm();
+    let (mut surfnet_svm, simnet_events_rx, geyser_events_rx) =
+        test_type.initialize_svm_with_features(feature_config);
     // The runloop and the SVM must agree on slot time, as they do when the CLI builds both.
     surfnet_svm.slot_time = slot_time;
     let (simnet_commands_tx, simnet_commands_rx) = unbounded();
@@ -4633,8 +4649,13 @@ fn boot_simnet(
 // before the first transaction completes its full finalization window.
 #[tokio::test(flavor = "multi_thread")]
 async fn transaction_mode_processes_queued_transactions_before_finalization() {
-    let simnet = boot_simnet(BlockProductionMode::Transaction, Some(1), TestType::no_db())
-        .expect("the simnet should boot");
+    let simnet = boot_simnet_with_features(
+        BlockProductionMode::Transaction,
+        Some(1),
+        TestType::no_db(),
+        SvmFeatureConfig::new().disable(agave_feature_set::alpenglow::id()),
+    )
+    .expect("the simnet should boot");
     let payer = Keypair::new();
     simnet.locker.with_svm_writer(|svm| {
         svm.set_account(
@@ -4716,7 +4737,8 @@ async fn transaction_mode_processes_queued_transactions_before_finalization() {
                 })
             });
             if let [Some(first_slot), Some(second_slot)] = slots
-                && locker.get_latest_absolute_slot() >= second_slot + FINALIZATION_SLOT_THRESHOLD
+                && locker.get_latest_absolute_slot()
+                    >= second_slot + LEGACY_FINALIZATION_SLOT_THRESHOLD
             {
                 break (first_slot, second_slot);
             }
@@ -4727,7 +4749,7 @@ async fn transaction_mode_processes_queued_transactions_before_finalization() {
     .expect("both transactions should finalize");
 
     assert!(
-        slots.1 < slots.0 + FINALIZATION_SLOT_THRESHOLD,
+        slots.1 < slots.0 + LEGACY_FINALIZATION_SLOT_THRESHOLD,
         "the second transaction should not wait for a separate finalization window"
     );
 }
@@ -6006,8 +6028,8 @@ fn test_reset_network_keeps_latest_blockhash_valid(test_type: TestType) {
             svm_reader.latest_epoch_info.absolute_slot,
         )
     });
-    assert_eq!(genesis_slot, FINALIZATION_SLOT_THRESHOLD);
-    assert_eq!(latest_slot, FINALIZATION_SLOT_THRESHOLD);
+    assert_eq!(genesis_slot, INITIAL_SLOT);
+    assert_eq!(latest_slot, INITIAL_SLOT);
     assert_eq!(epoch_schedule, EpochSchedule::without_warmup());
 
     let latest_blockhash = svm_locker.with_svm_reader(|svm_reader| svm_reader.latest_blockhash());
@@ -7137,6 +7159,201 @@ async fn test_remote_get_multiple_accounts_ordering(test_type: TestType) {
     assert_eq!(
         plain_account.lamports, LAMPORTS_PER_SOL,
         "accounts[1] should have airdrop lamports"
+    );
+}
+
+// Regression #875: commitment queries, subscriptions, and roots must agree on
+// finality, including when Alpenglow is disabled to reproduce TowerBFT behavior.
+#[test_case(TestType::no_db(), true; "alpenglow without db")]
+#[test_case(TestType::in_memory(), true; "alpenglow with sqlite")]
+#[test_case(TestType::no_db(), false; "legacy without db")]
+#[test_case(TestType::in_memory(), false; "legacy with sqlite")]
+#[tokio::test(flavor = "multi_thread")]
+async fn finalization_follows_the_alpenglow_feature(test_type: TestType, alpenglow: bool) {
+    use solana_client::rpc_config::{RpcTransactionConfig, RpcTransactionLogsFilter};
+    use solana_transaction_status::TransactionConfirmationStatus;
+
+    use crate::{
+        rpc::full::{RpcGetTransactionsForAddressConfig, RpcTransactionForAddressEntry},
+        surfnet::GeyserSlotStatus,
+    };
+
+    let features = if alpenglow {
+        SvmFeatureConfig::new().enable(agave_feature_set::alpenglow::id())
+    } else {
+        SvmFeatureConfig::new().disable(agave_feature_set::alpenglow::id())
+    };
+    let (mut svm, _events, geyser_events) = test_type.initialize_svm_with_features(features);
+    let depth = if alpenglow { 1 } else { 31 };
+    assert_eq!(svm.genesis_slot, INITIAL_SLOT);
+    assert_eq!(svm.finalization_slot_threshold(), depth);
+    assert_eq!(
+        svm.feature_set
+            .is_active(&agave_feature_set::alpenglow::id()),
+        alpenglow,
+    );
+    let finalized_slot = svm.slot_for_commitment(&CommitmentConfig::finalized());
+    assert!(
+        svm.inner
+            .get_sysvar::<solana_slot_hashes::SlotHashes>()
+            .get(&finalized_slot)
+            .is_some()
+    );
+
+    let payer = Keypair::new();
+    svm.set_account(
+        &payer.pubkey(),
+        Account {
+            lamports: LAMPORTS_PER_SOL,
+            owner: system_program::id(),
+            ..Account::default()
+        },
+    )
+    .unwrap();
+    let transaction = Transaction::new_signed_with_payer(
+        &[transfer(&payer.pubkey(), &Pubkey::new_unique(), 1_000_000)],
+        Some(&payer.pubkey()),
+        &[&payer],
+        svm.latest_blockhash(),
+    );
+    let signature = transaction.signatures[0];
+    let transaction_slot = svm.get_latest_absolute_slot();
+    let locker = SurfnetSvmLocker::new(svm);
+    let slots = locker.subscribe_for_slot_updates();
+    let slot_updates = locker.subscribe_for_slots_updates();
+    let confirmed =
+        locker.subscribe_for_signature_updates(&signature, SignatureSubscriptionType::confirmed());
+    let finalized =
+        locker.subscribe_for_signature_updates(&signature, SignatureSubscriptionType::finalized());
+    let confirmed_logs = locker
+        .subscribe_for_logs_updates(&CommitmentLevel::Confirmed, &RpcTransactionLogsFilter::All);
+    let finalized_logs = locker
+        .subscribe_for_logs_updates(&CommitmentLevel::Finalized, &RpcTransactionLogsFilter::All);
+    let (status_tx, status_rx) = unbounded();
+    locker
+        .process_transaction(&None, transaction.into(), status_tx, false, true)
+        .await
+        .unwrap();
+
+    let assert_status = |expected, confirmations| {
+        let expected = Some(expected);
+        let status = locker
+            .get_transaction_local(&signature, &RpcTransactionConfig::default())
+            .unwrap()
+            .map_found_transaction()
+            .unwrap();
+        assert_eq!(status.slot, transaction_slot);
+        assert_eq!(status.confirmation_status, expected);
+        assert_eq!(status.confirmations, confirmations);
+        let signatures = locker.get_signatures_for_address_local(&payer.pubkey(), None);
+        assert_eq!(signatures.inner()[0].confirmation_status, expected);
+        let transactions = locker
+            .get_transactions_for_address_local(
+                &payer.pubkey(),
+                &RpcGetTransactionsForAddressConfig::default(),
+            )
+            .unwrap();
+        let RpcTransactionForAddressEntry::Signature(entry) = &transactions.inner().data[0] else {
+            panic!("expected signature metadata");
+        };
+        assert_eq!(entry.confirmation_status, expected);
+    };
+    assert_status(TransactionConfirmationStatus::Processed, Some(0));
+    assert!(confirmed.try_recv().is_err());
+    assert!(finalized.try_recv().is_err());
+    let LocalSignatureStatusOrSubscription::Subscription(atomic_finalized) = locker
+        .get_local_signature_status_or_subscribe(&signature, SignatureSubscriptionType::finalized())
+        .unwrap()
+    else {
+        panic!("a processed transaction must wait for finalization");
+    };
+    assert!(atomic_finalized.try_recv().is_err());
+    geyser_events.try_iter().for_each(drop);
+
+    for advancement in 1..=depth {
+        locker.confirm_current_block(&None).await.unwrap();
+        let now_finalized = advancement == depth;
+        let expected = if now_finalized {
+            TransactionConfirmationStatus::Finalized
+        } else {
+            TransactionConfirmationStatus::Confirmed
+        };
+        assert_status(
+            expected,
+            if now_finalized {
+                None
+            } else {
+                Some(advancement as usize)
+            },
+        );
+        assert_eq!(
+            locker.get_slot_for_commitment(&CommitmentConfig::confirmed()),
+            transaction_slot + advancement - 1
+        );
+        assert_eq!(
+            locker.get_slot_for_commitment(&CommitmentConfig::finalized()),
+            transaction_slot + advancement - depth
+        );
+        assert_eq!(
+            slots.try_recv().unwrap().root,
+            transaction_slot + advancement - depth
+        );
+        if alpenglow {
+            locker.with_svm_reader(|svm| {
+                assert_eq!(
+                    svm.blockhash_for_commitment(&CommitmentConfig::confirmed()),
+                    svm.blockhash_for_commitment(&CommitmentConfig::finalized()),
+                );
+            });
+        }
+        if advancement == 1 {
+            assert!(confirmed.try_recv().unwrap().1.is_none());
+            assert!(confirmed_logs.try_recv().is_ok());
+        }
+        assert_eq!(finalized.try_recv().is_ok(), now_finalized);
+        assert_eq!(atomic_finalized.try_recv().is_ok(), now_finalized);
+        assert_eq!(finalized_logs.try_recv().is_ok(), now_finalized);
+        assert_eq!(
+            locker.has_transactions_pending_finalization(),
+            !now_finalized
+        );
+        let rooted = geyser_events.try_iter().any(|event| {
+            matches!(event,
+                GeyserEvent::UpdateSlotStatus { slot, status: GeyserSlotStatus::Rooted, .. }
+                    if slot == transaction_slot
+            )
+        });
+        assert_eq!(rooted, now_finalized);
+        let root_update = slot_updates.try_iter().any(|event| {
+            matches!(event.as_ref(),
+                SlotUpdate::Root { slot, .. } if *slot == transaction_slot
+            )
+        });
+        assert_eq!(root_update, now_finalized);
+    }
+    assert!(matches!(
+        locker
+            .get_local_signature_status_or_subscribe(
+                &signature,
+                SignatureSubscriptionType::finalized(),
+            )
+            .unwrap(),
+        LocalSignatureStatusOrSubscription::Status(_)
+    ));
+    let promotions: Vec<_> = status_rx
+        .try_iter()
+        .filter_map(|event| match event {
+            TransactionStatusEvent::Success(status) => Some(status),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        promotions,
+        vec![
+            surfpool_types::TransactionConfirmationStatus::Processed,
+            surfpool_types::TransactionConfirmationStatus::Confirmed,
+            surfpool_types::TransactionConfirmationStatus::Finalized,
+        ]
     );
 }
 
@@ -8290,11 +8507,8 @@ async fn test_ws_slots_updates_subscribe_manual_advancement(test_type: TestType)
     svm_locker.confirm_current_block(&None).await.unwrap();
 
     // Drain all events emitted for this single block confirmation and assert we
-    // observe the per-block lifecycle variants. `Root` is intentionally NOT
-    // asserted here: the rooted slot only catches up to `genesis_slot` after
-    // ~FINALIZATION_SLOT_THRESHOLD advancements, so a single confirmation is
-    // not expected to produce a `Root` event. See the
-    // `_root_emission` test below for that coverage.
+    // observe the per-block lifecycle variants. Root timing is covered separately
+    // by the feature-dependent finalization test.
     let mut saw_created_bank = false;
     let mut saw_frozen = false;
     let mut saw_optimistic_confirmation = false;
@@ -8335,8 +8549,6 @@ async fn test_ws_slots_updates_subscribe_manual_advancement(test_type: TestType)
 #[cfg_attr(feature = "postgres", test_case(TestType::postgres(); "with postgres db"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_ws_slots_updates_subscribe_root_emission(test_type: TestType) {
-    use crate::surfnet::FINALIZATION_SLOT_THRESHOLD;
-
     let (svm_instance, _simnet_events_rx, _geyser_events_rx) = test_type.initialize_svm();
     let svm_locker = SurfnetSvmLocker::new(svm_instance);
 
@@ -8345,7 +8557,7 @@ async fn test_ws_slots_updates_subscribe_root_emission(test_type: TestType) {
 
     // Advance enough slots for the rooted slot to catch up to `genesis_slot`,
     // which is what gates emission of `SlotUpdate::Root`.
-    let advancements = (FINALIZATION_SLOT_THRESHOLD as usize) + 2;
+    let advancements = svm_locker.with_svm_reader(|svm| svm.finalization_slot_threshold()) + 2;
     for _ in 0..advancements {
         svm_locker.confirm_current_block(&None).await.unwrap();
     }
@@ -8668,8 +8880,6 @@ async fn test_ws_logs_subscribe_finalized_commitment(test_type: TestType) {
     use solana_commitment_config::CommitmentLevel;
     use solana_system_interface::instruction as system_instruction;
 
-    use crate::surfnet::FINALIZATION_SLOT_THRESHOLD;
-
     let (svm_instance, _simnet_events_rx, _geyser_events_rx) = test_type.initialize_svm();
     let svm_locker = SurfnetSvmLocker::new(svm_instance);
 
@@ -8706,11 +8916,8 @@ async fn test_ws_logs_subscribe_finalized_commitment(test_type: TestType) {
         .await
         .unwrap();
 
-    // confirm and finalize the block
-    svm_locker.confirm_current_block(&None).await.unwrap();
-
-    // advance enough slots to trigger finalization
-    for _ in 0..FINALIZATION_SLOT_THRESHOLD {
+    let depth = svm_locker.with_svm_reader(|svm| svm.finalization_slot_threshold());
+    for _ in 0..depth {
         svm_locker.confirm_current_block(&None).await.unwrap();
     }
 
@@ -11572,7 +11779,8 @@ async fn test_create_lookup_table_with_finalized_slot(test_type: TestType) {
 
     assert_eq!(
         finalized_slot,
-        processed_slot.saturating_sub(FINALIZATION_SLOT_THRESHOLD),
+        processed_slot
+            .saturating_sub(svm_locker.with_svm_reader(|svm| svm.finalization_slot_threshold())),
         "test setup should mirror Surfpool's finalized slot lag"
     );
 

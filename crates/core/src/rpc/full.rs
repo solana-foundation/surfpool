@@ -2806,7 +2806,10 @@ mod tests {
     use super::*;
     use crate::{
         runloops::start_block_production_runloop,
-        surfnet::{BlockHeader, FINALIZATION_SLOT_THRESHOLD, remote::SurfnetRemoteClient},
+        surfnet::{
+            BlockHeader, INITIAL_SLOT, LEGACY_FINALIZATION_SLOT_THRESHOLD,
+            remote::SurfnetRemoteClient,
+        },
         tests::helpers::TestSetup,
         types::{SyntheticBlockhash, TransactionWithStatusMeta},
     };
@@ -3657,7 +3660,11 @@ mod tests {
                 .blocking_read()
                 .latest_epoch_info
                 .absolute_slot,
-            transaction_start_slot + FINALIZATION_SLOT_THRESHOLD,
+            transaction_start_slot
+                + transaction_setup
+                    .context
+                    .svm_locker
+                    .with_svm_reader(|svm| svm.finalization_slot_threshold()),
             "a successful airdrop should produce blocks through finalization in transaction mode"
         );
 
@@ -4251,7 +4258,7 @@ mod tests {
 
         let res = setup
             .rpc
-            .get_block(Some(setup.context), FINALIZATION_SLOT_THRESHOLD, None)
+            .get_block(Some(setup.context), INITIAL_SLOT, None)
             .await
             .unwrap();
 
@@ -4280,7 +4287,7 @@ mod tests {
 
         let res = setup
             .rpc
-            .get_block_time(Some(setup.context), FINALIZATION_SLOT_THRESHOLD)
+            .get_block_time(Some(setup.context), INITIAL_SLOT)
             .await
             .unwrap();
 
@@ -4543,9 +4550,12 @@ mod tests {
 
     #[test]
     fn test_get_latest_blockhash() {
-        let setup = TestSetup::new(SurfpoolFullRpc);
+        let setup = TestSetup::new_with_features(
+            SurfpoolFullRpc,
+            surfpool_types::SvmFeatureConfig::new().enable(agave_feature_set::alpenglow::id()),
+        );
 
-        confirm_blocks(&setup, FINALIZATION_SLOT_THRESHOLD);
+        confirm_blocks(&setup, 1);
 
         // processed commitment
         {
@@ -4634,11 +4644,10 @@ mod tests {
                 .get_latest_blockhash(&commitment)
                 .unwrap();
 
-            // The finalized blockhash is 30 blocks old, so it expires 30 blocks sooner.
+            // Alpenglow exposes the same blockhash at confirmed and finalized.
             let current_block_height = setup.context.svm_locker.get_epoch_info().block_height;
-            let expected_last_valid_block_height = current_block_height
-                - (FINALIZATION_SLOT_THRESHOLD - 1)
-                + MAX_RECENT_BLOCKHASHES_STANDARD as u64;
+            let expected_last_valid_block_height =
+                current_block_height + MAX_RECENT_BLOCKHASHES_STANDARD as u64;
 
             assert_eq!(
                 res.value.blockhash,
@@ -4654,7 +4663,10 @@ mod tests {
 
     #[test]
     fn test_get_latest_blockhash_finalized_trails_the_tip_across_empty_slots() {
-        let setup = TestSetup::new(SurfpoolFullRpc);
+        let setup = TestSetup::new_with_features(
+            SurfpoolFullRpc,
+            surfpool_types::SvmFeatureConfig::new().disable(agave_feature_set::alpenglow::id()),
+        );
         let latest_blockhash = |commitment: CommitmentConfig| {
             setup
                 .rpc
@@ -4670,11 +4682,11 @@ mod tests {
                 .blockhash
         };
 
-        confirm_blocks(&setup, FINALIZATION_SLOT_THRESHOLD);
+        confirm_blocks(&setup, LEGACY_FINALIZATION_SLOT_THRESHOLD);
         let tip = latest_blockhash(CommitmentConfig::confirmed());
 
         // No transaction lands, so none of these slots is stored as a block.
-        confirm_blocks(&setup, FINALIZATION_SLOT_THRESHOLD - 2);
+        confirm_blocks(&setup, LEGACY_FINALIZATION_SLOT_THRESHOLD - 2);
         assert_ne!(latest_blockhash(CommitmentConfig::finalized()), tip);
         confirm_blocks(&setup, 1);
         assert_eq!(latest_blockhash(CommitmentConfig::finalized()), tip);
@@ -4685,8 +4697,12 @@ mod tests {
     async fn test_send_transaction_preflights_blockhash_at_preflight_commitment() {
         let payer = Keypair::new();
         let (mempool_tx, mempool_rx) = crossbeam_channel::unbounded();
-        let setup = TestSetup::new_with_mempool(SurfpoolFullRpc, mempool_tx);
-        confirm_blocks(&setup, FINALIZATION_SLOT_THRESHOLD);
+        let mut setup = TestSetup::new_with_features(
+            SurfpoolFullRpc,
+            surfpool_types::SvmFeatureConfig::new().disable(agave_feature_set::alpenglow::id()),
+        );
+        setup.context.simnet_commands_tx = mempool_tx;
+        confirm_blocks(&setup, LEGACY_FINALIZATION_SLOT_THRESHOLD);
 
         let confirmed_blockhash = setup
             .rpc
@@ -5175,7 +5191,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_get_blocks_with_limit_commitment_levels() {
-        let setup = TestSetup::new(SurfpoolFullRpc);
+        let setup = TestSetup::new_with_features(
+            SurfpoolFullRpc,
+            surfpool_types::SvmFeatureConfig::new().enable(agave_feature_set::alpenglow::id()),
+        );
 
         insert_test_blocks(&setup, 80..=120);
 
@@ -5215,7 +5234,7 @@ mod tests {
             .unwrap();
         assert_eq!(confirmed_result, vec![115, 116, 117, 118, 119]);
 
-        // Test finalized commitment (latest = 120 - 31 = 89)
+        // Alpenglow finalized commitment has the same latest slot as confirmed.
         let finalized_result = setup
             .rpc
             .get_blocks_with_limit(
@@ -5231,7 +5250,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(finalized_result, vec![85, 86, 87, 88, 89]);
+        assert_eq!(finalized_result, (85..95).collect::<Vec<_>>());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -5279,25 +5298,17 @@ mod tests {
     async fn test_get_blocks_with_limit_large_limit() {
         let setup = TestSetup::new(SurfpoolFullRpc);
 
-        insert_test_blocks(
-            &setup,
-            FINALIZATION_SLOT_THRESHOLD..1000 + FINALIZATION_SLOT_THRESHOLD,
-        );
+        insert_test_blocks(&setup, INITIAL_SLOT..1000 + INITIAL_SLOT);
 
         let result = setup
             .rpc
-            .get_blocks_with_limit(
-                Some(setup.context.clone()),
-                FINALIZATION_SLOT_THRESHOLD,
-                1000,
-                None,
-            )
+            .get_blocks_with_limit(Some(setup.context.clone()), INITIAL_SLOT, 1000, None)
             .await
             .unwrap();
 
         assert_eq!(result.len(), 1000);
-        assert_eq!(result[0], FINALIZATION_SLOT_THRESHOLD);
-        assert_eq!(result[999], 999 + FINALIZATION_SLOT_THRESHOLD);
+        assert_eq!(result[0], INITIAL_SLOT);
+        assert_eq!(result[999], 999 + INITIAL_SLOT);
 
         for i in 1..result.len() {
             assert!(
@@ -5361,7 +5372,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_get_blocks_commitment_levels() {
-        let setup = TestSetup::new(SurfpoolFullRpc);
+        let setup = TestSetup::new_with_features(
+            SurfpoolFullRpc,
+            surfpool_types::SvmFeatureConfig::new().enable(agave_feature_set::alpenglow::id()),
+        );
 
         insert_test_blocks(&setup, 50..=100);
 
@@ -5401,7 +5415,7 @@ mod tests {
             .unwrap();
         assert_eq!(confirmed_result, vec![95, 96, 97, 98, 99]);
 
-        // finalized commitment -> latest = 100 - 31(finalization threshold)
+        // Alpenglow finalized commitment -> latest = 99
         let finalized_result = setup
             .rpc
             .get_blocks(
@@ -5417,12 +5431,15 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(finalized_result, vec![65, 66, 67, 68, 69]);
+        assert_eq!(finalized_result, (65..=99).collect::<Vec<_>>());
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_get_blocks_config_in_place_of_end_slot() {
-        let setup = TestSetup::new(SurfpoolFullRpc);
+        let setup = TestSetup::new_with_features(
+            SurfpoolFullRpc,
+            surfpool_types::SvmFeatureConfig::new().enable(agave_feature_set::alpenglow::id()),
+        );
 
         insert_test_blocks(&setup, 50..=100);
 
@@ -5440,7 +5457,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(result, vec![65, 66, 67, 68, 69]);
+        assert_eq!(result, (65..=99).collect::<Vec<_>>());
 
         let result = setup
             .rpc
@@ -5459,11 +5476,14 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_get_blocks_min_context_slot() {
-        let setup = TestSetup::new(SurfpoolFullRpc);
+        let setup = TestSetup::new_with_features(
+            SurfpoolFullRpc,
+            surfpool_types::SvmFeatureConfig::new().enable(agave_feature_set::alpenglow::id()),
+        );
 
         insert_test_blocks(&setup, 100..=110);
 
-        // min_context_slot = 105 > 79, so should return MinContextSlotNotReached error
+        // Slot 110 is processed, but is newer than the finalized slot (109).
         let result = setup
             .rpc
             .get_blocks(
@@ -5472,7 +5492,7 @@ mod tests {
                 Some(RpcBlocksConfigWrapper::EndSlotOnly(Some(105))),
                 Some(RpcContextConfig {
                     commitment: Some(CommitmentConfig::finalized()),
-                    min_context_slot: Some(105),
+                    min_context_slot: Some(110),
                 }),
             )
             .await;
@@ -5590,7 +5610,7 @@ mod tests {
             .rpc
             .get_blocks(
                 Some(setup.context),
-                FINALIZATION_SLOT_THRESHOLD,
+                INITIAL_SLOT,
                 Some(RpcBlocksConfigWrapper::EndSlotOnly(Some(60))),
                 None,
             )
@@ -5599,7 +5619,7 @@ mod tests {
 
         // With sparse block storage, all slots in range are returned (empty blocks reconstructed)
         // local_min is now 0, so slots 10-60 are all within local range
-        let expected: Vec<Slot> = (FINALIZATION_SLOT_THRESHOLD..=60).collect();
+        let expected: Vec<Slot> = (INITIAL_SLOT..=60).collect();
         assert_eq!(
             result, expected,
             "Should return all local blocks in range including reconstructed empty blocks"
@@ -5624,7 +5644,7 @@ mod tests {
             "Stored blocks minimum should be slot 50"
         );
 
-        let start_slot = FINALIZATION_SLOT_THRESHOLD;
+        let start_slot = INITIAL_SLOT;
         // case 1: request blocks 31-40 (entirely "before" stored blocks, but within reconstructible range)
         // With sparse storage, local_min is 0, so slots 31-40 are all within local range
         let result = setup
@@ -5717,7 +5737,7 @@ mod tests {
         });
         assert_eq!(stored_min, Some(100), "Stored blocks minimum should be 100");
         assert_eq!(latest_slot, 200, "Latest slot should be 200");
-        let start_slot = FINALIZATION_SLOT_THRESHOLD;
+        let start_slot = INITIAL_SLOT;
         // Case 1: slots start_slot-50 - with sparse storage, all slots in range are returned
         let result = setup
             .rpc
@@ -5864,7 +5884,7 @@ mod tests {
         let expected_slot = setup.context.svm_locker.with_svm_reader(|svm_reader| {
             svm_reader
                 .get_latest_absolute_slot()
-                .saturating_sub(FINALIZATION_SLOT_THRESHOLD)
+                .saturating_sub(svm_reader.finalization_slot_threshold())
         });
 
         assert_eq!(result.context.slot, expected_slot);
@@ -5979,7 +5999,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_is_blockhash_valid_commitment_and_context_slot() {
-        let setup = TestSetup::new(SurfpoolFullRpc);
+        let setup = TestSetup::new_with_features(
+            SurfpoolFullRpc,
+            surfpool_types::SvmFeatureConfig::new().enable(agave_feature_set::alpenglow::id()),
+        );
 
         // Set up some block history to test commitment levels
         insert_test_blocks(&setup, 70..=100);
@@ -6025,7 +6048,7 @@ mod tests {
         assert_eq!(confirmed_result.value, true);
         assert_eq!(confirmed_result.context.slot, 99);
 
-        // Test finalized commitment (should use slot = 100 - 31 = 69)
+        // Alpenglow finalized commitment uses the confirmed slot (99).
         let finalized_result = setup
             .rpc
             .is_blockhash_valid(
@@ -6041,7 +6064,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(finalized_result.value, true);
-        assert_eq!(finalized_result.context.slot, 69);
+        assert_eq!(finalized_result.context.slot, 99);
 
         // Test min_context_slot validation - should succeed when slot is high enough
         let min_context_success = setup
@@ -6068,7 +6091,7 @@ mod tests {
                 commitment: Some(CommitmentConfig {
                     commitment: CommitmentLevel::Finalized,
                 }),
-                min_context_slot: Some(80),
+                min_context_slot: Some(100),
             }),
         );
 
@@ -6111,7 +6134,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_minimum_ledger_slot_finds_minimum() {
-        // With sparse block storage, minimum ledger slot is always FINALIZATION_SLOT_THRESHOLD for local surfnets
+        // With sparse block storage, minimum ledger slot is always INITIAL_SLOT for local surfnets
         let setup = TestSetup::new(SurfpoolFullRpc);
 
         insert_test_blocks(&setup, vec![500, 100, 1000, 50, 750]);
@@ -6125,8 +6148,8 @@ mod tests {
         // With sparse block storage, get_first_local_slot() returns 0 since all
         // blocks from slot 0 can be reconstructed on-the-fly
         assert_eq!(
-            result, FINALIZATION_SLOT_THRESHOLD,
-            "Should return FINALIZATION_SLOT_THRESHOLD since empty blocks can be reconstructed from that slot"
+            result, INITIAL_SLOT,
+            "Should return INITIAL_SLOT since empty blocks can be reconstructed from that slot"
         );
     }
 
