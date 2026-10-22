@@ -95,7 +95,10 @@ use crate::{
     rpc::utils::convert_transaction_metadata_from_canonical,
     scenarios::{
         TemplateRegistry, account_data_values,
-        protocols::phoenix_eternal::v1::state_builder::prepare_phoenix_override, template_registry,
+        protocols::phoenix_eternal::v1::state_builder::{
+            prepare_phoenix_override, write_all_or_none,
+        },
+        template_registry,
     },
     storage::{OverlayStorage, Storage, StorageBackend},
     surfnet::{
@@ -301,7 +304,7 @@ fn json_integer_digits(json: &serde_json::Value, target: &str) -> SurfpoolResult
 }
 
 /// Converts JSON into a txtx [`Value`] using the expected IDL type
-fn json_to_txtx_value_for_idl_type(
+pub(crate) fn json_to_txtx_value_for_idl_type(
     json: &serde_json::Value,
     idl_type: &IdlType,
     idl_types: &[IdlTypeDef],
@@ -3265,28 +3268,22 @@ impl SurfnetSvm {
 
                 match prepare_phoenix_override(
                     self,
+                    &override_instance.template_id,
                     &account_pubkey,
                     &account,
                     &account_values,
                     remote_ctx,
-                    // Only an account core has just refetched counts as fresh.
-                    fetch_from_upstream && settled_this_slot.contains(&account_pubkey),
                     target_slot,
                 )
                 .await
                 {
                     Ok(Some(writes)) => {
-                        for (pubkey, written) in writes {
-                            if let Err(e) =
-                                self.set_scenario_override_account(&pubkey, written, target_slot)
-                            {
-                                warn!(
-                                    "Failed to set {} for override {}: {}",
-                                    pubkey, override_instance.id, e
-                                );
-                                break;
-                            }
-                            settled_this_slot.insert(pubkey);
+                        match write_all_or_none(self, writes, target_slot) {
+                            Ok(written) => settled_this_slot.extend(written),
+                            Err(e) => warn!(
+                                "Skipping override {} for {}: {}",
+                                override_instance.id, account_pubkey, e
+                            ),
                         }
                         continue;
                     }

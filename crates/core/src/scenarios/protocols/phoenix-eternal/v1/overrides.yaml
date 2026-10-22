@@ -9,33 +9,11 @@ tags:
   - risk
 
 templates:
-  - id: phoenix-trader-collateral-stress
-    name: Phoenix Trader Collateral Stress
+  - id: phoenix-oracle-price
+    name: Phoenix Oracle Price
     description: >-
-      Set exact signed quote-lot collateral on a Phoenix Trader, and on its record in the local
-      GlobalTraderIndex when the index lists it.
-    idl_account_name: Trader
-    properties:
-      - path: traderState.quoteLotCollateral
-        label: Target Collateral in Quote Lots
-        description: Exact signed quote-lot collateral encoded as a decimal string
-    llm_context: |
-      This prepares collateral stress state. It does not execute liquidation.
-      Only lower collateral; raising it needs a real deposit into the global vault.
-      The target is quoteLotCollateral, which excludes the unrealized PnL and funding Phoenix adds
-      for effective collateral: lowering it by N quote lots lowers effective collateral by N.
-      For a liquidation cascade, put this override at slot 0 and phoenix-direct-mark-risk-shock at
-      slot 1 in one create_scenario call.
-      Set fetchBeforeUse: true so the Trader is fetched from the upstream datasource first; an
-      override on a Trader that is not in the local VM yet is skipped.
-      Keep override labels short. Pass traderState.quoteLotCollateral as a decimal string.
-    address:
-      type: pubkey
-
-  - id: phoenix-direct-mark-risk-shock
-    name: Phoenix Direct Mark Risk Shock
-    description: >-
-      Set exact mark-price ticks for one market in the Phoenix Eternal PerpAssetMap.
+      Set one Phoenix Eternal market's oracle price, in ticks or as a percentage change. Only the
+      oracles move: the order book and the makers' quotes stay where they are.
     idl_account_name: PerpAssetMap
     properties:
       - path: symbol
@@ -46,30 +24,36 @@ templates:
       - path: target_ticks
         type: input
         value_type: string
-        label: Target Mark Ticks
-        description: Exact mark-price ticks, at least 1, encoded as a decimal string
+        label: Oracle Price (ticks)
+        description: The new price in ticks, at least 1; leave empty to give a percentage instead
+      - path: change_percent
+        type: input
+        value_type: string
+        label: Change (%)
+        description: >-
+          Change from the current mark in percent, for example -5 or 2.5; leave
+          empty to give ticks instead
     llm_context: |
-      This directly changes Phoenix risk state, setting the mark ticks and stamping the mark slot
-      with the current slot. The market's spot and perp oracle readings get the same ticks and
-      slot. The orderbook and spline liquidity are not moved: trades still fill at the book's real
-      prices, and a mark Phoenix rebuilds after a trade can move back toward the book;
-      list_phoenix_markets shows the mark in the local VM.
-      Pass target_ticks as a decimal string.
-      The account is the singleton PerpAssetMap, so this template carries its address.
-      Resolve the market with list_phoenix_markets: a market named by its orderbook address takes
-      the symbol listed with that address, and a relative move (such as a 40% drop) is computed
-      from its markTicks there.
-      Set fetchBeforeUse: true so the asset map is fetched from the upstream datasource first; use
-      false only for a later override that builds on state an earlier one prepared in the same
-      scenario.
+      Every oracle key that reports the market sends the new price through Phoenix's own oracle
+      update, and Phoenix recomputes the mark from it. Nothing else moves: makers keep their
+      quotes and resting orders keep their prices, so a trade or liquidation right after fills
+      against the old book. Use phoenix-market-move and phoenix-market-uncross when the book
+      should follow the price.
+      Give exactly one of target_ticks and change_percent, as a decimal string. change_percent is
+      applied to the market's mark when the override plays, so moves at later slots add up.
+      USD per base unit = ticks * tickSize * 10^(baseLotDecimals - 6), all from
+      list_phoenix_markets.
+      Leave fetchBeforeUse false: a refetch puts every market's prices and factors back to
+      mainnet's while their order books keep earlier moves. list_phoenix_markets loads the map.
     address:
       type: pubkey
       value: 2nHGAaEw3D5dd4hVueaUNoygkQFmoeKqRQWnSPqSMFUC
 
-  - id: phoenix-maintenance-margin-stress
-    name: Phoenix Maintenance Margin Stress
+  - id: phoenix-market-move
+    name: Phoenix Market Move
     description: >-
-      Set the maintenance margin risk factor for one market in the Phoenix Eternal PerpAssetMap.
+      Move one Phoenix Eternal market to a new price the way mainnet moves it: oracle reports and
+      maker liquidity. Resting orders the new price crosses stay until phoenix-market-uncross.
     idl_account_name: PerpAssetMap
     properties:
       - path: symbol
@@ -77,29 +61,283 @@ templates:
         label: Market Symbol
         source: list_phoenix_markets
         description: Exact Phoenix market symbol
-      - path: maintenance_risk_factor_bps
+      - path: target_ticks
         type: input
         value_type: string
-        label: Maintenance Risk Factor (bps)
-        description: >-
-          Maintenance margin risk factor in basis points, above the market's backstop factor and at
-          most 10000, encoded as a decimal string
+        label: Target Price (ticks)
+        description: The new price in ticks, at least 1, encoded as a decimal string
     llm_context: |
-      This changes how much collateral positions in one market need to stay healthy.
-      It does not change prices, collateral or positions, and does not execute liquidation.
-      The maintenance margin scales linearly with the factor.
-      Mainnet markets use 5000, so 10000 doubles the requirement, the most it can be raised: Phoenix
-      reads a factor above 10000 as 10000.
-      A factor at or below the market's backstop factor is refused, since it would leave no
-      Liquidatable tier.
-      Pass the factor as a decimal string.
-      The account is the singleton PerpAssetMap, so this template carries its address.
-      Resolve the market with list_phoenix_markets: a market named by its orderbook address takes
-      the symbol listed with that address, and its current and backstop factors are
-      maintenanceRiskFactorBps and backstopRiskFactorBps there.
-      Set fetchBeforeUse: true so the asset map is fetched from the upstream datasource first; use
-      false only for a later override that builds on state an earlier one prepared in the same
-      scenario.
+      This runs Phoenix's own instructions: every oracle key that reports the market sends the new
+      price and every active market maker re-centres its spline liquidity on it. Resting orders on
+      the other side of the new price stay crossed, and trades and liquidations fill against them
+      at their old prices, until phoenix-market-uncross matches them: add it right after this
+      override, in the same slot.
+      USD per base unit = ticks * tickSize * 10^(baseLotDecimals - 6), all from
+      list_phoenix_markets; compute a relative move from markTicks there.
+      Leave fetchBeforeUse false: a refetch puts every market's prices and factors back to
+      mainnet's while their order books keep earlier moves. list_phoenix_markets loads the map.
+    address:
+      type: pubkey
+      value: 2nHGAaEw3D5dd4hVueaUNoygkQFmoeKqRQWnSPqSMFUC
+
+  - id: phoenix-market-uncross
+    name: Phoenix Market Uncross
+    description: >-
+      Match the resting orders a price move left crossed in one Phoenix Eternal market with
+      Phoenix's uncross crank, which anyone can send.
+    idl_account_name: PerpAssetMap
+    properties:
+      - path: symbol
+        type: dynamic_ref
+        label: Market Symbol
+        source: list_phoenix_markets
+        description: Exact Phoenix market symbol
+    llm_context: |
+      Runs Phoenix's uncross crank on the market until the book is uncrossed or a crank matches
+      nothing more. After phoenix-market-move the makers quote around the new price while resting
+      orders on the other side of it stay crossed; this matches them, so the best bid and ask
+      end up around the target. Add it right after phoenix-market-move, in the same slot.
+      Leave fetchBeforeUse false: a refetch puts every market's prices and factors back to
+      mainnet's while their order books keep earlier moves. list_phoenix_markets loads the map.
+    address:
+      type: pubkey
+      value: 2nHGAaEw3D5dd4hVueaUNoygkQFmoeKqRQWnSPqSMFUC
+
+  - id: phoenix-trader-cancel-orders
+    name: Phoenix Trader Cancel Orders
+    description: >-
+      Cancel all resting orders of a Phoenix Eternal trader, as the trader, on every market, on one
+      market or on several. On every market it takes the trader out of Phoenix's active trader
+      index. Positions stay open.
+    idl_account_name: PerpAssetMap
+    properties:
+      - path: trader
+        type: input
+        value_type: string
+        label: Trader Account
+        description: The trader's Trader account address, as list_phoenix_trader_positions takes it
+      - path: symbol
+        type: input
+        value_type: string
+        label: Market Symbols
+        description: Empty for every market, one symbol such as SOL, or several separated by commas such as SOL, BTC, ETH; symbols from list_phoenix_markets
+    llm_context: |
+      Runs Phoenix's CancelAll as the trader on every market where it holds a position or resting
+      orders when symbol is empty, or only on the markets symbol names: one, such as SOL, or
+      several separated by commas, such as SOL, BTC, ETH. Canceled on every market, a trader the
+      active trader index lists (hot: true in list_phoenix_trader_positions) leaves it, and
+      Phoenix reads its state from the Trader account again; canceled on some markets, it stays
+      in the index while it has orders elsewhere. A cold trader has no resting orders and nothing
+      changes. A keeper cannot liquidate a trader with risk-increasing resting orders on any
+      market until it force-cancels them, which Phoenix allows any signer while the trader is
+      liquidatable. With phoenix-trader-collateral for the same trader, put this first, in the
+      same slot. Before a price move that should make a trader liquidatable, leave symbol empty,
+      so the move cannot fill the trader's orders and change its positions.
+      A cancel freezes the mark for risk in its slot: play phoenix-market-move at a later slot.
+      A trader Phoenix still lists after a cancel on every market, such as a spline market maker,
+      is refused. An unknown symbol refuses the whole override, so nothing is canceled.
+      Set trader to the trader's Trader account; the override's own account is the PerpAssetMap,
+      as for the market templates.
+      Leave fetchBeforeUse false: a refetch puts every market's prices and factors back to
+      mainnet's while their order books keep earlier moves. list_phoenix_markets loads the map.
+    address:
+      type: pubkey
+      value: 2nHGAaEw3D5dd4hVueaUNoygkQFmoeKqRQWnSPqSMFUC
+
+  - id: phoenix-trader-collateral
+    name: Phoenix Trader Collateral
+    description: >-
+      Set one Phoenix Eternal trader's effective collateral in USDC, which sets its distance from
+      liquidation, with or without resting orders.
+    idl_account_name: Trader
+    properties:
+      - path: effective_collateral_usdc
+        type: input
+        value_type: string
+        label: Effective Collateral (USDC)
+        description: The effective collateral when the override plays, such as 750.5; it can be negative
+    llm_context: |
+      Brings the trader's effective collateral, which Phoenix measures margin against, to
+      effective_collateral_usdc when the override plays: it reads Hawkeye's effective collateral
+      then and moves the collateral field by the difference, where Phoenix reads it, the Trader
+      account or, for a trader Phoenix's active trader index lists (hot: true), its record there.
+      Effective collateral moves one for one with that field, so the value lands even with
+      funding pending or resting orders. list_phoenix_trader_positions reports quote lots, and 1
+      USDC is 1000000 quote lots: effective_collateral_usdc = target / 1000000.
+      Take the target from the tool's margin, the trader with its orders canceled, in the middle
+      of a range, as the state can drift a little before the keeper acts: between backstopMargin
+      and maintenanceMargin, one keeper liquidation makes the account healthy again; between
+      highRiskMargin and backstopMargin, a keeper can liquidate every position. Below
+      highRiskMargin a liquidation can leave the trader underwater and fail, and below 0 Phoenix
+      refuses it. A keeper force-cancels a trader's risk-increasing orders before it liquidates.
+      A scenario that also cancels the trader's orders puts phoenix-trader-cancel-orders before
+      this override, in the same slot: a cancel moves the effective collateral a little, and this
+      override lands on its target after it.
+      To have a trader cross on a phoenix-market-move and phoenix-market-uncross at a later slot,
+      call the tool with moves, put phoenix-trader-cancel-orders before this override in the same
+      slot, and set effective_collateral_usdc to wanted / 1000000, where wanted =
+      margin.effectiveCollateral - marginAfterMoves.effectiveCollateral + target in quote lots,
+      with target in a range of marginAfterMoves; wanted must stay above margin.maintenanceMargin
+      so the trader is healthy until the move.
+      A spline market maker is refused. A collateral above the current one is not backed by the
+      global vault, so a later withdrawal could take funds the vault does not count.
+      The account is the trader's Trader account.
+      Leave fetchBeforeUse false: a refetch drops earlier Phoenix changes to this trader. Call
+      list_phoenix_trader_positions first; it loads the trader into the surfnet.
+    address:
+      type: pubkey
+
+  - id: phoenix-market-risk-factors
+    name: Phoenix Market Risk Factors
+    description: >-
+      Set one market's maintenance, backstop and high-risk factors, which decide its liquidation tiers.
+    idl_account_name: PerpAssetMap
+    properties:
+      - path: symbol
+        type: dynamic_ref
+        label: Market Symbol
+        source: list_phoenix_markets
+        description: Exact Phoenix market symbol
+      - path: maintenanceRiskFactor
+        type: input
+        value_type: string
+        label: Maintenance factor (bps)
+        description: >-
+          Basis points of the initial margin, at most the cancel order factor (7500 on mainnet);
+          mainnet markets use 5000
+      - path: backstopRiskFactor
+        type: input
+        value_type: string
+        label: Backstop factor (bps)
+        description: >-
+          Basis points of the initial margin, below the maintenance factor; mainnet uses 2000
+      - path: highRiskRiskFactor
+        type: input
+        value_type: string
+        label: High-risk factor (bps)
+        description: >-
+          Basis points of the initial margin, below the backstop factor; mainnet uses 1000
+    llm_context: |
+      The three factors set the Liquidatable, BackstopLiquidatable and HighRisk tiers; keep them in
+      that descending order. Phoenix also refuses a maintenance factor above the market's cancel
+      order risk factor (7500 on mainnet); raise that first with phoenix-market-cancel-risk-factor.
+      list_phoenix_markets shows the current maintenance and backstop factors. Pass every factor
+      as a decimal string.
+      Leave fetchBeforeUse false: a refetch puts every market's prices and factors back to
+      mainnet's while their order books keep earlier moves. list_phoenix_markets loads the map.
+    address:
+      type: pubkey
+      value: 2nHGAaEw3D5dd4hVueaUNoygkQFmoeKqRQWnSPqSMFUC
+
+  - id: phoenix-market-cancel-risk-factor
+    name: Phoenix Cancel Order Risk Factor
+    description: >-
+      Set the risk factor of one market's resting orders, the ceiling for its maintenance factor.
+    idl_account_name: PerpAssetMap
+    properties:
+      - path: symbol
+        type: dynamic_ref
+        label: Market Symbol
+        source: list_phoenix_markets
+        description: Exact Phoenix market symbol
+      - path: cancelOrderRiskFactor
+        type: input
+        value_type: string
+        label: Cancel order factor (bps)
+        description: >-
+          Basis points; mainnet markets use 7500. Example: 10000
+    llm_context: |
+      Phoenix keeps every maintenance factor at or below this one, so raise it before setting a
+      maintenance factor above 7500. Pass the factor as a decimal string.
+      Leave fetchBeforeUse false: a refetch puts every market's prices and factors back to
+      mainnet's while their order books keep earlier moves. list_phoenix_markets loads the map.
+    address:
+      type: pubkey
+      value: 2nHGAaEw3D5dd4hVueaUNoygkQFmoeKqRQWnSPqSMFUC
+
+  - id: phoenix-market-max-liquidation-size
+    name: Phoenix Max Liquidation Size
+    description: >-
+      Set the most base lots one liquidation may close in a market.
+    idl_account_name: PerpAssetMap
+    properties:
+      - path: symbol
+        type: dynamic_ref
+        label: Market Symbol
+        source: list_phoenix_markets
+        description: Exact Phoenix market symbol
+      - path: maxLiquidationSize
+        type: input
+        value_type: string
+        label: Max liquidation size (base lots)
+        description: >-
+          Base lots one liquidate_via_market_order may close; mainnet SOL allows 500000
+    llm_context: |
+      A keeper's liquidation asking for more is refused, so a small value forces a large position to
+      be liquidated in several steps. Pass the size as a decimal string.
+      Leave fetchBeforeUse false: a refetch puts every market's prices and factors back to
+      mainnet's while their order books keep earlier moves. list_phoenix_markets loads the map.
+    address:
+      type: pubkey
+      value: 2nHGAaEw3D5dd4hVueaUNoygkQFmoeKqRQWnSPqSMFUC
+
+  - id: phoenix-market-open-interest-cap
+    name: Phoenix Open Interest Cap
+    description: >-
+      Set the most open interest a market accepts, in base lots.
+    idl_account_name: PerpAssetMap
+    properties:
+      - path: symbol
+        type: dynamic_ref
+        label: Market Symbol
+        source: list_phoenix_markets
+        description: Exact Phoenix market symbol
+      - path: openInterestCap
+        type: input
+        value_type: string
+        label: Open interest cap (base lots)
+        description: >-
+          The most open interest the market accepts
+    llm_context: |
+      Leave fetchBeforeUse false: a refetch puts every market's prices and factors back to
+      mainnet's while their order books keep earlier moves. list_phoenix_markets loads the map.
+    address:
+      type: pubkey
+      value: 2nHGAaEw3D5dd4hVueaUNoygkQFmoeKqRQWnSPqSMFUC
+
+  - id: phoenix-market-funding
+    name: Phoenix Market Funding
+    description: >-
+      Set one market's funding interval, funding period and maximum funding rate.
+    idl_account_name: PerpAssetMap
+    properties:
+      - path: symbol
+        type: dynamic_ref
+        label: Market Symbol
+        source: list_phoenix_markets
+        description: Exact Phoenix market symbol
+      - path: fundingIntervalSeconds
+        type: input
+        value_type: string
+        label: Funding interval (seconds)
+        description: >-
+          Leave empty to keep the current value
+      - path: fundingPeriodSeconds
+        type: input
+        value_type: string
+        label: Funding period (seconds)
+        description: >-
+          Leave empty to keep the current value
+      - path: maxFundingRate
+        type: input
+        value_type: string
+        label: Max funding rate (quote lots per base lot)
+        description: >-
+          Signed; leave empty to keep the current value
+    llm_context: |
+      Every field is optional: one left out keeps its current value. Pass values as decimal strings.
+      Leave fetchBeforeUse false: a refetch puts every market's prices and factors back to
+      mainnet's while their order books keep earlier moves. list_phoenix_markets loads the map.
     address:
       type: pubkey
       value: 2nHGAaEw3D5dd4hVueaUNoygkQFmoeKqRQWnSPqSMFUC
@@ -107,105 +345,229 @@ templates:
   - id: phoenix-market-fees
     name: Phoenix Market Fees
     description: >-
-      Set one market's default taker and maker fees on its Phoenix Eternal orderbook.
-    idl_account_name: OrderbookHeader
+      Set one market's default taker and maker fees.
+    idl_account_name: PerpAssetMap
     properties:
+      - path: symbol
+        type: dynamic_ref
+        label: Market Symbol
+        source: list_phoenix_markets
+        description: Exact Phoenix market symbol
       - path: defaultTakerFeeMicro
+        type: input
+        value_type: string
         label: Taker fee (micro)
         description: >-
-          Taker fee in millionths of the filled notional. Mainnet markets use 350 (0.035%, 3.5
-          bps).
-          Example: 1000
+          Millionths of the filled notional; mainnet markets use 350 (0.035%). Example: 1000
       - path: defaultMakerFeeMicro
+        type: input
+        value_type: string
         label: Maker fee (micro)
         description: >-
-          Maker fee in millionths of the filled notional; negative is a rebate. Mainnet markets use
-          50 (0.5 bps). Example: -50
+          Millionths of the filled notional, negative for a rebate; mainnet uses 50. Example: -50
     llm_context: |
-      This changes the fees a market charges on every fill, for example a fee hike or a maker
-      rebate. It does not change per-trader fee overrides, prices or orders.
-      The account is the market's orderbook: resolve the market with list_phoenix_markets and put
-      its orderbook address in account.pubkey.
-      Pass both fees as JSON numbers in millionths of the notional: 350 is 0.035%, 1000 is 0.1%.
-      defaultMakerFeeMicro may be negative (a rebate); keep it below the taker fee.
-      Set fetchBeforeUse: true so the orderbook is fetched from the upstream datasource first.
+      This changes the fees a market charges on every fill. It does not change per-trader fee
+      overrides. A fee left out keeps its current value. Keep the maker fee below the taker fee.
+      Leave fetchBeforeUse false: a refetch puts every market's prices and factors back to
+      mainnet's while their order books keep earlier moves. list_phoenix_markets loads the map.
     address:
       type: pubkey
+      value: 2nHGAaEw3D5dd4hVueaUNoygkQFmoeKqRQWnSPqSMFUC
+
+  - id: phoenix-market-status
+    name: Phoenix Market Status
+    description: >-
+      Pause a market, make it post-only, or activate it again.
+    idl_account_name: PerpAssetMap
+    properties:
+      - path: symbol
+        type: dynamic_ref
+        label: Market Symbol
+        source: list_phoenix_markets
+        description: Exact Phoenix market symbol
+      - path: nextMarketStatus
+        type: input
+        value_type: string
+        label: Market status
+        description: >-
+          Active, PostOnly, Paused or Closed
+    llm_context: |
+      Paused stops all trading in the market, PostOnly accepts only orders that rest on the book,
+      and Active trades normally. Closed and Tombstoned are one-way steps toward removing a market.
+      Leave fetchBeforeUse false: a refetch puts every market's prices and factors back to
+      mainnet's while their order books keep earlier moves. list_phoenix_markets loads the map.
+    address:
+      type: pubkey
+      value: 2nHGAaEw3D5dd4hVueaUNoygkQFmoeKqRQWnSPqSMFUC
+
+  - id: phoenix-exchange-status
+    name: Phoenix Exchange Status
+    description: >-
+      Switch the exchange-wide active, gated and maintenance flags.
+    idl_account_name: GlobalConfiguration
+    properties:
+      - path: active
+        type: input
+        value_type: string
+        label: Active
+        description: >-
+          true or false; leave empty to keep it
+      - path: gated
+        type: input
+        value_type: string
+        label: Gated
+        description: >-
+          true or false; leave empty to keep it
+      - path: maintenance
+        type: input
+        value_type: string
+        label: Maintenance
+        description: >-
+          true or false; leave empty to keep it
+    llm_context: |
+      Each flag left out keeps its current value. An inactive exchange refuses trading for everyone.
+      Use fetchBeforeUse: true the first time a scenario changes this account on a surfnet, false
+      after that. It stands alone, so a refetch only drops earlier changes to it.
+    address:
+      type: pubkey
+      value: 2zskx2iyCvb6Stg7RBZkt1f6MrF4dpYtMG3yMvKwqtUZ
 
   - id: phoenix-withdraw-limits
     name: Phoenix Withdraw Limits
     description: >-
-      Set the exchange-wide withdrawal budget and the withdrawal and queueing fees.
+      Set the exchange-wide withdrawal budget and how fast it refills.
     idl_account_name: WithdrawQueueHeader
     properties:
-      - path: withdrawThrottle.maxBudget.inner
+      - path: maxBudget
+        type: input
+        value_type: string
         label: Max withdraw budget
         description: >-
-          Most quote lots withdrawable before requests queue (1000000 = 1 USDC).
-          Mainnet: 2000000000000. Example: 1000000000
-      - path: withdrawThrottle.remainingBudget.inner
-        label: Remaining withdraw budget
-        description: >-
-          Quote lots still withdrawable right now; 0 sends every withdrawal to the queue.
-          Example: 0
-      - path: withdrawThrottle.replenishAmountPerSlot.inner
+          Quote lots withdrawable before requests queue (1000000 = 1 USDC). Mainnet: 2000000000000
+      - path: replenishAmountPerSlot
+        type: input
+        value_type: string
         label: Budget refill per slot
         description: >-
-          Quote lots added back to the budget each slot. Mainnet: 450000000 (450 USDC). Example: 0
-      - path: withdrawalFee.inner
-        label: Withdrawal fee
-        description: >-
-          Quote lots charged per withdrawal. Mainnet: 500000 (0.5 USDC). Example: 2000000
-      - path: enqueueingFee.inner
-        label: Queueing fee
-        description: >-
-          Quote lots charged when a withdrawal is queued. Mainnet: 500000 (0.5 USDC).
-          Example: 2000000
+          Quote lots added back each slot. Mainnet: 450000000 (450 USDC)
     llm_context: |
       This throttles withdrawals for every trader, for example a bank run where withdrawals queue
-      instead of paying out. It does not move collateral or cancel queued requests.
-      A withdrawal is paid at once only when the queue is empty and it fits the remaining budget.
-      Otherwise it is queued, never partially filled, and paid later by the permissionless
-      ConsumeWithdrawQueue instruction; the budget refills by replenishAmountPerSlot each slot.
-      SOL withdrawals never queue, so this throttles USDC withdrawals only.
-      Amounts are quote lots of Phoenix USDC with 6 decimals: 1000000 is 1 USDC. Pass them as JSON
-      numbers. Keep remainingBudget at or below maxBudget, and set replenishAmountPerSlot to 0 to
-      keep the budget empty while you test.
-      The account is the singleton WithdrawQueue, so this template carries its address.
-      Set fetchBeforeUse: true so the queue is fetched from the upstream datasource first.
+      instead of paying out. A withdrawal is paid at once only when the queue is empty and it fits
+      the remaining budget; otherwise it waits for the permissionless ConsumeWithdrawQueue.
+      A field left out keeps its current value. Amounts are quote lots of Phoenix USDC with
+      6 decimals, passed as decimal strings.
+      Use fetchBeforeUse: true the first time a scenario changes this account on a surfnet, false
+      after that. It stands alone, so a refetch only drops earlier changes to it.
     address:
       type: pubkey
       value: 3c3NTwpg7yW91FxijkHBXwVH1xUifun3Z8TC5eW5Si3K
 
+  - id: phoenix-withdraw-parameters
+    name: Phoenix Withdraw Parameters
+    description: >-
+      Set the deposit cooldown and the withdrawal and queueing fees.
+    idl_account_name: WithdrawQueueHeader
+    properties:
+      - path: depositCooldownPeriodInSlots
+        type: input
+        value_type: string
+        label: Deposit cooldown (slots)
+        description: >-
+          Slots after a deposit before the trader may withdraw
+      - path: withdrawalFee
+        type: input
+        value_type: string
+        label: Withdrawal fee
+        description: >-
+          Quote lots charged per withdrawal. Mainnet: 500000 (0.5 USDC)
+      - path: enqueueingFee
+        type: input
+        value_type: string
+        label: Queueing fee
+        description: >-
+          Quote lots charged when a withdrawal is queued. Mainnet: 500000
+    llm_context: |
+      A field left out keeps its current value. Pass values as decimal strings.
+      Use fetchBeforeUse: true the first time a scenario changes this account on a surfnet, false
+      after that. It stands alone, so a refetch only drops earlier changes to it.
+    address:
+      type: pubkey
+      value: 3c3NTwpg7yW91FxijkHBXwVH1xUifun3Z8TC5eW5Si3K
+
+  - id: phoenix-trader-fees
+    name: Phoenix Trader Fees
+    description: >-
+      Set one trader's maker and taker fee override multipliers.
+    idl_account_name: Trader
+    properties:
+      - path: makerFeeOverrideMultiplier
+        type: input
+        value_type: string
+        label: Maker fee multiplier
+        description: >-
+          Signed 8-bit multiplier as Phoenix defines it
+      - path: takerFeeOverrideMultiplier
+        type: input
+        value_type: string
+        label: Taker fee multiplier
+        description: >-
+          Signed 8-bit multiplier as Phoenix defines it
+    llm_context: |
+      Both multipliers are required. Pass them as decimal strings.
+      The account is the trader's Trader account.
+      Leave fetchBeforeUse false: a refetch drops earlier Phoenix changes to this trader. Call
+      list_phoenix_trader_positions first; it loads the trader into the surfnet.
+    address:
+      type: pubkey
+
   - id: phoenix-trader-capabilities
     name: Phoenix Trader Capabilities
     description: >-
-      Set what a Phoenix Trader outside the GlobalTraderIndex may do: activate a fresh trader, make
-      it reduce-only or freeze it.
+      Allow or block what one trader may do: orders, risk-increasing trades, deposits, withdrawals.
     idl_account_name: Trader
     properties:
-      - path: traderState.flags
-        label: Capability bits
+      - path: PlaceLimitOrder
+        type: input
+        value_type: string
+        label: PlaceLimitOrder
         description: >-
-          1 hot (in the GlobalTraderIndex, cannot be set here), 2 limit, 4 market, 8 risk increase,
-          16 deposit, 32 withdraw. 62 grants every capability except hot. Example: 62
+          true or false; leave empty to keep it
+      - path: PlaceMarketOrder
+        type: input
+        value_type: string
+        label: PlaceMarketOrder
+        description: >-
+          true or false; leave empty to keep it
+      - path: RiskIncreasingTrade
+        type: input
+        value_type: string
+        label: RiskIncreasingTrade
+        description: >-
+          true or false; leave empty to keep it
+      - path: RiskReducingTrade
+        type: input
+        value_type: string
+        label: RiskReducingTrade
+        description: >-
+          true or false; leave empty to keep it
+      - path: DepositCollateral
+        type: input
+        value_type: string
+        label: DepositCollateral
+        description: >-
+          true or false; leave empty to keep it
+      - path: WithdrawCollateral
+        type: input
+        value_type: string
+        label: WithdrawCollateral
+        description: >-
+          true or false; leave empty to keep it
     llm_context: |
-      This changes a trader's capability bits, for example to activate a freshly registered trader
-      in the local VM so a bot can deposit and trade, or to make a trader reduce-only or frozen.
-      It does not change collateral or positions.
-      Bits: 1 hot, 2 place limit, 4 place market, 8 increase risk, 16 deposit, 32 withdraw.
-      A freshly registered trader is frozen with 6 until Phoenix activates it; 62 activates it
-      without the hot bit. 54 = 2 + 4 + 16 + 32 is reduce-only (no risk increase) and 6 is frozen.
-      The hot bit (1) cannot be set: Phoenix would look the trader up in the GlobalTraderIndex,
-      which does not list it, and reject its transactions. Limit orders need a trader in the
-      index, so a trader outside it places market orders only.
-      Only a Trader the local GlobalTraderIndex does not list is supported: a listed Trader keeps
-      these bits in its index record, so Play skips the override with a warning.
-      Pass traderState.flags as a JSON number.
-      The account is the Trader PDA ["trader", authority, [pda index, subaccount index]], usually
-      [0, 0]: pda index 0, and subaccount 0 is the cross-margin account (1 and up are isolated
-      accounts).
-      Set fetchBeforeUse: true so the trader is fetched from the upstream datasource first.
+      Set a capability to false to block it, true to allow it; one left out keeps its current value.
+      RiskIncreasingTrade false makes the trader reduce-only; every capability false freezes it.
+      The account is the trader's Trader account.
+      Leave fetchBeforeUse false: a refetch drops earlier Phoenix changes to this trader. Call
+      list_phoenix_trader_positions first; it loads the trader into the surfnet.
     address:
       type: pubkey
 
