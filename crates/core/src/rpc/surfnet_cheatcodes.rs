@@ -18,7 +18,8 @@ use spl_associated_token_account_interface::address::get_associated_token_addres
 use surfpool_types::{
     AccountSnapshot, CheatcodeControlConfig, CheatcodeFilter, ClockCommand, ExportSnapshotConfig,
     GetStreamedAccountsResponse, GetSurfnetInfoResponse, Idl, OfflineAccountConfig,
-    ResetAccountConfig, RpcProfileResultConfig, Scenario, SimnetCommand, StreamAccountConfig,
+    ResetAccountConfig, RpcProfileResultConfig, Scenario, ScenarioSnapshotCaptureRequest,
+    ScenarioSnapshotRetrievalConfig, ScenarioSnapshotSeries, SimnetCommand, StreamAccountConfig,
     StreamAccountsEntry, UiKeyedProfileResult,
     types::{
         AccountUpdate, ConfidentialBalanceKeys, DeriveConfidentialKeysResponse,
@@ -1515,7 +1516,23 @@ pub trait SurfnetCheatcodes {
         meta: Self::Metadata,
         scenario: Scenario,
         slot: Option<Slot>,
+        capture_config: Option<ScenarioSnapshotCaptureRequest>,
     ) -> BoxFuture<Result<RpcResponse<()>>>;
+
+    #[rpc(meta, name = "surfnet_getScenarioSnapshotSeries")]
+    fn get_scenario_snapshot_series(
+        &self,
+        meta: Self::Metadata,
+        capture_id: String,
+        config: Option<ScenarioSnapshotRetrievalConfig>,
+    ) -> Result<RpcResponse<ScenarioSnapshotSeries>>;
+
+    #[rpc(meta, name = "surfnet_applyScenarioSnapshotSeries")]
+    fn apply_scenario_snapshot_series(
+        &self,
+        meta: Self::Metadata,
+        series: ScenarioSnapshotSeries,
+    ) -> Result<RpcResponse<()>>;
 }
 
 #[derive(Clone)]
@@ -2541,6 +2558,7 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
         meta: Self::Metadata,
         scenario: Scenario,
         slot: Option<Slot>,
+        capture_config: Option<ScenarioSnapshotCaptureRequest>,
     ) -> BoxFuture<Result<RpcResponse<()>>> {
         let SurfnetRpcContext {
             svm_locker,
@@ -2556,21 +2574,11 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
 
             // Register the scenario with explicit base slot
             svm_locker
-                .register_scenario(scenario, Some(base_slot))
-                .map_err(|e| jsonrpc_core::Error {
-                    code: jsonrpc_core::ErrorCode::InternalError,
-                    message: format!("Failed to register scenario: {}", e),
-                    data: None,
-                })?;
-
-            // Immediately materialize overrides for the BASE slot (not current slot)
-            // This ensures slot 0's override is applied right away
-            svm_locker
-                .materialize_overrides_for_slot(&remote_ctx, base_slot)
+                .register_and_materialize_scenario(scenario, base_slot, capture_config, &remote_ctx)
                 .await
                 .map_err(|e| jsonrpc_core::Error {
                     code: jsonrpc_core::ErrorCode::InternalError,
-                    message: format!("Failed to materialize initial overrides: {}", e),
+                    message: format!("Failed to register or materialize scenario: {}", e),
                     data: None,
                 })?;
 
@@ -2578,6 +2586,37 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
                 context: RpcResponseContext::new(svm_locker.get_latest_absolute_slot()),
                 value: (),
             })
+        })
+    }
+
+    fn get_scenario_snapshot_series(
+        &self,
+        meta: Self::Metadata,
+        capture_id: String,
+        config: Option<ScenarioSnapshotRetrievalConfig>,
+    ) -> Result<RpcResponse<ScenarioSnapshotSeries>> {
+        let svm_locker = meta.get_svm_locker()?;
+        let value = svm_locker
+            .get_scenario_snapshot_series(&capture_id, config.unwrap_or_default())
+            .map_err(|e| Error::invalid_params(e.to_string()))?;
+        Ok(RpcResponse {
+            context: RpcResponseContext::new(svm_locker.get_latest_absolute_slot()),
+            value,
+        })
+    }
+
+    fn apply_scenario_snapshot_series(
+        &self,
+        meta: Self::Metadata,
+        series: ScenarioSnapshotSeries,
+    ) -> Result<RpcResponse<()>> {
+        let svm_locker = meta.get_svm_locker()?;
+        svm_locker
+            .apply_scenario_snapshot_series(series)
+            .map_err(|e| Error::invalid_params(e.to_string()))?;
+        Ok(RpcResponse {
+            context: RpcResponseContext::new(svm_locker.get_latest_absolute_slot()),
+            value: (),
         })
     }
 }
