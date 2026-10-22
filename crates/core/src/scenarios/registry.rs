@@ -23,6 +23,10 @@ pub const RAYDIUM_AMM_V4_OVERRIDES_CONTENT: &str =
 pub const METEORA_DLMM_IDL_CONTENT: &str = include_str!("./protocols/meteora/dlmm/v1/idl.json");
 pub const METEORA_DLMM_OVERRIDES_CONTENT: &str =
     include_str!("./protocols/meteora/dlmm/v1/overrides.yaml");
+pub const METEORA_DAMM_V2_IDL_CONTENT: &str =
+    include_str!("./protocols/meteora/damm-v2/v1/idl.json");
+pub const METEORA_DAMM_V2_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/meteora/damm-v2/v1/overrides.yaml");
 pub const KAMINO_V1_IDL_CONTENT: &str = include_str!("./protocols/kamino/v1/idl.json");
 pub const KAMINO_V1_OVERRIDES_CONTENT: &str = include_str!("./protocols/kamino/v1/overrides.yaml");
 
@@ -136,6 +140,11 @@ impl TemplateRegistry {
         self.load_protocol_overrides(
             METEORA_DLMM_IDL_CONTENT,
             METEORA_DLMM_OVERRIDES_CONTENT,
+            "meteora",
+        );
+        self.load_protocol_overrides(
+            METEORA_DAMM_V2_IDL_CONTENT,
+            METEORA_DAMM_V2_OVERRIDES_CONTENT,
             "meteora",
         );
     }
@@ -604,13 +613,14 @@ mod tests {
     fn test_registry_loads_all_protocols() {
         let registry = TemplateRegistry::new();
 
-        // Pyth (1) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Drift (4) + Meteora (2)
+        // Pyth (1) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Drift (4)
+        // + Meteora (DLMM 2, DAMM v2 2 = 4)
         // + Kamino (Lend 17, Scope 3, Farms 5, Swap 2, Vault 5, Liquidity 4 = 36)
-        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + Phoenix Eternal (8) = 70
+        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + Phoenix Eternal (8) = 72
         assert_eq!(
             registry.count(),
-            70,
-            "Registry should load 70 templates total"
+            72,
+            "Registry should load 72 templates total"
         );
 
         assert!(registry.contains("pyth-price-feed-v2"));
@@ -626,6 +636,8 @@ mod tests {
 
         assert!(registry.contains("meteora-dlmm-sol-usdc"));
         assert!(registry.contains("meteora-dlmm-usdt-sol"));
+        assert!(registry.contains("meteora-damm-v2-sol-usdc"));
+        assert!(registry.contains("meteora-damm-v2-met-usdc"));
 
         assert!(registry.contains("kamino-reserve-state"));
         assert!(registry.contains("kamino-reserve-config"));
@@ -1000,6 +1012,13 @@ templates: []
             "Should have 6 Whirlpool templates"
         );
 
+        let meteora_templates = registry.by_protocol("Meteora");
+        assert_eq!(
+            meteora_templates.len(),
+            4,
+            "Should have 4 Meteora templates (2 DLMM + 2 DAMM v2)"
+        );
+
         let pump_templates = registry.by_protocol("Pump");
         assert_eq!(pump_templates.len(), 2, "Should have 2 Pump templates");
 
@@ -1075,6 +1094,7 @@ templates: []
         assert!(ids.contains(&"jupiter-token-ledger-override".to_string()));
         assert!(ids.contains(&"pyth-price-feed-v2".to_string()));
         assert!(ids.contains(&"meteora-dlmm-sol-usdc".to_string()));
+        assert!(ids.contains(&"meteora-damm-v2-sol-usdc".to_string()));
         assert!(ids.contains(&"kamino-reserve-state".to_string()));
         assert!(ids.contains(&"kamino-reserve-config".to_string()));
         assert!(ids.contains(&"kamino-obligation-health".to_string()));
@@ -1742,5 +1762,34 @@ templates: []
             described,
             missing.join("\n  ")
         );
+    }
+
+    #[test]
+    fn meteora_damm_v2_pool_overrides_keep_the_account_layout() {
+        use crate::surfnet::svm::SurfnetSvm;
+
+        // Mainnet SOL/USDC DAMM v2 pool 8Pm2kZpnxD3hoMmt4bjStX2Pw2Z9abpbHzZxMPqxPmie at slot 455742233
+        let account_data = include_bytes!("../tests/assets/meteora_damm_v2_sol_usdc_pool.bin");
+        let idl: anchor_lang_idl::types::Idl =
+            serde_json::from_str(METEORA_DAMM_V2_IDL_CONTENT).unwrap();
+        let pool = idl.accounts.iter().find(|a| a.name == "Pool").unwrap();
+        let (discriminator, data) = account_data.split_at(8);
+        assert_eq!(discriminator, pool.discriminator.as_slice());
+
+        // Pool is a zero-copy account, so re-encoding it must give back the same bytes
+        let unchanged =
+            SurfnetSvm::get_forged_idl_type_data(data, &idl, "Pool", &HashMap::new()).unwrap();
+        assert_eq!(unchanged, data);
+
+        // sqrt_price sits at bytes 448..464 after the discriminator; only those should change
+        let overrides = HashMap::from([(
+            "sqrt_price".to_string(),
+            serde_json::json!((1u128 << 64).to_string()),
+        )]);
+        let forged = SurfnetSvm::get_forged_idl_type_data(data, &idl, "Pool", &overrides).unwrap();
+        assert_eq!(forged.len(), data.len());
+        assert_eq!(&forged[448..464], &(1u128 << 64).to_le_bytes());
+        assert_eq!(&forged[..448], &data[..448]);
+        assert_eq!(&forged[464..], &data[464..]);
     }
 }
