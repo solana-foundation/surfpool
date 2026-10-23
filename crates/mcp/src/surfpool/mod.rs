@@ -313,6 +313,22 @@ pub struct StartSurfnetWithTokenAccountsResponse {
     pub error: Option<String>,
 }
 
+/// The successful token account updates and the failed ones' errors: a failure is
+/// reported, never dropped. With no success at all there is no success list.
+fn collect_token_results(
+    results: Vec<SetTokenAccountsResponse>,
+) -> (Option<Vec<SetAccountSuccess>>, Option<String>) {
+    let mut accounts = Vec::new();
+    let mut errors = Vec::new();
+    for result in results {
+        accounts.extend(result.success.into_iter().flatten());
+        errors.extend(result.error);
+    }
+    let error = (!errors.is_empty()).then(|| errors.join("; "));
+    let accounts = (error.is_none() || !accounts.is_empty()).then_some(accounts);
+    (accounts, error)
+}
+
 impl StartSurfnetWithTokenAccountsResponse {
     pub fn success(data: StartSurfnetWithTokenAccountsSuccess) -> Self {
         Self {
@@ -634,13 +650,11 @@ impl Surfpool {
             }
         }
 
-        let response = SetTokenAccountsResponse::success(
-            results
-                .into_iter()
-                .filter_map(|r| r.success)
-                .flatten()
-                .collect(),
-        );
+        let (accounts, error) = collect_token_results(results);
+        let response = SetTokenAccountsResponse {
+            success: accounts,
+            error,
+        };
         let json_str = serde_json::to_string(&response).unwrap_or_default();
         Ok(CallToolResult::success(vec![Content::text(json_str)]))
     }
@@ -712,16 +726,14 @@ impl Surfpool {
             }
         }
 
-        let response =
+        let (accounts, error) = collect_token_results(results);
+        let mut response =
             StartSurfnetWithTokenAccountsResponse::success(StartSurfnetWithTokenAccountsSuccess {
                 surfnet_url,
                 surfnet_id,
-                accounts: results
-                    .into_iter()
-                    .filter_map(|r| r.success)
-                    .flatten()
-                    .collect(),
+                accounts: accounts.unwrap_or_default(),
             });
+        response.error = error;
         let json_str = serde_json::to_string(&response).unwrap_or_default();
         Ok(CallToolResult::success(vec![Content::text(json_str)]))
     }
@@ -1574,6 +1586,30 @@ mod tests {
                 .expect("error")
                 .contains("Invalid token mint")
         );
+    }
+
+    /// A token account update that fails is reported, never dropped; with no success at all
+    /// there is no success list.
+    #[tokio::test]
+    async fn set_token_accounts_reports_the_updates_that_failed() {
+        let surfpool = Surfpool::new();
+        let result = surfpool
+            .set_token_accounts(Parameters(SetTokenAccountsParams {
+                // No surfnet listens here: every update fails.
+                surfnet_address: "http://127.0.0.1:1".to_string(),
+                token_params_with_owner: vec![CreateTokenAccountForOwnerParams {
+                    owner: None,
+                    params: vec![CreateTokenAccountParams {
+                        token_symbol: Some("USDC".to_string()),
+                        ..CreateTokenAccountParams::default()
+                    }],
+                }],
+            }))
+            .await
+            .expect("tool result");
+        let response = json_of(&result);
+        assert!(response["error"].is_string(), "{response}");
+        assert!(response["success"].is_null(), "{response}");
     }
 
     fn json_of(result: &CallToolResult) -> serde_json::Value {
