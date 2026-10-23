@@ -195,6 +195,21 @@ pub async fn start_local_surfnet_runloop(
         )?),
     };
 
+    let simnet_events_tx_cc = svm_locker.simnet_events_tx();
+    let (plugin_commands_tx, plugin_commands_rx) = unbounded::<PluginCommand>();
+    // Drain startup events before initialization or snapshots can fill the bounded queue.
+    match start_geyser_runloop(
+        config.plugin_config_path.clone(),
+        simnet_events_tx_cc.clone(),
+        geyser_events_rx,
+        plugin_commands_rx,
+    ) {
+        Ok(_) => {}
+        Err(e) => {
+            simnet_events_tx_cc.error(format!("Geyser plugin failed: {e}"));
+        }
+    };
+
     svm_locker.initialize(&remote_rpc_client).await?;
 
     if let Some(remote_client) = &remote_rpc_client {
@@ -235,10 +250,6 @@ pub async fn start_local_surfnet_runloop(
         }
     }
 
-    let simnet_events_tx_cc = svm_locker.simnet_events_tx();
-
-    let (plugin_commands_tx, plugin_commands_rx) = unbounded::<PluginCommand>();
-
     let (_rpc_handle, _ws_handle, shutdown_rpc_servers) = start_rpc_servers_runloop(
         &config,
         &simnet_commands_tx,
@@ -248,18 +259,6 @@ pub async fn start_local_surfnet_runloop(
     )?;
 
     let simnet_config = simnet.clone();
-
-    match start_geyser_runloop(
-        config.plugin_config_path.clone(),
-        simnet_events_tx_cc.clone(),
-        geyser_events_rx,
-        plugin_commands_rx,
-    ) {
-        Ok(_) => {}
-        Err(e) => {
-            let _ = simnet_events_tx_cc.error(format!("Geyser plugin failed: {e}"));
-        }
-    };
 
     let (clock_event_rx, clock_command_tx) =
         start_clock_runloop(simnet_config.slot_time, Some(simnet_events_tx_cc.clone()));
