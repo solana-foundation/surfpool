@@ -30,6 +30,11 @@ use crate::{
 };
 
 pub(crate) mod backend;
+pub use backend::receipt::{
+    FailedTransactionMetadata, SimulatedTransactionInfo, TransactionResult,
+};
+pub(crate) mod historical_archive;
+mod historical_chain;
 mod local_chain;
 pub mod locker;
 pub mod noop_program;
@@ -460,6 +465,17 @@ impl GetTransactionResult {
         };
 
         Self::FoundTransaction(signature, tx, status)
+    }
+
+    /// A historical fork's frozen slot never ages: once its block confirmed the transaction,
+    /// the transaction is final (the immediate local finalization of historical forks).
+    pub fn finalized_on_historical_fork(mut self) -> Self {
+        if let Self::FoundTransaction(_, _, status) = &mut self {
+            status.confirmation_status =
+                Some(solana_transaction_status::TransactionConfirmationStatus::Finalized);
+            status.confirmations = None;
+        }
+        self
     }
 
     pub const fn is_none(&self) -> bool {

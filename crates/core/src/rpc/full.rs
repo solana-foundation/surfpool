@@ -3,7 +3,6 @@ use std::str::FromStr;
 use itertools::Itertools;
 use jsonrpc_core::{BoxFuture, Error, Result};
 use jsonrpc_derive::rpc;
-use litesvm::types::TransactionMetadata;
 use solana_account_decoder::UiAccount;
 use solana_client::{
     rpc_config::{
@@ -49,9 +48,10 @@ use crate::{
     error::{SurfpoolError, SurfpoolResult},
     rpc::utils::{adjust_default_transaction_config, get_default_transaction_config},
     surfnet::{
-        GetTransactionResult, locker::SvmAccessContext, svm::MAX_RECENT_BLOCKHASHES_STANDARD,
+        GetTransactionResult, backend::TransactionMetadata, locker::SvmAccessContext,
+        svm::MAX_RECENT_BLOCKHASHES_STANDARD,
     },
-    types::{SurfnetTransactionStatus, surfpool_tx_metadata_to_litesvm_tx_metadata},
+    types::SurfnetTransactionStatus,
 };
 
 const MAX_PRIORITIZATION_FEE_BLOCKS_CACHE: usize = 150;
@@ -1659,6 +1659,12 @@ impl Full for SurfpoolFullRpc {
             Ok(res) => res,
             Err(e) => return e.into(),
         };
+        if signatures.len() > 256 && svm_locker.is_historical() {
+            return SurfpoolError::invalid_params(
+                "historical getSignatureStatuses accepts at most 256 signatures",
+            )
+            .into();
+        }
         let remote_client = if search_transaction_history {
             remote_ctx.map(|(remote_client, _)| remote_client)
         } else {
@@ -1671,10 +1677,27 @@ impl Full for SurfpoolFullRpc {
             let context_slot = svm_locker.get_latest_absolute_slot();
 
             let mut responses = Vec::with_capacity(signatures.len());
+            let historical = svm_locker.archive_reader();
             for signature in signatures.into_iter() {
-                let res = svm_locker
-                    .get_transaction(&remote_client, &signature, get_default_transaction_config())
-                    .await?;
+                // A historical fork's archive answers as a datasource does: only with
+                // searchTransactionHistory beyond the boundary block's own transactions.
+                let res = match &historical {
+                    Some(reader) => svm_locker.get_transaction_local_then_archive(
+                        reader,
+                        &signature,
+                        &get_default_transaction_config(),
+                        search_transaction_history,
+                    )?,
+                    None => {
+                        svm_locker
+                            .get_transaction(
+                                &remote_client,
+                                &signature,
+                                get_default_transaction_config(),
+                            )
+                            .await?
+                    }
+                };
 
                 let mut status = res.map_some_transaction_status();
                 if let Some(confirmation_status) =
@@ -1863,14 +1886,14 @@ impl Full for SurfpoolFullRpc {
                     return Err(Error {
                         data: Some(
                             serde_json::to_value(get_simulate_transaction_result(
-                                surfpool_tx_metadata_to_litesvm_tx_metadata(&metadata),
+                                metadata.clone(),
                                 None,
                                 Some(error.clone()),
                                 None,
                                 false,
                                 &tx_message,
                                 None, // No loaded addresses available in error reporting context
-                                Some(metadata.loaded_accounts_data_size),
+                                metadata.loaded_accounts_data_size,
                             ))
                             .map_err(|e| {
                                 Error::invalid_params(format!(
@@ -2084,7 +2107,7 @@ impl Full for SurfpoolFullRpc {
                         config.inner_instructions,
                         &tx_message,
                         loaded_addresses_data.as_ref(),
-                        Some(loaded_accounts_data_size),
+                        loaded_accounts_data_size,
                     )
                 }
                 Err(tx_info) => get_simulate_transaction_result(
@@ -2095,7 +2118,7 @@ impl Full for SurfpoolFullRpc {
                     config.inner_instructions,
                     &tx_message,
                     loaded_addresses_data.as_ref(),
-                    Some(loaded_accounts_data_size),
+                    loaded_accounts_data_size,
                 ),
             };
 
@@ -2164,6 +2187,9 @@ impl Full for SurfpoolFullRpc {
         };
 
         Box::pin(async move {
+            if let Some(reader) = svm_locker.archive_reader() {
+                return Ok(svm_locker.historical_block_time(&reader, slot)?);
+            }
             let block_time = svm_locker.with_svm_reader(|svm_reader| {
                 Ok::<_, jsonrpc_core::Error>(match svm_reader.blocks.get(&slot)? {
                     Some(block) => Some(block.block_time),
@@ -2227,6 +2253,22 @@ impl Full for SurfpoolFullRpc {
             let effective_end_slot = end_slot
                 .map(|end| end.min(committed_latest_slot))
                 .unwrap_or(committed_latest_slot);
+
+            if let Some(reader) = svm_locker.archive_reader() {
+                if effective_end_slot.saturating_sub(start_slot) > MAX_SLOT_RANGE {
+                    return Err(Error::invalid_params(format!(
+                        "Slot range too large. Maximum: {}, Requested: {}",
+                        MAX_SLOT_RANGE,
+                        effective_end_slot.saturating_sub(start_slot)
+                    )));
+                }
+                return Ok(svm_locker.historical_blocks(
+                    &reader,
+                    start_slot,
+                    effective_end_slot,
+                    usize::MAX,
+                )?);
+            }
 
             let genesis_slot = svm_locker.with_svm_reader(|svm| svm.genesis_slot);
 
@@ -2336,6 +2378,14 @@ impl Full for SurfpoolFullRpc {
         Box::pin(async move {
             let committed_latest_slot =
                 context_slot(&svm_locker, Some(commitment), config.min_context_slot)?;
+            if let Some(reader) = svm_locker.archive_reader() {
+                return Ok(svm_locker.historical_blocks(
+                    &reader,
+                    start_slot,
+                    committed_latest_slot,
+                    limit,
+                )?);
+            }
             let genesis_slot = svm_locker.with_svm_reader(|svm| svm.genesis_slot);
 
             // With sparse block storage, all slots from genesis_slot onwards are valid
@@ -3330,6 +3380,21 @@ mod tests {
                 .expect_err(&format!("{config:?} should be rejected"));
             assert_eq!(err.code, jsonrpc_core::ErrorCode::InvalidParams);
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn security_normal_signature_status_count_behavior_is_preserved() {
+        let setup = TestSetup::new(SurfpoolFullRpc);
+        let result = setup
+            .rpc
+            .get_signature_statuses(
+                Some(setup.context),
+                vec![Signature::new_unique().to_string(); 257],
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.value.len(), 257);
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -2,7 +2,6 @@ use std::any::type_name;
 
 use base64::prelude::*;
 use jsonrpc_core::{Error, Result};
-use litesvm::types::TransactionMetadata;
 use solana_client::{
     rpc_config::{RpcTokenAccountsFilter, RpcTransactionConfig},
     rpc_custom_error::RpcCustomError,
@@ -22,7 +21,7 @@ use solana_transaction_status::{TransactionBinaryEncoding, UiTransactionEncoding
 
 use crate::{
     error::{SurfpoolError, SurfpoolResult},
-    surfnet::locker::SurfnetSvmLocker,
+    surfnet::{backend::TransactionMetadata, locker::SurfnetSvmLocker},
 };
 
 /// Returns the slot a read at `commitment` answers for, judged before the read.

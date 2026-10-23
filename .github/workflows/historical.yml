@@ -1,0 +1,63 @@
+name: Historical SDK
+
+# Opt in until the compatible runtime and redistribution-cleared fixture exist.
+# Set the four public artifact repository variables below, then run this job.
+# No secrets or provider calls are needed. This does not publish artifacts.
+on: workflow_dispatch
+permissions:
+  contents: read
+
+jobs:
+  historical:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: "4"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      SVM_REPLAY_URL: ${{ vars.SVM_REPLAY_LINUX_X64_URL }}
+      SVM_REPLAY_ARCHIVE_SHA256: ${{ vars.SVM_REPLAY_LINUX_X64_SHA256 }}
+      HISTORICAL_FIXTURE_URL: ${{ vars.HISTORICAL_FIXTURE_URL }}
+      HISTORICAL_FIXTURE_SHA256: ${{ vars.HISTORICAL_FIXTURE_SHA256 }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Native build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev clang libclang-dev
+      - name: Fetch pinned inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${SVM_REPLAY_URL:?Set the reviewed public runtime URL}"
+          : "${SVM_REPLAY_ARCHIVE_SHA256:?Set its SHA256}"
+          : "${HISTORICAL_FIXTURE_URL:?Set the cleared public fixture URL}"
+          : "${HISTORICAL_FIXTURE_SHA256:?Set its SHA256}"
+          curl --fail --location --proto '=https' --proto-redir '=https' --max-time 180 \
+            "$SVM_REPLAY_URL" -o "$RUNNER_TEMP/runtime.tar.gz"
+          curl --fail --location --proto '=https' --proto-redir '=https' --max-time 180 \
+            "$HISTORICAL_FIXTURE_URL" -o "$RUNNER_TEMP/fixture.tar.gz"
+          printf '%s  %s\n' "$SVM_REPLAY_ARCHIVE_SHA256" "$RUNNER_TEMP/runtime.tar.gz" \
+            "$HISTORICAL_FIXTURE_SHA256" "$RUNNER_TEMP/fixture.tar.gz" | sha256sum --check -
+      - name: Build the existing tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p surfpool-sdk --test historical --no-run \
+            --message-format=json > "$RUNNER_TEMP/build.jsonl"
+          binary=$(jq -sr '[.[] | select(.reason == "compiler-artifact" and
+            .target.name == "historical" and .executable != null) | .executable]
+            | if length == 1 then .[0] else error("Expected one test executable") end' \
+            "$RUNNER_TEMP/build.jsonl")
+          printf 'HISTORICAL_TEST_BINARY=%s\n' "$binary" >> "$GITHUB_ENV"
+      - name: Execute without provider access
+        shell: bash
+        env:
+          SVM_REPLAY_ARCHIVE: ${{ runner.temp }}/runtime.tar.gz
+          HISTORICAL_FIXTURE_ARCHIVE: ${{ runner.temp }}/fixture.tar.gz
+        run: |
+          set -euo pipefail
+          # Only namespace setup runs as root; tests run as the runner user.
+          sudo --preserve-env unshare --net bash -euc '
+            ip link set lo up
+            exec setpriv --reuid="$SUDO_UID" --regid="$SUDO_GID" --init-groups \
+              python3 .github/scripts/historical-sdk.py'

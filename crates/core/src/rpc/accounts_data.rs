@@ -437,6 +437,13 @@ impl AccountsData for SurfpoolAccountsDataRpc {
             Err(e) => return e.into(),
         };
 
+        if pubkeys.len() > 100 && svm_locker.is_historical() {
+            return SurfpoolError::invalid_params(
+                "historical getMultipleAccounts accepts at most 100 accounts",
+            )
+            .into();
+        }
+
         #[cfg(feature = "prometheus")]
         let rpc_start = std::time::Instant::now();
 
@@ -684,7 +691,7 @@ mod tests {
             AccountSource, FINALIZATION_SLOT_THRESHOLD, GetAccountResult,
             remote::SurfnetRemoteClient, svm::AccountUpdatePolicy,
         },
-        tests::helpers::TestSetup,
+        tests::helpers::{TestSetup, recording_canned_rpc},
         types::SyntheticBlockhash,
     };
 
@@ -1740,14 +1747,15 @@ mod tests {
         }
     }
 
-    #[ignore = "requires-network"]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_get_multiple_accounts_with_remote_preserves_order() {
         // This test checks that order is preserved when mixing local and remote accounts
         let mut setup = TestSetup::new(SurfpoolAccountsDataRpc);
 
-        // Add a remote client to trigger get_multiple_accounts_with_remote_fallback path
-        let remote_client = SurfnetRemoteClient::new("https://api.mainnet-beta.solana.com");
+        // The controlled datasource guarantees absence; new_unique keys may exist on mainnet.
+        let (url, requests) =
+            recording_canned_rpc(r#"{"context":{"slot":123},"value":[null]}"#).await;
+        let remote_client = SurfnetRemoteClient::new(url);
         setup.context.remote_rpc_client = Some(remote_client);
 
         // Create three accounts with different lamport amounts
@@ -1794,7 +1802,7 @@ mod tests {
             .unwrap();
 
         // Request accounts in order: [pk1, pk2, pk3]
-        // pk1 and pk3 are local, pk2 is missing (will try remote fetch and fail)
+        // pk1 and pk3 are local; the datasource returns a successful, absent pk2.
         let pubkeys_str = vec![pk1.to_string(), pk2.to_string(), pk3.to_string()];
 
         let response = setup
@@ -1806,6 +1814,17 @@ mod tests {
             )
             .await
             .unwrap();
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "only the missing key needs a remote lookup"
+        );
+        let (_, body) = requests[0].split_once("\r\n\r\n").unwrap();
+        let request: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(request["method"], "getMultipleAccounts");
+        assert_eq!(request["params"][0], serde_json::json!([pk2.to_string()]));
 
         // Verify we got 3 results
         assert_eq!(response.value.len(), 3);

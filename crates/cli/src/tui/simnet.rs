@@ -41,6 +41,9 @@ const SURFPOOL_LINK: &str = "Need help? https://docs.surfpool.run/tui";
 
 const ITEM_HEIGHT: usize = 1;
 
+#[cfg(test)]
+mod tests;
+
 /// Theme variants for the TUI
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Theme {
@@ -257,6 +260,7 @@ struct App {
     simnet_commands_tx: Sender<SimnetCommand>,
     clock: Clock,
     epoch_info: EpochInfo,
+    epoch_info_known: bool,
     successful_transactions: u32,
     events: Vec<(EventType, DateTime<Local>, String)>,
     transactions: Vec<(bool, DateTime<Local>, String)>, // (success, time, signature)
@@ -268,6 +272,7 @@ struct App {
     paused: bool,
     blink_state: bool,
     last_blink: Instant,
+    historical_loading_since: Option<Instant>,
     selected_tab: usize,
 }
 
@@ -285,26 +290,45 @@ impl App {
         let palette = theme.palette();
 
         let mut events = vec![];
-        let (rpc_url, ws_url, datasource) = match &displayed_url {
-            DisplayedUrl::Datasource(config) | DisplayedUrl::Studio(config) => (
+        let (rpc_url, ws_url, datasource, forks_after) = match &displayed_url {
+            DisplayedUrl::Datasource(config)
+            | DisplayedUrl::Historical(config)
+            | DisplayedUrl::Studio(config) => (
                 config.rpc_url.clone(),
                 config.ws_url.clone(),
                 config.rpc_datasource_url.clone(),
+                config
+                    .historical
+                    .as_ref()
+                    .map(|historical| historical.after.clone()),
             ),
         };
+        let historical_loading_since = match &displayed_url {
+            DisplayedUrl::Historical(_) => Some(Instant::now()),
+            _ => None,
+        };
         events.push((
-            EventType::Success,
+            if historical_loading_since.is_some() {
+                EventType::Info
+            } else {
+                EventType::Success
+            },
             Local::now(),
-            format!("Surfnet up and running, emulating local Solana validator (RPC: {rpc_url}, WS: {ws_url})"),
+            if historical_loading_since.is_some() {
+                format!("Preparing historical fork; RPC will be available when ready ({rpc_url}, WS: {ws_url})")
+            } else {
+                format!("Surfnet up and running, emulating local Solana validator (RPC: {rpc_url}, WS: {ws_url})")
+            },
         ));
         events.push((
             EventType::Info,
             Local::now(),
-            match &datasource {
-                Some(url) => {
-                    format!("Connecting surfnet to datasource {url}")
+            match (&forks_after, &datasource) {
+                (Some(after), _) => {
+                    format!("Forking after {after}: state comes from its history, not a datasource")
                 }
-                None => "No datasource configured, working in offline mode".to_string(),
+                (None, Some(url)) => format!("Connecting surfnet to datasource {url}"),
+                (None, None) => "No datasource configured, working in offline mode".to_string(),
             },
         ));
 
@@ -324,6 +348,7 @@ impl App {
                 transaction_count: None,
             },
             successful_transactions: initial_transactions as u32,
+            epoch_info_known: false,
             events,
             transactions: vec![],
             include_debug_logs,
@@ -334,6 +359,7 @@ impl App {
             paused: false,
             blink_state: false,
             last_blink: Instant::now(),
+            historical_loading_since,
             selected_tab: 0,
         }
     }
@@ -371,7 +397,7 @@ impl App {
     }
 
     pub fn update_blink_state(&mut self) {
-        if self.paused {
+        if self.paused && !matches!(self.displayed_url, DisplayedUrl::Historical(_)) {
             let now = Instant::now();
             if now.duration_since(self.last_blink).as_millis() >= 500 {
                 self.blink_state = !self.blink_state;
@@ -390,6 +416,7 @@ impl App {
 pub enum DisplayedUrl {
     Studio(SanitizedConfig),
     Datasource(SanitizedConfig),
+    Historical(SanitizedConfig),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -441,7 +468,9 @@ fn run_app<B: Backend>(
 ) -> io::Result<()> {
     let (tx, rx) = unbounded();
     let rpc_api_url = match app.displayed_url {
-        DisplayedUrl::Datasource(ref config) => config.rpc_url.clone(),
+        DisplayedUrl::Datasource(ref config) | DisplayedUrl::Historical(ref config) => {
+            config.rpc_url.clone()
+        }
         DisplayedUrl::Studio(ref config) => config.rpc_url.clone(),
     };
     let _ = hiro_system_kit::thread_named("break solana").spawn(move || {
@@ -499,6 +528,7 @@ fn run_app<B: Backend>(
                                 ));
                             }
                             SimnetEvent::EpochInfoUpdate(epoch_info) => {
+                                app.epoch_info_known = true;
                                 app.epoch_info = epoch_info.clone();
                                 new_events.push((
                                     EventType::Success,
@@ -507,9 +537,13 @@ fn run_app<B: Backend>(
                                 ));
                             }
                             SimnetEvent::SystemClockUpdated(clock) => {
+                                app.epoch_info.epoch = clock.epoch;
                                 app.clock = clock.clone();
+                                app.historical_loading_since = None;
                             }
-                            SimnetEvent::ClockUpdate(ClockCommand::PauseWithConfirmation(_)) => {
+                            SimnetEvent::ClockUpdate(
+                                ClockCommand::PauseWithConfirmation(_) | ClockCommand::Pause,
+                            ) => {
                                 app.paused = true;
                             }
                             SimnetEvent::ClockUpdate(ClockCommand::Resume) => {
@@ -594,6 +628,17 @@ fn run_app<B: Backend>(
                                 let _ = app
                                     .simnet_commands_tx
                                     .send(SimnetCommand::StartRunbookExecution(runbook_id.clone()));
+                            }
+                            SimnetEvent::NetworkReset(clock) => {
+                                app.epoch_info.epoch = clock.epoch;
+                                app.clock = clock.clone();
+                                app.transactions.clear();
+                                app.successful_transactions = 0;
+                                new_events.push((
+                                    EventType::Info,
+                                    Local::now(),
+                                    format!("Network reset to slot {}", clock.slot),
+                                ));
                             }
                             SimnetEvent::RunbookCompleted(runbook_id, errors) => {
                                 runbooks_completed = true;
@@ -736,7 +781,11 @@ fn run_app<B: Backend>(
                         Right => app.selected_tab = 1,
                         Char('f') | Char('j') => {
                             // Break Solana
-                            let sender = app.breaker.as_ref().unwrap();
+                            let Some(sender) = app.breaker.as_ref() else {
+                                app.events.push((EventType::Warning, Local::now(),
+                                    "Use the historical transaction example to fund a local wallet and send a transaction.".into()));
+                                continue;
+                            };
                             let instruction = system_instruction::transfer(
                                 &sender.pubkey(),
                                 &Pubkey::new_unique(),
@@ -808,7 +857,9 @@ fn title_block(title: &str, alignment: Alignment) -> Block<'_> {
 fn render_header(f: &mut Frame, app: &mut App, area: Rect) {
     // Layout: [slot/epoch box with gray border] [gap] [studio box with cyan border]
     let url = match &app.displayed_url {
-        DisplayedUrl::Datasource(config) => config.rpc_url.clone(),
+        DisplayedUrl::Datasource(config) | DisplayedUrl::Historical(config) => {
+            config.rpc_url.clone()
+        }
         DisplayedUrl::Studio(config) => config.studio_url.clone(),
     };
     let studio_width = (url.len() + 13) as u16; // "Studio │ " + url + borders + padding
@@ -845,8 +896,17 @@ fn render_header(f: &mut Frame, app: &mut App, area: Rect) {
 
 fn render_epoch(f: &mut Frame, app: &mut App, area: Rect) {
     // The compact bar row: [progress] SLOT xxx    EPOCH xxx ●
-    let slot_str = format!("{}", app.clock.slot);
-    let epoch_str = format!("{}", app.epoch_info.epoch);
+    let loading = app.historical_loading_since.is_some();
+    let slot_str = if loading {
+        "—".into()
+    } else {
+        format!("{}", app.clock.slot)
+    };
+    let epoch_str = if loading {
+        "—".into()
+    } else {
+        format!("{}", app.epoch_info.epoch)
+    };
 
     let bar_row = Layout::horizontal([
         Constraint::Length(1),                          // Left bracket
@@ -891,13 +951,18 @@ fn render_epoch(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(epoch_num, bar_row[8]);
 
     // Circular progress indicator based on epoch progress
-    let epoch_progress = app.epoch_progress();
-    let circle_char = match epoch_progress {
-        0..=12 => "○",  // Empty
-        13..=37 => "◔", // Quarter
-        38..=62 => "◑", // Half
-        63..=87 => "◕", // Three quarters
-        _ => "●",       // Full
+    let circle_char = if loading {
+        " "
+    } else if !app.epoch_info_known {
+        "?"
+    } else {
+        match app.epoch_progress() {
+            0..=12 => "○",  // Empty
+            13..=37 => "◔", // Quarter
+            38..=62 => "◑", // Half
+            63..=87 => "◕", // Three quarters
+            _ => "●",       // Full
+        }
     };
     let circle = Paragraph::new(circle_char).style(Style::default().fg(app.colors.accent));
     f.render_widget(circle, bar_row[9]);
@@ -905,13 +970,21 @@ fn render_epoch(f: &mut Frame, app: &mut App, area: Rect) {
 
 fn render_stats(f: &mut Frame, app: &mut App, area: Rect) {
     let url = match &app.displayed_url {
-        DisplayedUrl::Datasource(config) => config.rpc_url.clone(),
+        DisplayedUrl::Datasource(config) | DisplayedUrl::Historical(config) => {
+            config.rpc_url.clone()
+        }
         DisplayedUrl::Studio(config) => config.studio_url.clone(),
     };
 
     // Content: "Studio │ <url>"
     let content = Line::from(vec![
-        Span::styled("Studio ", Style::default().fg(app.colors.white)),
+        Span::styled(
+            match &app.displayed_url {
+                DisplayedUrl::Datasource(_) | DisplayedUrl::Historical(_) => "RPC ",
+                DisplayedUrl::Studio(_) => "Studio ",
+            },
+            Style::default().fg(app.colors.white),
+        ),
         Span::styled("│ ", Style::default().fg(app.colors.light_gray)),
         Span::styled(url, Style::default().fg(app.colors.accent)),
     ]);
@@ -923,6 +996,20 @@ fn render_stats(f: &mut Frame, app: &mut App, area: Rect) {
 
 fn render_slot_bar(f: &mut Frame, app: &mut App, area: Rect) {
     if area.width == 0 {
+        return;
+    }
+    if let Some(started) = app.historical_loading_since {
+        let elapsed = started.elapsed();
+        let spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let content = format!(
+            "{} Loading historical state · {}s elapsed",
+            spinner[(elapsed.as_millis() / 100 % spinner.len() as u128) as usize],
+            elapsed.as_secs()
+        );
+        f.render_widget(
+            Paragraph::new(content).style(Style::default().fg(app.colors.white)),
+            area,
+        );
         return;
     }
 
@@ -1088,7 +1175,7 @@ fn render_transactions(f: &mut Frame, app: &mut App, area: Rect) {
     // Get studio URL if available
     let studio_url = match &app.displayed_url {
         DisplayedUrl::Studio(config) => Some(config.studio_url.clone()),
-        DisplayedUrl::Datasource(_) => None,
+        DisplayedUrl::Datasource(_) | DisplayedUrl::Historical(_) => None,
     };
 
     let mut rows = Vec::new();

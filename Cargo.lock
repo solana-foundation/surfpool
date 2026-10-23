@@ -12152,6 +12152,7 @@ dependencies = [
  "jsonrpc-pubsub",
  "jsonrpc-ws-server",
  "lazy_static",
+ "libc",
  "libloading 0.7.4",
  "libsecp256k1 0.7.2",
  "litesvm",

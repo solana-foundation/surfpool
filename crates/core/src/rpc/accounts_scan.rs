@@ -21,7 +21,7 @@ use super::{
         context_slot, optimize_filters, verify_filters, verify_pubkey, verify_token_account_filter,
     },
 };
-use crate::surfnet::locker::SvmAccessContext;
+use crate::{error::SurfpoolError, surfnet::locker::SvmAccessContext};
 
 #[rpc]
 pub trait AccountsScan {
@@ -567,6 +567,22 @@ impl AccountsScan for SurfpoolAccountsScanRpc {
                     .as_ref()
                     .map(|c| c.exclude_non_circulating_accounts_list)
                     .unwrap_or(false);
+
+                // A historical fork's real supply would sum every account at its slot; it
+                // reports only the figures a caller defined with `surfnet_setSupply`.
+                let defined = svm_reader.supply_overrides;
+                if svm_reader.inner.is_historical()
+                    && !(defined.total
+                        && defined.circulating
+                        && defined.non_circulating
+                        && (exclude_accounts || defined.non_circulating_accounts))
+                {
+                    return Err(SurfpoolError::historical_unavailable(
+                        "getSupply",
+                        "the supply at a historical slot sums every account, which no index holds; define it with surfnet_setSupply",
+                    )
+                    .into());
+                }
 
                 Ok(RpcResponse {
                     context: RpcResponseContext::new(slot),

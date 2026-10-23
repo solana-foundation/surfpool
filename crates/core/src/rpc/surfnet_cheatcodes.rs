@@ -2015,18 +2015,22 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
                 // update the supply fields if provided
                 if let Some(total) = update.total {
                     svm_writer.total_supply = total;
+                    svm_writer.supply_overrides.total = true;
                 }
 
                 if let Some(circulating) = update.circulating {
                     svm_writer.circulating_supply = circulating;
+                    svm_writer.supply_overrides.circulating = true;
                 }
 
                 if let Some(non_circulating) = update.non_circulating {
                     svm_writer.non_circulating_supply = non_circulating;
+                    svm_writer.supply_overrides.non_circulating = true;
                 }
 
                 if let Some(ref accounts) = update.non_circulating_accounts {
                     svm_writer.non_circulating_accounts = accounts.clone();
+                    svm_writer.supply_overrides.non_circulating_accounts = true;
                 }
 
                 svm_writer.get_latest_absolute_slot()
@@ -2487,6 +2491,13 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
             None
         };
 
+        // Refuse oversized writes before allocating decoded bytes or acquiring accounts.
+        if let Err(error) =
+            crate::surfnet::locker::program_write_end(offset, data_hex.len().div_ceil(2))
+        {
+            return error.into();
+        }
+
         // Decode hex data
         let data = match hex::decode(&data_hex) {
             Ok(data) => data,
@@ -2497,13 +2508,6 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
                 ))));
             }
         };
-
-        // Validate offset doesn't cause overflow
-        if offset.checked_add(data.len()).is_none() {
-            return Box::pin(future::err(Error::invalid_params(
-                "Offset + data length causes integer overflow",
-            )));
-        }
 
         let SurfnetRpcContext {
             svm_locker,
@@ -3937,6 +3941,55 @@ mod tests {
         assert!(
             !snapshot.contains_key(&excluded_system_account_pubkey.to_string()),
             "Excluded system account should not be present"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn security_program_upload_refused_before_normal_account_creation() {
+        let setup = TestSetup::new(SurfnetCheatcodesRpc::empty());
+        let program = Pubkey::new_unique();
+        let error = setup
+            .rpc
+            .write_program(
+                Some(setup.context.clone()),
+                program.to_string(),
+                "01".into(),
+                solana_system_interface::MAX_PERMITTED_DATA_LENGTH as usize,
+                None,
+            )
+            .await
+            .expect_err("oversized upload must fail");
+        assert_eq!(error.code, jsonrpc_core::ErrorCode::InvalidParams);
+        assert!(error.message.contains("program write"), "{error}");
+        assert!(
+            setup.context.svm_locker.with_svm_reader(|svm| svm
+                .inner
+                .get_account(&program)
+                .unwrap()
+                .is_none())
+        );
+        let program_data = solana_loader_v3_interface::get_program_data_address(&program);
+        let error = setup
+            .context
+            .svm_locker
+            .write_program_data_account_with_offset(
+                program,
+                None,
+                program_data,
+                solana_system_interface::MAX_PERMITTED_DATA_LENGTH as usize,
+                &[],
+                &None,
+            )
+            .await
+            .unwrap_err();
+        let error: jsonrpc_core::Error = error.into();
+        assert_eq!(error.code, jsonrpc_core::ErrorCode::InvalidParams);
+        assert!(
+            setup.context.svm_locker.with_svm_reader(|svm| svm
+                .inner
+                .get_account(&program_data)
+                .unwrap()
+                .is_none())
         );
     }
 

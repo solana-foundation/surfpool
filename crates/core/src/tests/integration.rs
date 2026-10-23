@@ -4567,6 +4567,184 @@ async fn startup_fails_when_the_datasource_cannot_be_reached(test_type: TestType
     );
 }
 
+/// A system account a clone datasource holds (4242 lamports), as getMultipleAccounts answers.
+const CLONED_ACCOUNT_JSON: &str = r#"{"context":{"slot":1},"value":[{"lamports":4242,"owner":"11111111111111111111111111111111","data":["","base64"],"executable":false,"rentEpoch":0,"space":0}]}"#;
+
+/// Explicit cloning on a normal surfnet keeps its behaviour: a cloned account absent locally
+/// is fetched from the clone's datasource and hydrated before readiness.
+#[test_case(TestType::in_memory(); "with in-memory sqlite db")]
+#[tokio::test(flavor = "multi_thread")]
+async fn an_explicit_clone_hydrates_a_normal_surfnet_from_its_datasource(test_type: TestType) {
+    let (datasource, requests) =
+        crate::tests::helpers::recording_canned_rpc(CLONED_ACCOUNT_JSON).await;
+    let cloned = Pubkey::new_unique();
+    let (observer, commands, _runloop) = start_runloop_awaiting_a_planner(test_type);
+
+    let (reply_tx, reply_rx) = bounded(1);
+    commands
+        .send(SimnetCommand::SealStartupPlan(
+            vec![SurfnetStartupTask::RemoteAccounts],
+            reply_tx,
+        ))
+        .unwrap();
+    reply_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the runloop should answer the seal")
+        .expect("sealing an unsealed plan should be accepted");
+    for command in [
+        SimnetCommand::StartStartupTask(SurfnetStartupTask::RemoteAccounts),
+        SimnetCommand::FetchRemoteAccounts(vec![cloned], datasource),
+    ] {
+        commands.send(command).unwrap();
+    }
+    await_startup(&observer, "readiness", |status| status.is_ready()).await;
+
+    assert!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| request.contains("getMultipleAccounts")),
+        "the clone's datasource was not asked"
+    );
+    let account = observer
+        .get_account_local(&cloned)
+        .unwrap()
+        .inner
+        .map_account()
+        .unwrap();
+    assert_eq!(account.lamports, 4242);
+}
+
+/// A historical fork's datasource is its archive: an explicit clone (a project's declared
+/// clones reach a historical session with the default mainnet URL) must never hydrate it from
+/// a tip RPC. Two confirmed absences are cloned from a loopback datasource that holds both: a
+/// fork-local account explicitly deleted, and an account the archive records absent at the
+/// boundary (`M59_ABSENT_ACCOUNT`). That datasource is never asked, both accounts stay absent,
+/// and the clone is reported absent. Needs a staged SVM Replay backend and its cached history
+/// (the `M59_*` variables), so it is ignored unless run explicitly.
+#[test]
+#[ignore = "needs a staged SVM Replay backend and its cached history (the M59_* variables)"]
+fn an_explicit_clone_never_hydrates_a_historical_fork_from_its_datasource() {
+    let var = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name} is required"));
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (datasource, requests) = runtime.block_on(crate::tests::helpers::recording_canned_rpc(
+        CLONED_ACCOUNT_JSON,
+    ));
+    let backend =
+        surfpool_types::HistoricalSimnetConfig::session(surfpool_types::HistoricalSessionOptions {
+            after: var("M59_AFTER"),
+            program: Some(var("M59_SVM_REPLAY_BIN")),
+            data_dir: Some(std::path::PathBuf::from(var("M59_HISTORICAL_DATA_DIR"))),
+            config: Some(std::path::PathBuf::from(var("M59_HISTORICAL_CONFIG"))),
+            ..Default::default()
+        })
+        .unwrap();
+    let (instance, events_rx) = crate::lifecycle::SurfnetInstance::open(
+        None,
+        crate::surfnet::svm::SurfnetSvmConfig {
+            historical: Some(backend),
+            ..crate::surfnet::svm::SurfnetSvmConfig::default()
+        },
+    )
+    .unwrap();
+    let rpc_port = get_free_port().unwrap();
+    let config = SurfpoolConfig {
+        simnets: vec![SimnetConfig::default()],
+        rpc: RpcConfig {
+            bind_port: rpc_port,
+            ws_port: get_free_port().unwrap(),
+            ..Default::default()
+        },
+        ..SurfpoolConfig::default()
+    };
+    let (commands_tx, commands_rx) = unbounded();
+    let (runloop_commands, handle) = (commands_tx.clone(), runtime.handle().clone());
+    let runloop = std::thread::spawn(move || {
+        handle
+            .block_on(instance.run(config, runloop_commands, commands_rx))
+            .map_err(|e| e.to_string())
+    });
+
+    let rpc = solana_client::rpc_client::RpcClient::new(format!("http://127.0.0.1:{rpc_port}"));
+    let deadline = std::time::Instant::now() + Duration::from_secs(240);
+    while rpc.get_health().is_err() {
+        assert!(
+            std::time::Instant::now() < deadline && !runloop.is_finished(),
+            "the historical fork never became ready"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    // Confirmed absences: a fork-local account, then explicitly deleted (the fork holds its empty
+    // image), and an account the archive records absent at the boundary.
+    let deleted = Pubkey::new_unique();
+    let boundary_absent: Pubkey = var("M59_ABSENT_ACCOUNT").parse().unwrap();
+    for lamports in [1_000_000u64, 0] {
+        rpc.send::<serde_json::Value>(
+            solana_client::rpc_request::RpcRequest::Custom {
+                method: "surfnet_setAccount",
+            },
+            serde_json::json!([deleted.to_string(), {"lamports": lamports,
+                "owner": "11111111111111111111111111111111", "data": "",
+                "executable": false, "rentEpoch": 0}]),
+        )
+        .unwrap();
+    }
+    let account = |rpc: &solana_client::rpc_client::RpcClient, pubkey: &Pubkey| {
+        rpc.get_account_with_commitment(pubkey, CommitmentConfig::processed())
+            .unwrap()
+            .value
+    };
+    for pubkey in [&deleted, &boundary_absent] {
+        assert!(account(&rpc, pubkey).is_none(), "{pubkey} is not absent");
+    }
+
+    for command in [
+        SimnetCommand::StartStartupTask(SurfnetStartupTask::RemoteAccounts),
+        SimnetCommand::FetchRemoteAccounts(vec![deleted, boundary_absent], datasource),
+    ] {
+        commands_tx.send(command).unwrap();
+    }
+    // The handler is done once it reports the task's end: the default planner sealed an empty
+    // plan before readiness, so the late RemoteAccounts task's bookkeeping is refused, after the
+    // clone itself ran. Every log line meanwhile is kept for the verdict.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let (mut reported_absent, mut finished, mut logs) = (false, false, vec![]);
+    while !finished && std::time::Instant::now() < deadline {
+        match events_rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(SimnetEvent::WarnLog(_, message)) => {
+                reported_absent |= message.contains("Cloned accounts not found")
+                    && message.contains(&boundary_absent.to_string());
+                logs.push(format!("warn: {message}"));
+            }
+            Ok(SimnetEvent::ErrorLog(_, message)) => {
+                finished |= message.contains("remote account hydration");
+                logs.push(format!("error: {message}"));
+            }
+            Ok(SimnetEvent::InfoLog(_, message)) => logs.push(format!("info: {message}")),
+            _ => {}
+        }
+    }
+    let asked = requests.lock().unwrap().clone();
+    let after = [account(&rpc, &deleted), account(&rpc, &boundary_absent)];
+    commands_tx.send(SimnetCommand::Terminate(None)).unwrap();
+    let _ = runloop.join();
+
+    assert!(finished, "the clone never finished; logs {logs:#?}");
+    let asked: Vec<_> = asked
+        .iter()
+        .filter_map(|request| request.split("\r\n\r\n").nth(1))
+        .collect();
+    assert!(
+        asked.is_empty() && after.iter().all(Option::is_none) && reported_absent,
+        "datasource asked {asked:?}; after the clone [deleted, boundary-absent] = {after:?}; \
+         reported absent {reported_absent}; logs {logs:#?}"
+    );
+}
+
 /// A booted simnet, with the handles a test drives it through.
 ///
 /// The guard rides along rather than being handed back separately, so holding
@@ -11914,6 +12092,15 @@ async fn test_create_lookup_table_with_finalized_slot(test_type: TestType) {
 #[cfg_attr(feature = "postgres", test_case(TestType::postgres(); "with postgres db"))]
 #[tokio::test]
 async fn test_send_transaction_skip_sig_verify_processes_and_updates_state(test_type: TestType) {
+    assert_skip_sig_verify_updates_state(test_type, false).await;
+}
+
+#[tokio::test]
+async fn skip_sig_verify_state_is_observable_when_the_event_queue_is_full() {
+    assert_skip_sig_verify_updates_state(TestType::no_db(), true).await;
+}
+
+async fn assert_skip_sig_verify_updates_state(test_type: TestType, saturate_events: bool) {
     let payer = Keypair::new();
     let recipient = Keypair::new().pubkey();
     let transfer_amount = LAMPORTS_PER_SOL / 2;
@@ -11925,6 +12112,7 @@ async fn test_send_transaction_skip_sig_verify_processes_and_updates_state(test_
     let config = SurfpoolConfig {
         simnets: vec![SimnetConfig {
             slot_time: 1,
+            offline_mode: saturate_events,
             airdrop_addresses: vec![payer.pubkey()],
             airdrop_token_amount: airdrop_amount,
             ..SimnetConfig::default()
@@ -11951,7 +12139,11 @@ async fn test_send_transaction_skip_sig_verify_processes_and_updates_state(test_
     )
     .expect("the runloop should start");
 
-    wait_for_ready_and_connected(&simnet_events_rx).expect("the surfnet should start");
+    if saturate_events {
+        wait_for_ready(&simnet_events_rx).expect("the offline surfnet should start");
+    } else {
+        wait_for_ready_and_connected(&simnet_events_rx).expect("the surfnet should start");
+    }
 
     let minimal_client =
         http::connect::<MinimalClient>(format!("http://{bind_host}:{bind_port}").as_str())
@@ -12018,21 +12210,40 @@ async fn test_send_transaction_skip_sig_verify_processes_and_updates_state(test_
         skip_sig_verify: Some(true),
     };
     let signature = tx.signatures[0];
+    if saturate_events {
+        let capacity = simnet_events_rx.capacity().expect("bounded event queue");
+        let events = svm_locker.0.read().await.simnet_events_tx.clone();
+        for _ in 0..capacity {
+            events.info("event backpressure regression");
+        }
+        assert!(
+            simnet_events_rx.is_full(),
+            "the regression must saturate the queue"
+        );
+    }
     let _sig = full_client
         .send_transaction(data, Some(send_config))
         .await
         .expect("send_transaction with skip_sig_verify should succeed");
 
-    // Wait for the transaction to be processed
-    let _ = task::spawn_blocking(move || {
+    // UI notifications are lossy under backpressure; stored status is authoritative.
+    tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            match simnet_events_rx.recv() {
-                Ok(SimnetEvent::TransactionProcessed(..)) => break,
-                _ => (),
+            let recorded = full_client
+                .get_signature_statuses(vec![signature.to_string()], None)
+                .await
+                .expect("recorded transaction status");
+            assert_eq!(recorded.value.len(), 1);
+            if let Some(status) = &recorded.value[0] {
+                assert!(status.err.is_none(), "transaction failed: {:?}", status.err);
+                break;
             }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
-    .await;
+    .await
+    .expect("transaction status should be stored");
+    drop(simnet_events_rx);
     tokio::time::timeout(Duration::from_secs(1), async {
         while svm_locker.0.read().await.is_transaction_pending(&signature) {
             tokio::task::yield_now().await;

@@ -56,6 +56,23 @@ Surfpool Cloud extends that same experience to the cloud — letting you index m
 With Surfpool Scenarios you can curate slot-by-slot account states for key accounts, mixing live mainnet data with overridden account states.
 This allows you to stress test your protocol in key real-world situations and to reproduce any chain-state conditions. See the [Scenarios Docs](./crates/core/src/scenarios/README.md) for more details.
 
+### Historical signing safety
+
+Historical mode (`surfpool start --after ...`) does not implicitly fund
+`~/.config/solana/id.json`. Use disposable session keys; explicit `-k` and
+`--airdrop` funding remain available. Normal-mode default funding is unchanged.
+Transactions signed with real keys and a recent blockhash may also be valid on the
+source network; durable nonce transactions may remain valid without that expiry
+window. Suppressing default funding mitigates accidental real-key use but is not
+cryptographic domain separation. Do not sign historical tests with real wallets.
+
+Historical token-owner queries refuse more than 100 candidate accounts before
+account acquisition, and holder rankings refuse more than 100 unloaded holders.
+The native owner-list pagination happens before this guard and remains a separate
+resource-cost risk. Historical signature-status queries accept at most 256
+signatures. Program uploads must fit the 10 MiB account limit including loader
+metadata, in either mode; oversized requests are refused, never truncated.
+
 ## Installation
 
 Surfpool installer:

@@ -311,7 +311,7 @@ impl LocalBackend {
             &sanitized_message,
             self.lamports_per_signature(),
             configuration.priority_fee_lamports,
-            FeeFeatures::from(feature_set),
+            FeeFeatures {},
         ))
     }
 

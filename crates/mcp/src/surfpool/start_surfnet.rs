@@ -77,6 +77,23 @@ pub fn run_command(surfnet_id: u16, rpc_port: u16, ws_port: u16) -> StartSurfnet
 }
 
 pub fn run_headless(surfnet_id: u16, rpc_port: u16, ws_port: u16) -> StartSurfnetResponse {
+    run_headless_with_config(
+        surfnet_id,
+        rpc_port,
+        ws_port,
+        SimnetConfig {
+            expiry: Some(15 * 60 * 1000),
+            ..Default::default()
+        },
+    )
+}
+
+fn run_headless_with_config(
+    surfnet_id: u16,
+    rpc_port: u16,
+    ws_port: u16,
+    simnet_config: SimnetConfig,
+) -> StartSurfnetResponse {
     let (instance, simnet_events_rx) =
         match SurfnetInstance::open(None, SurfnetSvmConfig::default()) {
             Ok(opened) => opened,
@@ -89,7 +106,7 @@ pub fn run_headless(surfnet_id: u16, rpc_port: u16, ws_port: u16) -> StartSurfne
 
     let (simnet_commands_tx, simnet_commands_rx) = crossbeam_channel::unbounded();
 
-    let simnet_events_tx = instance.locker().simnet_events_tx();
+    let simnet_events_tx = instance.simnet_events_tx();
 
     // The default StartupPlanner::Runloop makes the runloop seal an empty
     // startup plan before announcing Ready, so this embedded surfnet reads
@@ -97,11 +114,6 @@ pub fn run_headless(surfnet_id: u16, rpc_port: u16, ws_port: u16) -> StartSurfne
     let mut config = SurfpoolConfig::default();
     config.rpc.bind_port = rpc_port;
     config.rpc.ws_port = ws_port;
-
-    let simnet_config = SimnetConfig {
-        expiry: Some(15 * 60 * 1000),
-        ..Default::default()
-    };
 
     config.simnets = vec![simnet_config];
 
@@ -257,7 +269,17 @@ mod tests {
         let rpc_port = free_port();
         let ws_port = free_port();
 
-        let response = run_headless(1, rpc_port, ws_port);
+        let response = run_headless_with_config(
+            1,
+            rpc_port,
+            ws_port,
+            SimnetConfig {
+                offline_mode: true,
+                remote_rpc_url: None,
+                expiry: Some(15 * 60 * 1000),
+                ..Default::default()
+            },
+        );
         assert!(
             response.error.is_none(),
             "surfnet failed to start: {:?}",

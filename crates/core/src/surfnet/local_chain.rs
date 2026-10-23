@@ -2,7 +2,8 @@
 //! epoch schedule and housekeeping that a normal surfnet's block production, time travel,
 //! datasource alignment and reset apply to LiteSVM. Surfpool decides what and when from its own
 //! chain state (chain tip, genesis slot, epoch info); the local backend holds the VM. This is the
-//! only module with mutable implementation access to the local backend (`Backend::local_mut`).
+//! only module with mutable implementation access to the local backend (`Backend::local_mut`);
+//! on a historical fork every operation here is refused with a typed error.
 //! It owns no store, index or event: those stay in `SurfnetSvm`'s workflows.
 
 use agave_feature_set::FeatureSet;
@@ -13,11 +14,27 @@ use solana_sysvar::last_restart_slot::LastRestartSlot;
 
 use super::{
     BlockIdentifier, FINALIZATION_SLOT_THRESHOLD,
+    backend::LocalBackend,
     svm::{MAX_RECENT_BLOCKHASHES_STANDARD, SurfnetSvm, synthetic_blockhash_for_slot},
 };
-use crate::types::SyntheticBlockhash;
+use crate::{
+    error::{SurfpoolError, SurfpoolResult},
+    types::SyntheticBlockhash,
+};
 
 impl SurfnetSvm {
+    /// The local VM this policy acts on. A historical fork refuses it: its clock, blockhashes and
+    /// sysvars move only inside SVM Replay.
+    fn local_vm(&mut self) -> SurfpoolResult<&mut LocalBackend> {
+        self.inner.local_mut().ok_or_else(|| {
+            SurfpoolError::historical(
+                "UNSUPPORTED_IN_HISTORICAL_MODE",
+                "normal chain policy on a historical fork: its clock, blockhashes and sysvars move only inside SVM Replay",
+                None,
+            )
+        })
+    }
+
     /// Reconstructs RecentBlockhashes, SlotHashes, and Clock sysvars deterministically
     /// from the current slot. Called on startup and after garbage collection to ensure
     /// consistent sysvar state without requiring database persistence.
@@ -25,7 +42,7 @@ impl SurfnetSvm {
     /// Note: SyntheticBlockhash uses chain_tip.index (relative index), while SlotHashes
     /// and Clock use absolute slots (chain_tip.index + genesis_slot).
     #[allow(deprecated)]
-    pub fn reconstruct_sysvars(&mut self) {
+    pub fn reconstruct_sysvars(&mut self) -> SurfpoolResult<()> {
         use solana_slot_hashes::SlotHashes;
         use solana_sysvar::recent_blockhashes::{IterItem, RecentBlockhashes};
 
@@ -49,7 +66,7 @@ impl SurfnetSvm {
             .map(|(index, hash)| IterItem(index as u64, hash.hash(), 0))
             .collect();
         let recent_blockhashes = RecentBlockhashes::from_iter(recent_blockhashes_vec);
-        self.inner.local_mut().set_sysvar(&recent_blockhashes);
+        self.local_vm()?.set_sysvar(&recent_blockhashes);
 
         // 2. Reconstruct SlotHashes - maps absolute slots to blockhashes.
         // The local ledger starts at genesis_slot, but finalized commitment is
@@ -77,7 +94,7 @@ impl SurfnetSvm {
             })
             .collect();
         let slot_hashes = SlotHashes::new(&slot_hashes_vec);
-        self.inner.local_mut().set_sysvar(&slot_hashes);
+        self.local_vm()?.set_sysvar(&slot_hashes);
 
         // 3. Reconstruct Clock using absolute slot
         let unix_timestamp = self.calculate_block_time_for_slot(current_absolute_slot) / 1_000;
@@ -88,7 +105,8 @@ impl SurfnetSvm {
             epoch_start_timestamp: 0,
             leader_schedule_epoch: 0,
         };
-        self.inner.local_mut().set_sysvar(&clock);
+        self.local_vm()?.set_sysvar(&clock);
+        Ok(())
     }
 
     /// Generates and sets a new blockhash, updating the RecentBlockhashes sysvar.
@@ -96,20 +114,20 @@ impl SurfnetSvm {
     /// # Returns
     /// A new `BlockIdentifier` for the updated blockhash.
     #[allow(deprecated)]
-    pub(super) fn new_blockhash(&mut self) -> BlockIdentifier {
+    pub(super) fn new_blockhash(&mut self) -> SurfpoolResult<BlockIdentifier> {
         use solana_slot_hashes::SlotHashes;
         use solana_sysvar::recent_blockhashes::{IterItem, RecentBlockhashes};
         // Backup the current block hashes
-        let recent_blockhashes_backup = self.inner.local_mut().get_sysvar::<RecentBlockhashes>();
+        let recent_blockhashes_backup = self.local_vm()?.get_sysvar::<RecentBlockhashes>();
         let num_blockhashes_expected = recent_blockhashes_backup
             .len()
             .min(MAX_RECENT_BLOCKHASHES_STANDARD);
         // Invalidate the current block hash.
         // LiteSVM bug / feature: calling this method empties `sysvar::<RecentBlockhashes>()`
-        self.inner.local_mut().expire_blockhash();
+        self.local_vm()?.expire_blockhash();
         // Rebuild recent blockhashes
         let mut recent_blockhashes = Vec::with_capacity(num_blockhashes_expected);
-        let recent_blockhashes_overriden = self.inner.local_mut().get_sysvar::<RecentBlockhashes>();
+        let recent_blockhashes_overriden = self.local_vm()?.get_sysvar::<RecentBlockhashes>();
         let latest_entry = recent_blockhashes_overriden
             .first()
             .expect("Latest blockhash not found");
@@ -135,53 +153,64 @@ impl SurfnetSvm {
             ));
         }
 
-        self.inner
-            .local_mut()
+        self.local_vm()?
             .set_sysvar(&RecentBlockhashes::from_iter(recent_blockhashes));
 
-        let mut slot_hashes = self.inner.local_mut().get_sysvar::<SlotHashes>();
+        let mut slot_hashes = self.local_vm()?.get_sysvar::<SlotHashes>();
         slot_hashes.add(
             self.get_latest_absolute_slot() + 1,
             *new_synthetic_blockhash.hash(),
         );
-        self.inner
-            .local_mut()
-            .set_sysvar(&SlotHashes::new(&slot_hashes));
+        self.local_vm()?.set_sysvar(&SlotHashes::new(&slot_hashes));
 
-        BlockIdentifier::new(
+        Ok(BlockIdentifier::new(
             self.chain_tip.index + 1,
             new_synthetic_blockhash_str.as_str(),
-        )
+        ))
     }
 
     /// The local VM's own settings (its log limit), from the surfnet's configuration.
-    pub(super) fn configure_local_vm(&mut self, log_bytes_limit: Option<usize>) {
-        self.inner.local_mut().set_log_bytes_limit(log_bytes_limit);
+    pub(super) fn configure_local_vm(
+        &mut self,
+        log_bytes_limit: Option<usize>,
+    ) -> SurfpoolResult<()> {
+        self.local_vm()?.set_log_bytes_limit(log_bytes_limit);
+        Ok(())
     }
 
     /// The surfnet's epoch schedule (its own, or the datasource's) applied to the local VM.
-    pub(crate) fn apply_local_epoch_schedule(&mut self, epoch_schedule: &EpochSchedule) {
-        self.inner.local_mut().set_sysvar(epoch_schedule);
+    pub(crate) fn apply_local_epoch_schedule(
+        &mut self,
+        epoch_schedule: &EpochSchedule,
+    ) -> SurfpoolResult<()> {
+        self.local_vm()?.set_sysvar(epoch_schedule);
+        Ok(())
     }
 
     /// The clock Surfpool's block production or time travel moved to, applied to the local VM.
-    pub(crate) fn apply_local_clock(&mut self, clock: &Clock) {
-        self.inner.local_mut().set_sysvar(clock);
+    pub(crate) fn apply_local_clock(&mut self, clock: &Clock) -> SurfpoolResult<()> {
+        self.local_vm()?.set_sysvar(clock);
+        Ok(())
     }
 
     /// Clears the local VM's account cache, keeping the database and the chain's sysvars.
-    pub(super) fn collect_local_garbage(&mut self) {
+    pub(super) fn collect_local_garbage(&mut self) -> SurfpoolResult<()> {
         let feature_set: FeatureSet = self.feature_set.clone();
-        self.inner.local_mut().garbage_collect(feature_set);
+        self.local_vm()?.garbage_collect(feature_set);
+        Ok(())
     }
 
     /// The local VM's LastRestartSlot (the datasource's, once aligned).
-    pub(crate) fn local_last_restart_slot(&mut self) -> LastRestartSlot {
-        self.inner.local_mut().get_sysvar::<LastRestartSlot>()
+    pub(crate) fn local_last_restart_slot(&mut self) -> SurfpoolResult<LastRestartSlot> {
+        Ok(self.local_vm()?.get_sysvar::<LastRestartSlot>())
     }
 
     /// Applies a LastRestartSlot (the datasource's, or one kept across a reset) to the local VM.
-    pub(crate) fn apply_local_last_restart_slot(&mut self, last_restart_slot: &LastRestartSlot) {
-        self.inner.local_mut().set_sysvar(last_restart_slot);
+    pub(crate) fn apply_local_last_restart_slot(
+        &mut self,
+        last_restart_slot: &LastRestartSlot,
+    ) -> SurfpoolResult<()> {
+        self.local_vm()?.set_sysvar(last_restart_slot);
+        Ok(())
     }
 }
