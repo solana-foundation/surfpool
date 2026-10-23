@@ -325,7 +325,12 @@ impl Middleware<Option<RunloopContext>> for SurfpoolMiddleware {
         debug!("Processing request '{}'", method_name);
 
         if let Some(error) = self.disabled_cheatcode_error(&method_name) {
-            let error = Response::from(error, None);
+            // The refusal answers this call, with its id and version, as a batch element does.
+            let error = Response::Single(Output::from(
+                Err(error),
+                method_call.id.clone(),
+                method_call.jsonrpc,
+            ));
             return Either::Left(Box::pin(async move { Some(error) }));
         }
 
@@ -732,6 +737,21 @@ mod tests {
                     "message": "Cheatcode rpc method: surfnet_setAccount is currently disabled"
                 }, "id": 2}
             ])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rejected_single_call_keeps_its_id() {
+        let request = r#"{"jsonrpc":"2.0","id":7,"method":"surfnet_setAccount"}"#;
+
+        let response = test_handler().handle_request(request, None).await.unwrap();
+
+        assert_eq!(
+            serde_json::from_str::<Value>(&response).unwrap(),
+            json!({"jsonrpc": "2.0", "error": {
+                "code": -32600,
+                "message": "Cheatcode rpc method: surfnet_setAccount is currently disabled"
+            }, "id": 7})
         );
     }
 
