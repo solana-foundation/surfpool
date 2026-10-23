@@ -4764,6 +4764,39 @@ fn a_surfnet_stops_when_it_is_told_to(test_type: TestType) {
         .expect("the runloop should stop when told to");
 }
 
+#[test]
+fn test_pause_clock_acknowledges_the_final_slot() {
+    let rpc_server = SurfnetCheatcodesRpc::empty();
+    let simnet = boot_simnet(BlockProductionMode::Clock, Some(5), TestType::no_db())
+        .expect("the simnet should boot");
+    let (plugin_commands_tx, _plugin_commands_rx) = crossbeam_channel::unbounded::<PluginCommand>();
+    let runloop_context = RunloopContext {
+        id: None,
+        svm_locker: simnet.locker.clone(),
+        simnet_commands_tx: simnet.commands.clone(),
+        remote_rpc_client: None,
+        rpc_config: RpcConfig::default(),
+        cheatcode_config: CheatcodeConfig::new(),
+        plugin_commands_tx,
+    };
+    // A tick the clock queued before reading the pause must not move the slot after the ack.
+    for _ in 0..5 {
+        std::thread::sleep(Duration::from_millis(100));
+        let paused = rpc_server
+            .pause_clock(Some(runloop_context.clone()))
+            .expect("pause clock");
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            simnet.locker.get_latest_absolute_slot(),
+            paused.absolute_slot,
+            "the acknowledged slot is the paused slot"
+        );
+        rpc_server
+            .resume_clock(Some(runloop_context.clone()))
+            .expect("resume clock");
+    }
+}
+
 #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
 #[test_case(TestType::in_memory(); "with in-memory sqlite db")]
 #[test_case(TestType::no_db(); "with no db")]
