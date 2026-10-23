@@ -20,7 +20,7 @@ use surfpool_types::{
 
 use super::{
     RunloopContext,
-    utils::{context_slot, decode_and_deserialize},
+    utils::{context_slot, decode_and_deserialize, require_signature_structure},
 };
 use crate::{
     error::SurfpoolResult,
@@ -319,6 +319,9 @@ impl Jito for SurfpoolJitoRpc {
                     ),
                     data: e.data,
                 })?;
+                // As simulateBundle does: a signature list that does not fit its message is
+                // refused before the bundle reaches the execution lane.
+                require_signature_structure(&tx, &format!("Bundle transaction {}", idx + 1))?;
                 decoded_txs.push(tx);
             }
 
@@ -576,13 +579,9 @@ impl Jito for SurfpoolJitoRpc {
                 // synthesize a zero-byte placeholder Signature into the
                 // RpcBundleExecutionError::TransactionFailure(Signature, _)
                 // wire variant downstream — that would mislead clients
-                // keying off the sig inside `error`.
-                if tx.signatures.is_empty() {
-                    return Err(Error::invalid_params(format!(
-                        "Bundle transaction {} has no signatures",
-                        idx + 1
-                    )));
-                }
+                // keying off the sig inside `error`. A signature count other than the
+                // message requires is refused the same way.
+                require_signature_structure(&tx, &format!("Bundle transaction {}", idx + 1))?;
                 decoded_txs.push(tx);
             }
 
@@ -3049,6 +3048,71 @@ mod tests {
             "expected explicit no-signatures rejection (got {})",
             err.message,
         );
+    }
+
+    /// One payer's transfer, carrying `signatures` placeholders whatever the message requires.
+    fn bundle_tx_with_signatures(setup: &TestSetup<SurfpoolJitoRpc>, signatures: usize) -> String {
+        let recent_blockhash = setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm| svm.latest_blockhash());
+        let payer = Keypair::new();
+        let msg = VersionedMessage::V0(
+            V0Message::try_compile(
+                &payer.pubkey(),
+                &[system_instruction::transfer(
+                    &payer.pubkey(),
+                    &Pubkey::new_unique(),
+                    1_000,
+                )],
+                &[],
+                recent_blockhash,
+            )
+            .unwrap(),
+        );
+        let tx = VersionedTransaction {
+            signatures: vec![Signature::default(); signatures],
+            message: msg,
+        };
+        bs58::encode(bincode::serialize(&tx).unwrap()).into_string()
+    }
+
+    /// sendBundle refuses a transaction whose signature list does not fit its message (none,
+    /// or more than the message requires) as invalid params, as simulateBundle does, before the
+    /// bundle reaches the execution lane; simulateBundle refuses a count mismatch the same way.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_bundles_reject_a_signature_list_that_does_not_fit_its_message() {
+        use base64::Engine;
+        let setup = TestSetup::new(SurfpoolJitoRpc);
+        for (signatures, reason) in [
+            (0, "has no signatures"),
+            (2, "has 2 signatures but its message requires 1 signature"),
+        ] {
+            let tx = bundle_tx_with_signatures(&setup, signatures);
+            let sent = setup
+                .rpc
+                .send_bundle(Some(setup.context.clone()), vec![tx.clone()], None)
+                .await
+                .unwrap_err();
+            assert_eq!(sent.code, jsonrpc_core::ErrorCode::InvalidParams);
+            assert_eq!(sent.message, format!("Bundle transaction 1 {reason}"));
+
+            let tx_b64 = base64::engine::general_purpose::STANDARD
+                .encode(bs58::decode(&tx).into_vec().unwrap());
+            let simulated = setup
+                .rpc
+                .simulate_bundle(
+                    Some(setup.context.clone()),
+                    RpcBundleRequest {
+                        encoded_transactions: vec![tx_b64],
+                    },
+                    None,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(simulated.code, jsonrpc_core::ErrorCode::InvalidParams);
+            assert_eq!(simulated.message, format!("Bundle transaction 1 {reason}"));
+        }
     }
 
     /// Pins the partial-config behavior. Reviewer @copilot flagged that

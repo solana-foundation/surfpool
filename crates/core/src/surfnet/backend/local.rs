@@ -215,22 +215,7 @@ impl LocalBackend {
         tx: &VersionedTransaction,
         is_processed: IsProcessed<'_>,
     ) -> Result<(), FailedTransactionMetadata> {
-        let signature = tx.signatures[0];
-
-        if tx.verify_with_results().iter().any(|valid| !*valid) {
-            return Err(FailedTransactionMetadata {
-                err: TransactionError::SignatureFailure,
-                meta: TransactionMetadata::default(),
-            });
-        }
-
-        if is_processed(&signature) {
-            return Err(FailedTransactionMetadata {
-                err: TransactionError::AlreadyProcessed,
-                meta: TransactionMetadata::default(),
-            });
-        }
-        Ok(())
+        super::verify_signatures(tx, is_processed)
     }
 
     /// Checks if the provided blockhash is recent (present in the RecentBlockhashes sysvar).

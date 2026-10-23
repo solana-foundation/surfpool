@@ -41,7 +41,7 @@ use super::{
     RunloopContext, State, SurfnetRpcContext,
     utils::{
         context_slot, decode_and_deserialize, decode_rpc_versioned_transaction,
-        verify_and_parse_signatures_for_address_params, verify_pubkey,
+        require_signature_structure, verify_and_parse_signatures_for_address_params, verify_pubkey,
     },
 };
 use crate::{
@@ -1762,8 +1762,6 @@ impl Full for SurfpoolFullRpc {
 
             let config = config.unwrap_or_default();
             let unsanitized_tx = decode_rpc_versioned_transaction(data, config.base.encoding)?;
-            let signatures = unsanitized_tx.signatures.clone();
-            let signature = signatures[0];
             // Clone the message before moving the transaction, as we'll need it for error reporting
             let tx_message = unsanitized_tx.message.clone();
 
@@ -1786,6 +1784,10 @@ impl Full for SurfpoolFullRpc {
                 Some(preflight_commitment),
                 config.base.min_context_slot,
             )?;
+            // With or without preflight, a signature list that does not fit its message is refused
+            // before any signature is read or any state is touched.
+            require_signature_structure(&unsanitized_tx, "Transaction")?;
+            let signature = unsanitized_tx.signatures[0];
 
             if !config.base.skip_preflight {
                 let blockhash_visible = ctx.svm_locker.with_svm_reader(|svm_reader| {
@@ -1973,6 +1975,40 @@ impl Full for SurfpoolFullRpc {
 
         Box::pin(async move {
             context_slot(&svm_locker, config.commitment, config.min_context_slot)?;
+            // With or without sigVerify, a signature list that does not fit its message is
+            // refused before any signature is read or any lookup table or account acquired; a
+            // well-formed unsigned transaction (zeroed placeholders) still simulates without it.
+            require_signature_structure(&unsanitized_tx, "Transaction")?;
+            // With sigVerify, Surfpool's signature rules run before any lookup table or account
+            // is acquired: a transaction they refuse loads nothing, from a datasource or a
+            // historical archive, and is answered as the refused simulation it is, at the slot
+            // a full simulation reports (the latest).
+            let refusal = if config.sig_verify {
+                let (slot, verdict) = svm_locker.with_svm_reader(|svm_reader| {
+                    (
+                        svm_reader.get_latest_absolute_slot(),
+                        svm_reader.sigverify(&unsanitized_tx),
+                    )
+                });
+                verdict?.err().map(|refused| (slot, refused))
+            } else {
+                None
+            };
+            if let Some((slot, refused)) = refusal {
+                return Ok(RpcResponse {
+                    context: RpcResponseContext::new(slot),
+                    value: get_simulate_transaction_result(
+                        refused.meta,
+                        None,
+                        Some(refused.err),
+                        None,
+                        config.inner_instructions,
+                        &unsanitized_tx.message,
+                        None,
+                        None,
+                    ),
+                });
+            }
             let loaded_addresses = svm_locker
                 .get_loaded_addresses(&remote_ctx, &unsanitized_tx.message)
                 .await?;
@@ -3872,6 +3908,334 @@ mod tests {
             })]),
             "Wrong account content"
         );
+    }
+
+    /// Records every datasource request and answers each with a transport failure.
+    struct RecordsAndFails(Arc<Mutex<Vec<RpcRequest>>>);
+
+    #[async_trait]
+    impl RpcSender for RecordsAndFails {
+        async fn send(
+            &self,
+            request: RpcRequest,
+            _params: serde_json::Value,
+        ) -> ClientResult<serde_json::Value> {
+            self.0.lock().unwrap().push(request);
+            Err(solana_client::client_error::ClientErrorKind::Custom(
+                "datasource unavailable".to_string(),
+            )
+            .into())
+        }
+
+        fn get_transport_stats(&self) -> RpcTransportStats {
+            RpcTransportStats::default()
+        }
+
+        fn url(&self) -> String {
+            "http://records-and-fails.example".to_string()
+        }
+    }
+
+    /// With sigVerify, a transaction whose signature does not verify is refused before any of
+    /// its accounts or lookup tables is acquired: the datasource is never asked, and the refusal
+    /// reports the slot a full simulation reports (the latest, not the finalized one). Without
+    /// sigVerify the same transaction's accounts are acquired as before.
+    #[test_case(false ; "legacy")]
+    #[test_case(true ; "v0 with an address lookup table")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_simulate_refuses_a_bad_signature_before_acquiring_accounts(lookup_table: bool) {
+        let requests = Arc::new(Mutex::new(vec![]));
+        let mut setup = TestSetup::new(SurfpoolFullRpc);
+        // Past the finalization lag, so the latest and finalized slots differ.
+        confirm_blocks(&setup, 40);
+        let latest = setup.context.svm_locker.get_latest_absolute_slot();
+        assert!(
+            setup
+                .context
+                .svm_locker
+                .get_slot_for_commitment(&CommitmentConfig::finalized())
+                < latest
+        );
+        setup.context.remote_rpc_client = Some(SurfnetRemoteClient {
+            client: RpcClient::new_sender(
+                RecordsAndFails(Arc::clone(&requests)),
+                RpcClientConfig::default(),
+            )
+            .into(),
+        });
+        let recent_blockhash = setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm_reader| svm_reader.latest_blockhash());
+        // Neither the payer nor the lookup table is known locally.
+        let payer = Keypair::new();
+        let recipient = Pubkey::new_unique();
+        let transfer = system_instruction::transfer(&payer.pubkey(), &recipient, 1);
+        let mut tx = if lookup_table {
+            let message = V0Message {
+                header: MessageHeader {
+                    num_required_signatures: 1,
+                    num_readonly_signed_accounts: 0,
+                    num_readonly_unsigned_accounts: 1,
+                },
+                account_keys: vec![payer.pubkey(), recipient, system_program::id()],
+                recent_blockhash,
+                instructions: vec![solana_message::compiled_instruction::CompiledInstruction {
+                    program_id_index: 2,
+                    accounts: vec![0, 1],
+                    data: transfer.data.clone(),
+                }],
+                address_table_lookups: vec![solana_message::v0::MessageAddressTableLookup {
+                    account_key: Pubkey::new_unique(),
+                    writable_indexes: vec![],
+                    readonly_indexes: vec![0],
+                }],
+            };
+            VersionedTransaction::try_new(solana_message::VersionedMessage::V0(message), &[&payer])
+                .unwrap()
+        } else {
+            build_legacy_transaction(
+                &payer.pubkey(),
+                &[&payer.insecure_clone()],
+                &[transfer],
+                &recent_blockhash,
+            )
+        };
+        tx.signatures[0] = solana_signature::Signature::from([7u8; 64]);
+        let encoded = bs58::encode(wincode::serialize(&tx).unwrap()).into_string();
+        let config = |sig_verify| {
+            Some(RpcSimulateTransactionConfig {
+                sig_verify,
+                ..RpcSimulateTransactionConfig::default()
+            })
+        };
+
+        let refused = setup
+            .rpc
+            .simulate_transaction(Some(setup.context.clone()), encoded.clone(), config(true))
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&refused.value.err).unwrap(),
+            serde_json::json!("SignatureFailure")
+        );
+        assert_eq!(refused.context.slot, latest);
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec![],
+            "the datasource was asked"
+        );
+
+        // Without sigVerify the accounts are acquired: here the datasource fails, and that is
+        // what the simulation reports, never a signature failure.
+        let unverified = setup
+            .rpc
+            .simulate_transaction(Some(setup.context), encoded, config(false))
+            .await;
+        assert!(!requests.lock().unwrap().is_empty());
+        assert!(
+            !format!("{unverified:?}").contains("SignatureFailure"),
+            "{unverified:?}"
+        );
+    }
+
+    /// A message in which every signer funds a new account (above its rent-exempt minimum), so
+    /// it requires one signature per signer.
+    fn message_signed_by(
+        v0: bool,
+        signers: &[Keypair],
+        recent_blockhash: Hash,
+    ) -> solana_message::VersionedMessage {
+        let to = Pubkey::new_unique();
+        let instructions: Vec<_> = signers
+            .iter()
+            .map(|signer| transfer(&signer.pubkey(), &to, 1_000_000))
+            .collect();
+        let payer = signers[0].pubkey();
+        if v0 {
+            solana_message::VersionedMessage::V0(
+                V0Message::try_compile(&payer, &instructions, &[], recent_blockhash).unwrap(),
+            )
+        } else {
+            let mut message = LegacyMessage::new(&instructions, Some(&payer));
+            message.recent_blockhash = recent_blockhash;
+            solana_message::VersionedMessage::Legacy(message)
+        }
+    }
+
+    /// A signature list that does not fit its message (none; more or fewer than the message
+    /// requires) is refused as invalid params, with or without sigVerify, before any signature
+    /// is read or any lookup table or account is acquired: the datasource is never asked.
+    #[test_case(false, 1, 0, true ; "legacy without signatures, sigVerify")]
+    #[test_case(false, 1, 0, false ; "legacy without signatures, no sigVerify")]
+    #[test_case(true, 1, 0, true ; "v0 without signatures, sigVerify")]
+    #[test_case(true, 1, 0, false ; "v0 without signatures, no sigVerify")]
+    #[test_case(false, 1, 2, true ; "legacy with more signatures than required, sigVerify")]
+    #[test_case(true, 1, 2, false ; "v0 with more signatures than required, no sigVerify")]
+    #[test_case(false, 2, 1, false ; "legacy with fewer signatures than required, no sigVerify")]
+    #[test_case(true, 2, 1, true ; "v0 with fewer signatures than required, sigVerify")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_simulate_refuses_a_signature_list_that_does_not_fit_its_message(
+        v0: bool,
+        required: usize,
+        given: usize,
+        sig_verify: bool,
+    ) {
+        let requests = Arc::new(Mutex::new(vec![]));
+        let mut setup = TestSetup::new(SurfpoolFullRpc);
+        setup.context.remote_rpc_client = Some(SurfnetRemoteClient {
+            client: RpcClient::new_sender(
+                RecordsAndFails(Arc::clone(&requests)),
+                RpcClientConfig::default(),
+            )
+            .into(),
+        });
+        let recent_blockhash = setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm_reader| svm_reader.latest_blockhash());
+        let signers: Vec<Keypair> = (0..required).map(|_| Keypair::new()).collect();
+        let tx = VersionedTransaction {
+            signatures: vec![solana_signature::Signature::default(); given],
+            message: message_signed_by(v0, &signers, recent_blockhash),
+        };
+        let refused = setup
+            .rpc
+            .simulate_transaction(
+                Some(setup.context.clone()),
+                bs58::encode(wincode::serialize(&tx).unwrap()).into_string(),
+                Some(RpcSimulateTransactionConfig {
+                    sig_verify,
+                    ..RpcSimulateTransactionConfig::default()
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code, jsonrpc_core::ErrorCode::InvalidParams);
+        let expected = if given == 0 {
+            "Transaction has no signatures".to_string()
+        } else {
+            let count = |n: usize| match n {
+                1 => "1 signature".to_string(),
+                n => format!("{n} signatures"),
+            };
+            format!(
+                "Transaction has {} but its message requires {}",
+                count(given),
+                count(required)
+            )
+        };
+        assert_eq!(refused.message, expected);
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec![],
+            "the datasource was asked"
+        );
+    }
+
+    /// A well-formed v0 transaction carrying zeroed placeholder signatures (unsigned) still
+    /// simulates without sigVerify, and fails only the cryptographic check with it (the legacy
+    /// case is `test_simulate_transaction_no_signers` and `..._no_signers_err`).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_simulate_an_unsigned_v0_transaction_with_and_without_sigverify() {
+        let setup = TestSetup::new_with_serial_vm_executor(SurfpoolFullRpc);
+        let payer = Keypair::new();
+        let _ = setup
+            .rpc
+            .request_airdrop(
+                Some(setup.context.clone()),
+                payer.pubkey().to_string(),
+                LAMPORTS_PER_SOL,
+                None,
+            )
+            .unwrap();
+        let recent_blockhash = setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm_reader| svm_reader.latest_blockhash());
+        let unsigned = VersionedTransaction {
+            signatures: vec![solana_signature::Signature::default()],
+            message: message_signed_by(true, &[payer], recent_blockhash),
+        };
+        let encoded = bs58::encode(wincode::serialize(&unsigned).unwrap()).into_string();
+        let simulate = |sig_verify| {
+            setup.rpc.simulate_transaction(
+                Some(setup.context.clone()),
+                encoded.clone(),
+                Some(RpcSimulateTransactionConfig {
+                    sig_verify,
+                    ..RpcSimulateTransactionConfig::default()
+                }),
+            )
+        };
+        assert_eq!(simulate(false).await.unwrap().value.err, None);
+        assert_eq!(
+            simulate(true).await.unwrap().value.err,
+            Some(TransactionError::SignatureFailure.into())
+        );
+    }
+
+    /// With or without preflight, a send whose signature list does not fit its message is
+    /// refused as invalid params before anything is queued: nothing reaches the runloop, and no
+    /// signature is marked pending.
+    #[test_case(false, 1, 0, false ; "legacy without signatures, preflight")]
+    #[test_case(true, 1, 0, true ; "v0 without signatures, skipPreflight")]
+    #[test_case(false, 1, 2, true ; "legacy with more signatures than required, skipPreflight")]
+    #[test_case(true, 2, 1, false ; "v0 with fewer signatures than required, preflight")]
+    fn test_send_refuses_a_signature_list_that_does_not_fit_its_message(
+        v0: bool,
+        required: usize,
+        given: usize,
+        skip_preflight: bool,
+    ) {
+        let (mempool_tx, mempool_rx) = crossbeam_channel::unbounded();
+        let setup = TestSetup::new_with_mempool(SurfpoolFullRpc, mempool_tx);
+        let recent_blockhash = setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm_reader| svm_reader.latest_blockhash());
+        let signers: Vec<Keypair> = (0..required).map(|_| Keypair::new()).collect();
+        let tx = VersionedTransaction {
+            signatures: vec![solana_signature::Signature::new_unique(); given],
+            message: message_signed_by(v0, &signers, recent_blockhash),
+        };
+        // Sent on its own thread: a queued transaction would wait for a status that this setup's
+        // runloop-less mempool never produces, so the wait is bounded.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let (rpc, context) = (setup.rpc.clone(), setup.context.clone());
+        let encoded = bs58::encode(wincode::serialize(&tx).unwrap()).into_string();
+        std::thread::spawn(move || {
+            let _ = done_tx.send(hiro_system_kit::nestable_block_on(rpc.send_transaction(
+                Some(context),
+                encoded,
+                Some(SurfpoolRpcSendTransactionConfig {
+                    base: RpcSendTransactionConfig {
+                        skip_preflight,
+                        ..RpcSendTransactionConfig::default()
+                    },
+                    ..SurfpoolRpcSendTransactionConfig::default()
+                }),
+            )));
+        });
+        let refused = match done_rx.recv_timeout(std::time::Duration::from_secs(30)) {
+            Ok(result) => result.unwrap_err(),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("sendTransaction never returned: the transaction was queued")
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("sendTransaction panicked")
+            }
+        };
+        assert_eq!(refused.code, jsonrpc_core::ErrorCode::InvalidParams);
+        assert!(
+            refused.message.starts_with("Transaction has "),
+            "{}",
+            refused.message
+        );
+        assert!(mempool_rx.try_recv().is_err(), "a command was queued");
+        if let Some(signature) = tx.signatures.first() {
+            assert!(!setup.context.svm_locker.is_transaction_pending(signature));
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

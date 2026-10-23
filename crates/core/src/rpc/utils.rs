@@ -244,6 +244,19 @@ pub fn decode_rpc_versioned_transaction(
     Ok(unsanitized_tx)
 }
 
+/// Refuses, as invalid params (the bundle decoders' convention), a decoded transaction whose
+/// signature list does not fit its message, before any of its signatures is read or any state
+/// or account is touched. `prefix` names it ("Transaction", "Bundle transaction 2").
+pub(crate) fn require_signature_structure(
+    tx: &solana_transaction::versioned::VersionedTransaction,
+    prefix: &str,
+) -> Result<()> {
+    match crate::surfnet::backend::signature_structure_error(tx) {
+        Some(reason) => Err(Error::invalid_params(format!("{prefix} {reason}"))),
+        None => Ok(()),
+    }
+}
+
 /// Substrings that, when present in a lowercased error message, indicate the
 /// remote RPC method is not supported by the upstream (often a public endpoint
 /// that has gated methods behind a 410 Gone response or a custom refusal).

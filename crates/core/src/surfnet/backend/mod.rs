@@ -12,7 +12,9 @@
 pub mod local;
 
 use agave_feature_set::FeatureSet;
-use litesvm::types::{FailedTransactionMetadata, SimulatedTransactionInfo, TransactionResult};
+use litesvm::types::{
+    FailedTransactionMetadata, SimulatedTransactionInfo, TransactionMetadata, TransactionResult,
+};
 pub use local::LocalBackend;
 use solana_account::{Account, AccountSharedData};
 use solana_clock::Clock;
@@ -23,6 +25,7 @@ use solana_pubkey::Pubkey;
 use solana_signature::Signature;
 use solana_sysvar::rent::Rent;
 use solana_transaction::versioned::VersionedTransaction;
+use solana_transaction_error::TransactionError;
 
 use crate::{
     error::SurfpoolResult,
@@ -55,6 +58,70 @@ pub struct Backend {
 enum Concrete {
     /// LiteSVM with Surfpool's account database: a normal surfnet's VM and account source.
     Local(LocalBackend),
+}
+
+/// Why a transaction's signature list does not fit its message, if it does not (Solana's
+/// structural rule for signatures, as `VersionedTransaction::sanitize` states it): at least one
+/// signature (the fee payer's), exactly as many as the message header requires, and no more than
+/// the message's static account keys. Public RPCs refuse such a transaction before any of its
+/// signatures is read or any account acquired; the signature rules refuse it too.
+pub(crate) fn signature_structure_error(tx: &VersionedTransaction) -> Option<String> {
+    let given = tx.signatures.len();
+    let required = usize::from(tx.message.header().num_required_signatures);
+    let keys = tx.message.static_account_keys().len();
+    let signatures = |n: usize| {
+        if n == 1 {
+            "1 signature".to_string()
+        } else {
+            format!("{n} signatures")
+        }
+    };
+    if given == 0 {
+        Some("has no signatures".to_string())
+    } else if given != required {
+        Some(format!(
+            "has {} but its message requires {}",
+            signatures(given),
+            signatures(required)
+        ))
+    } else if given > keys {
+        Some(format!(
+            "has {} but only {keys} static account keys",
+            signatures(given)
+        ))
+    } else {
+        None
+    }
+}
+
+/// Surfpool's signature rules, consulting no VM: every signature verifies, then the first one
+/// is not already processed in Surfpool's store. A signature list that does not fit its message
+/// cannot be verified: it is refused as a sanitize failure.
+pub(crate) fn verify_signatures(
+    tx: &VersionedTransaction,
+    is_processed: IsProcessed<'_>,
+) -> Result<(), FailedTransactionMetadata> {
+    let (Some(&signature), None) = (tx.signatures.first(), signature_structure_error(tx)) else {
+        return Err(FailedTransactionMetadata {
+            err: TransactionError::SanitizeFailure,
+            meta: TransactionMetadata::default(),
+        });
+    };
+
+    if tx.verify_with_results().iter().any(|valid| !*valid) {
+        return Err(FailedTransactionMetadata {
+            err: TransactionError::SignatureFailure,
+            meta: TransactionMetadata::default(),
+        });
+    }
+
+    if is_processed(&signature) {
+        return Err(FailedTransactionMetadata {
+            err: TransactionError::AlreadyProcessed,
+            meta: TransactionMetadata::default(),
+        });
+    }
+    Ok(())
 }
 
 impl Backend {
@@ -108,16 +175,14 @@ impl Backend {
         }
     }
 
-    /// The signature rules on their own: signature verification, then the already-processed rule.
+    /// The signature rules on their own (see [`verify_signatures`]), the same in both modes.
     /// The outer error is an infrastructure failure, the inner one the transaction's refusal.
     pub fn verify_transaction(
         &self,
         tx: &VersionedTransaction,
         is_processed: IsProcessed<'_>,
     ) -> SurfpoolResult<Result<(), FailedTransactionMetadata>> {
-        match &self.concrete {
-            Concrete::Local(local) => Ok(local.verify_transaction(tx, is_processed)),
-        }
+        Ok(verify_signatures(tx, is_processed))
     }
 
     /// A recent blockhash, or else a valid durable nonce (unless `skip_blockhash_check`).
@@ -296,6 +361,84 @@ impl Backend {
     pub fn account_db_mut(&mut self) -> Option<&mut Box<dyn Storage<String, AccountSharedData>>> {
         match &mut self.concrete {
             Concrete::Local(local) => local.account_db_mut(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use solana_hash::Hash;
+    use solana_keypair::Keypair;
+    use solana_message::{Message, VersionedMessage, v0};
+    use solana_signer::Signer;
+    use solana_system_interface::instruction::transfer;
+
+    use super::*;
+
+    fn message(v0_message: bool, signers: &[&Keypair]) -> VersionedMessage {
+        let to = Pubkey::new_unique();
+        let instructions: Vec<_> = signers
+            .iter()
+            .map(|signer| transfer(&signer.pubkey(), &to, 1))
+            .collect();
+        let payer = signers[0].pubkey();
+        if v0_message {
+            VersionedMessage::V0(
+                v0::Message::try_compile(&payer, &instructions, &[], Hash::new_unique()).unwrap(),
+            )
+        } else {
+            VersionedMessage::Legacy(Message::new_with_blockhash(
+                &instructions,
+                Some(&payer),
+                &Hash::new_unique(),
+            ))
+        }
+    }
+
+    /// A signature list that does not fit its message (none, fewer or more than the message
+    /// requires) is refused as a sanitize failure without a signature being read; a well-formed
+    /// list still meets the cryptographic rule, and a signed transaction passes.
+    #[test]
+    fn the_signature_rules_refuse_a_signature_list_that_does_not_fit_its_message() {
+        let (payer, cosigner) = (Keypair::new(), Keypair::new());
+        let never_processed: IsProcessed<'_> = &|_| false;
+        for v0_message in [false, true] {
+            let one = message(v0_message, &[&payer]);
+            let two = message(v0_message, &[&payer, &cosigner]);
+            for (msg, given, reason) in [
+                (&one, 0, "has no signatures"),
+                (
+                    &one,
+                    2,
+                    "has 2 signatures but its message requires 1 signature",
+                ),
+                (
+                    &two,
+                    1,
+                    "has 1 signature but its message requires 2 signatures",
+                ),
+            ] {
+                let tx = VersionedTransaction {
+                    signatures: vec![Signature::default(); given],
+                    message: msg.clone(),
+                };
+                assert_eq!(signature_structure_error(&tx).as_deref(), Some(reason));
+                let refused = verify_signatures(&tx, never_processed).unwrap_err();
+                assert_eq!(refused.err, TransactionError::SanitizeFailure);
+            }
+            let placeholders = VersionedTransaction {
+                signatures: vec![Signature::default()],
+                message: one.clone(),
+            };
+            assert_eq!(signature_structure_error(&placeholders), None);
+            assert_eq!(
+                verify_signatures(&placeholders, never_processed)
+                    .unwrap_err()
+                    .err,
+                TransactionError::SignatureFailure
+            );
+            let signed = VersionedTransaction::try_new(one, &[&payer]).unwrap();
+            assert!(verify_signatures(&signed, never_processed).is_ok());
         }
     }
 }
