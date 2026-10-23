@@ -603,7 +603,7 @@ impl Jito for SurfpoolJitoRpc {
             // distinguishes simulate from send.
             let bundle_sandbox = ctx
                 .svm_locker
-                .with_svm_reader(|svm_reader| svm_reader.clone_for_bundle_sandbox());
+                .with_svm_reader(|svm_reader| svm_reader.clone_for_bundle_sandbox())?;
             let BundleSandbox {
                 svm: sandbox_svm,
                 geyser_rx: _geyser_rx, // discarded on drop
@@ -673,7 +673,7 @@ impl Jito for SurfpoolJitoRpc {
                 // to recover the variant.
                 if sigverify {
                     if let Err(failed) =
-                        sandbox_locker.with_svm_reader(|svm_reader| svm_reader.sigverify(&tx))
+                        sandbox_locker.with_svm_reader(|svm_reader| svm_reader.sigverify(&tx))?
                     {
                         let post_accounts =
                             snapshot_accounts(&sandbox_locker, &post_pubkeys[idx]).await?;
@@ -942,8 +942,9 @@ async fn execute_bundle_in_sandbox(
     svm_locker: &SurfnetSvmLocker,
     decoded_txs: &[VersionedTransaction],
 ) -> std::result::Result<(BundleSandbox, Vec<Signature>), String> {
-    let bundle_sandbox =
-        svm_locker.with_svm_reader(|svm_reader| svm_reader.clone_for_bundle_sandbox());
+    let bundle_sandbox = svm_locker
+        .with_svm_reader(|svm_reader| svm_reader.clone_for_bundle_sandbox())
+        .map_err(|e| e.to_string())?;
 
     let BundleSandbox {
         svm: sandbox_svm,
@@ -1488,7 +1489,8 @@ mod tests {
             .with_svm_reader(|svm| svm.latest_blockhash());
         setup.context.svm_locker.with_svm_writer(|svm| {
             svm.inner
-                .svm
+                .local_mut_for_tests()
+                .svm_mut()
                 .add_builtin(PauseBundleBuiltin::ID, PauseBundleBuiltin::register);
             svm.airdrop(&bundle_payer.pubkey(), 2 * LAMPORTS_PER_SOL)
                 .expect("bundle payer airdrop should be accepted")

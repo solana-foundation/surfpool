@@ -2010,7 +2010,7 @@ impl Full for SurfpoolFullRpc {
             // Clone the message before moving the transaction for later use in result formatting
             let tx_message = unsanitized_tx.message.clone();
 
-            let simulation = svm_locker.simulate_transaction(unsanitized_tx, config.sig_verify);
+            let simulation = svm_locker.simulate_transaction(unsanitized_tx, config.sig_verify)?;
             let loaded_accounts_data_size = match &simulation {
                 Ok(info) => info.meta.loaded_accounts_data_size,
                 Err(info) => info.meta.loaded_accounts_data_size,
@@ -2527,7 +2527,7 @@ impl Full for SurfpoolFullRpc {
         let slot = context_slot(&svm_locker, config.commitment, config.min_context_slot)?;
 
         let is_valid =
-            svm_locker.with_svm_reader(|svm_reader| svm_reader.check_blockhash_is_recent(&hash));
+            svm_locker.with_svm_reader(|svm_reader| svm_reader.check_blockhash_is_recent(&hash))?;
 
         Ok(RpcResponse {
             context: RpcResponseContext::new(slot),
@@ -2553,7 +2553,7 @@ impl Full for SurfpoolFullRpc {
 
         Ok(RpcResponse {
             context: RpcResponseContext::new(slot),
-            value: Some(fee),
+            value: fee,
         })
     }
 
@@ -3906,10 +3906,9 @@ mod tests {
         let pk = Pubkey::new_unique();
         let lamports = LAMPORTS_PER_SOL;
         let setup = TestSetup::new_with_serial_vm_executor(SurfpoolFullRpc);
-        setup
-            .context
-            .svm_locker
-            .with_svm_writer(|svm_writer| svm_writer.inner.set_sigverify(false));
+        setup.context.svm_locker.with_svm_writer(|svm_writer| {
+            svm_writer.inner.local_mut_for_tests().set_sigverify(false)
+        });
         let recent_blockhash = setup
             .context
             .svm_locker
@@ -3990,10 +3989,9 @@ mod tests {
                 None,
             )
             .unwrap();
-        setup
-            .context
-            .svm_locker
-            .with_svm_writer(|svm_writer| svm_writer.inner.set_sigverify(false));
+        setup.context.svm_locker.with_svm_writer(|svm_writer| {
+            svm_writer.inner.local_mut_for_tests().set_sigverify(false)
+        });
 
         //build_legacy_transaction
         let mut msg = LegacyMessage::new(
@@ -6384,7 +6382,9 @@ mod tests {
             let tx = build_transaction_with_invalid_blockhash(&payer, &recipient, lamports);
             assert!(
                 !setup.context.svm_locker.with_svm_reader(|svm_reader| {
-                    svm_reader.check_blockhash_is_recent(tx.message.recent_blockhash())
+                    svm_reader
+                        .check_blockhash_is_recent(tx.message.recent_blockhash())
+                        .unwrap()
                 }),
                 "test transaction should use a non-recent blockhash"
             );
@@ -6441,7 +6441,9 @@ mod tests {
             let tx = build_transaction_with_invalid_blockhash(&payer, &recipient, lamports);
             assert!(
                 !setup.context.svm_locker.with_svm_reader(|svm_reader| {
-                    svm_reader.check_blockhash_is_recent(tx.message.recent_blockhash())
+                    svm_reader
+                        .check_blockhash_is_recent(tx.message.recent_blockhash())
+                        .unwrap()
                 }),
                 "test transaction should use a non-recent blockhash"
             );

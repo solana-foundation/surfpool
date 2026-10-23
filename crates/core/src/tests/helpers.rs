@@ -84,7 +84,10 @@ where
             leader_schedule_epoch: 1,
             unix_timestamp: 123,
         };
-        surfnet_svm.inner.set_sysvar::<Clock>(&clock);
+        surfnet_svm
+            .inner
+            .local_mut_for_tests()
+            .set_sysvar::<Clock>(&clock);
         surfnet_svm.latest_epoch_info = EpochInfo {
             epoch: clock.epoch,
             slot_index: clock.slot,
@@ -178,9 +181,8 @@ where
     pub async fn without_blockhash(self) -> Self {
         let mut state_writer = self.context.svm_locker.0.write().await;
         state_writer.skip_blockhash_check = true;
-        let svm = state_writer.inner.clone();
-        let svm = svm.with_blockhash_check(false);
-        state_writer.inner = svm;
+        let local = state_writer.inner.local_mut_for_tests();
+        *local = local.clone().with_blockhash_check(false);
         drop(state_writer);
         self
     }

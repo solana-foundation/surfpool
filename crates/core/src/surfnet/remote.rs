@@ -47,9 +47,7 @@ use super::GetTransactionResult;
 use crate::{
     error::{SurfpoolError, SurfpoolResult},
     rpc::utils::is_method_not_supported_error,
-    surfnet::{
-        AccountSource, CoupledAccount, GetAccountResult, locker::is_supported_token_program,
-    },
+    surfnet::{AccountSource, CoupledAccount, GetAccountResult, is_supported_token_program},
     types::{RemoteRpcResult, TokenAccount},
 };
 

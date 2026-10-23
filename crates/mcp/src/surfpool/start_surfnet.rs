@@ -1,7 +1,7 @@
 use std::{process::Command, time::Duration};
 
 use serde::Serialize;
-use surfpool_core::{start_local_surfnet, surfnet::svm::SurfnetSvm};
+use surfpool_core::{lifecycle::SurfnetInstance, surfnet::svm::SurfnetSvmConfig};
 use surfpool_types::{SimnetConfig, SimnetEvent, SurfpoolConfig};
 
 #[derive(Serialize)]
@@ -77,11 +77,19 @@ pub fn run_command(surfnet_id: u16, rpc_port: u16, ws_port: u16) -> StartSurfnet
 }
 
 pub fn run_headless(surfnet_id: u16, rpc_port: u16, ws_port: u16) -> StartSurfnetResponse {
-    let (surfnet_svm, simnet_events_rx, geyser_events_rx) = SurfnetSvm::default();
+    let (instance, simnet_events_rx) =
+        match SurfnetInstance::open(None, SurfnetSvmConfig::default()) {
+            Ok(opened) => opened,
+            Err(e) => {
+                return StartSurfnetResponse::error(format!(
+                    "Failed to initialize Surfnet SVM: {e}"
+                ));
+            }
+        };
 
     let (simnet_commands_tx, simnet_commands_rx) = crossbeam_channel::unbounded();
 
-    let simnet_events_tx = surfnet_svm.simnet_events_tx.clone();
+    let simnet_events_tx = instance.locker().simnet_events_tx();
 
     // The default StartupPlanner::Runloop makes the runloop seal an empty
     // startup plan before announcing Ready, so this embedded surfnet reads
@@ -99,13 +107,7 @@ pub fn run_headless(surfnet_id: u16, rpc_port: u16, ws_port: u16) -> StartSurfne
 
     let handle = hiro_system_kit::thread_named("surfnet").spawn(move || {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let future = start_local_surfnet(
-                surfnet_svm,
-                config,
-                simnet_commands_tx,
-                simnet_commands_rx,
-                geyser_events_rx,
-            );
+            let future = instance.run(config, simnet_commands_tx, simnet_commands_rx);
             hiro_system_kit::nestable_block_on(future)
         }));
 

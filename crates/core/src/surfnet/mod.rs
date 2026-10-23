@@ -29,6 +29,8 @@ use crate::{
     types::{GeyserAccountUpdate, TransactionWithStatusMeta},
 };
 
+pub(crate) mod backend;
+mod local_chain;
 pub mod locker;
 pub mod noop_program;
 pub mod remote;
@@ -243,6 +245,11 @@ impl Display for SignatureSubscriptionType {
             SignatureSubscriptionType::Commitment(level) => write!(f, "{level}"),
         }
     }
+}
+
+/// Whether `program_id` is a token program Surfpool indexes (SPL Token or Token-2022).
+pub fn is_supported_token_program(program_id: &Pubkey) -> bool {
+    *program_id == spl_token_interface::ID || *program_id == spl_token_2022_interface::ID
 }
 
 /// Identifies where an account result was read from.

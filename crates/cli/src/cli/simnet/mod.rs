@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use solana_keypair::Keypair;
 use solana_pubkey::Pubkey;
 use solana_signer::Signer;
-use surfpool_core::{start_local_surfnet, surfnet::svm::SurfnetSvm};
+use surfpool_core::lifecycle::SurfnetInstance;
 use surfpool_types::{SanitizedConfig, SimnetCommand, SimnetEvent, SimnetEventsTx, SubgraphEvent};
 use txtx_core::kit::{channel::Receiver, helpers::fs::FileLocation, types::frontend::BlockEvent};
 use txtx_gql::kit::{indexmap::IndexMap, types::frontend::LogLevel, uuid::Uuid};
@@ -51,8 +51,8 @@ pub async fn handle_start_local_surfnet_command(
     // We start the simnet as soon as possible. Startup work (account
     // cloning, runbook executions) is planned, sealed, and dispatched only
     // after the simnet's `Ready` event arrives below.
-    let (surfnet_svm, simnet_events_rx, geyser_events_rx) =
-        SurfnetSvm::new_with_db(cmd.accounts.db.as_deref(), cmd.svm_config())
+    let (instance, simnet_events_rx) =
+        SurfnetInstance::open(cmd.accounts.db.as_deref(), cmd.svm_config())
             .map_err(|e| format!("Failed to initialize Surfnet SVM: {}", e))?;
     #[cfg(feature = "prometheus")]
     {
@@ -62,12 +62,13 @@ pub async fn handle_start_local_surfnet_command(
                 &cmd.observability.metrics_addr,
             ) {
                 Err(e) => {
-                    surfnet_svm
-                        .simnet_events_tx
+                    instance
+                        .locker()
+                        .simnet_events_tx()
                         .warn(format!("Metrics init failed: {}", e));
                 }
                 Ok(_) => {
-                    surfnet_svm.simnet_events_tx.info(format!(
+                    instance.locker().simnet_events_tx().info(format!(
                         "Metrics available at http://{}/metrics",
                         cmd.observability.metrics_addr
                     ));
@@ -88,10 +89,10 @@ pub async fn handle_start_local_surfnet_command(
     })
     .map_err(|error| format!("Failed to install shutdown signal handler: {error}"))?;
     let (subgraph_events_tx, subgraph_events_rx) = crossbeam::channel::unbounded();
-    let simnet_events_tx = surfnet_svm.simnet_events_tx.clone();
-    // Subscribe before the SVM moves into the simnet thread; the receiver
+    let simnet_events_tx = instance.locker().simnet_events_tx();
+    // Subscribe before the instance moves into the simnet thread; the receiver
     // stays valid, and subscribing this early means no transition is missed.
-    let startup_status_rx = surfnet_svm.subscribe_startup_status();
+    let startup_status_rx = instance.locker().subscribe_startup_status();
 
     // Check aidrop addresses
     let (mut airdrop_addresses, airdrop_events) = cmd.get_airdrop_addresses();
@@ -183,13 +184,7 @@ pub async fn handle_start_local_surfnet_command(
     let simnet_events_tx_for_thread = simnet_events_tx.clone();
     let simnet_handle = hiro_system_kit::thread_named("simnet")
         .spawn(move || {
-            let future = start_local_surfnet(
-                surfnet_svm,
-                config_copy,
-                simnet_commands_tx_copy,
-                simnet_commands_rx,
-                geyser_events_rx,
-            );
+            let future = instance.run(config_copy, simnet_commands_tx_copy, simnet_commands_rx);
             if let Err(e) = hiro_system_kit::nestable_block_on(future) {
                 // Send the error through the event channel so the main thread can handle it
                 simnet_events_tx_for_thread.aborted(e.to_string());

@@ -4998,7 +4998,11 @@ mod tests {
         .unwrap();
 
         // Simulate the transaction
-        let sim_result = client.context.svm_locker.simulate_transaction(tx, false);
+        let sim_result = client
+            .context
+            .svm_locker
+            .simulate_transaction(tx, false)
+            .expect("simulation reaches the backend");
 
         // The error program returns r0=1, which should cause an InstructionError.
         // If the noop (r0=0) is still cached, this would incorrectly succeed.
@@ -5044,6 +5048,7 @@ mod tests {
             .context
             .svm_locker
             .simulate_transaction(tx, false)
+            .expect("simulation reaches the backend")
             .map(|_| ())
             .map_err(|e| format!("{:?}", e.err))
     }
@@ -5057,6 +5062,7 @@ mod tests {
             .context
             .svm_locker
             .get_account_local(&programdata_address)
+            .unwrap()
             .inner
             .map_account()
             .unwrap()

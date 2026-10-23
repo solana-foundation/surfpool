@@ -10,9 +10,9 @@ use solana_keypair::Keypair;
 use solana_pubkey::Pubkey;
 use solana_rpc_client::rpc_client::RpcClient;
 use solana_signer::Signer;
-use surfpool_core::surfnet::{
-    locker::SurfnetSvmLocker,
-    svm::{SurfnetSvm, SurfnetSvmConfig},
+use surfpool_core::{
+    lifecycle::SurfnetInstance,
+    surfnet::{locker::SurfnetSvmLocker, svm::SurfnetSvmConfig},
 };
 use surfpool_types::{
     BlockProductionMode, RpcConfig, SimnetCommand, SimnetConfig, SimnetEvent, SurfpoolConfig,
@@ -196,23 +196,20 @@ impl SurfnetBuilder {
             feature_config,
             skip_blockhash_check,
         };
-        let (surfnet_svm, simnet_events_rx, geyser_events_rx) = SurfnetSvm::new(svm_config)
+        let (instance, simnet_events_rx) = SurfnetInstance::open(None, svm_config)
             .map_err(|e| SurfnetError::Runtime(format!("failed to initialize Surfnet SVM: {e}")))?;
         let (simnet_commands_tx, simnet_commands_rx) = crossbeam_channel::unbounded();
 
-        let svm_locker = SurfnetSvmLocker::new(surfnet_svm);
-        let svm_locker_clone = svm_locker.clone();
+        let svm_locker = instance.locker().clone();
         let simnet_commands_tx_clone = simnet_commands_tx.clone();
 
         let _handle = std::thread::Builder::new()
             .name("surfnet-sdk".into())
             .spawn(move || {
-                let future = surfpool_core::runloops::start_local_surfnet_runloop(
-                    svm_locker_clone,
+                let future = instance.run(
                     surfpool_config,
                     simnet_commands_tx_clone,
                     simnet_commands_rx,
-                    geyser_events_rx,
                 );
                 if let Err(e) = hiro_system_kit::nestable_block_on(future) {
                     log::error!("Surfnet exited with error: {e}");

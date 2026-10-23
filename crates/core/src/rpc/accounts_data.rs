@@ -8,7 +8,7 @@ use solana_client::{
     rpc_config::RpcAccountInfoConfig,
     rpc_response::{RpcBlockCommitment, RpcResponseContext},
 };
-use solana_clock::{Clock, Slot};
+use solana_clock::Slot;
 use solana_commitment_config::CommitmentConfig;
 use solana_rpc_client_api::response::Response as RpcResponse;
 use solana_runtime::commitment::BlockCommitmentArray;
@@ -583,10 +583,7 @@ impl AccountsData for SurfpoolAccountsDataRpc {
             }
             let mint_data = svm_locker
                 .with_svm_reader(|svm| {
-                    spl_token_additional_data(
-                        &mint_account.data,
-                        svm.inner.get_sysvar::<Clock>().unix_timestamp,
-                    )
+                    spl_token_additional_data(&mint_account.data, svm.inner.clock().unix_timestamp)
                 })
                 .ok_or_else(SurfpoolError::unpack_mint_account)?;
 
@@ -644,10 +641,7 @@ impl AccountsData for SurfpoolAccountsDataRpc {
             .supply;
             let mint_data = svm_locker
                 .with_svm_reader(|svm| {
-                    spl_token_additional_data(
-                        &mint_account.data,
-                        svm.inner.get_sysvar::<Clock>().unix_timestamp,
-                    )
+                    spl_token_additional_data(&mint_account.data, svm.inner.clock().unix_timestamp)
                 })
                 .ok_or_else(SurfpoolError::unpack_mint_account)?;
 
@@ -989,9 +983,9 @@ mod tests {
         let (mint, holder, config) = set_scaled_mint(&setup, 6);
         // The new multiplier takes effect after the mint was indexed.
         setup.context.svm_locker.with_svm_writer(|svm| {
-            let mut clock = svm.inner.get_sysvar::<solana_clock::Clock>();
+            let mut clock = svm.inner.clock();
             clock.unix_timestamp = 2_000;
-            svm.inner.set_sysvar(&clock);
+            svm.inner.local_mut_for_tests().set_sysvar(&clock);
         });
         let expected = token_amount_to_ui_amount_v3(
             1_000_000,
@@ -1043,7 +1037,7 @@ mod tests {
         let t0 = setup
             .context
             .svm_locker
-            .with_svm_reader(|svm| svm.inner.get_sysvar::<Clock>().unix_timestamp);
+            .with_svm_reader(|svm| svm.inner.clock().unix_timestamp);
         let t1 = t0 + 365 * 24 * 60 * 60;
 
         let len = ExtensionType::try_calculate_account_len::<Token2022Mint>(&[
@@ -1089,9 +1083,9 @@ mod tests {
                 };
                 svm.set_account(&pubkey, account).unwrap();
             }
-            let mut clock = svm.inner.get_sysvar::<Clock>();
+            let mut clock = svm.inner.clock();
             clock.unix_timestamp = t1;
-            svm.inner.set_sysvar(&clock);
+            svm.inner.local_mut_for_tests().set_sysvar(&clock);
         });
 
         let amount_at = |ts| {
