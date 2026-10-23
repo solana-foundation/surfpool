@@ -1,5 +1,8 @@
 #![allow(dead_code)]
-use std::net::TcpListener;
+use std::{
+    net::TcpListener,
+    sync::{Arc, Mutex},
+};
 
 use crossbeam_channel::{Receiver, Sender};
 use solana_clock::Clock;
@@ -54,6 +57,45 @@ pub async fn canned_rpc(result_json: impl Into<String>) -> String {
     format!("http://{addr}")
 }
 
+/// `canned_rpc` that also keeps every request body it receives, so a test can show which
+/// requests a datasource was (or was never) asked.
+pub async fn recording_canned_rpc(
+    result_json: impl Into<String>,
+) -> (String, Arc<Mutex<Vec<String>>>) {
+    let result_json = result_json.into();
+    let requests = Arc::new(Mutex::new(vec![]));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind recording rpc");
+    let addr = listener.local_addr().expect("local addr");
+
+    let recorded = Arc::clone(&requests);
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let (result_json, recorded) = (result_json.clone(), Arc::clone(&recorded));
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = vec![0u8; 64 * 1024];
+                let read = stream.read(&mut buf).await.unwrap_or(0);
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&buf[..read]).into_owned());
+                let body = format!(r#"{{"jsonrpc":"2.0","result":{result_json},"id":1}}"#);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.flush().await;
+            });
+        }
+    });
+
+    (format!("http://{addr}"), requests)
+}
+
 #[derive(Clone)]
 pub struct TestSetup<T>
 where
@@ -84,7 +126,10 @@ where
             leader_schedule_epoch: 1,
             unix_timestamp: 123,
         };
-        surfnet_svm.inner.set_sysvar::<Clock>(&clock);
+        surfnet_svm
+            .inner
+            .local_mut_for_tests()
+            .set_sysvar::<Clock>(&clock);
         surfnet_svm.latest_epoch_info = EpochInfo {
             epoch: clock.epoch,
             slot_index: clock.slot,
@@ -178,9 +223,8 @@ where
     pub async fn without_blockhash(self) -> Self {
         let mut state_writer = self.context.svm_locker.0.write().await;
         state_writer.skip_blockhash_check = true;
-        let svm = state_writer.inner.clone();
-        let svm = svm.with_blockhash_check(false);
-        state_writer.inner = svm;
+        let local = state_writer.inner.local_mut_for_tests();
+        *local = local.clone().with_blockhash_check(false);
         drop(state_writer);
         self
     }

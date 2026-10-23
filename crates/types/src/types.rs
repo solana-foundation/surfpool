@@ -49,8 +49,9 @@ pub struct TransactionMetadata {
     pub compute_units_consumed: u64,
     pub return_data: TransactionReturnData,
     pub fee: u64,
+    /// Runtime-metered bytes, if the executor reports them. Missing is not zero.
     #[serde(default)]
-    pub loaded_accounts_data_size: u32,
+    pub loaded_accounts_data_size: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -480,6 +481,9 @@ pub enum SimnetEvent {
     },
     RunbookStarted(String),
     RunbookCompleted(String, Option<Vec<String>>),
+    /// A historical fork was reset to its boundary, with the clock it restarts from: its
+    /// local transactions are gone, so frontends drop their views of them.
+    NetworkReset(Clock),
 }
 
 impl SimnetEvent {
@@ -658,7 +662,8 @@ impl SimnetEventsTx {
             | SimnetEvent::TransactionProcessed(..)
             | SimnetEvent::TaggedProfile { .. }
             | SimnetEvent::RunbookStarted(..)
-            | SimnetEvent::RunbookCompleted(..) => self.emit(event),
+            | SimnetEvent::RunbookCompleted(..)
+            | SimnetEvent::NetworkReset(..) => self.emit(event),
         }
     }
 
@@ -715,6 +720,12 @@ impl SimnetEventsTx {
             runbook_id.into(),
             diagnostics,
         ));
+    }
+
+    /// Lossless: blocks on a full buffer; never call
+    /// while holding the SVM lock.
+    pub fn network_reset(&self, clock: Clock) {
+        self.emit(SimnetEvent::NetworkReset(clock));
     }
 
     /// Senders hold the SVM lock when startup transitions publish, so this
@@ -867,6 +878,17 @@ pub struct SanitizedConfig {
     pub graphql_query_route_url: String,
     pub version: String,
     pub workspace: Option<String>,
+    /// Present only for a historical surfnet (`surfpool start --after`); a normal surfnet's
+    /// config omits it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub historical: Option<SanitizedHistoricalConfig>,
+}
+
+/// What a historical surfnet forks after: the validated `--after` argument as given, a
+/// transaction signature or a slot. Interfaces read its current slot from RPC, not from here.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SanitizedHistoricalConfig {
+    pub after: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -921,6 +943,159 @@ pub struct SimnetConfig {
     /// Snapshot accounts to preload at startup.
     /// Keys are pubkey strings, values can be None to fetch from remote RPC.
     pub snapshot: BTreeMap<String, Option<AccountSnapshot>>,
+    /// Keys created for this session (such as the TUI's burner), funded with
+    /// `airdrop_token_amount`: on a historical fork a fresh key has no archived image, so it is
+    /// defined as a new local account; otherwise it is airdropped.
+    #[serde(default)]
+    pub session_addresses: Vec<Pubkey>,
+}
+
+/// How to start SVM Replay's historical backend for a surfnet.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoricalSimnetConfig {
+    /// The `svm-replay` executable.
+    pub program: String,
+    /// Its `session ... --backend stdio` arguments; credentials only by reference.
+    pub args: Vec<String>,
+    /// Environment for the backend, such as a provider credential given literally on the
+    /// command line. Never serialized or printed.
+    #[serde(skip)]
+    pub envs: Vec<(String, String)>,
+}
+
+/// What `surfpool start --after` and the SDKs ask SVM Replay for: the boundary, the
+/// provider configuration and where cached history lives.
+#[derive(Clone, Default)]
+pub struct HistoricalSessionOptions {
+    /// A transaction signature or slot number to fork after.
+    pub after: String,
+    /// The `svm-replay` executable; `$SVM_REPLAY_BIN`, else `svm-replay` on `PATH`.
+    pub program: Option<String>,
+    /// Where cached history and runs live (SVM Replay's default when unset).
+    pub data_dir: Option<std::path::PathBuf>,
+    /// The historical provider adapter name, not a key.
+    pub provider: Option<String>,
+    /// Provider settings file.
+    pub config: Option<std::path::PathBuf>,
+    /// A provider credential, literally or as `env:NAME`.
+    pub key: Option<String>,
+    /// A file holding the provider credential.
+    pub key_file: Option<std::path::PathBuf>,
+    /// A reviewed runtime registry and its independent SHA-256 pin.
+    pub runtime_registry: Option<(std::path::PathBuf, String)>,
+    /// A persistent store's journal (path, binding): SVM Replay journals the fork's committed
+    /// operations there and restores them when the same store starts again.
+    pub journal: Option<(std::path::PathBuf, String)>,
+}
+
+impl std::fmt::Debug for HistoricalSessionOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HistoricalSessionOptions")
+            .field("after", &self.after)
+            .field("program", &self.program)
+            .field("data_dir", &self.data_dir)
+            .field("provider", &self.provider)
+            .field("config", &self.config)
+            .field("key", &self.key.as_ref().map(|_| "[REDACTED]"))
+            .field("key_file", &self.key_file)
+            .field("runtime_registry", &self.runtime_registry)
+            .field("journal", &self.journal)
+            .finish()
+    }
+}
+
+/// The environment variable that carries a literal credential to the backend, so it never
+/// appears in its arguments or in any configuration.
+pub const HISTORICAL_KEY_ENV: &str = "SVM_REPLAY_HISTORICAL_KEY";
+
+impl HistoricalSimnetConfig {
+    /// SVM Replay's private backend session for these options.
+    pub fn session(options: HistoricalSessionOptions) -> Result<Self, String> {
+        let HistoricalSessionOptions {
+            after,
+            program,
+            data_dir,
+            provider,
+            config,
+            key,
+            key_file,
+            runtime_registry,
+            journal,
+        } = options;
+        if after.trim().is_empty() {
+            return Err("a historical surfnet needs a boundary (--after)".into());
+        }
+        if key.is_some() && key_file.is_some() {
+            return Err("choose a provider key or a key file, not both".into());
+        }
+        let program = program
+            .or_else(|| std::env::var("SVM_REPLAY_BIN").ok())
+            .unwrap_or_else(|| "svm-replay".to_string());
+        let path = |path: std::path::PathBuf| path.to_string_lossy().into_owned();
+        let mut args = vec![
+            "session".to_string(),
+            "--after".to_string(),
+            after,
+            "--backend".to_string(),
+            "stdio".to_string(),
+        ];
+        if let Some(dir) = data_dir {
+            args.extend(["--data-dir".to_string(), path(dir)]);
+        }
+        if let Some(provider) = provider {
+            args.extend(["--provider".to_string(), provider]);
+        }
+        if let Some(config) = config {
+            args.extend(["--config".to_string(), path(config)]);
+        }
+        let mut envs = Vec::new();
+        match key {
+            Some(key) if key.starts_with("env:") => args.extend(["--key".to_string(), key]),
+            Some(key) => {
+                envs.push((HISTORICAL_KEY_ENV.to_string(), key));
+                args.extend(["--key".to_string(), format!("env:{HISTORICAL_KEY_ENV}")]);
+            }
+            None => {}
+        }
+        if let Some(file) = key_file {
+            args.extend(["--key-file".to_string(), path(file)]);
+        }
+        if let Some((registry, pin)) = runtime_registry {
+            args.extend([
+                "--runtime-registry".to_string(),
+                path(registry),
+                "--runtime-registry-sha256".to_string(),
+                pin,
+            ]);
+        }
+        if let Some((journal, binding)) = journal {
+            args.extend([
+                "--journal".to_string(),
+                path(journal),
+                "--journal-binding".to_string(),
+                binding,
+            ]);
+        }
+        Ok(Self {
+            program,
+            args,
+            envs,
+        })
+    }
+}
+
+impl std::fmt::Debug for HistoricalSimnetConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HistoricalSimnetConfig")
+            .field("program", &self.program)
+            .field("args", &self.args)
+            .field(
+                "envs",
+                &self.envs.iter().map(|(name, _)| name).collect::<Vec<_>>(),
+            )
+            .finish()
+    }
 }
 
 impl Default for SimnetConfig {
@@ -940,6 +1115,7 @@ impl Default for SimnetConfig {
             skip_blockhash_check: false,
             surfnet_id: "default".to_string(),
             snapshot: BTreeMap::new(),
+            session_addresses: vec![],
         }
     }
 }
@@ -1937,6 +2113,28 @@ impl CheatcodeConfig {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_normal_sanitized_config_has_no_historical_field() {
+        let json = serde_json::to_value(super::SanitizedConfig::default()).unwrap();
+        assert!(json.get("historical").is_none(), "{json}");
+    }
+
+    #[test]
+    fn a_historical_sanitized_config_names_what_it_forks_after() {
+        let config = super::SanitizedConfig {
+            historical: Some(super::SanitizedHistoricalConfig {
+                after: "413023260".to_string(),
+            }),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(config).unwrap();
+        assert_eq!(
+            json["historical"],
+            serde_json::json!({"after": "413023260"})
+        );
+        assert_eq!(json["rpc_datasource_url"], serde_json::Value::Null);
+    }
+
     use serde_json::json;
     use solana_account_decoder_client_types::{ParsedAccount, UiAccountData};
 

@@ -429,7 +429,7 @@ impl BankData for SurfpoolBankDataRpc {
                 .into_iter()
                 .min()
                 .unwrap_or_default();
-            let epoch_schedule = svm_reader.inner.get_sysvar::<EpochSchedule>();
+            let epoch_schedule = svm_reader.inner.epoch_schedule();
             let inflation_start_slot = epoch_schedule.get_first_slot_in_epoch(
                 epoch_schedule
                     .get_epoch(inflation_activation_slot)
@@ -454,7 +454,7 @@ impl BankData for SurfpoolBankDataRpc {
     }
 
     fn get_epoch_schedule(&self, meta: Self::Metadata) -> Result<EpochSchedule> {
-        meta.with_svm_reader(move |svm_reader| svm_reader.inner.get_sysvar::<EpochSchedule>())
+        meta.with_svm_reader(move |svm_reader| svm_reader.inner.epoch_schedule())
             .map_err(Into::into)
     }
 

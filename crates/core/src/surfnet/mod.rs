@@ -29,6 +29,13 @@ use crate::{
     types::{GeyserAccountUpdate, TransactionWithStatusMeta},
 };
 
+pub(crate) mod backend;
+pub use backend::receipt::{
+    FailedTransactionMetadata, SimulatedTransactionInfo, TransactionResult,
+};
+pub(crate) mod historical_archive;
+mod historical_chain;
+mod local_chain;
 pub mod locker;
 pub mod noop_program;
 pub mod remote;
@@ -245,6 +252,11 @@ impl Display for SignatureSubscriptionType {
     }
 }
 
+/// Whether `program_id` is a token program Surfpool indexes (SPL Token or Token-2022).
+pub fn is_supported_token_program(program_id: &Pubkey) -> bool {
+    *program_id == spl_token_interface::ID || *program_id == spl_token_2022_interface::ID
+}
+
 /// Identifies where an account result was read from.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AccountSource {
@@ -453,6 +465,17 @@ impl GetTransactionResult {
         };
 
         Self::FoundTransaction(signature, tx, status)
+    }
+
+    /// A historical fork's frozen slot never ages: once its block confirmed the transaction,
+    /// the transaction is final (the immediate local finalization of historical forks).
+    pub fn finalized_on_historical_fork(mut self) -> Self {
+        if let Self::FoundTransaction(_, _, status) = &mut self {
+            status.confirmation_status =
+                Some(solana_transaction_status::TransactionConfirmationStatus::Finalized);
+            status.confirmations = None;
+        }
+        self
     }
 
     pub const fn is_none(&self) -> bool {

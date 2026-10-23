@@ -3,7 +3,6 @@ use std::{collections::HashSet, vec};
 use base64::{Engine, prelude::BASE64_STANDARD};
 use bytemuck::{Pod, Zeroable, bytes_of, from_bytes};
 use chrono::Utc;
-use litesvm::types::TransactionMetadata;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use solana_account::Account;
 use solana_account_decoder::{
@@ -49,7 +48,10 @@ use surfpool_types::types::{
 };
 use txtx_addon_kit::indexmap::IndexMap;
 
-use crate::error::{SurfpoolError, SurfpoolResult};
+use crate::{
+    error::{SurfpoolError, SurfpoolResult},
+    surfnet::backend::{FailedTransactionMetadata, TransactionMetadata},
+};
 
 /// Helper function to serialize a Pod type to base64
 fn serialize_pod_to_base64<T: Pod>(value: &T) -> String {
@@ -528,7 +530,7 @@ impl TransactionWithStatusMeta {
     pub fn from_failure(
         slot: u64,
         transaction: VersionedTransaction,
-        failure: &litesvm::types::FailedTransactionMetadata,
+        failure: &FailedTransactionMetadata,
         accounts_before: &[Option<Account>],
         accounts_after: &[Option<Account>],
         pre_token_accounts_with_indexes: &[(usize, TokenAccount)],
@@ -590,16 +592,22 @@ impl TransactionWithStatusMeta {
 
 pub fn surfpool_tx_metadata_to_litesvm_tx_metadata(
     metadata: &surfpool_types::TransactionMetadata,
-) -> litesvm::types::TransactionMetadata {
-    litesvm::types::TransactionMetadata {
+) -> SurfpoolResult<litesvm::types::TransactionMetadata> {
+    Ok(litesvm::types::TransactionMetadata {
         compute_units_consumed: metadata.compute_units_consumed,
         logs: metadata.logs.clone(),
         return_data: metadata.return_data.clone(),
         inner_instructions: metadata.inner_instructions.clone(),
         signature: metadata.signature,
         fee: metadata.fee,
-        loaded_accounts_data_size: metadata.loaded_accounts_data_size,
-    }
+        loaded_accounts_data_size: metadata.loaded_accounts_data_size.ok_or_else(|| {
+            SurfpoolError::historical(
+                "CAPABILITY_UNAVAILABLE",
+                "the executor does not report metered loaded-account data size",
+                None,
+            )
+        })?,
+    })
 }
 
 #[derive(Debug, Clone)]

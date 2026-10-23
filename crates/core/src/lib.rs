@@ -12,6 +12,7 @@ extern crate serde_json;
 
 pub mod error;
 pub mod helpers;
+pub mod lifecycle;
 pub mod rpc;
 pub mod runloops;
 pub mod scenarios;
@@ -36,6 +37,8 @@ use uuid::Uuid;
 pub const SURFPOOL_IDENTITY_PUBKEY: Pubkey =
     Pubkey::from_str_const("SUrFPooLSUrFPooLSUrFPooLSUrFPooLSUrFPooLSUr");
 
+/// Runs an already-built normal surfnet state (the legacy low-level entry point, normal-only).
+/// Frontends open and run instances through [`lifecycle::SurfnetInstance`].
 pub async fn start_local_surfnet(
     surfnet_svm: SurfnetSvm,
     config: SurfpoolConfig,

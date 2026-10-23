@@ -731,6 +731,7 @@ async fn test_add_alt_entries_fetching(test_type: TestType) {
         acc_keys.iter().all(|key| {
             svm_locker
                 .get_account_local(key)
+                .unwrap()
                 .inner
                 .map_account()
                 .is_ok()
@@ -1036,7 +1037,9 @@ async fn assert_precompile_transaction_succeeds<F>(
     let recent_blockhash = svm_instance.latest_blockhash();
     let tx = build_tx(&payer, recent_blockhash);
     let svm_locker = SurfnetSvmLocker::new(svm_instance);
-    let simulation_res = svm_locker.simulate_transaction(tx.clone(), true);
+    let simulation_res = svm_locker
+        .simulate_transaction(tx.clone(), true)
+        .expect("simulation reaches the backend");
 
     if let Err(err) = simulation_res {
         panic!(
@@ -1310,7 +1313,9 @@ async fn test_transaction_with_ed25519_instruction(test_type: TestType) {
             .expect("Failed to create ed25519 transaction")
     };
     let svm_locker = SurfnetSvmLocker::new(svm_instance);
-    let simulation_res = svm_locker.simulate_transaction(tx.clone(), true);
+    let simulation_res = svm_locker
+        .simulate_transaction(tx.clone(), true)
+        .expect("simulation reaches the backend");
 
     assert!(
         simulation_res.is_ok(),
@@ -4562,6 +4567,184 @@ async fn startup_fails_when_the_datasource_cannot_be_reached(test_type: TestType
     );
 }
 
+/// A system account a clone datasource holds (4242 lamports), as getMultipleAccounts answers.
+const CLONED_ACCOUNT_JSON: &str = r#"{"context":{"slot":1},"value":[{"lamports":4242,"owner":"11111111111111111111111111111111","data":["","base64"],"executable":false,"rentEpoch":0,"space":0}]}"#;
+
+/// Explicit cloning on a normal surfnet keeps its behaviour: a cloned account absent locally
+/// is fetched from the clone's datasource and hydrated before readiness.
+#[test_case(TestType::in_memory(); "with in-memory sqlite db")]
+#[tokio::test(flavor = "multi_thread")]
+async fn an_explicit_clone_hydrates_a_normal_surfnet_from_its_datasource(test_type: TestType) {
+    let (datasource, requests) =
+        crate::tests::helpers::recording_canned_rpc(CLONED_ACCOUNT_JSON).await;
+    let cloned = Pubkey::new_unique();
+    let (observer, commands, _runloop) = start_runloop_awaiting_a_planner(test_type);
+
+    let (reply_tx, reply_rx) = bounded(1);
+    commands
+        .send(SimnetCommand::SealStartupPlan(
+            vec![SurfnetStartupTask::RemoteAccounts],
+            reply_tx,
+        ))
+        .unwrap();
+    reply_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the runloop should answer the seal")
+        .expect("sealing an unsealed plan should be accepted");
+    for command in [
+        SimnetCommand::StartStartupTask(SurfnetStartupTask::RemoteAccounts),
+        SimnetCommand::FetchRemoteAccounts(vec![cloned], datasource),
+    ] {
+        commands.send(command).unwrap();
+    }
+    await_startup(&observer, "readiness", |status| status.is_ready()).await;
+
+    assert!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| request.contains("getMultipleAccounts")),
+        "the clone's datasource was not asked"
+    );
+    let account = observer
+        .get_account_local(&cloned)
+        .unwrap()
+        .inner
+        .map_account()
+        .unwrap();
+    assert_eq!(account.lamports, 4242);
+}
+
+/// A historical fork's datasource is its archive: an explicit clone (a project's declared
+/// clones reach a historical session with the default mainnet URL) must never hydrate it from
+/// a tip RPC. Two confirmed absences are cloned from a loopback datasource that holds both: a
+/// fork-local account explicitly deleted, and an account the archive records absent at the
+/// boundary (`M59_ABSENT_ACCOUNT`). That datasource is never asked, both accounts stay absent,
+/// and the clone is reported absent. Needs a staged SVM Replay backend and its cached history
+/// (the `M59_*` variables), so it is ignored unless run explicitly.
+#[test]
+#[ignore = "needs a staged SVM Replay backend and its cached history (the M59_* variables)"]
+fn an_explicit_clone_never_hydrates_a_historical_fork_from_its_datasource() {
+    let var = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name} is required"));
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (datasource, requests) = runtime.block_on(crate::tests::helpers::recording_canned_rpc(
+        CLONED_ACCOUNT_JSON,
+    ));
+    let backend =
+        surfpool_types::HistoricalSimnetConfig::session(surfpool_types::HistoricalSessionOptions {
+            after: var("M59_AFTER"),
+            program: Some(var("M59_SVM_REPLAY_BIN")),
+            data_dir: Some(std::path::PathBuf::from(var("M59_HISTORICAL_DATA_DIR"))),
+            config: Some(std::path::PathBuf::from(var("M59_HISTORICAL_CONFIG"))),
+            ..Default::default()
+        })
+        .unwrap();
+    let (instance, events_rx) = crate::lifecycle::SurfnetInstance::open(
+        None,
+        crate::surfnet::svm::SurfnetSvmConfig {
+            historical: Some(backend),
+            ..crate::surfnet::svm::SurfnetSvmConfig::default()
+        },
+    )
+    .unwrap();
+    let rpc_port = get_free_port().unwrap();
+    let config = SurfpoolConfig {
+        simnets: vec![SimnetConfig::default()],
+        rpc: RpcConfig {
+            bind_port: rpc_port,
+            ws_port: get_free_port().unwrap(),
+            ..Default::default()
+        },
+        ..SurfpoolConfig::default()
+    };
+    let (commands_tx, commands_rx) = unbounded();
+    let (runloop_commands, handle) = (commands_tx.clone(), runtime.handle().clone());
+    let runloop = std::thread::spawn(move || {
+        handle
+            .block_on(instance.run(config, runloop_commands, commands_rx))
+            .map_err(|e| e.to_string())
+    });
+
+    let rpc = solana_client::rpc_client::RpcClient::new(format!("http://127.0.0.1:{rpc_port}"));
+    let deadline = std::time::Instant::now() + Duration::from_secs(240);
+    while rpc.get_health().is_err() {
+        assert!(
+            std::time::Instant::now() < deadline && !runloop.is_finished(),
+            "the historical fork never became ready"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    // Confirmed absences: a fork-local account, then explicitly deleted (the fork holds its empty
+    // image), and an account the archive records absent at the boundary.
+    let deleted = Pubkey::new_unique();
+    let boundary_absent: Pubkey = var("M59_ABSENT_ACCOUNT").parse().unwrap();
+    for lamports in [1_000_000u64, 0] {
+        rpc.send::<serde_json::Value>(
+            solana_client::rpc_request::RpcRequest::Custom {
+                method: "surfnet_setAccount",
+            },
+            serde_json::json!([deleted.to_string(), {"lamports": lamports,
+                "owner": "11111111111111111111111111111111", "data": "",
+                "executable": false, "rentEpoch": 0}]),
+        )
+        .unwrap();
+    }
+    let account = |rpc: &solana_client::rpc_client::RpcClient, pubkey: &Pubkey| {
+        rpc.get_account_with_commitment(pubkey, CommitmentConfig::processed())
+            .unwrap()
+            .value
+    };
+    for pubkey in [&deleted, &boundary_absent] {
+        assert!(account(&rpc, pubkey).is_none(), "{pubkey} is not absent");
+    }
+
+    for command in [
+        SimnetCommand::StartStartupTask(SurfnetStartupTask::RemoteAccounts),
+        SimnetCommand::FetchRemoteAccounts(vec![deleted, boundary_absent], datasource),
+    ] {
+        commands_tx.send(command).unwrap();
+    }
+    // The handler is done once it reports the task's end: the default planner sealed an empty
+    // plan before readiness, so the late RemoteAccounts task's bookkeeping is refused, after the
+    // clone itself ran. Every log line meanwhile is kept for the verdict.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let (mut reported_absent, mut finished, mut logs) = (false, false, vec![]);
+    while !finished && std::time::Instant::now() < deadline {
+        match events_rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(SimnetEvent::WarnLog(_, message)) => {
+                reported_absent |= message.contains("Cloned accounts not found")
+                    && message.contains(&boundary_absent.to_string());
+                logs.push(format!("warn: {message}"));
+            }
+            Ok(SimnetEvent::ErrorLog(_, message)) => {
+                finished |= message.contains("remote account hydration");
+                logs.push(format!("error: {message}"));
+            }
+            Ok(SimnetEvent::InfoLog(_, message)) => logs.push(format!("info: {message}")),
+            _ => {}
+        }
+    }
+    let asked = requests.lock().unwrap().clone();
+    let after = [account(&rpc, &deleted), account(&rpc, &boundary_absent)];
+    commands_tx.send(SimnetCommand::Terminate(None)).unwrap();
+    let _ = runloop.join();
+
+    assert!(finished, "the clone never finished; logs {logs:#?}");
+    let asked: Vec<_> = asked
+        .iter()
+        .filter_map(|request| request.split("\r\n\r\n").nth(1))
+        .collect();
+    assert!(
+        asked.is_empty() && after.iter().all(Option::is_none) && reported_absent,
+        "datasource asked {asked:?}; after the clone [deleted, boundary-absent] = {after:?}; \
+         reported absent {reported_absent}; logs {logs:#?}"
+    );
+}
+
 /// A booted simnet, with the handles a test drives it through.
 ///
 /// The guard rides along rather than being handed back separately, so holding
@@ -4764,6 +4947,39 @@ fn a_surfnet_stops_when_it_is_told_to(test_type: TestType) {
         .expect("the runloop should stop when told to");
 }
 
+#[test]
+fn test_pause_clock_acknowledges_the_final_slot() {
+    let rpc_server = SurfnetCheatcodesRpc::empty();
+    let simnet = boot_simnet(BlockProductionMode::Clock, Some(5), TestType::no_db())
+        .expect("the simnet should boot");
+    let (plugin_commands_tx, _plugin_commands_rx) = crossbeam_channel::unbounded::<PluginCommand>();
+    let runloop_context = RunloopContext {
+        id: None,
+        svm_locker: simnet.locker.clone(),
+        simnet_commands_tx: simnet.commands.clone(),
+        remote_rpc_client: None,
+        rpc_config: RpcConfig::default(),
+        cheatcode_config: CheatcodeConfig::new(),
+        plugin_commands_tx,
+    };
+    // A tick the clock queued before reading the pause must not move the slot after the ack.
+    for _ in 0..5 {
+        std::thread::sleep(Duration::from_millis(100));
+        let paused = rpc_server
+            .pause_clock(Some(runloop_context.clone()))
+            .expect("pause clock");
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            simnet.locker.get_latest_absolute_slot(),
+            paused.absolute_slot,
+            "the acknowledged slot is the paused slot"
+        );
+        rpc_server
+            .resume_clock(Some(runloop_context.clone()))
+            .expect("resume clock");
+    }
+}
+
 #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
 #[test_case(TestType::in_memory(); "with in-memory sqlite db")]
 #[test_case(TestType::no_db(); "with no db")]
@@ -4962,9 +5178,9 @@ fn time_travel_keeps_the_clock_on_the_absolute_slot() {
     let state = || {
         svm_locker.with_svm_reader(|svm| {
             (
-                svm.inner.get_sysvar::<Clock>(),
+                svm.inner.clock(),
                 svm.latest_epoch_info.clone(),
-                svm.inner.get_sysvar::<EpochSchedule>(),
+                svm.inner.epoch_schedule(),
                 svm.updated_at,
             )
         })
@@ -5509,7 +5725,11 @@ async fn it_should_delete_accounts_with_no_lamports(test_type: TestType) {
     }
 
     assert!(
-        svm_locker.get_account_local(&p1.pubkey()).inner.is_none(),
+        svm_locker
+            .get_account_local(&p1.pubkey())
+            .unwrap()
+            .inner
+            .is_none(),
         "Account should be deleted"
     );
 }
@@ -5602,7 +5822,7 @@ fn test_reset_account(test_type: TestType) {
 
     println!(
         "Account before reset: {:?}",
-        svm_locker.get_account_local(&p1.pubkey()).inner
+        svm_locker.get_account_local(&p1.pubkey()).unwrap().inner
     );
 
     svm_locker.reset_account(p1.pubkey(), false).unwrap();
@@ -5611,11 +5831,15 @@ fn test_reset_account(test_type: TestType) {
 
     println!(
         "Account deleted: {:?}",
-        svm_locker.get_account_local(&p1.pubkey()).inner
+        svm_locker.get_account_local(&p1.pubkey()).unwrap().inner
     );
 
     assert!(
-        svm_locker.get_account_local(&p1.pubkey()).inner.is_none(),
+        svm_locker
+            .get_account_local(&p1.pubkey())
+            .unwrap()
+            .inner
+            .is_none(),
         "Account should be deleted"
     );
 }
@@ -5658,15 +5882,39 @@ fn test_reset_account_cascade(test_type: TestType) {
         .unwrap();
 
     // Verify accounts exist
-    assert!(!svm_locker.get_account_local(&owner).inner.is_none());
-    assert!(!svm_locker.get_account_local(&owned).inner.is_none());
+    assert!(
+        !svm_locker
+            .get_account_local(&owner)
+            .unwrap()
+            .inner
+            .is_none()
+    );
+    assert!(
+        !svm_locker
+            .get_account_local(&owned)
+            .unwrap()
+            .inner
+            .is_none()
+    );
 
     // Reset with cascade=true (for regular accounts, doesn't cascade but tests the code path)
     svm_locker.reset_account(owner, true).unwrap();
 
     // Owner is deleted, owned account is deleted
-    assert!(svm_locker.get_account_local(&owner).inner.is_none());
-    assert!(svm_locker.get_account_local(&owned).inner.is_none());
+    assert!(
+        svm_locker
+            .get_account_local(&owner)
+            .unwrap()
+            .inner
+            .is_none()
+    );
+    assert!(
+        svm_locker
+            .get_account_local(&owned)
+            .unwrap()
+            .inner
+            .is_none()
+    );
 
     // Clean up
     svm_locker.reset_account(owned, false).unwrap();
@@ -5690,14 +5938,24 @@ async fn test_reset_streamed_account(test_type: TestType) {
 
     let _ = svm_locker.confirm_current_block(&None).await;
     // Account still exists
-    assert!(!svm_locker.get_account_local(&p1.pubkey()).inner.is_none());
+    assert!(
+        !svm_locker
+            .get_account_local(&p1.pubkey())
+            .unwrap()
+            .inner
+            .is_none()
+    );
 
     svm_locker.stream_account(p1.pubkey(), false).unwrap();
 
     let _ = svm_locker.confirm_current_block(&None).await;
     // Account is cleaned up as soon as the block is processed
     assert!(
-        svm_locker.get_account_local(&p1.pubkey()).inner.is_none(),
+        svm_locker
+            .get_account_local(&p1.pubkey())
+            .unwrap()
+            .inner
+            .is_none(),
         "Streamed account should be deleted"
     );
 }
@@ -5741,20 +5999,56 @@ async fn test_reset_streamed_account_cascade(test_type: TestType) {
         .unwrap();
 
     // Verify accounts exist
-    assert!(!svm_locker.get_account_local(&owner).inner.is_none());
-    assert!(!svm_locker.get_account_local(&owned).inner.is_none());
+    assert!(
+        !svm_locker
+            .get_account_local(&owner)
+            .unwrap()
+            .inner
+            .is_none()
+    );
+    assert!(
+        !svm_locker
+            .get_account_local(&owned)
+            .unwrap()
+            .inner
+            .is_none()
+    );
 
     let _ = svm_locker.confirm_current_block(&None).await;
     // Accounts still exists
-    assert!(!svm_locker.get_account_local(&owner).inner.is_none());
-    assert!(!svm_locker.get_account_local(&owned).inner.is_none());
+    assert!(
+        !svm_locker
+            .get_account_local(&owner)
+            .unwrap()
+            .inner
+            .is_none()
+    );
+    assert!(
+        !svm_locker
+            .get_account_local(&owned)
+            .unwrap()
+            .inner
+            .is_none()
+    );
 
     svm_locker.stream_account(owner, true).unwrap();
     let _ = svm_locker.confirm_current_block(&None).await;
 
     // Owner is deleted, owned account is deleted
-    assert!(svm_locker.get_account_local(&owner).inner.is_none());
-    assert!(svm_locker.get_account_local(&owned).inner.is_none());
+    assert!(
+        svm_locker
+            .get_account_local(&owner)
+            .unwrap()
+            .inner
+            .is_none()
+    );
+    assert!(
+        svm_locker
+            .get_account_local(&owned)
+            .unwrap()
+            .inner
+            .is_none()
+    );
 }
 
 #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
@@ -5781,9 +6075,27 @@ async fn test_stream_accounts_multiple(test_type: TestType) {
     let _ = svm_locker.confirm_current_block(&None).await;
 
     // All accounts exist
-    assert!(!svm_locker.get_account_local(&p1.pubkey()).inner.is_none());
-    assert!(!svm_locker.get_account_local(&p2.pubkey()).inner.is_none());
-    assert!(!svm_locker.get_account_local(&p3.pubkey()).inner.is_none());
+    assert!(
+        !svm_locker
+            .get_account_local(&p1.pubkey())
+            .unwrap()
+            .inner
+            .is_none()
+    );
+    assert!(
+        !svm_locker
+            .get_account_local(&p2.pubkey())
+            .unwrap()
+            .inner
+            .is_none()
+    );
+    assert!(
+        !svm_locker
+            .get_account_local(&p3.pubkey())
+            .unwrap()
+            .inner
+            .is_none()
+    );
 
     // Stream all three accounts at once
     for kp in [&p1, &p2, &p3] {
@@ -5794,15 +6106,27 @@ async fn test_stream_accounts_multiple(test_type: TestType) {
 
     // All accounts should be evicted
     assert!(
-        svm_locker.get_account_local(&p1.pubkey()).inner.is_none(),
+        svm_locker
+            .get_account_local(&p1.pubkey())
+            .unwrap()
+            .inner
+            .is_none(),
         "First streamed account should be deleted"
     );
     assert!(
-        svm_locker.get_account_local(&p2.pubkey()).inner.is_none(),
+        svm_locker
+            .get_account_local(&p2.pubkey())
+            .unwrap()
+            .inner
+            .is_none(),
         "Second streamed account should be deleted"
     );
     assert!(
-        svm_locker.get_account_local(&p3.pubkey()).inner.is_none(),
+        svm_locker
+            .get_account_local(&p3.pubkey())
+            .unwrap()
+            .inner
+            .is_none(),
         "Third streamed account should be deleted"
     );
 }
@@ -5877,10 +6201,34 @@ async fn test_stream_accounts_with_cascade(test_type: TestType) {
         .unwrap();
 
     // Verify all accounts exist
-    assert!(!svm_locker.get_account_local(&owner1).inner.is_none());
-    assert!(!svm_locker.get_account_local(&owned1).inner.is_none());
-    assert!(!svm_locker.get_account_local(&owner2).inner.is_none());
-    assert!(!svm_locker.get_account_local(&owned2).inner.is_none());
+    assert!(
+        !svm_locker
+            .get_account_local(&owner1)
+            .unwrap()
+            .inner
+            .is_none()
+    );
+    assert!(
+        !svm_locker
+            .get_account_local(&owned1)
+            .unwrap()
+            .inner
+            .is_none()
+    );
+    assert!(
+        !svm_locker
+            .get_account_local(&owner2)
+            .unwrap()
+            .inner
+            .is_none()
+    );
+    assert!(
+        !svm_locker
+            .get_account_local(&owned2)
+            .unwrap()
+            .inner
+            .is_none()
+    );
 
     let _ = svm_locker.confirm_current_block(&None).await;
 
@@ -5892,19 +6240,35 @@ async fn test_stream_accounts_with_cascade(test_type: TestType) {
 
     // All four accounts should be evicted
     assert!(
-        svm_locker.get_account_local(&owner1).inner.is_none(),
+        svm_locker
+            .get_account_local(&owner1)
+            .unwrap()
+            .inner
+            .is_none(),
         "First owner should be deleted"
     );
     assert!(
-        svm_locker.get_account_local(&owned1).inner.is_none(),
+        svm_locker
+            .get_account_local(&owned1)
+            .unwrap()
+            .inner
+            .is_none(),
         "First owned account should be deleted"
     );
     assert!(
-        svm_locker.get_account_local(&owner2).inner.is_none(),
+        svm_locker
+            .get_account_local(&owner2)
+            .unwrap()
+            .inner
+            .is_none(),
         "Second owner should be deleted"
     );
     assert!(
-        svm_locker.get_account_local(&owned2).inner.is_none(),
+        svm_locker
+            .get_account_local(&owned2)
+            .unwrap()
+            .inner
+            .is_none(),
         "Second owned account should be deleted"
     );
 }
@@ -5925,13 +6289,23 @@ async fn test_stream_accounts_empty(test_type: TestType) {
         .unwrap();
 
     let _ = svm_locker.confirm_current_block(&None).await;
-    assert!(!svm_locker.get_account_local(&p1.pubkey()).inner.is_none());
+    assert!(
+        !svm_locker
+            .get_account_local(&p1.pubkey())
+            .unwrap()
+            .inner
+            .is_none()
+    );
 
     // Streaming zero accounts should not error and should not affect existing accounts
     let _ = svm_locker.confirm_current_block(&None).await;
 
     assert!(
-        !svm_locker.get_account_local(&p1.pubkey()).inner.is_none(),
+        !svm_locker
+            .get_account_local(&p1.pubkey())
+            .unwrap()
+            .inner
+            .is_none(),
         "Existing account should not be affected when no accounts are streamed"
     );
 }
@@ -5974,15 +6348,39 @@ fn test_reset_network(test_type: TestType) {
         .unwrap();
 
     // Verify accounts exist
-    assert!(!svm_locker.get_account_local(&owner).inner.is_none());
-    assert!(!svm_locker.get_account_local(&owned).inner.is_none());
+    assert!(
+        !svm_locker
+            .get_account_local(&owner)
+            .unwrap()
+            .inner
+            .is_none()
+    );
+    assert!(
+        !svm_locker
+            .get_account_local(&owned)
+            .unwrap()
+            .inner
+            .is_none()
+    );
 
     // Reset with cascade=true (for regular accounts, doesn't cascade but tests the code path)
     hiro_system_kit::nestable_block_on(svm_locker.reset_network(&None)).unwrap();
 
     // Owner is deleted, owned account is deleted
-    assert!(svm_locker.get_account_local(&owner).inner.is_none());
-    assert!(svm_locker.get_account_local(&owned).inner.is_none());
+    assert!(
+        svm_locker
+            .get_account_local(&owner)
+            .unwrap()
+            .inner
+            .is_none()
+    );
+    assert!(
+        svm_locker
+            .get_account_local(&owned)
+            .unwrap()
+            .inner
+            .is_none()
+    );
 
     // Clean up
     svm_locker.reset_account(owned, false).unwrap();
@@ -5998,8 +6396,7 @@ fn test_reset_network_keeps_latest_blockhash_valid(test_type: TestType) {
 
     hiro_system_kit::nestable_block_on(svm_locker.reset_network(&None)).unwrap();
 
-    let epoch_schedule =
-        svm_locker.with_svm_reader(|svm_reader| svm_reader.inner.get_sysvar::<EpochSchedule>());
+    let epoch_schedule = svm_locker.with_svm_reader(|svm_reader| svm_reader.inner.epoch_schedule());
     let (genesis_slot, latest_slot) = svm_locker.with_svm_reader(|svm_reader| {
         (
             svm_reader.genesis_slot,
@@ -6012,7 +6409,8 @@ fn test_reset_network_keeps_latest_blockhash_valid(test_type: TestType) {
 
     let latest_blockhash = svm_locker.with_svm_reader(|svm_reader| svm_reader.latest_blockhash());
     let is_recent = svm_locker
-        .with_svm_reader(|svm_reader| svm_reader.check_blockhash_is_recent(&latest_blockhash));
+        .with_svm_reader(|svm_reader| svm_reader.check_blockhash_is_recent(&latest_blockhash))
+        .unwrap();
     assert!(
         is_recent,
         "latest_blockhash returned after reset should be present in RecentBlockhashes sysvar",
@@ -6312,6 +6710,7 @@ async fn test_closed_accounts(test_type: TestType) {
         assert!(
             surfnet_svm_locker
                 .get_account_local(&pubkey)
+                .unwrap()
                 .inner
                 .is_none(),
             "Account should be deleted locally after reset_account"
@@ -6372,6 +6771,7 @@ async fn test_closed_accounts(test_type: TestType) {
         assert!(
             surfnet_svm_locker
                 .get_account_local(&pubkey)
+                .unwrap()
                 .inner
                 .is_none(),
             "Account should be deleted locally after being closed"
@@ -6726,7 +7126,11 @@ async fn test_offline_account_including_owned_accounts(test_type: TestType) {
         "Offline owner account should not be fetched from remote"
     );
     assert!(
-        surfnet_svm_locker.get_account_local(&owner).inner.is_none(),
+        surfnet_svm_locker
+            .get_account_local(&owner)
+            .unwrap()
+            .inner
+            .is_none(),
         "Offline owner account should remain absent locally"
     );
 
@@ -6736,7 +7140,11 @@ async fn test_offline_account_including_owned_accounts(test_type: TestType) {
         "Owned account should not be fetched from remote once marked offline"
     );
     assert!(
-        surfnet_svm_locker.get_account_local(&owned).inner.is_none(),
+        surfnet_svm_locker
+            .get_account_local(&owned)
+            .unwrap()
+            .inner
+            .is_none(),
         "Offline owned account should remain absent locally"
     );
 }
@@ -8955,6 +9363,7 @@ struct Token2022PausableFixture {
 fn token_2022_account_balance(svm_locker: &SurfnetSvmLocker, token_account: &Pubkey) -> u64 {
     let account = svm_locker
         .get_account_local(token_account)
+        .unwrap()
         .inner
         .map_account()
         .expect("token account should exist");
@@ -8967,6 +9376,7 @@ fn token_2022_account_balance(svm_locker: &SurfnetSvmLocker, token_account: &Pub
 fn token_2022_mint_is_paused(svm_locker: &SurfnetSvmLocker, mint: &Pubkey) -> bool {
     let account = svm_locker
         .get_account_local(mint)
+        .unwrap()
         .inner
         .map_account()
         .expect("mint account should exist");
@@ -9050,8 +9460,9 @@ fn setup_token2022_pausable_fixture(svm_locker: &SurfnetSvmLocker) -> Token2022P
     let create_mint_tx =
         VersionedTransaction::try_new(VersionedMessage::Legacy(create_mint_msg), &[&payer, &mint])
             .unwrap();
-    let create_mint_result =
-        svm_locker.with_svm_writer(|svm| svm.send_transaction(create_mint_tx, false, false));
+    let create_mint_result = svm_locker
+        .with_svm_writer(|svm| svm.send_transaction(create_mint_tx, false, false))
+        .expect("execution reaches the backend");
     assert!(
         create_mint_result.is_ok(),
         "Pausable mint setup failed: {:?}",
@@ -9094,7 +9505,9 @@ fn setup_token2022_pausable_fixture(svm_locker: &SurfnetSvmLocker) -> Token2022P
     );
     let fund_tx =
         VersionedTransaction::try_new(VersionedMessage::Legacy(fund_msg), &[&payer]).unwrap();
-    let fund_result = svm_locker.with_svm_writer(|svm| svm.send_transaction(fund_tx, false, false));
+    let fund_result = svm_locker
+        .with_svm_writer(|svm| svm.send_transaction(fund_tx, false, false))
+        .expect("execution reaches the backend");
     assert!(
         fund_result.is_ok(),
         "Pausable mint funding failed: {:?}",
@@ -9160,8 +9573,9 @@ async fn test_token2022_pausable_mint(test_type: TestType) {
     let transfer_tx =
         VersionedTransaction::try_new(VersionedMessage::Legacy(transfer_msg), &[&fixture.payer])
             .unwrap();
-    let transfer_result =
-        svm_locker.with_svm_writer(|svm| svm.send_transaction(transfer_tx, false, false));
+    let transfer_result = svm_locker
+        .with_svm_writer(|svm| svm.send_transaction(transfer_tx, false, false))
+        .expect("execution reaches the backend");
     assert!(
         transfer_result.is_ok(),
         "Transfer before pause failed: {:?}",
@@ -9191,8 +9605,9 @@ async fn test_token2022_pausable_mint(test_type: TestType) {
     let pause_tx =
         VersionedTransaction::try_new(VersionedMessage::Legacy(pause_msg), &[&fixture.payer])
             .unwrap();
-    let pause_result =
-        svm_locker.with_svm_writer(|svm| svm.send_transaction(pause_tx, false, false));
+    let pause_result = svm_locker
+        .with_svm_writer(|svm| svm.send_transaction(pause_tx, false, false))
+        .expect("execution reaches the backend");
     assert!(
         pause_result.is_ok(),
         "Pause instruction failed: {:?}",
@@ -9227,7 +9642,8 @@ async fn test_token2022_pausable_mint(test_type: TestType) {
     )
     .unwrap();
     let post_pause_transfer_result = svm_locker
-        .with_svm_writer(|svm| svm.send_transaction(post_pause_transfer_tx, false, false));
+        .with_svm_writer(|svm| svm.send_transaction(post_pause_transfer_tx, false, false))
+        .expect("execution reaches the backend");
     assert!(
         post_pause_transfer_result.is_err(),
         "Transfers while paused should fail"
@@ -9264,8 +9680,9 @@ async fn test_token2022_pausable_mint(test_type: TestType) {
         &[&fixture.payer],
     )
     .unwrap();
-    let post_pause_mint_result =
-        svm_locker.with_svm_writer(|svm| svm.send_transaction(post_pause_mint_tx, false, false));
+    let post_pause_mint_result = svm_locker
+        .with_svm_writer(|svm| svm.send_transaction(post_pause_mint_tx, false, false))
+        .expect("execution reaches the backend");
     assert!(
         post_pause_mint_result.is_err(),
         "Minting while paused should fail"
@@ -9385,8 +9802,9 @@ async fn test_token2022_full_lifecycle(test_type: TestType) {
         VersionedTransaction::try_new(VersionedMessage::Legacy(setup_msg), &[&payer, &mint])
             .unwrap();
 
-    let setup_result =
-        svm_locker.with_svm_writer(|svm| svm.send_transaction(setup_tx, false, false));
+    let setup_result = svm_locker
+        .with_svm_writer(|svm| svm.send_transaction(setup_tx, false, false))
+        .expect("execution reaches the backend");
     assert!(
         setup_result.is_ok(),
         "Setup transaction failed: {:?}",
@@ -9411,8 +9829,9 @@ async fn test_token2022_full_lifecycle(test_type: TestType) {
     let transfer_tx =
         VersionedTransaction::try_new(VersionedMessage::Legacy(transfer_msg), &[&payer]).unwrap();
 
-    let transfer_result =
-        svm_locker.with_svm_writer(|svm| svm.send_transaction(transfer_tx, false, false));
+    let transfer_result = svm_locker
+        .with_svm_writer(|svm| svm.send_transaction(transfer_tx, false, false))
+        .expect("execution reaches the backend");
     assert!(
         transfer_result.is_ok(),
         "Transfer transaction failed: {:?}",
@@ -9435,7 +9854,9 @@ async fn test_token2022_full_lifecycle(test_type: TestType) {
     let burn_tx =
         VersionedTransaction::try_new(VersionedMessage::Legacy(burn_msg), &[&recipient]).unwrap();
 
-    let burn_result = svm_locker.with_svm_writer(|svm| svm.send_transaction(burn_tx, false, false));
+    let burn_result = svm_locker
+        .with_svm_writer(|svm| svm.send_transaction(burn_tx, false, false))
+        .expect("execution reaches the backend");
     assert!(
         burn_result.is_ok(),
         "Burn transaction failed: {:?}",
@@ -9472,8 +9893,9 @@ async fn test_token2022_full_lifecycle(test_type: TestType) {
     let close_tx =
         VersionedTransaction::try_new(VersionedMessage::Legacy(close_msg), &[&recipient]).unwrap();
 
-    let close_result =
-        svm_locker.with_svm_writer(|svm| svm.send_transaction(close_tx, false, false));
+    let close_result = svm_locker
+        .with_svm_writer(|svm| svm.send_transaction(close_tx, false, false))
+        .expect("execution reaches the backend");
     assert!(
         close_result.is_ok(),
         "Close transaction failed: {:?}",
@@ -9482,6 +9904,7 @@ async fn test_token2022_full_lifecycle(test_type: TestType) {
 
     let recipient_account = svm_locker
         .get_account_local(&recipient_ata)
+        .unwrap()
         .inner
         .map_account()
         .ok();
@@ -9601,8 +10024,9 @@ async fn test_token2022_error_cases(test_type: TestType) {
         VersionedTransaction::try_new(VersionedMessage::Legacy(setup_msg), &[&payer, &mint])
             .unwrap();
 
-    let setup_result =
-        svm_locker.with_svm_writer(|svm| svm.send_transaction(setup_tx, false, false));
+    let setup_result = svm_locker
+        .with_svm_writer(|svm| svm.send_transaction(setup_tx, false, false))
+        .expect("execution reaches the backend");
     assert!(
         setup_result.is_ok(),
         "Setup failed: {:?}",
@@ -9628,8 +10052,9 @@ async fn test_token2022_error_cases(test_type: TestType) {
         VersionedTransaction::try_new(VersionedMessage::Legacy(bad_transfer_msg), &[&payer])
             .unwrap();
 
-    let transfer_result =
-        svm_locker.with_svm_writer(|svm| svm.send_transaction(bad_transfer_tx, false, false));
+    let transfer_result = svm_locker
+        .with_svm_writer(|svm| svm.send_transaction(bad_transfer_tx, false, false))
+        .expect("execution reaches the backend");
     assert!(
         transfer_result.is_err(),
         "Transfer exceeding balance should fail"
@@ -9651,8 +10076,9 @@ async fn test_token2022_error_cases(test_type: TestType) {
     let bad_burn_tx =
         VersionedTransaction::try_new(VersionedMessage::Legacy(bad_burn_msg), &[&payer]).unwrap();
 
-    let burn_result =
-        svm_locker.with_svm_writer(|svm| svm.send_transaction(bad_burn_tx, false, false));
+    let burn_result = svm_locker
+        .with_svm_writer(|svm| svm.send_transaction(bad_burn_tx, false, false))
+        .expect("execution reaches the backend");
     assert!(burn_result.is_err(), "Burn exceeding balance should fail");
 
     let bad_close_ix = close_account(
@@ -9669,8 +10095,9 @@ async fn test_token2022_error_cases(test_type: TestType) {
     let bad_close_tx =
         VersionedTransaction::try_new(VersionedMessage::Legacy(bad_close_msg), &[&payer]).unwrap();
 
-    let close_result =
-        svm_locker.with_svm_writer(|svm| svm.send_transaction(bad_close_tx, false, false));
+    let close_result = svm_locker
+        .with_svm_writer(|svm| svm.send_transaction(bad_close_tx, false, false))
+        .expect("execution reaches the backend");
     assert!(
         close_result.is_err(),
         "Close account with balance should fail"
@@ -9785,8 +10212,9 @@ async fn test_token2022_delegate_operations(test_type: TestType) {
         VersionedTransaction::try_new(VersionedMessage::Legacy(setup_msg), &[&owner, &mint])
             .unwrap();
 
-    let setup_result =
-        svm_locker.with_svm_writer(|svm| svm.send_transaction(setup_tx, false, false));
+    let setup_result = svm_locker
+        .with_svm_writer(|svm| svm.send_transaction(setup_tx, false, false))
+        .expect("execution reaches the backend");
     assert!(
         setup_result.is_ok(),
         "Setup failed: {:?}",
@@ -9809,8 +10237,9 @@ async fn test_token2022_delegate_operations(test_type: TestType) {
     let approve_tx =
         VersionedTransaction::try_new(VersionedMessage::Legacy(approve_msg), &[&owner]).unwrap();
 
-    let approve_result =
-        svm_locker.with_svm_writer(|svm| svm.send_transaction(approve_tx, false, false));
+    let approve_result = svm_locker
+        .with_svm_writer(|svm| svm.send_transaction(approve_tx, false, false))
+        .expect("execution reaches the backend");
     assert!(
         approve_result.is_ok(),
         "Approve failed: {:?}",
@@ -9841,8 +10270,9 @@ async fn test_token2022_delegate_operations(test_type: TestType) {
     )
     .unwrap();
 
-    let delegated_transfer_result =
-        svm_locker.with_svm_writer(|svm| svm.send_transaction(delegated_transfer_tx, false, false));
+    let delegated_transfer_result = svm_locker
+        .with_svm_writer(|svm| svm.send_transaction(delegated_transfer_tx, false, false))
+        .expect("execution reaches the backend");
     assert!(
         delegated_transfer_result.is_ok(),
         "Delegated transfer failed: {:?}",
@@ -9862,8 +10292,9 @@ async fn test_token2022_delegate_operations(test_type: TestType) {
     let revoke_tx =
         VersionedTransaction::try_new(VersionedMessage::Legacy(revoke_msg), &[&owner]).unwrap();
 
-    let revoke_result =
-        svm_locker.with_svm_writer(|svm| svm.send_transaction(revoke_tx, false, false));
+    let revoke_result = svm_locker
+        .with_svm_writer(|svm| svm.send_transaction(revoke_tx, false, false))
+        .expect("execution reaches the backend");
     assert!(
         revoke_result.is_ok(),
         "Revoke failed: {:?}",
@@ -9891,8 +10322,9 @@ async fn test_token2022_delegate_operations(test_type: TestType) {
         VersionedTransaction::try_new(VersionedMessage::Legacy(post_revoke_msg), &[&delegate])
             .unwrap();
 
-    let post_revoke_result =
-        svm_locker.with_svm_writer(|svm| svm.send_transaction(post_revoke_tx, false, false));
+    let post_revoke_result = svm_locker
+        .with_svm_writer(|svm| svm.send_transaction(post_revoke_tx, false, false))
+        .expect("execution reaches the backend");
     assert!(
         post_revoke_result.is_err(),
         "Transfer after revoke should fail"
@@ -10002,8 +10434,9 @@ async fn test_token2022_freeze_thaw(test_type: TestType) {
         VersionedTransaction::try_new(VersionedMessage::Legacy(setup_msg), &[&owner, &mint])
             .unwrap();
 
-    let setup_result =
-        svm_locker.with_svm_writer(|svm| svm.send_transaction(setup_tx, false, false));
+    let setup_result = svm_locker
+        .with_svm_writer(|svm| svm.send_transaction(setup_tx, false, false))
+        .expect("execution reaches the backend");
     assert!(
         setup_result.is_ok(),
         "Setup failed: {:?}",
@@ -10024,8 +10457,9 @@ async fn test_token2022_freeze_thaw(test_type: TestType) {
     let freeze_tx =
         VersionedTransaction::try_new(VersionedMessage::Legacy(freeze_msg), &[&owner]).unwrap();
 
-    let freeze_result =
-        svm_locker.with_svm_writer(|svm| svm.send_transaction(freeze_tx, false, false));
+    let freeze_result = svm_locker
+        .with_svm_writer(|svm| svm.send_transaction(freeze_tx, false, false))
+        .expect("execution reaches the backend");
     assert!(
         freeze_result.is_ok(),
         "Freeze failed: {:?}",
@@ -10054,8 +10488,9 @@ async fn test_token2022_freeze_thaw(test_type: TestType) {
         VersionedTransaction::try_new(VersionedMessage::Legacy(frozen_transfer_msg), &[&owner])
             .unwrap();
 
-    let frozen_transfer_result =
-        svm_locker.with_svm_writer(|svm| svm.send_transaction(frozen_transfer_tx, false, false));
+    let frozen_transfer_result = svm_locker
+        .with_svm_writer(|svm| svm.send_transaction(frozen_transfer_tx, false, false))
+        .expect("execution reaches the backend");
     assert!(
         frozen_transfer_result.is_err(),
         "Transfer from frozen account should fail"
@@ -10076,7 +10511,9 @@ async fn test_token2022_freeze_thaw(test_type: TestType) {
     let thaw_tx =
         VersionedTransaction::try_new(VersionedMessage::Legacy(thaw_msg), &[&owner]).unwrap();
 
-    let thaw_result = svm_locker.with_svm_writer(|svm| svm.send_transaction(thaw_tx, false, false));
+    let thaw_result = svm_locker
+        .with_svm_writer(|svm| svm.send_transaction(thaw_tx, false, false))
+        .expect("execution reaches the backend");
     assert!(thaw_result.is_ok(), "Thaw failed: {:?}", thaw_result.err());
     println!("✓ Step 3: Account thawed");
 
@@ -10103,8 +10540,9 @@ async fn test_token2022_freeze_thaw(test_type: TestType) {
     let post_thaw_tx =
         VersionedTransaction::try_new(VersionedMessage::Legacy(post_thaw_msg), &[&owner]).unwrap();
 
-    let post_thaw_result =
-        svm_locker.with_svm_writer(|svm| svm.send_transaction(post_thaw_tx, false, false));
+    let post_thaw_result = svm_locker
+        .with_svm_writer(|svm| svm.send_transaction(post_thaw_tx, false, false))
+        .expect("execution reaches the backend");
     assert!(
         post_thaw_result.is_ok(),
         "Transfer after thaw failed: {:?}",
@@ -10169,8 +10607,9 @@ fn test_nonce_accounts() {
     )
     .unwrap();
 
-    let create_result =
-        svm_locker.with_svm_writer(|svm| svm.send_transaction(create_nonce_tx, false, false));
+    let create_result = svm_locker
+        .with_svm_writer(|svm| svm.send_transaction(create_nonce_tx, false, false))
+        .expect("execution reaches the backend");
     assert!(
         create_result.is_ok(),
         "Create nonce account failed: {:?}",
@@ -10180,6 +10619,7 @@ fn test_nonce_accounts() {
     // Fetch and verify nonce account state
     let nonce_account_data = svm_locker
         .get_account_local(&nonce_account.pubkey())
+        .unwrap()
         .inner
         .map_account()
         .expect("Failed to fetch nonce account");
@@ -10214,8 +10654,9 @@ fn test_nonce_accounts() {
     let nonce_tx =
         VersionedTransaction::try_new(VersionedMessage::Legacy(nonce_msg), &[&payer]).unwrap();
 
-    let nonce_result =
-        svm_locker.with_svm_writer(|svm| svm.send_transaction(nonce_tx, false, false));
+    let nonce_result = svm_locker
+        .with_svm_writer(|svm| svm.send_transaction(nonce_tx, false, false))
+        .expect("execution reaches the backend");
     assert!(
         nonce_result.is_ok(),
         "Transaction using nonce failed: {:?}",
@@ -10225,6 +10666,7 @@ fn test_nonce_accounts() {
     // Verify to_pubkey received the funds
     let to_account_data = svm_locker
         .get_account_local(&to_pubkey)
+        .unwrap()
         .inner
         .map_account()
         .expect("Failed to fetch recipient account");
@@ -10354,8 +10796,9 @@ async fn test_profile_transaction_does_not_mutate_state(test_type: TestType) {
     );
 
     // Now actually execute the transaction to prove the state can still be mutated
-    let execution_result =
-        svm_locker.with_svm_writer(|svm| svm.send_transaction(tx.clone(), false, false));
+    let execution_result = svm_locker
+        .with_svm_writer(|svm| svm.send_transaction(tx.clone(), false, false))
+        .expect("execution reaches the backend");
 
     assert!(
         execution_result.is_ok(),
@@ -10929,8 +11372,9 @@ async fn test_token2022_metadata_realloc(test_type: TestType) {
     let setup_tx =
         VersionedTransaction::try_new(VersionedMessage::Legacy(setup_msg), &[&payer, &mint])
             .unwrap();
-    let setup_result =
-        svm_locker.with_svm_writer(|svm| svm.send_transaction(setup_tx, false, false));
+    let setup_result = svm_locker
+        .with_svm_writer(|svm| svm.send_transaction(setup_tx, false, false))
+        .expect("execution reaches the backend");
 
     assert!(
         setup_result.is_ok(),
@@ -10968,7 +11412,9 @@ async fn test_token2022_metadata_realloc(test_type: TestType) {
     );
 
     let tx = VersionedTransaction::try_new(VersionedMessage::Legacy(msg), &[&payer]).unwrap();
-    let result = svm_locker.with_svm_writer(|svm| svm.send_transaction(tx, false, false));
+    let result = svm_locker
+        .with_svm_writer(|svm| svm.send_transaction(tx, false, false))
+        .expect("execution reaches the backend");
 
     // Regression test for #530: CPI realloc previously failed when Token-2022
     // tried to realloc the mint account to store metadata
@@ -11578,7 +12024,8 @@ async fn test_create_lookup_table_with_finalized_slot(test_type: TestType) {
 
     let slot_hash_slots = svm_locker.with_svm_reader(|svm| {
         svm.inner
-            .get_sysvar::<SlotHashes>()
+            .read_sysvar::<SlotHashes>()
+            .expect("the local backend has slot hashes")
             .slot_hashes()
             .iter()
             .map(|(slot, _)| *slot)
@@ -11645,6 +12092,15 @@ async fn test_create_lookup_table_with_finalized_slot(test_type: TestType) {
 #[cfg_attr(feature = "postgres", test_case(TestType::postgres(); "with postgres db"))]
 #[tokio::test]
 async fn test_send_transaction_skip_sig_verify_processes_and_updates_state(test_type: TestType) {
+    assert_skip_sig_verify_updates_state(test_type, false).await;
+}
+
+#[tokio::test]
+async fn skip_sig_verify_state_is_observable_when_the_event_queue_is_full() {
+    assert_skip_sig_verify_updates_state(TestType::no_db(), true).await;
+}
+
+async fn assert_skip_sig_verify_updates_state(test_type: TestType, saturate_events: bool) {
     let payer = Keypair::new();
     let recipient = Keypair::new().pubkey();
     let transfer_amount = LAMPORTS_PER_SOL / 2;
@@ -11656,6 +12112,7 @@ async fn test_send_transaction_skip_sig_verify_processes_and_updates_state(test_
     let config = SurfpoolConfig {
         simnets: vec![SimnetConfig {
             slot_time: 1,
+            offline_mode: saturate_events,
             airdrop_addresses: vec![payer.pubkey()],
             airdrop_token_amount: airdrop_amount,
             ..SimnetConfig::default()
@@ -11682,7 +12139,11 @@ async fn test_send_transaction_skip_sig_verify_processes_and_updates_state(test_
     )
     .expect("the runloop should start");
 
-    wait_for_ready_and_connected(&simnet_events_rx).expect("the surfnet should start");
+    if saturate_events {
+        wait_for_ready(&simnet_events_rx).expect("the offline surfnet should start");
+    } else {
+        wait_for_ready_and_connected(&simnet_events_rx).expect("the surfnet should start");
+    }
 
     let minimal_client =
         http::connect::<MinimalClient>(format!("http://{bind_host}:{bind_port}").as_str())
@@ -11749,21 +12210,40 @@ async fn test_send_transaction_skip_sig_verify_processes_and_updates_state(test_
         skip_sig_verify: Some(true),
     };
     let signature = tx.signatures[0];
+    if saturate_events {
+        let capacity = simnet_events_rx.capacity().expect("bounded event queue");
+        let events = svm_locker.0.read().await.simnet_events_tx.clone();
+        for _ in 0..capacity {
+            events.info("event backpressure regression");
+        }
+        assert!(
+            simnet_events_rx.is_full(),
+            "the regression must saturate the queue"
+        );
+    }
     let _sig = full_client
         .send_transaction(data, Some(send_config))
         .await
         .expect("send_transaction with skip_sig_verify should succeed");
 
-    // Wait for the transaction to be processed
-    let _ = task::spawn_blocking(move || {
+    // UI notifications are lossy under backpressure; stored status is authoritative.
+    tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            match simnet_events_rx.recv() {
-                Ok(SimnetEvent::TransactionProcessed(..)) => break,
-                _ => (),
+            let recorded = full_client
+                .get_signature_statuses(vec![signature.to_string()], None)
+                .await
+                .expect("recorded transaction status");
+            assert_eq!(recorded.value.len(), 1);
+            if let Some(status) = &recorded.value[0] {
+                assert!(status.err.is_none(), "transaction failed: {:?}", status.err);
+                break;
             }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
-    .await;
+    .await
+    .expect("transaction status should be stored");
+    drop(simnet_events_rx);
     tokio::time::timeout(Duration::from_secs(1), async {
         while svm_locker.0.read().await.is_transaction_pending(&signature) {
             tokio::task::yield_now().await;

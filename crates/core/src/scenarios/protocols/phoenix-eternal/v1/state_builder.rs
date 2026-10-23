@@ -7,7 +7,6 @@ use phoenix_rise_accounts::{
     trader::TraderHeader,
 };
 use solana_account::Account;
-use solana_clock::Clock;
 use solana_commitment_config::CommitmentConfig;
 use solana_pubkey::Pubkey;
 use surfpool_types::{AccountAddress, OverrideInstance, Scenario};
@@ -334,7 +333,7 @@ pub async fn prepare_phoenix_override(
     }
     match phoenix_account_kind(&account.data) {
         Some(PhoenixAccount::PerpAssetMap) => {
-            let mark_slot = svm.inner.get_sysvar::<Clock>().slot;
+            let mark_slot = svm.inner.clock().slot;
             let data = forge_phoenix_override(account_pubkey, account, values, mark_slot)?;
             // This override writes the map Phoenix reads, so the thresholds go in the same write.
             let data = match raise_stale_thresholds(account_pubkey, &data) {
@@ -816,9 +815,9 @@ mod tests {
         svm.inner
             .set_account(PHOENIX_PERP_ASSET_MAP, perp_asset_map_account())
             .unwrap();
-        let mut clock = svm.inner.get_sysvar::<Clock>();
+        let mut clock = svm.inner.clock();
         clock.slot = 1_000;
-        svm.inner.set_sysvar(&clock);
+        svm.inner.local_mut_for_tests().set_sysvar(&clock);
         let template = TemplateRegistry::new()
             .get("phoenix-direct-mark-risk-shock")
             .expect("template")

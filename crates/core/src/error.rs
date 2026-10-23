@@ -15,6 +15,9 @@ use solana_transaction_status::EncodeError;
 
 use crate::storage::StorageError;
 
+/// The JSON-RPC code of every failure from SVM Replay's historical backend.
+const HISTORICAL_ERROR_CODE: i64 = -32050;
+
 pub type SurfpoolResult<T> = std::result::Result<T, SurfpoolError>;
 
 #[derive(Debug, Clone)]
@@ -59,7 +62,11 @@ impl std::fmt::Display for SurfpoolError {
             format!("{}: {}", code.description(), message)
         };
 
-        if let Some(data_value) = data {
+        // A historical backend failure's message already leads with its code; its details
+        // (receipts, provider paths) stay in `data` for RPC clients instead of the log line.
+        if *code == jsonrpc_core::ErrorCode::ServerError(HISTORICAL_ERROR_CODE) {
+            write!(f, "{}", message)
+        } else if let Some(data_value) = data {
             write!(f, "{}: {}", core, data_value.to_string().as_str())
         } else {
             write!(f, "{}", core)
@@ -439,10 +446,80 @@ impl SurfpoolError {
         Self(error)
     }
 
+    /// A typed failure from SVM Replay's historical backend: its code leads the message and
+    /// `data` keeps its details, such as the provider that could not supply data.
+    pub fn historical(code: &str, message: &str, details: Option<serde_json::Value>) -> Self {
+        let mut error = Error::new(jsonrpc_core::ErrorCode::ServerError(HISTORICAL_ERROR_CODE));
+        error.message = format!("{code}: {message}");
+        error.data = Some(json!({"code": code, "details": details}));
+        Self(error)
+    }
+
+    /// The typed code of a historical backend failure (see [`Self::historical`]).
+    pub fn historical_code(&self) -> Option<&str> {
+        self.0.data.as_ref()?.get("code")?.as_str()
+    }
+
+    /// What historical mode cannot answer truthfully, such as a complete account scan at a
+    /// past slot: no historical index exists, so a local-only answer would be partial.
+    /// A namespace-lease refusal, keeping its code (`SESSION_IN_USE`, `SESSION_LEASE_IO`).
+    pub fn store_lease(message: String) -> Self {
+        match message.split_once(": ") {
+            Some((code, reason)) => Self::historical(code, reason, None),
+            None => Self::historical("SESSION_LEASE_IO", &message, None),
+        }
+    }
+
+    pub fn historical_unavailable(method: &str, reason: &str) -> Self {
+        Self::historical(
+            "HISTORICAL_DATA_UNAVAILABLE",
+            &format!("{method} is unavailable in historical mode: {reason}"),
+            None,
+        )
+    }
+
     pub fn sig_verify_replace_recent_blockhash_collision() -> Self {
         Self(Error::invalid_params(
             "sigVerify may not be used with replaceRecentBlockhash",
         ))
+    }
+
+    /// `getBlock`'s answer for a slot this surfnet has no complete block for, and why.
+    pub fn block_not_available(slot: Slot, reason: &str) -> Self {
+        let mut error = Error::new(jsonrpc_core::ErrorCode::ServerError(-32004));
+        error.message = format!("Block not available for slot {slot}: {reason}");
+        Self(error)
+    }
+
+    /// An archived slot the provider reports skipped (or missing from its long-term storage),
+    /// answered with the provider's own code: no block exists to serve.
+    pub fn historical_slot_skipped(slot: Slot, rpc_code: i64) -> Self {
+        let mut error = Error::new(jsonrpc_core::ErrorCode::ServerError(rpc_code));
+        error.message = match rpc_code {
+            -32007 => {
+                format!("Slot {slot} was skipped, or missing due to ledger jump to recent snapshot")
+            }
+            _ => format!("Slot {slot} was skipped, or missing in long-term storage"),
+        };
+        Self(error)
+    }
+
+    /// The provider's JSON-RPC code inside a historical backend failure, if it carried one.
+    pub fn historical_rpc_code(&self) -> Option<i64> {
+        fn find(value: &serde_json::Value, depth: usize) -> Option<i64> {
+            if depth == 0 {
+                return None;
+            }
+            match value {
+                serde_json::Value::Object(map) => map
+                    .get("rpcCode")
+                    .and_then(serde_json::Value::as_i64)
+                    .or_else(|| map.values().find_map(|value| find(value, depth - 1))),
+                _ => None,
+            }
+        }
+        self.historical_code()?;
+        find(self.0.data.as_ref()?, 4)
     }
 
     pub fn slot_too_old(slot: Slot) -> Self {
