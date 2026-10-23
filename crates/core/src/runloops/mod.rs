@@ -378,12 +378,16 @@ pub async fn start_block_production_runloop(
     // block. Keeping it in the select lets commands submitted in the meantime
     // join that block instead of waiting for a whole finalization window.
     let (scheduled_block_tx, scheduled_block_rx) = bounded::<()>(1);
+    // Whether the clock is paused as this loop sees it: a tick the clock thread queued before
+    // it read a Pause is no slot, and a pause is acknowledged only after no tick can follow.
+    let mut clock_paused = false;
     loop {
         let mut do_produce_block = false;
 
         select! {
             recv(clock_event_rx) -> msg => if let Ok(event) = msg {
                 match event {
+                    ClockEvent::Tick if clock_paused => continue,
                     ClockEvent::Tick => {
                         if block_production_mode.eq(&BlockProductionMode::Clock) {
                             do_produce_block = true;
@@ -419,6 +423,14 @@ pub async fn start_block_production_runloop(
                             svm_locker.with_svm_writer(|svm_writer| {
                                 svm_writer.slot_time = updated_slot_time;
                             });
+                        }
+                        match &update {
+                            ClockCommand::Pause | ClockCommand::PauseWithConfirmation(_) => {
+                                clock_paused = true
+                            }
+                            ClockCommand::Resume => clock_paused = false,
+                            ClockCommand::Toggle => clock_paused = !clock_paused,
+                            ClockCommand::UpdateSlotInterval(_) => {}
                         }
 
                         // Handle PauseWithConfirmation specially
