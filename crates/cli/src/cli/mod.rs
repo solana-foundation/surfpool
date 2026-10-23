@@ -1066,8 +1066,25 @@ fn parse_stop_response(body: &str) -> Result<(), String> {
     Ok(())
 }
 
-async fn generate_completion_helpers(cmd: Completions) -> Result<(), String> {
+/// The command tree completion scripts are generated from. Subcommands name themselves as bare
+/// binaries for their help; a completion script needs each one's path from the root, or it
+/// offers none of their arguments.
+fn completion_command() -> clap::Command {
     let mut app = Opts::command();
+    let names: Vec<String> = app
+        .get_subcommands()
+        .map(|subcommand| subcommand.get_name().to_string())
+        .collect();
+    for name in names {
+        app = app.mut_subcommand(&name, |subcommand| {
+            subcommand.bin_name(format!("surfpool {name}"))
+        });
+    }
+    app
+}
+
+async fn generate_completion_helpers(cmd: Completions) -> Result<(), String> {
+    let mut app = completion_command();
     let file_name = cmd.shell.file_name("surfpool");
     let mut file = File::create(file_name.clone())
         .map_err(|e| format!("unable to create file {}: {}", file_name, e))?;
@@ -1208,6 +1225,42 @@ pub fn setup_logger(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bash_completion_offers_the_start_arguments() {
+        let mut script = Vec::new();
+        clap_complete::generate(
+            Shell::Bash,
+            &mut completion_command(),
+            "surfpool",
+            &mut script,
+        );
+        let script = String::from_utf8(script).unwrap();
+        // The case `surfpool start` enters, then the options that case offers.
+        let lines: Vec<&str> = script.lines().map(str::trim).collect();
+        let entered = lines
+            .iter()
+            .position(|line| *line == "surfpool,start)")
+            .expect("a start transition");
+        let name = lines[entered + 1]
+            .strip_prefix("cmd=\"")
+            .and_then(|rest| rest.strip_suffix('"'))
+            .expect("the start case name");
+        let section = lines
+            .iter()
+            .position(|line| *line == format!("{name})"))
+            .expect("a start section");
+        let opts = lines[section..]
+            .iter()
+            .find(|line| line.starts_with("opts="))
+            .expect("start options");
+        for flag in ["--rpc-url", "--port", "--no-tui"] {
+            assert!(
+                opts.split(['"', ' ']).any(|word| word == flag),
+                "{flag} missing from {opts}"
+            );
+        }
+    }
 
     fn start_long_help() -> String {
         let mut command = Opts::command();
