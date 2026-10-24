@@ -7,8 +7,8 @@ use solana_pubkey::Pubkey;
 use solana_signer::Signer as _;
 use spl_associated_token_account_interface::address::get_associated_token_address_with_program_id;
 use surfpool_types::{
+    VERIFIED_TOKENS, VERIFIED_TOKENS_BY_SYMBOL,
     types::{AccountUpdate, TokenAccountUpdate},
-    verified_tokens::VERIFIED_TOKENS_BY_SYMBOL,
 };
 
 const SOL_DECIMALS: u32 = 9;
@@ -187,10 +187,10 @@ pub async fn run(
         })
     } else if let Ok(mint_pubkey) = Pubkey::try_from(token_identifier.as_str()) {
         let mint_str = mint_pubkey.to_string();
-        let token_info = VERIFIED_TOKENS_BY_SYMBOL
+        let token_info = VERIFIED_TOKENS
             .iter()
-            .find(|(_, info)| info.address == mint_str)
-            .map(|(symbol, info)| (symbol.clone(), info.decimals as u32));
+            .find(|info| info.address == mint_str)
+            .map(|info| (info.symbol.clone(), info.decimals as u32));
         if let Some((symbol, decimals)) = token_info {
             Ok(TokenDetails {
                 is_sol: false,
@@ -361,5 +361,47 @@ pub async fn run(
         Err(_e) => SetTokenAccountsResponse::error(
             "RPC request failed (timeout or other network error)".to_string(),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+    };
+
+    use super::*;
+
+    #[tokio::test]
+    async fn portal_wbtc_mint_resolves_its_decimals() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind canned rpc");
+        let addr = listener.local_addr().expect("local addr");
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            assert_ne!(stream.read(&mut [0u8; 16 * 1024]).expect("read request"), 0);
+            let body = r#"{"jsonrpc":"2.0","result":null,"id":1}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .expect("write response");
+        });
+
+        let response = run(
+            format!("http://{addr}"),
+            SeededAccount::new(None),
+            Some("3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh".to_string()),
+            Some(1),
+            None,
+            None,
+        )
+        .await;
+
+        let Some([SetAccountSuccess::Token(updated)]) = response.success.as_deref() else {
+            panic!("{:?}", response.error);
+        };
+        assert_eq!(updated.token_amount, 100_000_000);
     }
 }

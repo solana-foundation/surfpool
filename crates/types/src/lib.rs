@@ -16,4 +16,4 @@ pub use features::*;
 pub use jito_bundles::*;
 pub use scenarios::*;
 pub use types::*;
-pub use verified_tokens::{TokenInfo, VERIFIED_TOKENS_BY_SYMBOL};
+pub use verified_tokens::{TokenInfo, VERIFIED_TOKENS, VERIFIED_TOKENS_BY_SYMBOL};
