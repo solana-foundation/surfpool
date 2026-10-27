@@ -46,7 +46,8 @@ pub type IsProcessed<'a> = &'a dyn Fn(&Signature) -> bool;
 pub struct Admission<'a> {
     /// `Some(is_processed)`: verify the signatures, then refuse a signature the store reports as
     /// already processed. `None` skips both (Surfpool's `sigverify: false`). On a historical
-    /// fork SVM Replay verifies signatures and refuses duplicates itself.
+    /// fork live sends require verification; SVM Replay also verifies signatures and refuses
+    /// duplicates itself. Unverified instruction prefixes use a separate profiling-only path.
     pub sigverify: Option<IsProcessed<'a>>,
     /// Accept any blockhash (Surfpool's `skip_blockhash_check`); otherwise the transaction needs
     /// a recent blockhash or a valid durable nonce. A historical fork cannot skip SVM Replay's
@@ -145,7 +146,7 @@ pub(crate) fn verify_signatures(
 }
 
 /// The typed refusal for a decision that SVM Replay owns on a historical fork.
-fn engine_owned(what: &str) -> SurfpoolError {
+pub(crate) fn engine_owned(what: &str) -> SurfpoolError {
     SurfpoolError::historical(
         "UNSUPPORTED_IN_HISTORICAL_MODE",
         &format!(
@@ -329,6 +330,9 @@ impl Backend {
                 if admission.skip_blockhash_check {
                     return Err(engine_owned("skipping the blockhash check"));
                 }
+                if admission.sigverify.is_none() {
+                    return Err(engine_owned("skipping signatures for a live send"));
+                }
                 let tx = tx.into();
                 // Surfpool's signature rules first: a refused transaction acquires nothing.
                 if let Some(is_processed) = admission.sigverify
@@ -336,8 +340,27 @@ impl Backend {
                 {
                     return Ok(Err(refused.into()));
                 }
-                fork.send(tx, admission.sigverify.is_some())
+                fork.send(tx, true)
             }
+        }
+    }
+
+    /// Instruction prefixes have invalidated signatures and execute only on a discarded
+    /// profiling fork. Live sends, including bundle admission, never use this path.
+    pub(crate) fn send_profile_prefix(
+        &mut self,
+        tx: VersionedTransaction,
+        skip_blockhash_check: bool,
+    ) -> SurfpoolResult<TransactionResult> {
+        match &mut self.concrete {
+            Concrete::Historical(fork) => fork.send(tx, false),
+            Concrete::Local(_) => self.send_transaction(
+                tx,
+                &Admission {
+                    sigverify: None,
+                    skip_blockhash_check,
+                },
+            ),
         }
     }
 

@@ -56,6 +56,9 @@ impl Surfpool {
             .args(["--port", &ports[0].to_string()])
             .args(["--ws-port", &ports[1].to_string()])
             .args(["--studio-port", &ports[2].to_string()])
+            .args(["--airdrop", &snapshot_key(u32::MAX)])
+            .arg("-k")
+            .arg(directory.path().join("unused-keypair.json"))
             .arg("--snapshot")
             .arg(snapshot_path)
             .current_dir(directory.path())
@@ -77,7 +80,7 @@ impl Surfpool {
         fs::read_to_string(self.directory.path().join("surfpool.log")).unwrap()
     }
 
-    fn wait_for_phase(&mut self, fully_started: bool) {
+    fn wait_for_phase(&mut self, fully_started: bool) -> bool {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             assert!(
@@ -97,11 +100,7 @@ impl Surfpool {
             let logging_started = self.log().contains("Genesis airdrop successful");
             match ready {
                 Ok(true) if !fully_started || logging_started => {
-                    assert_eq!(
-                        logging_started, fully_started,
-                        "missed the early-startup window"
-                    );
-                    return;
+                    return logging_started == fully_started;
                 }
                 Err(error) if Instant::now() >= deadline => {
                     panic!("Studio readiness failed: {error}; {}", self.log());
@@ -172,7 +171,7 @@ fn snapshot_key(index: u32) -> String {
 async fn startup_drains_snapshot_events_before_the_bounded_queue_fills() {
     let count = 1025;
     let mut surfpool = Surfpool::with_snapshot(count, String::new());
-    surfpool.wait_for_phase(true);
+    assert!(surfpool.wait_for_phase(true));
     let response: serde_json::Value = reqwest::Client::new()
         .post(format!("http://127.0.0.1:{}", surfpool.ports[0]))
         .json(&serde_json::json!({
@@ -193,9 +192,27 @@ async fn startup_drains_snapshot_events_before_the_bounded_queue_fills() {
 fn signals_stop_all_servers_during_startup_and_after_readiness() {
     for signal in ["-TERM", "-INT"] {
         for fully_started in [false, false, false, true] {
-            let mut surfpool = Surfpool::start();
-            surfpool.wait_for_phase(fully_started);
-            surfpool.stop(signal);
+            let mut observed_phase = false;
+            for _ in 0..8 {
+                let mut surfpool = Surfpool::start();
+                let matched_phase = surfpool.wait_for_phase(fully_started);
+                // A delayed observer can miss startup; shutdown must still work.
+                surfpool.stop(signal);
+                if matched_phase {
+                    observed_phase = true;
+                    break;
+                }
+                eprintln!("Startup completed before the early probe; retrying");
+            }
+            assert!(observed_phase, "Could not observe requested startup phase");
         }
     }
+}
+
+#[test]
+fn a_delayed_startup_probe_can_be_retried_without_a_shutdown_failure() {
+    let mut surfpool = Surfpool::start();
+    assert!(surfpool.wait_for_phase(true));
+    assert!(!surfpool.wait_for_phase(false));
+    surfpool.stop("-TERM");
 }

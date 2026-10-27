@@ -709,6 +709,7 @@ mod tests {
 import json, sys
 keys = json.loads(sys.argv[1])
 log = sys.argv[2]
+installs = 0
 print(json.dumps({'schema':'svm-historical-backend/v1','kind':'ready','pins':{}}), flush=True)
 for line in sys.stdin:
     req = json.loads(line)
@@ -726,6 +727,14 @@ for line in sys.stdin:
         result = [{'loaded':False} for _ in op['peek']['pubkeys']]
     elif isinstance(op, dict) and op.get('command', {}).get('method') == 'accounts':
         result = [None for _ in op['command']['params']['pubkeys']]
+    elif isinstance(op, dict) and op.get('command', {}).get('method') in ('send', 'rpcSend', 'overrideAccounts'):
+        if op['command']['method'] == 'overrideAccounts':
+            installs += 1
+            if len(keys) == 1 and installs > 1:
+                print(json.dumps({'id':req['id'],'result':None}), flush=True)
+                continue
+        print(json.dumps({'id':req['id'],'error':{'code':'TEST_RUNTIME_REFUSAL','message':'recorded attempt refused'}}), flush=True)
+        continue
     else: raise RuntimeError('unexpected request: ' + repr(req))
     print(json.dumps({'id':req['id'],'result':result}), flush=True)
 "#;
@@ -776,6 +785,123 @@ for line in sys.stdin:
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => vec![],
                 Err(error) => panic!("cannot read IPC transcript: {error}"),
             }
+        }
+
+        #[test]
+        fn review_live_signature_skip_refuses_before_execution_ipc() {
+            use crate::surfnet::backend::{Admission, Backend};
+            let (fork, dir) = ipc_fixture(0);
+            let mut backend = Backend::historical(fork);
+            let error = backend
+                .send_transaction(
+                    solana_transaction::versioned::VersionedTransaction::default(),
+                    &Admission {
+                        sigverify: None,
+                        skip_blockhash_check: false,
+                    },
+                )
+                .unwrap_err();
+            assert_eq!(
+                error.historical_code(),
+                Some("UNSUPPORTED_IN_HISTORICAL_MODE")
+            );
+            assert!(
+                ipc_requests(&dir).is_empty(),
+                "live signature skipping must not become an unverified send"
+            );
+            let error = backend
+                .send_profile_prefix(
+                    solana_transaction::versioned::VersionedTransaction::default(),
+                    false,
+                )
+                .unwrap_err();
+            assert_eq!(error.historical_code(), Some("TEST_RUNTIME_REFUSAL"));
+            assert_eq!(
+                ipc_requests(&dir)[0]["op"]["command"]["method"],
+                "send",
+                "instruction-prefix profiling still uses the disposable executor"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn review_upload_holes_wait_and_rejected_upload_keeps_its_bytes() {
+            use crate::{rpc::full::SurfpoolFullRpc, tests::helpers::TestSetup};
+            let setup = TestSetup::new(SurfpoolFullRpc);
+            let (fork, dir) = ipc_fixture(0);
+            setup.context.svm_locker.with_svm_writer(|svm| {
+                svm.inner = crate::surfnet::backend::Backend::historical(fork)
+            });
+            let locker = &setup.context.svm_locker;
+            let program = Pubkey::new_unique();
+            let elf = crate::surfnet::noop_program::NOOP_PROGRAM_ELF;
+            locker
+                .write_program(program, None, 0, &elf[..64], &None)
+                .await
+                .unwrap();
+            locker
+                .write_program(program, None, elf.len() - 1, &elf[elf.len() - 1..], &None)
+                .await
+                .expect("the unreceived middle must not be installed");
+            assert!(
+                !ipc_requests(&dir)
+                    .iter()
+                    .any(|r| r["op"]["command"]["method"] == "overrideAccounts")
+            );
+            let error = locker
+                .write_program(program, None, 64, &elf[64..elf.len() - 1], &None)
+                .await
+                .unwrap_err();
+            assert_eq!(error.historical_code(), Some("TEST_RUNTIME_REFUSAL"));
+            assert!(
+                locker.with_svm_reader(|svm| svm.historical_uploads.contains_key(&program)),
+                "keep staged bytes after refusal"
+            );
+            let retry = locker
+                .write_program(program, None, 64, &elf[64..65], &None)
+                .await
+                .unwrap_err();
+            assert_eq!(retry.historical_code(), Some("TEST_RUNTIME_REFUSAL"));
+            assert_eq!(
+                ipc_requests(&dir)
+                    .iter()
+                    .filter(|r| r["op"]["command"]["method"] == "overrideAccounts")
+                    .count(),
+                2,
+                "retry a corrected chunk without reuploading the rest"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn review_upload_is_removed_only_after_successful_install() {
+            use crate::{rpc::full::SurfpoolFullRpc, tests::helpers::TestSetup};
+            let setup = TestSetup::new(SurfpoolFullRpc);
+            let (fork, dir) = ipc_fixture(1);
+            setup.context.svm_locker.with_svm_writer(|svm| {
+                svm.inner = crate::surfnet::backend::Backend::historical(fork)
+            });
+            let locker = &setup.context.svm_locker;
+            let program = Pubkey::new_unique();
+            let elf = crate::surfnet::noop_program::NOOP_PROGRAM_ELF;
+            assert_eq!(
+                locker
+                    .write_program(program, None, 0, elf, &None)
+                    .await
+                    .unwrap_err()
+                    .historical_code(),
+                Some("TEST_RUNTIME_REFUSAL")
+            );
+            locker
+                .write_program(program, None, 0, &elf[..1], &None)
+                .await
+                .unwrap();
+            assert!(locker.with_svm_reader(|svm| svm.historical_uploads.is_empty()));
+            assert_eq!(
+                ipc_requests(&dir)
+                    .iter()
+                    .filter(|r| r["op"]["command"]["method"] == "overrideAccounts")
+                    .count(),
+                2
+            );
         }
 
         #[test]

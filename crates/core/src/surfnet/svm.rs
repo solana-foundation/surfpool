@@ -588,7 +588,7 @@ pub struct SurfnetSvm {
     pub supply_overrides: SupplyOverrides,
     /// A historical fork's chunked program uploads still in progress: the ELF bytes received
     /// so far, applied to the fork only once complete (see `write_historical_program`).
-    pub historical_uploads: HashMap<Pubkey, Vec<u8>>,
+    pub(crate) historical_uploads: HashMap<Pubkey, super::locker::program_upload::ProgramUpload>,
     /// A historical fork's current slot and its block while still open: stored in `blocks`
     /// only when the fork leaves the slot, with the blockhash SVM Replay then registers.
     pub historical_open_block: Option<(Slot, BlockHeader)>,
@@ -1223,6 +1223,7 @@ impl SurfnetSvm {
             .map(|lease| Arc::new(Mutex::new(lease)));
         let (channels, simnet_events_rx, geyser_events_rx) = SurfnetChannels::new();
         let storage_backend = StorageBackend::open(&database_url, &config.surfnet_id)?;
+        crate::lifecycle::check_store(&storage_backend, None)?;
         let svm = Self::build_with(storage_backend, store_lease, channels, config, None)?;
         Ok((svm, simnet_events_rx, geyser_events_rx))
     }
@@ -2411,8 +2412,8 @@ impl SurfnetSvm {
     ) -> SurfpoolResult<TransactionResult> {
         if self.inner.admission_authority() == AdmissionAuthority::Engine {
             // SVM Replay admits historically: signatures, blockhash age, durable nonces and
-            // duplicates are its rules, never Surfpool's current ones. An unverified send
-            // (instruction-prefix profiling) executes without admission, as LiteSVM does.
+            // duplicates are its rules, never Surfpool's current ones. Unverified prefixes
+            // use the separate disposable profiling path, never a live send.
             self.transactions_processed += 1;
             let transactions = &self.transactions;
             let is_processed = |signature: &Signature| {
@@ -2472,6 +2473,19 @@ impl SurfnetSvm {
                 Ok(Err(tx_failure))
             }
         }
+    }
+
+    /// Executes a partial instruction list only on the disposable instruction-profiling copy.
+    pub(crate) fn send_profile_prefix(
+        &mut self,
+        tx: VersionedTransaction,
+    ) -> SurfpoolResult<TransactionResult> {
+        if !self.inner.is_historical() {
+            return self.send_transaction(tx, false, false);
+        }
+        self.transactions_processed += 1;
+        self.inner
+            .send_profile_prefix(tx, self.skip_blockhash_check)
     }
 
     /// Estimates the compute units that a transaction will consume by simulating it.

@@ -94,6 +94,7 @@ use crate::{
 
 mod historical_history;
 mod historical_tokens;
+pub(crate) mod program_upload;
 
 struct LocalTransactionLookup {
     result: GetTransactionResult,
@@ -2210,6 +2211,11 @@ impl SurfnetSvmLocker {
         sigverify: bool,
         do_propagate: bool,
     ) -> SurfpoolResult<KeyedProfileResult> {
+        if self.is_historical() && !sigverify {
+            return Err(super::backend::engine_owned(
+                "skipping signatures for a live send",
+            ));
+        }
         let signature = transaction.signatures[0];
 
         // Sigverify the transaction upfront before doing any account fetching or other pre-processing.
@@ -2384,6 +2390,7 @@ impl SurfnetSvmLocker {
                 pre_execution_capture,
                 &status_tx,
                 do_propagate,
+                false,
             )
             .await?;
 
@@ -2483,6 +2490,7 @@ impl SurfnetSvmLocker {
                     pre_execution_capture_cursor,
                     status_tx,
                     do_propagate,
+                    true,
                 )
                 .await?;
 
@@ -2893,6 +2901,7 @@ impl SurfnetSvmLocker {
         pre_execution_capture: ExecutionCapture,
         status_tx: &Sender<TransactionStatusEvent>,
         do_propagate: bool,
+        profiling_prefix: bool,
     ) -> SurfpoolResult<ProfileResult> {
         if !skip_preflight {
             if let Err(failed) = self.with_svm_reader(|svm_reader| {
@@ -2912,7 +2921,12 @@ impl SurfnetSvmLocker {
         let mut svm_writer = self.0.write().await;
         svm_writer.bump_state_revision();
         svm_writer.begin_historical_write();
-        let processed = match svm_writer.send_transaction(transaction.clone(), false, sigverify) {
+        let execution = if profiling_prefix {
+            svm_writer.send_profile_prefix(transaction.clone())
+        } else {
+            svm_writer.send_transaction(transaction.clone(), false, sigverify)
+        };
+        let processed = match execution {
             Err(error) => Err(error),
             Ok(Ok(transaction_metadata)) => Self::handle_execution_success(
                 &mut svm_writer,
@@ -5000,11 +5014,7 @@ impl SurfnetSvmLocker {
         }
         let elf = self.with_svm_writer(|svm_writer| {
             let upload = svm_writer.historical_uploads.entry(program_id).or_default();
-            if upload.len() < end {
-                upload.resize(end, 0);
-            }
-            upload[offset..end].copy_from_slice(data);
-            elf_is_complete(upload).then(|| upload.clone())
+            upload.stage(offset, end, data)
         });
         let Some(elf) = elf else {
             self.simnet_events_tx().info(format!(
@@ -5076,11 +5086,11 @@ impl SurfnetSvmLocker {
                 },
             ),
         ];
-        // Complete either way: a refused program must be uploaded again.
         let written = self.with_svm_writer(|svm_writer| {
-            svm_writer.historical_uploads.remove(&program_id);
             svm_writer.bump_state_revision();
-            svm_writer.set_historical_accounts(accounts)
+            svm_writer.set_historical_accounts(accounts)?;
+            svm_writer.historical_uploads.remove(&program_id);
+            Ok::<_, SurfpoolError>(())
         });
         written?;
         self.simnet_events_tx().info(format!(

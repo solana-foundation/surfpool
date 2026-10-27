@@ -72,6 +72,9 @@ The native owner-list pagination happens before this guard and remains a separat
 resource-cost risk. Historical signature-status queries accept at most 256
 signatures. Program uploads must fit the 10 MiB account limit including loader
 metadata, in either mode; oversized requests are refused, never truncated.
+Historical live sends reject `skip_sig_verify: true`: SVM Replay 0.2.0 cannot
+skip signatures without also skipping lifetime admission. Disposable instruction
+profiling remains supported through its separate unverified path.
 
 ## Installation
 

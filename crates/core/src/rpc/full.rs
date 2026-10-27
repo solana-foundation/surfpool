@@ -1810,6 +1810,12 @@ impl Full for SurfpoolFullRpc {
             // With or without preflight, a signature list that does not fit its message is refused
             // before any signature is read or any state is touched.
             require_signature_structure(&unsanitized_tx, "Transaction")?;
+            if ctx.svm_locker.is_historical() && config.skip_sig_verify == Some(true) {
+                return Err(crate::surfnet::backend::engine_owned(
+                    "skipping signatures for a live send",
+                )
+                .into());
+            }
             let signature = unsanitized_tx.signatures[0];
 
             if !config.base.skip_preflight {

@@ -36,6 +36,8 @@ use crate::{
     },
 };
 
+mod historical_commands;
+
 /// An opened surfnet, ready to run.
 pub struct SurfnetInstance {
     opened: Opened,
@@ -82,7 +84,7 @@ fn journaled(historical: &HistoricalSimnetConfig) -> bool {
 /// One store holds one chain: a historical fork's store reopens only as that fork, with its
 /// journal, and a new fork never starts in a store that holds another chain. Checked before the
 /// store is seeded. Returns whether the store holds a historical fork.
-fn check_store(
+pub(crate) fn check_store(
     storage_backend: &StorageBackend,
     historical: Option<&HistoricalSimnetConfig>,
 ) -> SurfpoolResult<bool> {
@@ -207,11 +209,12 @@ impl SurfnetInstance {
         simnet_commands_tx: Sender<SimnetCommand>,
         simnet_commands_rx: Receiver<SimnetCommand>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let (locker, geyser_events_rx, _backend) = match self.opened {
+        let (locker, geyser_events_rx, _backend, _commands, simnet_commands_rx) = match self.opened
+        {
             Opened::Local {
                 locker,
                 geyser_events_rx,
-            } => (locker, geyser_events_rx, None),
+            } => (locker, geyser_events_rx, None, None, simnet_commands_rx),
             Opened::Historical(pending) => {
                 let PendingHistorical {
                     storage_backend,
@@ -259,6 +262,11 @@ impl SurfnetInstance {
                 })?;
                 // However this run ends, a failed attach included, the backend ends with it.
                 let backend = EndsWithRun(session.clone());
+                let (commands, commands_rx) = historical_commands::HistoricalCommands::start(
+                    session.clone(),
+                    simnet_commands_rx,
+                    self.simnet_events_tx.clone(),
+                )?;
                 let svm = session
                     .attach()
                     .and_then(|fork| {
@@ -277,7 +285,13 @@ impl SurfnetInstance {
                 // The historical clock is in place: interfaces waiting for the fork can show it.
                 self.simnet_events_tx
                     .system_clock_updated(svm.inner.clock());
-                (SurfnetSvmLocker::new(svm), geyser_events_rx, Some(backend))
+                (
+                    SurfnetSvmLocker::new(svm),
+                    geyser_events_rx,
+                    Some(backend),
+                    Some(commands),
+                    commands_rx,
+                )
             }
         };
         runloops::start_local_surfnet_runloop(
@@ -295,6 +309,10 @@ impl SurfnetInstance {
 pub fn terminate_historical_backends() {
     historical::terminate_all();
 }
+
+#[cfg(all(test, unix, feature = "sqlite"))]
+#[path = "lifecycle/review_tests.rs"]
+mod review_tests;
 
 #[cfg(all(test, unix, feature = "sqlite"))]
 mod tests {
@@ -513,5 +531,39 @@ mod tests {
                 .contains("UNSUPPORTED_IN_HISTORICAL_MODE"),
             "{refused}"
         );
+    }
+
+    #[test]
+    fn review_normal_constructor_refuses_a_released_historical_store() {
+        use crate::{
+            storage::{Storage, StorageBackend},
+            surfnet::svm::HISTORICAL_SLOT_CHECKPOINT,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let db = directory.path().join("saved.sqlite");
+        let db = db.to_str().unwrap();
+        {
+            let lease = HistoricalStoreLease::acquire(Some(db), "default").unwrap();
+            let backend = StorageBackend::open(&Some(db), "default").unwrap();
+            let mut checkpoints: Box<dyn Storage<String, u64>> =
+                backend.open_store("slot_checkpoint").unwrap();
+            checkpoints
+                .store(HISTORICAL_SLOT_CHECKPOINT.into(), 123)
+                .unwrap();
+            backend.shutdown();
+            drop((checkpoints, backend, lease));
+        }
+        let error = SurfnetSvm::new_with_db(Some(db), SurfnetSvmConfig::default())
+            .err()
+            .expect("a released historical store must not become a normal chain");
+        assert!(error.to_string().contains("SESSION_INTEGRITY"), "{error}");
+        let backend = StorageBackend::open(&Some(db), "default").unwrap();
+        let checkpoints: Box<dyn Storage<String, u64>> =
+            backend.open_store("slot_checkpoint").unwrap();
+        assert_eq!(
+            checkpoints.get(&HISTORICAL_SLOT_CHECKPOINT.into()).unwrap(),
+            Some(123)
+        );
+        assert_eq!(checkpoints.get(&"latest_slot".into()).unwrap(), None);
     }
 }
