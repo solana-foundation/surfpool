@@ -5236,6 +5236,106 @@ fn test_time_travel_absolute_timestamp(test_type: TestType) {
     println!("Time travel to absolute timestamp test passed successfully!");
 }
 
+/// A time travel to a slot at a given time lands there at that time, not at the time the slot
+/// time extrapolates, and leaves the time of every block before the jump as it was.
+#[test]
+fn time_travel_to_a_slot_at_a_time() {
+    use crate::rpc::full::{Full, SurfpoolFullRpc};
+
+    let slot_time = 1_000;
+    let simnet = boot_simnet(
+        BlockProductionMode::Manual,
+        Some(slot_time),
+        TestType::no_db(),
+    )
+    .expect("the simnet should boot");
+    let svm_locker = simnet.locker.clone();
+    let (plugin_commands_tx, _plugin_commands_rx) = crossbeam_channel::unbounded::<PluginCommand>();
+    let runloop_context = RunloopContext {
+        id: None,
+        svm_locker: svm_locker.clone(),
+        simnet_commands_tx: simnet.commands.clone(),
+        remote_rpc_client: None,
+        rpc_config: RpcConfig::default(),
+        cheatcode_config: CheatcodeConfig::new(),
+        plugin_commands_tx,
+    };
+    let confirm_block = || svm_locker.with_svm_writer(|svm| svm.confirm_current_block().unwrap());
+    let block_time = |slot| {
+        hiro_system_kit::nestable_block_on(
+            SurfpoolFullRpc.get_block_time(Some(runloop_context.clone()), slot),
+        )
+        .unwrap()
+    };
+
+    let airdrop = svm_locker
+        .airdrop(&Pubkey::new_unique(), LAMPORTS_PER_SOL)
+        .unwrap()
+        .unwrap()
+        .signature;
+    confirm_block();
+    confirm_block();
+    let before_jump = svm_locker.get_latest_absolute_slot() - 2;
+    let time_before_jump = block_time(before_jump);
+
+    let landing = 458_887_083;
+    let a_day_ago = (chrono::Utc::now().timestamp() - 24 * 60 * 60) as u64;
+    let travel = |slot| {
+        SurfnetCheatcodesRpc::empty().time_travel(
+            Some(runloop_context.clone()),
+            Some(TimeTravelConfig::AbsoluteSlotAt {
+                slot,
+                timestamp: a_day_ago * 1_000,
+            }),
+        )
+    };
+    assert!(travel(1).is_err(), "a slot in the past is rejected");
+    travel(landing).expect("time travel should succeed");
+    // A gap adds no depth: the transaction before it is finalized as `getSlot` says it is.
+    let finalized = svm_locker.get_slot_for_commitment(&CommitmentConfig::finalized());
+    let status = hiro_system_kit::nestable_block_on(SurfpoolFullRpc.get_signature_statuses(
+        Some(runloop_context.clone()),
+        vec![airdrop.to_string()],
+        None,
+    ))
+    .unwrap()
+    .value[0]
+        .clone()
+        .unwrap();
+    assert_eq!(
+        status.confirmation_status
+            == Some(solana_transaction_status::TransactionConfirmationStatus::Finalized),
+        status.slot <= finalized
+    );
+    // Skipped slots are no confirmations: the two blocks after it, then the landing.
+    assert_eq!(status.confirmations, Some(3));
+
+    let clock = svm_locker.with_svm_reader(|svm| svm.inner.clock());
+    assert_eq!(
+        (clock.slot, clock.unix_timestamp),
+        (landing, a_day_ago as i64)
+    );
+    confirm_block();
+    confirm_block();
+    // Under TowerBFT, a block's time is the Clock its transactions read.
+    assert_eq!(block_time(landing), Some(a_day_ago as i64));
+    assert_eq!(block_time(landing + 1), Some(a_day_ago as i64 + 1));
+    assert_eq!(block_time(before_jump), time_before_jump);
+
+    // The slot open when the travel is asked for is closed by the time it lands: it lands on
+    // the slot open then, so no slot is produced twice.
+    let open = svm_locker.get_latest_absolute_slot();
+    let landed = travel(open)
+        .expect("time travel should succeed")
+        .absolute_slot;
+    let clock = svm_locker.with_svm_reader(|svm| svm.inner.clock());
+    assert_eq!((landed, clock.slot), (open + 1, open + 1));
+    assert!(
+        travel(u64::MAX).is_err(),
+        "no block could follow the largest slot"
+    );
+}
+
 /// After each kind of time travel the Clock sysvar holds the absolute slot, as it does after
 /// every block, the epoch info agrees with the epoch schedule, and the slot moved as far as asked.
 #[test]
@@ -12375,53 +12475,57 @@ async fn test_create_lookup_table_with_finalized_slot(test_type: TestType) {
         "SlotHashes should contain finalized_slot={finalized_slot}; entries={slot_hash_slots:?}"
     );
 
-    let (create_lookup_table_ix, lookup_table_address) =
-        address_lookup_table_instruction::create_lookup_table(
-            payer.pubkey(),
-            payer.pubkey(),
-            finalized_slot,
+    // Clients pass `getSlot` at their commitment: Anchor's default is processed.
+    for recent_slot in [finalized_slot, processed_slot] {
+        let (create_lookup_table_ix, lookup_table_address) =
+            address_lookup_table_instruction::create_lookup_table(
+                payer.pubkey(),
+                payer.pubkey(),
+                recent_slot,
+            );
+        let recent_blockhash = svm_locker.with_svm_reader(|svm| svm.latest_blockhash());
+        let message = Message::new_with_blockhash(
+            &[create_lookup_table_ix],
+            Some(&payer.pubkey()),
+            &recent_blockhash,
         );
-    let recent_blockhash = svm_locker.with_svm_reader(|svm| svm.latest_blockhash());
-    let message = Message::new_with_blockhash(
-        &[create_lookup_table_ix],
-        Some(&payer.pubkey()),
-        &recent_blockhash,
-    );
-    let tx = VersionedTransaction::try_new(VersionedMessage::Legacy(message), &[&payer]).unwrap();
+        let tx =
+            VersionedTransaction::try_new(VersionedMessage::Legacy(message), &[&payer]).unwrap();
 
-    let (status_tx, status_rx) = crossbeam_unbounded();
-    let result = svm_locker
-        .process_transaction(&None, tx, status_tx, false, true)
-        .await;
-    assert!(
-        result.is_ok(),
-        "CreateLookupTable should accept getSlot(finalized) as recent_slot; \
+        let (status_tx, status_rx) = crossbeam_unbounded();
+        let result = svm_locker
+            .process_transaction(&None, tx, status_tx, false, true)
+            .await;
+        assert!(
+            result.is_ok(),
+            "CreateLookupTable should accept recent_slot={recent_slot}; \
          processed_slot={processed_slot}, finalized_slot={finalized_slot}, \
          SlotHashes entries={slot_hash_slots:?}, result={result:?}"
-    );
+        );
 
-    match status_rx.recv_timeout(Duration::from_secs(5)) {
-        Ok(TransactionStatusEvent::Success(_)) => {}
-        other => panic!(
-            "CreateLookupTable should succeed, got: {other:?}; \
+        match status_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(TransactionStatusEvent::Success(_)) => {}
+            other => panic!(
+                "CreateLookupTable should succeed, got: {other:?}; \
              processed_slot={processed_slot}, finalized_slot={finalized_slot}, \
              SlotHashes entries={slot_hash_slots:?}"
-        ),
-    }
+            ),
+        }
 
-    let lookup_table_account = svm_locker
-        .with_svm_reader(|svm| svm.get_account(&lookup_table_address))
-        .unwrap();
-    assert!(
-        matches!(
-            lookup_table_account,
-            Some(Account {
-                owner,
-                ..
-            }) if owner == solana_address_lookup_table_interface::program::id()
-        ),
-        "lookup table account {lookup_table_address} should be created"
-    );
+        let lookup_table_account = svm_locker
+            .with_svm_reader(|svm| svm.get_account(&lookup_table_address))
+            .unwrap();
+        assert!(
+            matches!(
+                lookup_table_account,
+                Some(Account {
+                    owner,
+                    ..
+                }) if owner == solana_address_lookup_table_interface::program::id()
+            ),
+            "lookup table account {lookup_table_address} should be created"
+        );
+    }
 }
 
 #[cfg_attr(feature = "ignore_tests_ci", ignore = "flaky CI tests")]

@@ -15,13 +15,15 @@ use solana_sysvar::last_restart_slot::LastRestartSlot;
 use super::{
     BlockIdentifier,
     backend::LocalBackend,
-    svm::{MAX_RECENT_BLOCKHASHES_STANDARD, SurfnetSvm, synthetic_blockhash_for_slot},
+    svm::{MAX_RECENT_BLOCKHASHES_STANDARD, SurfnetSvm},
 };
 use crate::{
     error::{SurfpoolError, SurfpoolResult},
     helpers::time_travel::clock_for_slot,
     types::SyntheticBlockhash,
 };
+
+mod time_travel;
 
 impl SurfnetSvm {
     /// The local VM this policy acts on. A historical fork refuses it: its clock, blockhashes and
@@ -75,30 +77,28 @@ impl SurfnetSvm {
         // initial warmup this points before genesis_slot, so seed those
         // synthetic slots into SlotHashes while preserving the local hash
         // mapping for genesis_slot and later.
-        let slot_hash_start_index =
-            current_index.saturating_sub(MAX_SLOT_HASHES_ENTRIES as u64 - 1);
-        let local_start_absolute_slot = slot_hash_start_index + self.genesis_slot;
-        let finalized_start_absolute_slot =
-            current_absolute_slot.saturating_sub(self.finalization_slot_threshold());
-        let earliest_retained_slot =
-            current_absolute_slot.saturating_sub(MAX_SLOT_HASHES_ENTRIES as u64 - 1);
-        let start_absolute_slot = local_start_absolute_slot
-            .min(finalized_start_absolute_slot)
-            .max(earliest_retained_slot);
-        let slot_hashes_vec: Vec<_> = (start_absolute_slot..=current_absolute_slot)
+        let finalized =
+            self.slot_for_commitment(&solana_commitment_config::CommitmentConfig::finalized());
+        let runs = self.block_runs(self.genesis_slot.min(finalized), current_absolute_slot);
+        let slot_hashes_vec: Vec<_> = runs
+            .into_iter()
             .rev()
-            .map(|slot| {
-                (
-                    slot,
-                    *synthetic_blockhash_for_slot(slot, self.genesis_slot).hash(),
-                )
+            .flat_map(|run| run.rev())
+            .take(MAX_SLOT_HASHES_ENTRIES)
+            .zip(1..)
+            .map(|(slot, depth)| {
+                let index = current_index.wrapping_sub(depth);
+                (slot, *SyntheticBlockhash::new(index).hash())
             })
             .collect();
         let slot_hashes = SlotHashes::new(&slot_hashes_vec);
         self.local_vm()?.set_sysvar(&slot_hashes);
 
         // 3. Reconstruct Clock using absolute slot
-        let unix_timestamp = self.calculate_block_time_for_slot(current_absolute_slot) / 1_000;
+        let unix_timestamp = self
+            .calculate_block_time_for_slot(current_absolute_slot)
+            .saturating_sub(self.block_time_lag())
+            / 1_000;
         let clock = Clock {
             epoch_start_timestamp: (unix_timestamp as i64).min((self.updated_at / 1_000) as i64),
             ..clock_for_slot(

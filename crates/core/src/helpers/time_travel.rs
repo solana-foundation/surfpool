@@ -109,8 +109,8 @@ pub fn calculate_absolute_slot_clock(
     }
 
     let time_jump_in_absolute_slots = new_absolute_slot - current_absolute_slot;
-    let time_jump_in_ms = time_jump_in_absolute_slots * slot_time;
-    let timestamp_target = current_updated_at + time_jump_in_ms;
+    let time_jump_in_ms = time_jump_in_absolute_slots.saturating_mul(slot_time);
+    let timestamp_target = current_updated_at.saturating_add(time_jump_in_ms);
 
     // timestamp_target is in milliseconds, we need to convert it to seconds
     let timestamp_target_seconds = timestamp_target / 1000;
@@ -207,6 +207,21 @@ pub fn calculate_time_travel_clock(
             slot_time,
             epoch_schedule,
         ),
+        TimeTravelConfig::AbsoluteSlotAt { slot, timestamp } => calculate_absolute_slot_clock(
+            *slot,
+            epoch_info.absolute_slot,
+            current_updated_at,
+            slot_time,
+            epoch_schedule,
+        )
+        .map(|clock| {
+            let timestamp_seconds = (*timestamp / 1000) as i64;
+            Clock {
+                epoch_start_timestamp: timestamp_seconds,
+                unix_timestamp: timestamp_seconds,
+                ..clock
+            }
+        }),
         TimeTravelConfig::AbsoluteEpoch(new_epoch) => calculate_absolute_epoch_clock(
             *new_epoch,
             epoch_info.epoch,
@@ -534,6 +549,16 @@ mod tests {
 
         assert_eq!(clock.unix_timestamp, target_time as i64 / 1_000);
         assert!(clock.epoch > 1); // Should advance many epochs
+
+        // A slot whose extrapolated time overflows still lands at the time asked for.
+        let config = TimeTravelConfig::AbsoluteSlotAt {
+            slot: u64::MAX,
+            timestamp: 5_000,
+        };
+        let clock =
+            calculate_time_travel_clock(&config, current_time, slot_time, &epoch_info, &schedule())
+                .unwrap();
+        assert_eq!((clock.slot, clock.unix_timestamp), (u64::MAX, 5));
     }
 
     #[test]

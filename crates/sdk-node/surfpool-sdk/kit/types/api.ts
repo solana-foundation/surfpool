@@ -46,6 +46,7 @@ export type EpochInfo = ReturnType<GetEpochInfoApi['getEpochInfo']>;
 export type TimeTravelConfig =
     | { absoluteEpoch: number | bigint }
     | { absoluteSlot: number | bigint }
+    | { absoluteSlotAt: { slot: number | bigint; timestamp: number | bigint } }
     | { absoluteTimestamp: number | bigint };
 
 /**

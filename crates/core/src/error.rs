@@ -6,7 +6,9 @@ use jsonrpc_core::{Error, Result};
 use litesvm::error::LiteSVMError;
 use serde::Serialize;
 use serde_json::json;
-use solana_client::{client_error::ClientError, rpc_request::TokenAccountsFilter};
+use solana_client::{
+    client_error::ClientError, rpc_custom_error::RpcCustomError, rpc_request::TokenAccountsFilter,
+};
 use solana_clock::Slot;
 use solana_pubkey::Pubkey;
 use solana_signature::Signature;
@@ -526,6 +528,14 @@ impl SurfpoolError {
         Self(Error::invalid_params(format!(
             "Requested {slot} is before the first local slot, and no remote RPC was provided."
         )))
+    }
+
+    /// A slot a time travel skipped, as Agave answers it: skipped once rooted, else unavailable.
+    pub fn slot_skipped(slot: Slot, rooted: bool) -> Self {
+        Self(match rooted {
+            true => RpcCustomError::SlotSkipped { slot }.into(),
+            false => RpcCustomError::BlockNotAvailable { slot }.into(),
+        })
     }
 
     pub fn get_block(e: ClientError, block: Slot) -> Self {

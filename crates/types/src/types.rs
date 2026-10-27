@@ -801,7 +801,11 @@ pub enum SimnetCommand {
     CommandClock(Option<(Hash, String)>, ClockCommand),
     GetClockState(Sender<ClockState>),
     UpdateInternalClock(Option<(Hash, String)>, Clock),
-    UpdateInternalClockWithConfirmation(Option<(Hash, String)>, Clock, Sender<EpochInfo>),
+    UpdateInternalClockWithConfirmation(
+        Option<(Hash, String)>,
+        Clock,
+        Sender<Result<EpochInfo, String>>,
+    ),
     UpdateBlockProductionMode(BlockProductionMode),
     /// Executes a transaction. `sendTransaction` enqueues this on the same
     /// channel as the startup commands below, so channel order decides which

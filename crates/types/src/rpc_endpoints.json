@@ -817,7 +817,7 @@
             {
               "name": "config",
               "type": "Option<TimeTravelConfig>",
-              "description": "One of {\"absoluteTimestamp\": <unix milliseconds>}, {\"absoluteSlot\": <slot>} or {\"absoluteEpoch\": <epoch>}. Note that absoluteTimestamp is in MILLISECONDS, while the Clock sysvar reports seconds. If omitted, jumps one hour ahead."
+              "description": "One of {\"absoluteTimestamp\": <unix milliseconds>}, {\"absoluteSlot\": <slot>}, {\"absoluteSlotAt\": {\"slot\": <slot>, \"timestamp\": <unix milliseconds>}} or {\"absoluteEpoch\": <epoch>}. Note that absoluteTimestamp and absoluteSlotAt's timestamp are in MILLISECONDS, while the Clock sysvar reports seconds. If omitted, jumps one hour ahead."
             }
           ],
           "returns": "An `EpochInfo` object describing the clock after the jump."

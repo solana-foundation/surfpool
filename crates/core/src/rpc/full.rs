@@ -2173,21 +2173,8 @@ impl Full for SurfpoolFullRpc {
             if let Some(reader) = svm_locker.archive_reader() {
                 return Ok(svm_locker.historical_block_time(&reader, slot)?);
             }
-            let block_time = svm_locker.with_svm_reader(|svm_reader| {
-                Ok::<_, jsonrpc_core::Error>(match svm_reader.blocks.get(&slot)? {
-                    Some(block) => Some(block.block_time),
-                    None => {
-                        // With sparse block storage, calculate time for missing blocks
-                        if svm_reader.is_slot_in_valid_range(slot) {
-                            let time_ms = svm_reader.calculate_block_time_for_slot(slot);
-                            Some((time_ms / 1_000) as i64)
-                        } else {
-                            None
-                        }
-                    }
-                })
-            })?;
-            Ok(block_time)
+            let block = svm_locker.with_svm_reader(|svm| svm.get_block_or_reconstruct(slot))?;
+            Ok(block.map(|block| block.block_time))
         })
     }
 
@@ -2253,24 +2240,6 @@ impl Full for SurfpoolFullRpc {
                     usize::MAX,
                 )?);
             }
-
-            let genesis_slot = svm_locker.with_svm_reader(|svm| svm.genesis_slot);
-
-            let (local_min_slot, local_slots, effective_end_slot) = if effective_end_slot
-                < start_slot
-            {
-                (None, vec![], effective_end_slot)
-            } else {
-                // With sparse block storage, all slots from genesis_slot onwards are valid
-                // Return all slots in the requested range instead of filtering by stored blocks
-                let local_min_slot = Some(genesis_slot);
-                let local_slots: Vec<Slot> = (start_slot.max(genesis_slot)..=effective_end_slot)
-                    .filter(|slot| *slot <= committed_latest_slot)
-                    .collect();
-
-                (local_min_slot, local_slots, effective_end_slot)
-            };
-
             if effective_end_slot.saturating_sub(start_slot) > MAX_SLOT_RANGE {
                 return Err(Error::invalid_params(format!(
                     "Slot range too large. Maximum: {}, Requested: {}",
@@ -2278,6 +2247,24 @@ impl Full for SurfpoolFullRpc {
                     effective_end_slot.saturating_sub(start_slot)
                 )));
             }
+
+            let genesis_slot = svm_locker.with_svm_reader(|svm| svm.genesis_slot);
+
+            let (local_min_slot, local_slots, effective_end_slot) =
+                if effective_end_slot < start_slot {
+                    (None, vec![], effective_end_slot)
+                } else {
+                    // With sparse block storage, all slots from genesis_slot onwards are valid
+                    // Return all slots in the requested range instead of filtering by stored blocks
+                    let local_min_slot = Some(genesis_slot);
+                    // A slot a time travel skipped holds no block.
+                    let runs = svm_locker.with_svm_reader(|svm| {
+                        svm.block_runs(start_slot.max(genesis_slot), effective_end_slot)
+                    });
+                    let local_slots: Vec<Slot> = runs.into_iter().flatten().collect();
+
+                    (local_min_slot, local_slots, effective_end_slot)
+                };
 
             let remote_slots = if let (Some((remote_client, _)), Some(local_min)) =
                 (&remote_ctx, local_min_slot)
@@ -2376,8 +2363,11 @@ impl Full for SurfpoolFullRpc {
             // With sparse block storage, all slots from genesis_slot onwards are valid
             // Return all slots in the requested range instead of filtering by stored blocks
             let local_min_slot = Some(genesis_slot);
-            let local_slots: Vec<Slot> =
-                (start_slot.max(genesis_slot)..=committed_latest_slot).collect();
+            // A slot a time travel skipped holds no block.
+            let runs = svm_locker.with_svm_reader(|svm| {
+                svm.block_runs(start_slot.max(genesis_slot), committed_latest_slot)
+            });
+            let local_slots: Vec<Slot> = runs.into_iter().flatten().take(limit).collect();
 
             // fetch remote blocks when needed, using the same logic as get_blocks
             let remote_slots = if let (Some((remote_client, _)), Some(local_min)) =
@@ -5945,6 +5935,48 @@ mod tests {
         assert_eq!(result, expected);
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_blocks_leaves_out_slots_a_time_travel_skipped() {
+        let setup = TestSetup::new(SurfpoolFullRpc);
+        let last_block = setup.context.svm_locker.with_svm_writer(|svm_writer| {
+            svm_writer.confirm_current_block().unwrap();
+            let last_block = svm_writer.get_latest_absolute_slot() - 1;
+            svm_writer.travel_to(last_block + 10).unwrap();
+            svm_writer.confirm_current_block().unwrap();
+            last_block
+        });
+        let landing = last_block + 10;
+
+        let blocks = setup
+            .rpc
+            .get_blocks(Some(setup.context.clone()), last_block, None, None)
+            .await
+            .unwrap();
+        assert_eq!(blocks, vec![last_block, landing, landing + 1]);
+
+        let skipped = last_block + 1;
+        let block_time = setup
+            .rpc
+            .get_block_time(Some(setup.context.clone()), skipped)
+            .await
+            .unwrap_err();
+        // Not rooted yet: Agave's `BlockNotAvailable`.
+        assert_eq!(block_time.code.code(), -32004);
+        let block = setup
+            .rpc
+            .get_block(
+                Some(setup.context.clone()),
+                skipped,
+                Some(RpcEncodingConfigWrapper::Current(Some(RpcBlockConfig {
+                    commitment: Some(CommitmentConfig::confirmed()),
+                    ..RpcBlockConfig::default()
+                }))),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(block.code.code(), -32004);
+    }
+
     // helper to insert blocks into the SVM at specific slots
     fn confirm_blocks(setup: &TestSetup<SurfpoolFullRpc>, count: u64) {
         setup.context.svm_locker.with_svm_writer(|svm_writer| {
@@ -5961,6 +5993,8 @@ mod tests {
         let slots: Vec<u64> = slots.into_iter().collect();
         setup.context.svm_locker.with_svm_writer(|svm_writer| {
             for slot in slots.iter() {
+                // A block at every slot from 0: the block at slot `s` is the `s + 1`th, and
+                // its hash is the synthetic one of the height before it.
                 svm_writer
                     .blocks
                     .store(
@@ -5970,7 +6004,7 @@ mod tests {
                             previous_blockhash: SyntheticBlockhash::new(slot.saturating_sub(1))
                                 .to_string(),
                             block_time: chrono::Utc::now().timestamp_millis(),
-                            block_height: *slot,
+                            block_height: slot + 1,
                             parent_slot: slot.saturating_sub(1),
                             signatures: vec![],
                         },

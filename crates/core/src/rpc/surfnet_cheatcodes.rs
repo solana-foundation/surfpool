@@ -754,6 +754,9 @@ pub trait SurfnetCheatcodes {
     ///     **milliseconds** (like JavaScript `Date.now()`). Note that the `Clock` sysvar
     ///     programs read is in seconds, so a value taken from it must be multiplied by 1000.
     ///   - `absoluteSlot(u64)`: Moves to the specified absolute slot.
+    ///   - `absoluteSlotAt { slot, timestamp }`: Moves to the specified absolute slot at the
+    ///     specified UNIX timestamp in **milliseconds**, instead of the time the slot time
+    ///     extrapolates (e.g. to stand in for mainnet at its current slot and time).
     ///   - `absoluteEpoch(u64)`: Advances time to the specified epoch (each epoch = 432,000 slots).
     ///
     /// ## Returns
@@ -2648,6 +2651,13 @@ mod tests {
             (
                 TimeTravelConfig::AbsoluteSlot(6),
                 serde_json::json!({ "absoluteSlot": 6 }),
+            ),
+            (
+                TimeTravelConfig::AbsoluteSlotAt {
+                    slot: 8,
+                    timestamp: 9,
+                },
+                serde_json::json!({ "absoluteSlotAt": { "slot": 8, "timestamp": 9 } }),
             ),
             (
                 TimeTravelConfig::AbsoluteTimestamp(7),

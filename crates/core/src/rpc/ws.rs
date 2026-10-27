@@ -1274,7 +1274,9 @@ impl Rpc for SurfpoolWsRpc {
                                 signature,
                                 rpc_transaction_config.clone(),
                                 svm_locker.get_latest_absolute_slot(),
-                                svm_locker.with_svm_reader(|svm| svm.finalization_slot_threshold()),
+                                svm_locker.with_svm_reader(|svm| {
+                                    svm.slot_for_commitment(&CommitmentConfig::finalized())
+                                }),
                             )
                             .await
                     }

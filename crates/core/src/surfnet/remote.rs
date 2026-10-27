@@ -573,15 +573,10 @@ impl SurfnetRemoteClient {
         signature: Signature,
         config: RpcTransactionConfig,
         latest_absolute_slot: u64,
-        finalization_slot_threshold: u64,
+        finalized_slot: Slot,
     ) -> GetTransactionResult {
         match self
-            .try_get_transaction(
-                signature,
-                config,
-                latest_absolute_slot,
-                finalization_slot_threshold,
-            )
+            .try_get_transaction(signature, config, latest_absolute_slot, finalized_slot)
             .await
         {
             Ok(result) => result,
@@ -597,7 +592,7 @@ impl SurfnetRemoteClient {
         signature: Signature,
         config: RpcTransactionConfig,
         latest_absolute_slot: u64,
-        finalization_slot_threshold: u64,
+        finalized_slot: Slot,
     ) -> SurfpoolResult<GetTransactionResult> {
         let transaction = self
             .client
@@ -614,12 +609,11 @@ impl SurfnetRemoteClient {
             })?;
 
         Ok(match transaction {
-            Some(tx) => GetTransactionResult::found_transaction(
-                signature,
-                tx,
-                latest_absolute_slot,
-                finalization_slot_threshold,
-            ),
+            Some(tx) => {
+                // A remote transaction's slot can be ahead of the local chain's.
+                let blocks_after = latest_absolute_slot.saturating_sub(tx.slot);
+                GetTransactionResult::found_transaction(signature, tx, blocks_after, finalized_slot)
+            }
             None => GetTransactionResult::None(signature),
         })
     }

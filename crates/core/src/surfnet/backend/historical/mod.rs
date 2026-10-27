@@ -924,6 +924,29 @@ for line in sys.stdin:
         }
 
         #[test]
+        fn review_local_time_travel_refuses_historical_backend() {
+            use crate::{rpc::full::SurfpoolFullRpc, tests::helpers::TestSetup};
+            let setup = TestSetup::new(SurfpoolFullRpc);
+            let (fork, dir) = ipc_fixture(0);
+            setup.context.svm_locker.with_svm_writer(|svm| {
+                svm.inner = crate::surfnet::backend::Backend::historical(fork);
+                let before = (svm.get_latest_absolute_slot(), svm.updated_at);
+                for error in [
+                    svm.travel_to(before.0 + 10).unwrap_err(),
+                    svm.apply_time_travel(Default::default()).unwrap_err(),
+                ] {
+                    assert_eq!(
+                        error.historical_code(),
+                        Some("UNSUPPORTED_IN_HISTORICAL_MODE")
+                    );
+                }
+                assert_eq!((svm.get_latest_absolute_slot(), svm.updated_at), before);
+                assert!(svm.landings.is_empty());
+            });
+            assert!(ipc_requests(&dir).is_empty());
+        }
+
+        #[test]
         fn review_airdrop_preparation_replaces_an_interrupted_request() {
             let (mut fork, dir) = ipc_fixture(0);
             let previous = Pubkey::new_unique();

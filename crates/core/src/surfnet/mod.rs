@@ -431,11 +431,11 @@ impl GetTransactionResult {
     pub fn found_transaction(
         signature: Signature,
         tx: EncodedConfirmedTransactionWithStatusMeta,
-        latest_absolute_slot: u64,
-        finalization_slot_threshold: u64,
+        blocks_after: u64,
+        finalized_slot: Slot,
     ) -> Self {
-        let is_finalized = latest_absolute_slot >= tx.slot + finalization_slot_threshold;
-        let is_confirmed = latest_absolute_slot >= tx.slot + 1;
+        let is_finalized = tx.slot <= finalized_slot;
+        let is_confirmed = blocks_after >= 1;
         let (confirmation_status, confirmations) = if is_finalized {
             (
                 Some(solana_transaction_status::TransactionConfirmationStatus::Finalized),
@@ -444,12 +444,12 @@ impl GetTransactionResult {
         } else if is_confirmed {
             (
                 Some(solana_transaction_status::TransactionConfirmationStatus::Confirmed),
-                Some((latest_absolute_slot - tx.slot) as usize),
+                Some(blocks_after as usize),
             )
         } else {
             (
                 Some(solana_transaction_status::TransactionConfirmationStatus::Processed),
-                Some((latest_absolute_slot - tx.slot) as usize),
+                Some(blocks_after as usize),
             )
         };
         let status = TransactionStatus {

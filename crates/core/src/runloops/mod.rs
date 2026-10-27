@@ -542,17 +542,8 @@ pub async fn start_block_production_runloop(
                             ));
                         }
 
-                        let applied = svm_locker.with_svm_writer(|svm_writer| {
-                            svm_writer.apply_local_clock(&clock)?;
-                            svm_writer.updated_at = clock.unix_timestamp as u64 * 1_000;
-                            svm_writer.set_latest_absolute_slot(clock.slot);
-                            svm_writer.simnet_events_tx.system_clock_updated(clock);
-                            Ok::<_, SurfpoolError>(())
-                        });
-                        if let Err(e) = applied {
-                            svm_locker
-                                .simnet_events_tx()
-                                .error(format!("Failed to apply the clock: {e}"));
+                        if let Err(e) = svm_locker.with_svm_writer(|svm_writer| svm_writer.apply_time_travel(clock)) {
+                            svm_locker.simnet_events_tx().error(format!("Failed to time travel: {e}"));
                         }
                     }
                     SimnetCommand::UpdateInternalClockWithConfirmation(_, clock, response_tx) => {
@@ -563,22 +554,12 @@ pub async fn start_block_production_runloop(
                             ));
                         }
 
-                        let applied = svm_locker.with_svm_writer(|svm_writer| {
-                            svm_writer.apply_local_clock(&clock)?;
-                            svm_writer.updated_at = clock.unix_timestamp as u64 * 1_000;
-                            svm_writer.set_latest_absolute_slot(clock.slot);
-                            svm_writer.simnet_events_tx.system_clock_updated(clock);
-                            Ok::<_, SurfpoolError>(svm_writer.latest_epoch_info.clone())
-                        });
+                        let epoch_info = svm_locker
+                            .with_svm_writer(|svm_writer| svm_writer.apply_time_travel(clock))
+                            .map_err(|e| e.to_string());
 
-                        // Send confirmation back (none when the clock could not be applied)
-                        match applied {
-                            Ok(epoch_info) => {
-                                let _ = response_tx.send(epoch_info);
-                            }
-                            Err(e) => svm_locker
-                                .simnet_events_tx()
-                                .error(format!("Failed to apply the clock: {e}")),
+                        if let Err(error) = response_tx.send(epoch_info) {
+                            svm_locker.simnet_events_tx().error(format!("Clock confirmation receiver closed: {error}"));
                         }
                     }
                     SimnetCommand::UpdateBlockProductionMode(update) => {
