@@ -20,7 +20,9 @@ use solana_client::{
 };
 use solana_pubkey::Pubkey;
 
-use super::{SurfnetSvmLocker, SurfpoolContextualizedResult, is_supported_token_program};
+use super::{
+    SurfnetSvmLocker, SurfpoolContextualizedResult, SvmAccessContext, is_supported_token_program,
+};
 use crate::{
     error::{SurfpoolError, SurfpoolResult},
     surfnet::{backend::ArchiveReader, svm::spl_token_additional_data},
@@ -63,16 +65,15 @@ impl SurfnetSvmLocker {
     /// Each mint's UI-amount inputs from its current image at the fork's clock, as Agave
     /// derives them; nothing is registered in this fork's indexes.
     fn historical_mint_data(
-        &self,
         reader: &ArchiveReader,
         mints: impl IntoIterator<Item = Pubkey>,
+        now: i64,
     ) -> SurfpoolResult<BTreeMap<Pubkey, Option<SplTokenAdditionalDataV2>>> {
         let mints: Vec<Pubkey> = mints
             .into_iter()
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
-        let now = self.with_svm_reader(|svm| svm.inner.clock().unix_timestamp);
         Ok(mints
             .iter()
             .zip(reader.accounts(&mints)?)
@@ -93,43 +94,47 @@ impl SurfnetSvmLocker {
         filter: &TokenAccountsFilter,
         config: &RpcAccountInfoConfig,
     ) -> SurfpoolContextualizedResult<Vec<RpcKeyedAccount>> {
-        let (mint, program_id) = match filter {
-            TokenAccountsFilter::Mint(mint) => (Some(mint.to_string()), None),
-            TokenAccountsFilter::ProgramId(program_id) => (None, Some(program_id.to_string())),
-        };
-        let listed = reader.token_accounts_by_owner(&owner, mint, program_id)?;
-        let mut candidates = pubkeys(&listed["accounts"], "token account list")?;
-        candidates.extend(
-            self.with_svm_reader(|svm| svm.get_parsed_token_accounts_by_owner(&owner))
-                .into_iter()
-                .map(|(pubkey, _)| pubkey),
-        );
-        if candidates.len() > 100 {
-            return Err(SurfpoolError::historical_unavailable(
-                "getTokenAccountsByOwner",
-                "at most 100 candidate accounts can be acquired per query",
-            ));
-        }
-        let candidates: Vec<Pubkey> = candidates.into_iter().collect();
-        let mut found = Vec::new();
-        for (pubkey, image) in candidates.iter().zip(reader.accounts(&candidates)?) {
-            let Some((account, token)) = image.and_then(|a| token_account(&a).map(|t| (a, t)))
-            else {
-                continue;
+        self.with_svm_reader(|svm| {
+            let (mint, program_id) = match filter {
+                TokenAccountsFilter::Mint(mint) => (Some(mint.to_string()), None),
+                TokenAccountsFilter::ProgramId(program_id) => (None, Some(program_id.to_string())),
             };
-            let matches = token.owner() == owner
-                && match filter {
-                    TokenAccountsFilter::Mint(mint) => token.mint() == *mint,
-                    TokenAccountsFilter::ProgramId(program_id) => account.owner == *program_id,
-                };
-            if matches {
-                found.push((*pubkey, account, token.mint()));
+            let listed = reader.token_accounts_by_owner(&owner, mint, program_id)?;
+            let mut candidates = pubkeys(&listed["accounts"], "token account list")?;
+            candidates.extend(
+                svm.get_parsed_token_accounts_by_owner(&owner)
+                    .into_iter()
+                    .map(|(pubkey, _)| pubkey),
+            );
+            if candidates.len() > 100 {
+                return Err(SurfpoolError::historical_unavailable(
+                    "getTokenAccountsByOwner",
+                    "at most 100 candidate accounts can be acquired per query",
+                ));
             }
-        }
-        let mints = self.historical_mint_data(reader, found.iter().map(|(_, _, mint)| *mint))?;
-        let encoding = config.encoding.unwrap_or(UiAccountEncoding::Base64);
-        let encoded =
-            self.with_svm_reader(|svm| {
+            let candidates: Vec<Pubkey> = candidates.into_iter().collect();
+            let mut found = Vec::new();
+            for (pubkey, image) in candidates.iter().zip(reader.accounts(&candidates)?) {
+                let Some((account, token)) = image.and_then(|a| token_account(&a).map(|t| (a, t)))
+                else {
+                    continue;
+                };
+                let matches = token.owner() == owner
+                    && match filter {
+                        TokenAccountsFilter::Mint(mint) => token.mint() == *mint,
+                        TokenAccountsFilter::ProgramId(program_id) => account.owner == *program_id,
+                    };
+                if matches {
+                    found.push((*pubkey, account, token.mint()));
+                }
+            }
+            let mints = Self::historical_mint_data(
+                reader,
+                found.iter().map(|(_, _, mint)| *mint),
+                svm.inner.clock().unix_timestamp,
+            )?;
+            let encoding = config.encoding.unwrap_or(UiAccountEncoding::Base64);
+            let encoded =
                 found
                     .iter()
                     .map(|(pubkey, account, mint)| RpcKeyedAccount {
@@ -146,11 +151,14 @@ impl SurfnetSvmLocker {
                             config.data_slice,
                         ),
                     })
-                    .collect::<Vec<_>>()
-            });
-        Ok(self
-            .with_contextualized_svm_reader(|_| ())
-            .with_new_value(encoded))
+                    .collect::<Vec<_>>();
+            Ok(SvmAccessContext::new(
+                svm.get_latest_absolute_slot(),
+                svm.latest_epoch_info(),
+                svm.latest_blockhash(),
+                encoded,
+            ))
+        })
     }
 
     /// `getTokenLargestAccounts` on a historical fork: SVM Replay's ranking at the parent slot,
@@ -161,8 +169,8 @@ impl SurfnetSvmLocker {
         reader: &ArchiveReader,
         mint: &Pubkey,
     ) -> SurfpoolContextualizedResult<Vec<RpcTokenAccountBalance>> {
-        let local: BTreeSet<Pubkey> = self
-            .with_svm_reader(|svm| svm.get_token_accounts_by_mint(mint))
+        self.with_svm_reader(|svm| {
+        let local: BTreeSet<Pubkey> = svm.get_token_accounts_by_mint(mint)
             .into_iter()
             .map(|(pubkey, _)| pubkey)
             .collect();
@@ -251,8 +259,7 @@ impl SurfnetSvmLocker {
             };
             if proven {
                 ranking.truncate(LARGEST);
-                let data = self
-                    .historical_mint_data(reader, [*mint])?
+                let data = Self::historical_mint_data(reader, [*mint], svm.inner.clock().unix_timestamp)?
                     .remove(mint)
                     .flatten()
                     .unwrap_or_default();
@@ -263,9 +270,7 @@ impl SurfnetSvmLocker {
                         amount: token_amount_to_ui_amount_v3(amount, &data),
                     })
                     .collect();
-                return Ok(self
-                    .with_contextualized_svm_reader(|_| ())
-                    .with_new_value(largest));
+                return Ok(SvmAccessContext::new(svm.get_latest_absolute_slot(), svm.latest_epoch_info(), svm.latest_blockhash(), largest));
             }
             if complete {
                 break;
@@ -275,5 +280,6 @@ impl SurfnetSvmLocker {
             "getTokenLargestAccounts",
             reason,
         ))
+        })
     }
 }

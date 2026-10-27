@@ -1622,7 +1622,7 @@ impl SurfnetSvm {
         }
 
         // Capture pre-airdrop balances for the airdrop account, recipient, and system program.
-        self.inner.prepare_airdrop(pubkey, lamports)?;
+        let prepared_transaction = self.inner.prepare_airdrop(pubkey, lamports)?;
         let airdrop_pubkey = self.inner.airdrop_pubkey()?;
 
         let airdrop_account_before = self
@@ -1650,17 +1650,20 @@ impl SurfnetSvm {
                 .get_account(&system_program::id())?
                 .unwrap_or_else(|| Account::default());
 
-            // Construct a synthetic transaction that mirrors the underlying airdrop.
-            let tx = VersionedTransaction {
-                signatures: vec![tx_result.signature],
-                message: VersionedMessage::Legacy(Message::new(
-                    &[system_instruction::transfer(
-                        &airdrop_pubkey,
-                        pubkey,
-                        lamports,
-                    )],
-                    Some(&airdrop_pubkey),
-                )),
+            // Store the signed historical transfer exactly; normal airdrops retain their existing representation.
+            let tx = match prepared_transaction {
+                Some(tx) => tx,
+                None => VersionedTransaction {
+                    signatures: vec![tx_result.signature],
+                    message: VersionedMessage::Legacy(Message::new(
+                        &[system_instruction::transfer(
+                            &airdrop_pubkey,
+                            pubkey,
+                            lamports,
+                        )],
+                        Some(&airdrop_pubkey),
+                    )),
+                },
             };
 
             let transaction_with_status_meta = TransactionWithStatusMeta {

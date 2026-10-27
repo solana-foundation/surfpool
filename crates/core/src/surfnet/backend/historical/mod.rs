@@ -348,7 +348,11 @@ impl HistoricalFork {
 
     /// A fresh faucet signs each airdrop, including repeated requests in a frozen slot.
     /// Fund exactly the transfer plus the engine's fee: no unused faucet balance remains.
-    pub(crate) fn prepare_airdrop(&mut self, pubkey: &Pubkey, lamports: u64) -> SurfpoolResult<()> {
+    pub(crate) fn prepare_airdrop(
+        &mut self,
+        pubkey: &Pubkey,
+        lamports: u64,
+    ) -> SurfpoolResult<VersionedTransaction> {
         self.faucet = None;
         let faucet = Arc::new(solana_keypair::Keypair::new());
         let (blockhash, _) = self.vm.latest_blockhash()?;
@@ -380,8 +384,8 @@ impl HistoricalFork {
             SurfpoolError::invalid_params("airdrop amount plus fee overflows lamports")
         })?;
         self.vm.set_balance(&faucet.pubkey(), balance)?;
-        self.faucet = Some((faucet, tx));
-        Ok(())
+        self.faucet = Some((faucet, tx.clone()));
+        Ok(tx)
     }
 
     /// Executes the prepared transfer with normal signature, lifetime and duplicate checks.
@@ -714,10 +718,11 @@ mod tests {
                 .map(|_| Pubkey::new_unique().to_string())
                 .collect();
             let script = r#"
-import json, sys
+import json, os, sys, time
 keys = json.loads(sys.argv[1])
 log = sys.argv[2]
 installs = 0
+blocked = False
 print(json.dumps({'schema':'svm-historical-backend/v1','kind':'ready','pins':{}}), flush=True)
 for line in sys.stdin:
     req = json.loads(line)
@@ -734,6 +739,14 @@ for line in sys.stdin:
     elif isinstance(op, dict) and 'peek' in op:
         result = [{'loaded':False} for _ in op['peek']['pubkeys']]
     elif isinstance(op, dict) and op.get('command', {}).get('method') == 'accounts':
+        if len(keys) == 2 and not blocked:
+            blocked = True
+            open(os.path.join(os.path.dirname(log), 'read-started'), 'x').close()
+            release = os.path.join(os.path.dirname(log), 'release-read')
+            deadline = time.monotonic() + 5
+            while not os.path.exists(release):
+                if time.monotonic() > deadline: raise TimeoutError('test read was not released')
+                time.sleep(0.005)
         result = [None for _ in op['command']['params']['pubkeys']]
     elif isinstance(op, dict) and op.get('command', {}).get('method') == 'latestBlockhash':
         result = {'blockhash':'11111111111111111111111111111111', 'lastValidBlockHeight':150}
@@ -920,6 +933,78 @@ for line in sys.stdin:
                     .count(),
                 2,
                 "retry a corrected chunk without reuploading the rest"
+            );
+        }
+
+        #[test]
+        fn review_historical_wallet_queries_keep_one_read_state() {
+            use std::{
+                sync::mpsc,
+                time::{Duration, Instant},
+            };
+
+            use solana_client::{
+                rpc_config::RpcAccountInfoConfig, rpc_request::TokenAccountsFilter,
+            };
+
+            use crate::{rpc::full::SurfpoolFullRpc, tests::helpers::TestSetup};
+            let mut outcomes = Vec::new();
+            for largest in [false, true] {
+                let setup = TestSetup::new(SurfpoolFullRpc);
+                let (fork, dir) = ipc_fixture(2);
+                let locker = setup.context.svm_locker.clone();
+                locker.with_svm_writer(|svm| {
+                    svm.inner = crate::surfnet::backend::Backend::historical(fork)
+                });
+                let original = locker.get_latest_absolute_slot();
+                let reader = locker.archive_reader().unwrap();
+                let reading = locker.clone();
+                let query = std::thread::spawn(move || {
+                    let owner = Pubkey::new_unique();
+                    if largest {
+                        reading
+                            .historical_token_largest_accounts(&reader, &owner)
+                            .map(|result| (result.slot, result.inner.len()))
+                    } else {
+                        reading
+                            .historical_token_accounts_by_owner(
+                                &reader,
+                                owner,
+                                &TokenAccountsFilter::ProgramId(spl_token_interface::ID),
+                                &RpcAccountInfoConfig::default(),
+                            )
+                            .map(|result| (result.slot, result.inner.len()))
+                    }
+                });
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while !dir.path().join("read-started").exists() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                let started = dir.path().join("read-started").exists();
+                let (attempted_tx, attempted_rx) = mpsc::channel();
+                let (entered_tx, entered_rx) = mpsc::channel();
+                let writer = std::thread::spawn(move || {
+                    attempted_tx.send(()).unwrap();
+                    locker.with_svm_writer(|svm| {
+                        svm.set_latest_absolute_slot(original + 1);
+                        entered_tx.send(()).unwrap();
+                    });
+                });
+                attempted_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                let blocked = matches!(
+                    entered_rx.recv_timeout(Duration::from_millis(200)),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                );
+                std::fs::write(dir.path().join("release-read"), b"release").unwrap();
+                let result = query.join().unwrap().unwrap();
+                writer.join().unwrap();
+                outcomes.push((largest, started, blocked, result.0 == original));
+            }
+            assert!(
+                outcomes
+                    .iter()
+                    .all(|(_, started, blocked, same_slot)| *started && *blocked && *same_slot),
+                "{outcomes:?}"
             );
         }
 

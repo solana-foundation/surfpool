@@ -16,6 +16,18 @@ async fn review_repeated_airdrops_and_absolute_time_travel() {
     let second = client.request_airdrop(&recipient, 1_000_000);
     let balance = client.get_balance(&recipient);
     let frozen = client.get_slot();
+    let records = [&first, &second].map(|result| {
+        result.as_ref().ok().map(|signature| {
+            client.get_transaction_with_config(
+                signature,
+                solana_client::rpc_config::RpcTransactionConfig {
+                    encoding: Some(serde_json::from_value(serde_json::json!("base64")).unwrap()),
+                    max_supported_transaction_version: Some(1),
+                    ..Default::default()
+                },
+            )
+        })
+    });
     let mut travels = Vec::new();
     for _ in 0..8 {
         let target = client.get_slot().unwrap() + 1;
@@ -43,6 +55,14 @@ async fn review_repeated_airdrops_and_absolute_time_travel() {
         });
         travels.push((target, client.get_slot().unwrap(), results));
     }
+    let block = client.get_block_with_config(
+        slot,
+        solana_client::rpc_config::RpcBlockConfig {
+            encoding: Some(serde_json::from_value(serde_json::json!("base64")).unwrap()),
+            max_supported_transaction_version: Some(1),
+            ..Default::default()
+        },
+    );
     surfnet
         .stop()
         .expect("stop before checking results, including the unfixed implementation");
@@ -56,6 +76,38 @@ async fn review_repeated_airdrops_and_absolute_time_travel() {
     let first = first.expect("first airdrop");
     let second = second.expect("repeated identical airdrop");
     assert_ne!(first, second);
+    for record in records {
+        let tx = record
+            .unwrap()
+            .unwrap()
+            .transaction
+            .transaction
+            .decode()
+            .unwrap();
+        assert_eq!(
+            tx.verify_with_results(),
+            vec![true],
+            "returned airdrop bytes were not signed"
+        );
+    }
+    let block_transactions: Vec<_> = block
+        .unwrap()
+        .transactions
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.transaction.decode().unwrap())
+        .collect();
+    for signature in [first, second] {
+        let tx = block_transactions
+            .iter()
+            .find(|tx| tx.signatures.first() == Some(&signature))
+            .expect("confirmed block includes each airdrop");
+        assert_eq!(
+            tx.verify_with_results(),
+            vec![true],
+            "block airdrop bytes were not signed"
+        );
+    }
     assert_eq!(balance.unwrap(), 3_000_000);
     assert_eq!(
         frozen.unwrap(),

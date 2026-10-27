@@ -392,11 +392,15 @@ impl Backend {
         }
     }
 
-    /// Readies the airdrop account before pre-balances are captured.
-    pub fn prepare_airdrop(&mut self, pubkey: &Pubkey, lamports: u64) -> SurfpoolResult<()> {
+    /// Readies the faucet and returns the signed historical transfer; local airdrops keep their existing representation.
+    pub fn prepare_airdrop(
+        &mut self,
+        pubkey: &Pubkey,
+        lamports: u64,
+    ) -> SurfpoolResult<Option<VersionedTransaction>> {
         match &mut self.concrete {
-            Concrete::Local(_) => Ok(()),
-            Concrete::Historical(fork) => fork.prepare_airdrop(pubkey, lamports),
+            Concrete::Local(_) => Ok(None),
+            Concrete::Historical(fork) => fork.prepare_airdrop(pubkey, lamports).map(Some),
         }
     }
 
