@@ -6,7 +6,7 @@ use super::*;
 #[command(next_help_heading = "Historical state")]
 pub struct Options {
     /// Fork after a transaction signature or at the initialized next produced slot after a slot number.
-    #[arg(long, value_name = "SIGNATURE|SLOT", conflicts_with_all = ["rpc_url", "network", "offline", "block_production_mode", "features", "disable_features", "all_features", "skip_signature_verification", "skip_blockhash_check"])]
+    #[arg(long, value_name = "SIGNATURE|SLOT", conflicts_with_all = ["rpc_url", "network", "offline", "genesis_hash", "block_production_mode", "features", "disable_features", "all_features", "skip_signature_verification", "skip_blockhash_check"])]
     pub after: Option<String>,
     /// Historical provider adapter name, not a key (currently alchemy).
     #[arg(long, value_name = "NAME", requires = "after")]

@@ -3,6 +3,61 @@ use ratatui::backend::TestBackend;
 use super::*;
 
 #[test]
+fn review_aborted_startup_is_a_terminal_error() {
+    const CHILD: &str = "SURFPOOL_ABORTED_STARTUP_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let name = concat!(
+            module_path!(),
+            "::review_aborted_startup_is_a_terminal_error"
+        );
+        let name = name.split_once("::").unwrap().1;
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture"])
+            .env(CHILD, "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("Aborted left the TUI running");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        return;
+    }
+    let mut app = paused_app(true);
+    let (events, receiver) = unbounded();
+    app.simnet_events_rx = receiver;
+    events
+        .send(SimnetEvent::Aborted("historical preparation failed".into()))
+        .unwrap();
+    let exit = Arc::new(AtomicBool::new(false));
+    let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+    let result = run_app(&mut terminal, app, exit);
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("historical preparation failed")
+    );
+}
+
+#[test]
 fn a_historical_surfnet_names_what_it_forks_after_instead_of_offline_mode() {
     let (_, events) = unbounded();
     let (commands, _) = unbounded();

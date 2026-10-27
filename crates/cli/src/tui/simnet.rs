@@ -454,11 +454,7 @@ pub fn start_app(
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
-    if let Err(err) = res {
-        println!("{err:?}");
-    }
-
-    Ok(())
+    res.map_err(Into::into)
 }
 
 fn run_app<B: Backend>(
@@ -599,8 +595,8 @@ fn run_app<B: Backend>(
                                     app.successful_transactions += 1;
                                 }
                             }
-                            SimnetEvent::Aborted(_error) => {
-                                break;
+                            SimnetEvent::Aborted(error) => {
+                                return Err(io::Error::other(error.clone()));
                             }
                             SimnetEvent::CoreStarted(_) => {}
                             SimnetEvent::Connected(_) => {}

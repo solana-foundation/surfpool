@@ -951,6 +951,10 @@ pub struct SimnetConfig {
     /// Snapshot accounts to preload at startup.
     /// Keys are pubkey strings, values can be None to fetch from remote RPC.
     pub snapshot: BTreeMap<String, Option<AccountSnapshot>>,
+    /// Hash reported by `getGenesisHash`, overriding the datasource's (or, offline,
+    /// the local genesis config's), so clients can identify the surfnet as a cluster.
+    #[serde(default)]
+    pub genesis_hash: Option<solana_hash::Hash>,
     /// Keys created for this session (such as the TUI's burner), funded with
     /// `airdrop_token_amount`: on a historical fork a fresh key has no archived image, so it is
     /// defined as a new local account; otherwise it is airdropped.
@@ -1124,6 +1128,7 @@ impl Default for SimnetConfig {
             surfnet_id: "default".to_string(),
             snapshot: BTreeMap::new(),
             session_addresses: vec![],
+            genesis_hash: None,
         }
     }
 }

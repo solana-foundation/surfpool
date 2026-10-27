@@ -4356,43 +4356,47 @@ impl SurfnetSvmLocker {
             // unchanged; a timestamp or epoch maps to a slot with Surfpool's usual slot time.
             // A target in a later epoch is an explicit synthetic test warp: the Clock enters
             // that epoch while runtime, features, stakes and rewards stay at the boundary.
-            let current = self.get_latest_absolute_slot();
-            let (target, unix_timestamp) = match config {
-                TimeTravelConfig::AbsoluteSlot(slot) => (slot, None),
-                _ => {
-                    let (epoch_info, epoch_schedule, slot_time, updated_at) =
-                        self.with_svm_reader(|svm_reader| {
-                            (
-                                svm_reader.latest_epoch_info.clone(),
-                                svm_reader.inner.epoch_schedule(),
-                                svm_reader.slot_time,
-                                svm_reader.updated_at,
-                            )
-                        });
-                    let clock = calculate_time_travel_clock(
-                        &config,
-                        updated_at,
-                        slot_time,
-                        &epoch_info,
-                        &epoch_schedule,
-                    )
-                    .map_err(|e| SurfpoolError::internal(e.to_string()))?;
-                    (clock.slot, Some(clock.unix_timestamp.max(0) as u64 * 1_000))
+            let (epoch_info, synthetic_epoch) = self.with_svm_writer(|svm_writer| {
+                let current = svm_writer.get_latest_absolute_slot();
+                let (target, unix_timestamp) = match config {
+                    TimeTravelConfig::AbsoluteSlot(slot) => (slot, None),
+                    _ => {
+                        let (epoch_info, epoch_schedule, slot_time, updated_at) = (
+                            svm_writer.latest_epoch_info.clone(),
+                            svm_writer.inner.epoch_schedule(),
+                            svm_writer.slot_time,
+                            svm_writer.updated_at,
+                        );
+                        let clock = calculate_time_travel_clock(
+                            &config,
+                            updated_at,
+                            slot_time,
+                            &epoch_info,
+                            &epoch_schedule,
+                        )
+                        .map_err(|e| SurfpoolError::internal(e.to_string()))?;
+                        (clock.slot, Some(clock.unix_timestamp.max(0) as u64 * 1_000))
+                    }
+                };
+                if target <= current {
+                    return Err(SurfpoolError::historical(
+                        "UNSUPPORTED_IN_HISTORICAL_MODE",
+                        &format!(
+                            "a historical fork only advances: slot {target} is not after {current}"
+                        ),
+                        None,
+                    ));
                 }
-            };
-            if target <= current {
-                return Err(SurfpoolError::historical(
-                    "UNSUPPORTED_IN_HISTORICAL_MODE",
-                    &format!(
-                        "a historical fork only advances: slot {target} is not after {current}"
-                    ),
-                    None,
-                ));
-            }
-            let schedule = self.with_svm_reader(|svm_reader| svm_reader.inner.epoch_schedule());
-            let synthetic_epoch = schedule.get_epoch(target) != schedule.get_epoch(current);
-            let epoch_info =
-                self.advance_historical(target - current, unix_timestamp, synthetic_epoch)?;
+                let schedule = svm_writer.inner.epoch_schedule();
+                let synthetic_epoch = schedule.get_epoch(target) != schedule.get_epoch(current);
+                svm_writer.bump_state_revision();
+                let epoch_info = svm_writer.advance_historical(
+                    target - current,
+                    unix_timestamp,
+                    synthetic_epoch,
+                )?;
+                Ok::<_, SurfpoolError>((epoch_info, synthetic_epoch))
+            })?;
             if synthetic_epoch {
                 self.simnet_events_tx().warn(format!(
                     "Synthetic epoch warp to slot {} (epoch {}): no epoch rewards, stake or feature changes were applied",

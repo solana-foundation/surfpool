@@ -406,7 +406,7 @@ async fn start_service(
     let include_debug_logs = cmd.observability.log_level.to_lowercase().eq("debug");
 
     // Start frontend - kept on main thread
-    if cmd.runtime.daemon || cmd.runtime.no_tui {
+    let frontend_result = if cmd.runtime.daemon || cmd.runtime.no_tui {
         log_events(
             simnet_events_rx,
             subgraph_events_rx,
@@ -414,7 +414,7 @@ async fn start_service(
             runbook_progress_rx,
             simnet_commands_tx,
             runloop_terminator,
-        )?;
+        )
     } else {
         tui::simnet::start_app(
             simnet_events_rx,
@@ -426,13 +426,13 @@ async fn start_service(
             initial_transactions,
             runloop_terminator,
         )
-        .map_err(|e| format!("{}", e))?;
-    }
+        .map_err(|e| format!("{}", e))
+    };
     if let Some(explorer_handle) = explorer_handle {
-        let _ = explorer_handle.stop(true).await;
+        explorer_handle.stop(true).await;
     }
 
-    Ok(())
+    frontend_result
 }
 
 fn log_events(

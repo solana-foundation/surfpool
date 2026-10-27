@@ -189,6 +189,14 @@ pub async fn start_local_surfnet_runloop(
     // A historical surfnet has no datasource: SVM Replay supplies every account, pinned to
     // the boundary, and nothing is read from a current chain.
     let historical = svm_locker.is_historical();
+    if historical && simnet.genesis_hash.is_some() {
+        return Err(SurfpoolError::historical(
+            "UNSUPPORTED_IN_HISTORICAL_MODE",
+            "the historical genesis hash is pinned by SVM Replay and cannot be overridden",
+            None,
+        )
+        .into());
+    }
     let remote_rpc_client = match simnet.offline_mode || historical {
         true => None,
         false => Some(SurfnetRemoteClient::try_new(
@@ -215,6 +223,9 @@ pub async fn start_local_surfnet_runloop(
     };
 
     svm_locker.initialize(&remote_rpc_client).await?;
+    if let Some(genesis_hash) = simnet.genesis_hash {
+        svm_locker.with_svm_writer(|svm| svm.cached_genesis_hash = Some(genesis_hash));
+    }
 
     if let Some(remote_client) = &remote_rpc_client {
         svm_locker

@@ -392,11 +392,11 @@ impl Backend {
         }
     }
 
-    /// Readies the airdrop account: a historical fork funds its local faucet once.
-    pub fn prepare_airdrop(&mut self) -> SurfpoolResult<()> {
+    /// Readies the airdrop account before pre-balances are captured.
+    pub fn prepare_airdrop(&mut self, pubkey: &Pubkey, lamports: u64) -> SurfpoolResult<()> {
         match &mut self.concrete {
             Concrete::Local(_) => Ok(()),
-            Concrete::Historical(fork) => fork.prepare_airdrop(),
+            Concrete::Historical(fork) => fork.prepare_airdrop(pubkey, lamports),
         }
     }
 

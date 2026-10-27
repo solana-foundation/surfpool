@@ -16,6 +16,7 @@ use hiro_system_kit::{self, Logger};
 // The only caller is the daemon fork, which exists on Linux alone.
 #[cfg(target_os = "linux")]
 use log::info;
+use solana_hash::Hash;
 use solana_keypair::Keypair;
 use solana_pubkey::Pubkey;
 use solana_signer::{EncodableKey, Signer};
@@ -287,6 +288,13 @@ pub struct StartNetworkOptions {
         long_help = "Run without a remote RPC datasource. Use this to simulate an offline environment.\n\nExample: surfpool start --offline"
     )]
     pub offline: bool,
+    /// Report this hash from getGenesisHash.
+    #[arg(
+        long = "genesis-hash",
+        value_name = "HASH",
+        long_help = "Report this hash from getGenesisHash instead of the datasource's, so clients identify the surfnet as that cluster. Offline, the default is a hash that changes on every start.\n\nExample: surfpool start --offline --genesis-hash 5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d"
+    )]
+    pub genesis_hash: Option<Hash>,
 }
 
 #[derive(Args, PartialEq, Clone, Debug)]
@@ -702,6 +710,7 @@ impl StartSimnet {
             surfnet_id: self.accounts.surfnet_id.clone(),
             snapshot,
             session_addresses: vec![],
+            genesis_hash: self.network.genesis_hash,
         }
     }
 
@@ -1341,6 +1350,14 @@ mod tests {
                 "start",
                 "--after",
                 "slot:123",
+                "--genesis-hash",
+                "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d",
+            ],
+            vec![
+                "surfpool",
+                "start",
+                "--after",
+                "slot:123",
                 "--block-production-mode",
                 "clock",
             ],
@@ -1449,6 +1466,23 @@ mod tests {
         .expect_err("rpc-url and network should conflict");
 
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn start_parser_passes_genesis_hash_to_the_simnet() {
+        let mainnet = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d";
+        let cmd = parse_start(&["surfpool", "start", "--offline", "--genesis-hash", mainnet]);
+
+        assert_eq!(
+            cmd.simnet_config(vec![], BTreeMap::new()).genesis_hash,
+            Some(mainnet.parse().unwrap())
+        );
+        assert_eq!(
+            parse_start(&["surfpool", "start"])
+                .simnet_config(vec![], BTreeMap::new())
+                .genesis_hash,
+            None
+        );
     }
 
     #[test]

@@ -1564,7 +1564,7 @@ impl SurfnetSvm {
         }
 
         // Capture pre-airdrop balances for the airdrop account, recipient, and system program.
-        self.inner.prepare_airdrop()?;
+        self.inner.prepare_airdrop(pubkey, lamports)?;
         let airdrop_pubkey = self.inner.airdrop_pubkey()?;
 
         let airdrop_account_before = self
@@ -1610,7 +1610,7 @@ impl SurfnetSvm {
                 transaction: tx.clone(),
                 meta: TransactionStatusMeta {
                     status: Ok(()),
-                    fee: 5000,
+                    fee: tx_result.fee,
                     pre_balances: vec![
                         airdrop_account_before.lamports,
                         recipient_account_before.lamports,

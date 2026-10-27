@@ -6734,6 +6734,74 @@ fn start_surfnet(
     ))
 }
 
+/// Clients read `getGenesisHash` as the cluster's identity. A fork reports its
+/// datasource's hash and an offline surfnet its own genesis config's, unless
+/// `genesis_hash` names the cluster, which wins in both modes.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_genesis_hash_reports_the_configured_cluster() {
+    async fn genesis_hash_of(remote_rpc_url: Option<String>, genesis_hash: Option<Hash>) -> Hash {
+        let bind_port = get_free_port().unwrap();
+        let offline_mode = remote_rpc_url.is_none();
+        let config = SurfpoolConfig {
+            simnets: vec![SimnetConfig {
+                block_production_mode: BlockProductionMode::Manual,
+                offline_mode,
+                remote_rpc_url,
+                genesis_hash,
+                ..SimnetConfig::default()
+            }],
+            rpc: RpcConfig {
+                bind_host: "127.0.0.1".to_string(),
+                bind_port,
+                ws_port: get_free_port().unwrap(),
+                ..Default::default()
+            },
+            ..SurfpoolConfig::default()
+        };
+        let (svm, simnet_events_rx, geyser_events_rx) = TestType::no_db().initialize_svm();
+        let _runloop = spawn_runloop(
+            SurfnetSvmLocker::new(svm),
+            config,
+            unbounded(),
+            geyser_events_rx,
+        )
+        .expect("the surfnet should start");
+        let ready = if offline_mode {
+            wait_for_ready(&simnet_events_rx)
+        } else {
+            wait_for_ready_and_connected(&simnet_events_rx)
+        };
+        ready.expect("the surfnet should be ready");
+
+        RpcClient::new(format!("http://127.0.0.1:{bind_port}"))
+            .get_genesis_hash()
+            .await
+            .expect("getGenesisHash should answer")
+    }
+
+    let mainnet = Hash::from_str("5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d").unwrap();
+    let (datasource_url, datasource, _datasource_runloop) =
+        start_surfnet(vec![], None, TestType::no_db()).expect("the datasource should start");
+    let datasource_hash = datasource.with_svm_reader(|svm| svm.genesis_config.hash());
+
+    assert_eq!(
+        RpcClient::new(datasource_url.clone())
+            .get_genesis_hash()
+            .await
+            .expect("getGenesisHash should answer"),
+        datasource_hash
+    );
+    assert_eq!(genesis_hash_of(None, Some(mainnet)).await, mainnet);
+    assert_eq!(
+        genesis_hash_of(Some(datasource_url.clone()), None).await,
+        datasource_hash
+    );
+    assert_eq!(
+        genesis_hash_of(Some(datasource_url), Some(mainnet)).await,
+        mainnet
+    );
+}
+
 #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
 #[test_case(TestType::in_memory(); "with in-memory sqlite db")]
 #[test_case(TestType::no_db(); "with no db")]

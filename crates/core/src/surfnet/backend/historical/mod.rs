@@ -31,10 +31,6 @@ use crate::{
     },
 };
 
-/// What the local faucet of a historical fork starts with: an explicit balance override,
-/// visible in the session state, never a historical account.
-const HISTORICAL_FAUCET_LAMPORTS: u64 = 1_000_000_000 * super::local::LAMPORTS_PER_SOL;
-
 /// The sysvars Surfpool reads itself on a historical fork, decoded from SVM Replay's accounts.
 /// Each must exist there; any other sysvar is read from SVM Replay on demand like every account.
 #[derive(Clone, Debug, PartialEq)]
@@ -85,7 +81,7 @@ pub struct HistoricalFork {
     vm: HistoricalVm,
     view: StateView,
     /// Funds historical airdrops through a real transfer, as LiteSVM's airdrop account does.
-    faucet: Option<Arc<solana_keypair::Keypair>>,
+    faucet: Option<(Arc<solana_keypair::Keypair>, VersionedTransaction)>,
     pins: Arc<Pins>,
 }
 
@@ -346,34 +342,17 @@ impl HistoricalFork {
     pub(crate) fn airdrop_pubkey(&self) -> SurfpoolResult<Pubkey> {
         self.faucet
             .as_ref()
-            .map(|faucet| faucet.pubkey())
+            .map(|(faucet, _)| faucet.pubkey())
             .ok_or_else(|| SurfpoolError::internal("historical faucet missing"))
     }
 
-    /// Funds the fork's local faucet once (an explicit balance override on the branch), so
-    /// the airdrop account exists before anyone reads it.
-    pub(crate) fn prepare_airdrop(&mut self) -> SurfpoolResult<()> {
+    /// A fresh faucet signs each airdrop, including repeated requests in a frozen slot.
+    /// Fund exactly the transfer plus the engine's fee: no unused faucet balance remains.
+    pub(crate) fn prepare_airdrop(&mut self, pubkey: &Pubkey, lamports: u64) -> SurfpoolResult<()> {
         if self.faucet.is_some() {
             return Ok(());
         }
         let faucet = Arc::new(solana_keypair::Keypair::new());
-        self.vm
-            .set_balance(&faucet.pubkey(), HISTORICAL_FAUCET_LAMPORTS)?;
-        self.faucet = Some(faucet);
-        Ok(())
-    }
-
-    /// The same real transfer LiteSVM's airdrop makes, executed by SVM Replay from the faucet.
-    pub(crate) fn airdrop(
-        &mut self,
-        pubkey: &Pubkey,
-        lamports: u64,
-    ) -> SurfpoolResult<TransactionResult> {
-        self.prepare_airdrop()?;
-        let faucet = self
-            .faucet
-            .clone()
-            .ok_or_else(|| SurfpoolError::internal("historical faucet missing"))?;
         let (blockhash, _) = self.vm.latest_blockhash()?;
         let message = solana_message::Message::new_with_blockhash(
             &[solana_system_interface::instruction::transfer(
@@ -389,6 +368,35 @@ impl HistoricalFork {
             &[faucet.as_ref()],
         )
         .map_err(|e| SurfpoolError::internal(format!("sign historical airdrop: {e}")))?;
+        let fee = self
+            .vm
+            .fee_for_message(&tx.message.serialize())?
+            .ok_or_else(|| {
+                SurfpoolError::historical(
+                    "BLOCKHASH_NOT_FOUND",
+                    "historical airdrop blockhash has no fee",
+                    None,
+                )
+            })?;
+        let balance = lamports.checked_add(fee).ok_or_else(|| {
+            SurfpoolError::invalid_params("airdrop amount plus fee overflows lamports")
+        })?;
+        self.vm.set_balance(&faucet.pubkey(), balance)?;
+        self.faucet = Some((faucet, tx));
+        Ok(())
+    }
+
+    /// Executes the prepared transfer with normal signature, lifetime and duplicate checks.
+    pub(crate) fn airdrop(
+        &mut self,
+        pubkey: &Pubkey,
+        lamports: u64,
+    ) -> SurfpoolResult<TransactionResult> {
+        self.prepare_airdrop(pubkey, lamports)?;
+        let (_, tx) = self
+            .faucet
+            .take()
+            .ok_or_else(|| SurfpoolError::internal("historical faucet missing"))?;
         self.vm.send(&tx)
     }
 
@@ -820,6 +828,44 @@ for line in sys.stdin:
                 ipc_requests(&dir)[0]["op"]["command"]["method"],
                 "send",
                 "instruction-prefix profiling still uses the disposable executor"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn review_historical_genesis_override_refused_before_runloop_start() {
+            use crate::{rpc::full::SurfpoolFullRpc, tests::helpers::TestSetup};
+            let setup = TestSetup::new(SurfpoolFullRpc);
+            let (fork, dir) = ipc_fixture(0);
+            setup.context.svm_locker.with_svm_writer(|svm| {
+                svm.inner = crate::surfnet::backend::Backend::historical(fork)
+            });
+            let (commands, receiver) = crossbeam_channel::unbounded();
+            commands
+                .send(surfpool_types::SimnetCommand::Terminate(None))
+                .unwrap();
+            let (_geyser, geyser_rx) = crossbeam_channel::unbounded();
+            let result = crate::runloops::start_local_surfnet_runloop(
+                setup.context.svm_locker,
+                surfpool_types::SurfpoolConfig {
+                    simnets: vec![surfpool_types::SimnetConfig {
+                        genesis_hash: Some(solana_hash::Hash::new_unique()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                commands,
+                receiver,
+                geyser_rx,
+            )
+            .await;
+            let error = result.expect_err("a historical genesis hash is source-pinned");
+            assert!(
+                error.to_string().contains("UNSUPPORTED_IN_HISTORICAL_MODE"),
+                "{error}"
+            );
+            assert!(
+                ipc_requests(&dir).is_empty(),
+                "invalid configuration must not reach the backend"
             );
         }
 

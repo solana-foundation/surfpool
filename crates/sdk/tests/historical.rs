@@ -12,6 +12,9 @@ use solana_transaction::Transaction;
 use surfpool_sdk::Surfnet;
 use surfpool_types::HistoricalSessionOptions;
 
+#[path = "historical/review.rs"]
+mod review;
+
 fn options() -> HistoricalSessionOptions {
     let var = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name} is required"));
     HistoricalSessionOptions {
