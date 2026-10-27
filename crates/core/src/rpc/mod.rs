@@ -325,7 +325,6 @@ impl Middleware<Option<RunloopContext>> for SurfpoolMiddleware {
         debug!("Processing request '{}'", method_name);
 
         if let Some(error) = self.disabled_cheatcode_error(&method_name) {
-            // The refusal answers this call, with its id and version, as a batch element does.
             let error = Response::Single(Output::from(
                 Err(error),
                 method_call.id.clone(),

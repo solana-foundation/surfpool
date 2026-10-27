@@ -13,7 +13,7 @@ use solana_slot_hashes::MAX_ENTRIES as MAX_SLOT_HASHES_ENTRIES;
 use solana_sysvar::last_restart_slot::LastRestartSlot;
 
 use super::{
-    BlockIdentifier, FINALIZATION_SLOT_THRESHOLD,
+    BlockIdentifier,
     backend::LocalBackend,
     svm::{MAX_RECENT_BLOCKHASHES_STANDARD, SurfnetSvm, synthetic_blockhash_for_slot},
 };
@@ -70,7 +70,7 @@ impl SurfnetSvm {
 
         // 2. Reconstruct SlotHashes - maps absolute slots to blockhashes.
         // The local ledger starts at genesis_slot, but finalized commitment is
-        // reported as current_slot - FINALIZATION_SLOT_THRESHOLD. During the
+        // reported using the active finalization depth. During the
         // initial warmup this points before genesis_slot, so seed those
         // synthetic slots into SlotHashes while preserving the local hash
         // mapping for genesis_slot and later.
@@ -78,7 +78,7 @@ impl SurfnetSvm {
             current_index.saturating_sub(MAX_SLOT_HASHES_ENTRIES as u64 - 1);
         let local_start_absolute_slot = slot_hash_start_index + self.genesis_slot;
         let finalized_start_absolute_slot =
-            current_absolute_slot.saturating_sub(FINALIZATION_SLOT_THRESHOLD);
+            current_absolute_slot.saturating_sub(self.finalization_slot_threshold());
         let earliest_retained_slot =
             current_absolute_slot.saturating_sub(MAX_SLOT_HASHES_ENTRIES as u64 - 1);
         let start_absolute_slot = local_start_absolute_slot

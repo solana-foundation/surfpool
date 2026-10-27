@@ -7,6 +7,7 @@ export const SURFNET_CHEATCODE_METHODS = [
   "surfnet_enableCheatcode",
   "surfnet_exportSnapshot",
   "surfnet_getActiveIdl",
+  "surfnet_getClockState",
   "surfnet_getConfidentialBalance",
   "surfnet_getLocalSignatures",
   "surfnet_getProfileResultsByTag",

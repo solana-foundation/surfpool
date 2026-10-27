@@ -23,7 +23,7 @@ export type SurfnetCheatcodesConfig = {
  * Methods that return their result bare instead of wrapped in the standard
  * Solana RPC `{ context, value }` envelope.
  */
-const BARE_RESULT_METHODS = new Set(['pauseClock', 'resumeClock', 'timeTravel']);
+const BARE_RESULT_METHODS = new Set(['pauseClock', 'resumeClock', 'timeTravel', 'getClockState']);
 
 /**
  * A minimal HTTP transport with big-integer-safe JSON handling in both

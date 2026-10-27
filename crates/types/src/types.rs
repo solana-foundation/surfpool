@@ -867,6 +867,8 @@ pub enum ClockCommand {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(export))]
 pub struct ClockState {
     pub paused: bool,
 }
@@ -2013,13 +2015,14 @@ pub enum CheatcodeFilter {
 /// `surfpool-core/src/rpc/surfnet_cheatcodes.rs` asserts it matches the
 /// methods actually registered by the `SurfnetCheatcodes` trait, so adding,
 /// removing, or renaming a cheatcode without updating this list fails CI.
-pub const SURFNET_CHEATCODE_METHODS: [&str; 28] = [
+pub const SURFNET_CHEATCODE_METHODS: [&str; 29] = [
     "surfnet_cloneProgramAccount",
     "surfnet_deriveConfidentialKeys",
     "surfnet_disableCheatcode",
     "surfnet_enableCheatcode",
     "surfnet_exportSnapshot",
     "surfnet_getActiveIdl",
+    "surfnet_getClockState",
     "surfnet_getConfidentialBalance",
     "surfnet_getLocalSignatures",
     "surfnet_getProfileResultsByTag",

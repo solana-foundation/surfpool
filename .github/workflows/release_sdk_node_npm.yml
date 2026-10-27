@@ -31,7 +31,7 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
-          node-version: 22.14.0
+          node-version: 24.22.1
           registry-url: https://registry.npmjs.org
 
       - name: Ensure npm 11
@@ -113,7 +113,7 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
-          node-version: 22.14.0
+          node-version: 24.22.1
           cache: npm
           cache-dependency-path: crates/sdk-node/package-lock.json
 
@@ -216,7 +216,7 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
-          node-version: 22.14.0
+          node-version: 24.22.1
           registry-url: https://registry.npmjs.org
           cache: npm
           cache-dependency-path: crates/sdk-node/package-lock.json

@@ -573,9 +573,15 @@ impl SurfnetRemoteClient {
         signature: Signature,
         config: RpcTransactionConfig,
         latest_absolute_slot: u64,
+        finalization_slot_threshold: u64,
     ) -> GetTransactionResult {
         match self
-            .try_get_transaction(signature, config, latest_absolute_slot)
+            .try_get_transaction(
+                signature,
+                config,
+                latest_absolute_slot,
+                finalization_slot_threshold,
+            )
             .await
         {
             Ok(result) => result,
@@ -591,6 +597,7 @@ impl SurfnetRemoteClient {
         signature: Signature,
         config: RpcTransactionConfig,
         latest_absolute_slot: u64,
+        finalization_slot_threshold: u64,
     ) -> SurfpoolResult<GetTransactionResult> {
         let transaction = self
             .client
@@ -607,9 +614,12 @@ impl SurfnetRemoteClient {
             })?;
 
         Ok(match transaction {
-            Some(tx) => {
-                GetTransactionResult::found_transaction(signature, tx, latest_absolute_slot)
-            }
+            Some(tx) => GetTransactionResult::found_transaction(
+                signature,
+                tx,
+                latest_absolute_slot,
+                finalization_slot_threshold,
+            ),
             None => GetTransactionResult::None(signature),
         })
     }
@@ -978,7 +988,7 @@ mod tests {
         let signature = Signature::new_unique();
 
         let error = match client
-            .try_get_transaction(signature, RpcTransactionConfig::default(), 0)
+            .try_get_transaction(signature, RpcTransactionConfig::default(), 0, 1)
             .await
         {
             Ok(_) => panic!("an HTTP failure should reach the caller"),
@@ -1736,6 +1746,7 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread")]
     async fn any_other_invalid_params_rejection_on_largest_accounts_is_still_an_error() {
         let client = SurfnetRemoteClient {
             client: RpcClient::new_sender(RejectsParams, RpcClientConfig::default()).into(),
@@ -1796,6 +1807,7 @@ mod tests {
         assert_eq!(accounts[0].amount.amount, "42");
     }
 
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_mint_unknown_to_the_datasource_has_no_remote_largest_accounts() {
         let client = SurfnetRemoteClient {
             client: RpcClient::new_sender(RejectsUnknownMint, RpcClientConfig::default()).into(),

@@ -8,7 +8,7 @@ use solana_signer::Signer as _;
 use spl_associated_token_account_interface::address::get_associated_token_address_with_program_id;
 use surfpool_types::{
     types::{AccountUpdate, TokenAccountUpdate},
-    verified_tokens::VERIFIED_TOKENS_BY_SYMBOL,
+    verified_tokens::{VERIFIED_TOKENS, VERIFIED_TOKENS_BY_SYMBOL},
 };
 
 const SOL_DECIMALS: u32 = 9;
@@ -187,10 +187,10 @@ pub async fn run(
         })
     } else if let Ok(mint_pubkey) = Pubkey::try_from(token_identifier.as_str()) {
         let mint_str = mint_pubkey.to_string();
-        let token_info = VERIFIED_TOKENS_BY_SYMBOL
+        let token_info = VERIFIED_TOKENS
             .iter()
-            .find(|(_, info)| info.address == mint_str)
-            .map(|(symbol, info)| (symbol.clone(), info.decimals as u32));
+            .find(|info| info.address == mint_str)
+            .map(|info| (info.symbol.clone(), info.decimals as u32));
         if let Some((symbol, decimals)) = token_info {
             Ok(TokenDetails {
                 is_sol: false,
@@ -361,5 +361,68 @@ pub async fn run(
         Err(_e) => SetTokenAccountsResponse::error(
             "RPC request failed (timeout or other network error)".to_string(),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        thread::{self, JoinHandle},
+    };
+
+    use super::*;
+
+    fn canned_rpc() -> (String, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind canned rpc");
+        let url = format!("http://{}", listener.local_addr().expect("local addr"));
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut request = [0u8; 16 * 1024];
+            assert_ne!(stream.read(&mut request).expect("read request"), 0);
+            let body = r#"{"jsonrpc":"2.0","result":null,"id":1}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .expect("write response");
+        });
+        (url, handle)
+    }
+
+    #[tokio::test]
+    async fn resolves_shared_symbol_by_mint() {
+        for mint in [
+            "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh",
+            "5XZw2LKTyrfvfiskJ78AMpackRjPcyCif1WhUsPDuVqQ",
+        ] {
+            let (url, server) = canned_rpc();
+            let response = run(
+                url,
+                SeededAccount::new(None),
+                Some(mint.to_string()),
+                Some(1),
+                None,
+                None,
+            )
+            .await;
+            server.join().expect("canned rpc thread");
+
+            let success = response
+                .success
+                .unwrap_or_else(|| panic!("{mint}: {:?}", response.error));
+            assert!(
+                matches!(
+                    success.as_slice(),
+                    [SetAccountSuccess::Token(AccountUpdated {
+                        token_amount: 100_000_000,
+                        ..
+                    })]
+                ),
+                "{mint}: {success:?}"
+            );
+        }
     }
 }

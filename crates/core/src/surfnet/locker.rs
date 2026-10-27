@@ -79,12 +79,8 @@ use crate::{
         utils::{convert_transaction_metadata_from_canonical, verify_pubkey},
     },
     storage::StorageResult,
-    surfnet::{
-        FINALIZATION_SLOT_THRESHOLD,
-        backend::{
-            FailedTransactionMetadata, SimulatedTransactionInfo, TransactionMetadata,
-            TransactionResult,
-        },
+    surfnet::backend::{
+        FailedTransactionMetadata, SimulatedTransactionInfo, TransactionMetadata, TransactionResult,
     },
     types::{
         GeyserAccountUpdate, OfflineAccountConfig, RemoteRpcResult, SurfnetTransactionStatus,
@@ -100,6 +96,7 @@ struct LocalTransactionLookup {
     result: GetTransactionResult,
     is_pending: bool,
     latest_absolute_slot: Slot,
+    finalization_slot_threshold: u64,
 }
 
 pub struct SvmAccessContext<T> {
@@ -1511,7 +1508,7 @@ impl SurfnetSvmLocker {
                             .and_then(|signature| svm_reader.historical_confirmation(signature))
                             .unwrap_or(match current_slot {
                                 cs if cs == slot => SolanaTransactionConfirmationStatus::Processed,
-                                cs if cs < slot + FINALIZATION_SLOT_THRESHOLD => {
+                                cs if cs < slot + svm_reader.finalization_slot_threshold() => {
                                     SolanaTransactionConfirmationStatus::Confirmed
                                 }
                                 _ => SolanaTransactionConfirmationStatus::Finalized,
@@ -1690,7 +1687,7 @@ impl SurfnetSvmLocker {
                             .and_then(|signature| svm_reader.historical_confirmation(signature))
                             .unwrap_or(match current_slot {
                                 cs if cs == slot => SolanaTransactionConfirmationStatus::Processed,
-                                cs if cs < slot + FINALIZATION_SLOT_THRESHOLD => {
+                                cs if cs < slot + svm_reader.finalization_slot_threshold() => {
                                     SolanaTransactionConfirmationStatus::Confirmed
                                 }
                                 _ => SolanaTransactionConfirmationStatus::Finalized,
@@ -1980,6 +1977,7 @@ impl SurfnetSvmLocker {
             *signature,
             encoded,
             self.get_latest_absolute_slot(),
+            0,
         )
         .finalized_on_historical_fork())
     }
@@ -2029,6 +2027,7 @@ impl SurfnetSvmLocker {
                     result: GetTransactionResult::None(*signature),
                     is_pending,
                     latest_absolute_slot,
+                    finalization_slot_threshold: svm_reader.finalization_slot_threshold(),
                 });
             };
 
@@ -2057,6 +2056,7 @@ impl SurfnetSvmLocker {
                     transaction_index,
                 },
                 latest_absolute_slot,
+                svm_reader.finalization_slot_threshold(),
             );
             let result = match svm_reader.historical_confirmation(signature) {
                 Some(SolanaTransactionConfirmationStatus::Finalized) => {
@@ -2068,6 +2068,7 @@ impl SurfnetSvmLocker {
                 result,
                 is_pending,
                 latest_absolute_slot,
+                finalization_slot_threshold: svm_reader.finalization_slot_threshold(),
             })
         })
     }
@@ -2083,7 +2084,12 @@ impl SurfnetSvmLocker {
 
         if local_lookup.result.is_none() && !local_lookup.is_pending {
             client
-                .try_get_transaction(*signature, config, local_lookup.latest_absolute_slot)
+                .try_get_transaction(
+                    *signature,
+                    config,
+                    local_lookup.latest_absolute_slot,
+                    local_lookup.finalization_slot_threshold,
+                )
                 .await
         } else {
             Ok(local_lookup.result)

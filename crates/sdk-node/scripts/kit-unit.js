@@ -71,6 +71,21 @@ test("cheatcodes RPC passes bare (non-enveloped) results through untouched", asy
   }
 });
 
+test("clock-state queries preserve both bare boolean results", async () => {
+  for (const paused of [false, true]) {
+    const restore = mockFetch((request) => {
+      assert.equal(request.method, "surfnet_getClockState");
+      assert.deepEqual(request.params, []);
+      return { result: { paused } };
+    });
+    try {
+      assert.deepEqual(await createSurfnetCheatcodesRpc(ENDPOINT).getClockState().send(), { paused });
+    } finally {
+      restore();
+    }
+  }
+});
+
 test("cheatcodes RPC serializes bigint request params as plain JSON integers", async () => {
   const bodies = [];
   const originalFetch = globalThis.fetch;
