@@ -16,10 +16,10 @@ use solana_system_interface::program as system_program;
 use solana_transaction::versioned::VersionedTransaction;
 use spl_associated_token_account_interface::address::get_associated_token_address_with_program_id;
 use surfpool_types::{
-    AccountSnapshot, CheatcodeControlConfig, CheatcodeFilter, ClockCommand, ExportSnapshotConfig,
-    GetStreamedAccountsResponse, GetSurfnetInfoResponse, Idl, OfflineAccountConfig,
-    ResetAccountConfig, RpcProfileResultConfig, Scenario, SimnetCommand, StreamAccountConfig,
-    StreamAccountsEntry, UiKeyedProfileResult,
+    AccountSnapshot, CheatcodeControlConfig, CheatcodeFilter, ClockCommand, ClockState,
+    ExportSnapshotConfig, GetStreamedAccountsResponse, GetSurfnetInfoResponse, Idl,
+    OfflineAccountConfig, ResetAccountConfig, RpcProfileResultConfig, Scenario, SimnetCommand,
+    StreamAccountConfig, StreamAccountsEntry, UiKeyedProfileResult,
     types::{
         AccountUpdate, ConfidentialBalanceKeys, DeriveConfidentialKeysResponse,
         GetConfidentialBalanceResponse, SetSomeAccount, SupplyUpdate, TokenAccountUpdate,
@@ -822,6 +822,11 @@ pub trait SurfnetCheatcodes {
     /// ```
     #[rpc(meta, name = "surfnet_pauseClock")]
     fn pause_clock(&self, meta: Self::Metadata) -> Result<EpochInfo>;
+
+    /// Read the command loop's current pause state without changing the clock.
+    /// Returns `{ "paused": true }` when paused, including a historical boundary.
+    #[rpc(meta, name = "surfnet_getClockState")]
+    fn get_clock_state(&self, meta: Self::Metadata) -> Result<ClockState>;
 
     /// A cheat code to resume Solana clock progression after it was paused.
     /// The validator will start producing new slots again.
@@ -2228,6 +2233,24 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
             .map_err(|e| jsonrpc_core::Error {
                 code: jsonrpc_core::ErrorCode::InternalError,
                 message: format!("Failed to confirm clock pause: {}", e),
+                data: None,
+            })
+    }
+
+    fn get_clock_state(&self, meta: Self::Metadata) -> Result<ClockState> {
+        let (response_tx, response_rx) = crossbeam_channel::bounded(1);
+        meta.get_surfnet_command_tx()?
+            .send(SimnetCommand::GetClockState(response_tx))
+            .map_err(|error| Error {
+                code: jsonrpc_core::ErrorCode::InternalError,
+                message: format!("Unable to query clock state: {error}"),
+                data: None,
+            })?;
+        response_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .map_err(|error| Error {
+                code: jsonrpc_core::ErrorCode::InternalError,
+                message: format!("Unable to read clock state: {error}"),
                 data: None,
             })
     }

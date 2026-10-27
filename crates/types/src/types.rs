@@ -799,6 +799,7 @@ pub enum SimnetCommand {
     SlotForward(Option<Hash>),
     SlotBackward(Option<Hash>),
     CommandClock(Option<(Hash, String)>, ClockCommand),
+    GetClockState(Sender<ClockState>),
     UpdateInternalClock(Option<(Hash, String)>, Clock),
     UpdateInternalClockWithConfirmation(Option<(Hash, String)>, Clock, Sender<EpochInfo>),
     UpdateBlockProductionMode(BlockProductionMode),
@@ -863,6 +864,11 @@ pub enum ClockCommand {
     Resume,
     Toggle,
     UpdateSlotInterval(u64),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClockState {
+    pub paused: bool,
 }
 
 pub enum ClockEvent {

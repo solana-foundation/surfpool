@@ -4948,6 +4948,68 @@ fn a_surfnet_stops_when_it_is_told_to(test_type: TestType) {
 }
 
 #[test]
+fn test_clock_state_reads_the_runloop_without_changing_it() {
+    let simnet = boot_simnet(BlockProductionMode::Clock, Some(5), TestType::no_db())
+        .expect("the simnet should boot");
+    let (plugin_commands_tx, _plugin_commands_rx) = crossbeam_channel::unbounded();
+    let context = RunloopContext {
+        id: None,
+        svm_locker: simnet.locker.clone(),
+        simnet_commands_tx: simnet.commands.clone(),
+        remote_rpc_client: None,
+        rpc_config: RpcConfig::default(),
+        cheatcode_config: CheatcodeConfig::new(),
+        plugin_commands_tx,
+    };
+    let mut io = jsonrpc_core::MetaIoHandler::default();
+    io.extend_with(SurfnetCheatcodesRpc::empty().to_delegate());
+    let read = || {
+        let raw = io
+            .handle_request_sync(
+                r#"{"jsonrpc":"2.0","id":41,"method":"surfnet_getClockState","params":[]}"#,
+                Some(context.clone()),
+            )
+            .expect("clock state reply");
+        let response: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON reply");
+        assert_eq!(response["id"], 41);
+        assert!(response.get("error").is_none(), "{response}");
+        response["result"]["paused"]
+            .as_bool()
+            .expect("boolean pause state")
+    };
+    assert!(!read(), "normal clock begins running");
+    SurfnetCheatcodesRpc::empty()
+        .pause_clock(Some(context.clone()))
+        .expect("pause");
+    let slot = simnet.locker.get_latest_absolute_slot();
+    for _ in 0..3 {
+        assert!(read(), "queries must not resume the clock");
+    }
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(simnet.locker.get_latest_absolute_slot(), slot);
+    simnet
+        .commands
+        .send(SimnetCommand::CommandClock(
+            None,
+            surfpool_types::ClockCommand::Toggle,
+        ))
+        .expect("toggle");
+    assert!(!read(), "query follows the preceding toggle");
+    simnet
+        .commands
+        .send(SimnetCommand::CommandClock(
+            None,
+            surfpool_types::ClockCommand::Pause,
+        ))
+        .expect("pause");
+    assert!(read());
+    SurfnetCheatcodesRpc::empty()
+        .resume_clock(Some(context.clone()))
+        .expect("resume");
+    assert!(!read());
+}
+
+#[test]
 fn test_pause_clock_acknowledges_the_final_slot() {
     let rpc_server = SurfnetCheatcodesRpc::empty();
     let simnet = boot_simnet(BlockProductionMode::Clock, Some(5), TestType::no_db())

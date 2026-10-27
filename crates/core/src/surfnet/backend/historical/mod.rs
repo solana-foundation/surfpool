@@ -698,8 +698,9 @@ mod tests {
         // A deterministic IPC peer exercises Surfpool's real admission paths without native
         // execution or provider traffic. Every request is retained to prove refusal ordering.
         fn ipc_fixture(count: usize) -> (super::super::HistoricalFork, tempfile::TempDir) {
-            use super::super::{HistoricalFork, HistoricalLaunch, HistoricalVm, StateView, client};
             use std::sync::Arc;
+
+            use super::super::{HistoricalFork, HistoricalLaunch, HistoricalVm, StateView, client};
             let dir = tempfile::tempdir().unwrap();
             let keys: Vec<String> = (0..count)
                 .map(|_| Pubkey::new_unique().to_string())
@@ -779,10 +780,11 @@ for line in sys.stdin:
 
         #[test]
         fn security_historical_owner_candidates_refuse_101_before_accounts_ipc() {
-            use crate::{rpc::full::SurfpoolFullRpc, tests::helpers::TestSetup};
             use solana_client::{
                 rpc_config::RpcAccountInfoConfig, rpc_request::TokenAccountsFilter,
             };
+
+            use crate::{rpc::full::SurfpoolFullRpc, tests::helpers::TestSetup};
             let setup = TestSetup::new(SurfpoolFullRpc);
             for count in [100, 101] {
                 let (fork, dir) = ipc_fixture(count);

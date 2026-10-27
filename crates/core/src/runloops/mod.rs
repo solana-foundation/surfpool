@@ -30,9 +30,9 @@ use solana_pubkey::Pubkey;
 use solana_transaction::sanitized::{MessageHash, SanitizedTransaction};
 use solana_transaction_status::RewardsAndNumPartitions;
 use surfpool_types::{
-    BlockProductionMode, ClockCommand, ClockEvent, DEFAULT_MAINNET_RPC_URL, DataIndexingCommand,
-    SimnetCommand, SimnetConfig, SimnetEvent, SimnetEventsTx, StartupPlanner, SurfnetStartupTask,
-    SurfpoolConfig,
+    BlockProductionMode, ClockCommand, ClockEvent, ClockState, DEFAULT_MAINNET_RPC_URL,
+    DataIndexingCommand, SimnetCommand, SimnetConfig, SimnetEvent, SimnetEventsTx, StartupPlanner,
+    SurfnetStartupTask, SurfpoolConfig,
 };
 type PluginConstructor = unsafe fn() -> *mut dyn GeyserPlugin;
 use txtx_addon_kit::helpers::fs::FileLocation;
@@ -449,6 +449,12 @@ pub async fn start_block_production_runloop(
                     }
                     SimnetCommand::SlotBackward(_key) => {
 
+                    }
+                    SimnetCommand::GetClockState(response_tx) => {
+                        if let Err(error) = response_tx.send(ClockState { paused: clock_paused }) {
+                            svm_locker.simnet_events_tx().warn(format!("Clock state reply was not received: {error}"));
+                        }
+                        continue
                     }
                     SimnetCommand::CommandClock(_, update) => {
                         if let ClockCommand::UpdateSlotInterval(updated_slot_time) = update {
