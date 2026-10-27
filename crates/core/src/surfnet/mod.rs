@@ -195,14 +195,14 @@ pub enum LocalSignatureStatusOrSubscription {
 }
 
 pub type AccountSubscriptionData =
-    HashMap<Pubkey, Vec<(Option<UiAccountEncoding>, Sender<UiAccount>)>>;
+    HashMap<Pubkey, Vec<(Option<UiAccountEncoding>, Sender<(Slot, UiAccount)>)>>;
 
 pub type ProgramSubscriptionData = HashMap<
     Pubkey,
     Vec<(
         Option<UiAccountEncoding>,
         Option<Vec<RpcFilterType>>,
-        Sender<RpcKeyedAccount>,
+        Sender<(Slot, RpcKeyedAccount)>,
     )>,
 >;
 

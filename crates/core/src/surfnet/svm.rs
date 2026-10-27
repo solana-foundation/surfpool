@@ -21,8 +21,12 @@ use solana_account_decoder::{
 use solana_client::{
     rpc_client::SerializableTransaction,
     rpc_config::{RpcAccountInfoConfig, RpcBlockConfig, RpcTransactionLogsFilter},
+    rpc_custom_error::RpcCustomError,
     rpc_filter::RpcFilterType,
-    rpc_response::{RpcKeyedAccount, RpcLogsResponse, RpcPerfSample},
+    rpc_response::{
+        Response as RpcResponse, RpcKeyedAccount, RpcLogsResponse, RpcPerfSample,
+        RpcResponseContext,
+    },
 };
 use solana_clock::{Clock, Slot};
 use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
@@ -81,6 +85,7 @@ use super::{
 };
 use crate::{
     error::{AirdropError, SurfpoolError, SurfpoolResult},
+    helpers::time_travel::clock_for_slot,
     rpc::utils::convert_transaction_metadata_from_canonical,
     scenarios::{
         TemplateRegistry, account_data_values,
@@ -400,6 +405,43 @@ fn json_to_txtx_value(json: &serde_json::Value) -> SurfpoolResult<Value> {
 }
 
 pub type AccountOwner = Pubkey;
+
+/// The slot a read at some commitment answers for, with its `minContextSlot` already judged.
+/// Only [`SurfnetSvm::read_slot`] makes one.
+#[derive(Clone, Copy, Debug)]
+pub struct ReadSlot(Slot);
+
+impl ReadSlot {
+    pub fn slot(self) -> Slot {
+        self.0
+    }
+
+    /// Like Agave's `new_response(&bank, value)`: the response context is the slot read at.
+    #[allow(clippy::disallowed_methods)] // the one sanctioned context for request/response handlers
+    pub fn respond<T>(self, value: T) -> RpcResponse<T> {
+        RpcResponse {
+            context: RpcResponseContext::new(self.0),
+            value,
+        }
+    }
+
+    /// Like Agave's `bank.get_epoch_info()` on the bank at this slot.
+    pub fn epoch_info(self, svm: &SurfnetSvm) -> EpochInfo {
+        let tip = &svm.latest_epoch_info;
+        let schedule = svm.inner.epoch_schedule();
+        let (epoch, slot_index) = schedule.get_epoch_and_slot_index(self.0);
+        EpochInfo {
+            epoch,
+            slot_index,
+            slots_in_epoch: schedule.get_slots_in_epoch(epoch),
+            absolute_slot: self.0,
+            block_height: tip
+                .block_height
+                .saturating_sub(tip.absolute_slot.saturating_sub(self.0)),
+            transaction_count: tip.transaction_count,
+        }
+    }
+}
 
 #[allow(deprecated)]
 use solana_sysvar::recent_blockhashes::MAX_ENTRIES;
@@ -1834,6 +1876,23 @@ impl SurfnetSvm {
         }
     }
 
+    /// Resolves `commitment` to a slot and refuses a `min_context_slot` above it, as Agave's
+    /// `get_bank_with_config` does. The surfnet keeps one account state, so this read reflects
+    /// every transaction up to this slot.
+    pub fn read_slot(
+        &self,
+        commitment: Option<CommitmentConfig>,
+        min_context_slot: Option<Slot>,
+    ) -> jsonrpc_core::Result<ReadSlot> {
+        let slot = self.slot_for_commitment(&commitment.unwrap_or_default());
+        match min_context_slot {
+            Some(min_context_slot) if slot < min_context_slot => {
+                Err(RpcCustomError::MinContextSlotNotReached { context_slot: slot }.into())
+            }
+            _ => Ok(ReadSlot(slot)),
+        }
+    }
+
     /// Recent blockhashes from the chain tip back, newest first: Surfpool's RPC projection (the
     /// historical hash-age authority stays SVM Replay's, see `check_blockhash_is_recent`). A
     /// historical fork's tip is SVM Replay's latest blockhash, followed by the local blockhashes
@@ -1870,6 +1929,19 @@ impl SurfnetSvm {
         self.blockhashes_from_tip()
             .get(self.min_blockhash_age(commitment))
             .copied()
+    }
+
+    /// The blockhash getLatestBlockhash reports at `commitment`, with its last valid block height.
+    pub fn latest_blockhash_at(&self, commitment: &CommitmentConfig) -> (Hash, u64) {
+        let blockhash = self
+            .blockhash_for_commitment(commitment)
+            .unwrap_or_else(|| self.latest_blockhash());
+        let age = self.blockhash_age(&blockhash).unwrap_or(0);
+        let minted_at_block_height = self.latest_epoch_info.block_height.saturating_sub(age);
+        (
+            blockhash,
+            minted_at_block_height + MAX_RECENT_BLOCKHASHES_STANDARD as u64,
+        )
     }
 
     /// Blocks minted since `blockhash`, or `None` if it is not a recent blockhash.
@@ -3050,13 +3122,23 @@ impl SurfnetSvm {
             .send(GeyserEvent::NotifyEntry(entry_info))
             .ok();
 
-        let clock: Clock = Clock {
-            slot: self.latest_epoch_info.absolute_slot,
-            epoch: self.latest_epoch_info.epoch,
-            unix_timestamp: self.updated_at as i64 / 1_000,
-            epoch_start_timestamp: 0, // todo
-            leader_schedule_epoch: 0, // todo
-        };
+        let epoch_schedule = self.inner.epoch_schedule();
+        let mut closed = self.inner.clock();
+        // Under Alpenglow the footer of an epoch's first block starts the epoch at the time the
+        // block ended, the time the next slot opens at (`Bank::update_clock_from_footer`).
+        if self
+            .feature_set
+            .is_active(&agave_feature_set::alpenglow::id())
+            && epoch_schedule.get_epoch(slot.saturating_sub(1)) != closed.epoch
+        {
+            closed.epoch_start_timestamp = self.updated_at as i64 / 1_000;
+        }
+        let clock = clock_for_slot(
+            self.latest_epoch_info.absolute_slot,
+            self.updated_at as i64 / 1_000,
+            Some(&closed),
+            &epoch_schedule,
+        );
 
         let _ = self.simnet_events_tx.system_clock_updated(clock.clone());
         self.apply_local_clock(&clock)?;
@@ -3739,7 +3821,7 @@ impl SurfnetSvm {
         &mut self,
         account_pubkey: &Pubkey,
         encoding: Option<UiAccountEncoding>,
-    ) -> Receiver<UiAccount> {
+    ) -> Receiver<(Slot, UiAccount)> {
         let (tx, rx) = unbounded();
         self.account_subscriptions
             .entry(*account_pubkey)
@@ -3753,7 +3835,7 @@ impl SurfnetSvm {
         program_id: &Pubkey,
         encoding: Option<UiAccountEncoding>,
         filters: Option<Vec<RpcFilterType>>,
-    ) -> Receiver<RpcKeyedAccount> {
+    ) -> Receiver<(Slot, RpcKeyedAccount)> {
         let (tx, rx) = unbounded();
         self.program_subscriptions
             .entry(*program_id)
@@ -3799,6 +3881,7 @@ impl SurfnetSvm {
         account_updated_pubkey: &Pubkey,
         account: &Account,
     ) {
+        let slot = self.get_latest_absolute_slot();
         let mut remaining = vec![];
         if let Some(subscriptions) = self.account_subscriptions.remove(account_updated_pubkey) {
             for (encoding, tx) in subscriptions {
@@ -3809,7 +3892,7 @@ impl SurfnetSvm {
                 let account = self
                     .account_to_rpc_keyed_account(account_updated_pubkey, account, &config, None)
                     .account;
-                if tx.send(account).is_err() {
+                if tx.send((slot, account)).is_err() {
                     // The receiver has been dropped, so we can skip notifying
                     continue;
                 } else {
@@ -3825,6 +3908,7 @@ impl SurfnetSvm {
 
     pub fn notify_program_subscribers(&mut self, account_pubkey: &Pubkey, account: &Account) {
         let program_id = account.owner;
+        let slot = self.get_latest_absolute_slot();
         let mut remaining = vec![];
         if let Some(subscriptions) = self.program_subscriptions.remove(&program_id) {
             for (encoding, filters, tx) in subscriptions {
@@ -3843,7 +3927,7 @@ impl SurfnetSvm {
                 };
                 let keyed_account =
                     self.account_to_rpc_keyed_account(account_pubkey, account, &config, None);
-                if tx.send(keyed_account).is_err() {
+                if tx.send((slot, keyed_account)).is_err() {
                     // The receiver has been dropped, so we can skip notifying
                     continue;
                 } else {
@@ -7101,27 +7185,34 @@ mod tests {
     fn test_reconstruct_sysvars_clock(test_type: TestType) {
         let (mut svm, _events_rx, _geyser_rx) = test_type.initialize_svm();
 
-        // Set up: chain_tip.index = 50, genesis_slot = 1000 (absolute slot = 1050)
+        // Set up: chain_tip.index = 50, genesis_slot = 2_161_000 (absolute slot 2_161_050, epoch 5)
         svm.chain_tip = BlockIdentifier::new(50, "test_hash");
-        svm.genesis_slot = 1000;
-        svm.latest_epoch_info.absolute_slot = 1050;
-        svm.latest_epoch_info.epoch = 5;
+        svm.genesis_slot = 2_161_000;
+        svm.latest_epoch_info.absolute_slot = 2_161_050;
         svm.genesis_updated_at = 2_000_000; // 2 seconds in ms
         svm.slot_time = 400; // 400ms per slot
+        // As after a restart, block production resumes earlier than the rebuilt Clock.
+        svm.updated_at = 2_010_000;
 
         svm.reconstruct_sysvars().unwrap();
 
         // Verify Clock sysvar
         let clock = svm.inner.clock();
 
-        assert_eq!(clock.slot, 1050, "Clock slot should be absolute slot");
-        assert_eq!(clock.epoch, 5, "Clock epoch should match latest_epoch_info");
+        assert_eq!(clock.slot, 2_161_050, "Clock slot should be absolute slot");
+        assert_eq!(
+            clock.epoch, 5,
+            "Clock epoch should come from the epoch schedule"
+        );
 
         // Expected timestamp: genesis_updated_at + (50 slots * 400ms) = 2_000_000 + 20_000 = 2_020_000ms = 2020 seconds
         assert_eq!(
             clock.unix_timestamp, 2020,
             "Clock unix_timestamp should be calculated correctly"
         );
+        // The epoch starts no later than the time the next blocks write.
+        assert_eq!(clock.epoch_start_timestamp, 2010);
+        assert_eq!(clock.leader_schedule_epoch, 6);
     }
 
     #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
@@ -8446,6 +8537,55 @@ mod tests {
         }
     }
 
+    /// Block after block, the Clock carries the epoch's start time over and resets it at the first
+    /// block of the next epoch, with the leader schedule epoch the schedule gives the slot, as
+    /// Agave's `Bank::update_clock` writes it.
+    /// Under Alpenglow, the footer of the epoch's first block moves the epoch's start to the time
+    /// that block ended (`Bank::update_clock_from_footer`).
+    #[test_case(false; "towerbft")]
+    #[test_case(true; "alpenglow")]
+    fn clock_epoch_fields_follow_agave_across_an_epoch_boundary(alpenglow: bool) {
+        let features = match alpenglow {
+            true => SvmFeatureConfig::new().enable(agave_feature_set::alpenglow::id()),
+            false => SvmFeatureConfig::new().disable(agave_feature_set::alpenglow::id()),
+        };
+        let (mut svm, _events_rx, _geyser_rx) =
+            TestType::no_db().initialize_svm_with_features(features);
+        svm.slot_time = 1_000;
+        svm.updated_at = 1_000_000;
+        svm.latest_epoch_info.absolute_slot = 431_998;
+        svm.apply_local_clock(&Clock {
+            slot: 431_998,
+            epoch_start_timestamp: 7,
+            epoch: 0,
+            leader_schedule_epoch: 1,
+            unix_timestamp: 1_000,
+        })
+        .unwrap();
+
+        let mut seen = vec![];
+        for _ in 0..3 {
+            svm.confirm_current_block().unwrap();
+            let clock = svm.inner.clock();
+            seen.push((
+                clock.slot,
+                clock.unix_timestamp,
+                clock.epoch,
+                clock.epoch_start_timestamp,
+                clock.leader_schedule_epoch,
+            ));
+        }
+
+        assert_eq!(
+            seen,
+            [
+                (431_999, 1_001, 0, 7, 1),
+                (432_000, 1_002, 1, 1_002, 2),
+                (432_001, 1_003, 1, if alpenglow { 1_003 } else { 1_002 }, 2),
+            ]
+        );
+    }
+
     /// Garbage collection rebuilds LiteSVM, and must keep the epoch schedule the surfnet was
     /// started with: the epoch info is derived from it.
     #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
@@ -8665,7 +8805,7 @@ mod tests {
             .unwrap();
 
         let account = svm.get_account(&account_pubkey).unwrap().unwrap();
-        let update = updates
+        let (_, update) = updates
             .try_recv()
             .expect("the override must notify the account's subscribers");
         assert_eq!(update.data.decode(), Some(account.data));

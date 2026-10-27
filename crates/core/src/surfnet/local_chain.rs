@@ -19,6 +19,7 @@ use super::{
 };
 use crate::{
     error::{SurfpoolError, SurfpoolResult},
+    helpers::time_travel::clock_for_slot,
     types::SyntheticBlockhash,
 };
 
@@ -99,11 +100,13 @@ impl SurfnetSvm {
         // 3. Reconstruct Clock using absolute slot
         let unix_timestamp = self.calculate_block_time_for_slot(current_absolute_slot) / 1_000;
         let clock = Clock {
-            slot: current_absolute_slot,
-            epoch: self.latest_epoch_info.epoch,
-            unix_timestamp: unix_timestamp as i64,
-            epoch_start_timestamp: 0,
-            leader_schedule_epoch: 0,
+            epoch_start_timestamp: (unix_timestamp as i64).min((self.updated_at / 1_000) as i64),
+            ..clock_for_slot(
+                current_absolute_slot,
+                unix_timestamp as i64,
+                None,
+                &self.inner.epoch_schedule(),
+            )
         };
         self.local_vm()?.set_sysvar(&clock);
         Ok(())

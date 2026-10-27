@@ -83,8 +83,8 @@ def main() -> None:
     (root / "tests.log").write_text(result.stdout)
     print(result.stdout, end="", flush=True)
     result.check_returncode()
-    if "3 passed; 0 failed; 0 ignored" not in result.stdout:
-        raise RuntimeError("Expected all three existing historical SDK tests to execute")
+    if "4 passed; 0 failed; 0 ignored" not in result.stdout:
+        raise RuntimeError("Expected all four historical SDK tests to execute")
 
 
 if __name__ == "__main__":

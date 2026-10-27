@@ -1,0 +1,3 @@
+disallowed-methods = [
+    { path = "solana_rpc_client_types::response::RpcResponseContext::new", reason = "build responses through ReadSlot::respond" },
+]

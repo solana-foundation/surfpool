@@ -14,8 +14,7 @@ use solana_client::{
     rpc_custom_error::RpcCustomError,
     rpc_response::{
         RpcBlockhash, RpcConfirmedTransactionStatusWithSignature, RpcContactInfo,
-        RpcInflationReward, RpcPerfSample, RpcPrioritizationFee, RpcResponseContext,
-        RpcSimulateTransactionResult,
+        RpcInflationReward, RpcPerfSample, RpcPrioritizationFee, RpcSimulateTransactionResult,
     },
 };
 use solana_clock::{Slot, UnixTimestamp};
@@ -39,18 +38,15 @@ use surfpool_types::{
 use super::{
     RunloopContext, State, SurfnetRpcContext,
     utils::{
-        context_slot, decode_and_deserialize, decode_rpc_versioned_transaction,
-        require_signature_structure, verify_and_parse_signatures_for_address_params, verify_pubkey,
+        decode_and_deserialize, decode_rpc_versioned_transaction, require_signature_structure,
+        verify_and_parse_signatures_for_address_params, verify_pubkey,
     },
 };
 use crate::{
     SURFPOOL_IDENTITY_PUBKEY,
     error::{SurfpoolError, SurfpoolResult},
     rpc::utils::{adjust_default_transaction_config, get_default_transaction_config},
-    surfnet::{
-        GetTransactionResult, backend::TransactionMetadata, locker::SvmAccessContext,
-        svm::MAX_RECENT_BLOCKHASHES_STANDARD,
-    },
+    surfnet::{GetTransactionResult, backend::TransactionMetadata, locker::SvmAccessContext},
     types::SurfnetTransactionStatus,
 };
 
@@ -1544,8 +1540,7 @@ impl Full for SurfpoolFullRpc {
                 }
             };
 
-            context_slot(
-                &svm_locker,
+            svm_locker.read_slot(
                 config.as_ref().and_then(|config| config.commitment),
                 config.as_ref().and_then(|config| config.min_context_slot),
             )?;
@@ -1674,7 +1669,7 @@ impl Full for SurfpoolFullRpc {
         Box::pin(async move {
             // Capture the context slot once at the beginning to ensure consistency
             // across all signature lookups, even if the slot advances during the loop
-            let context_slot = svm_locker.get_latest_absolute_slot();
+            let read = svm_locker.read_slot(Some(CommitmentConfig::processed()), None)?;
 
             let mut responses = Vec::with_capacity(signatures.len());
             let historical = svm_locker.archive_reader();
@@ -1712,10 +1707,7 @@ impl Full for SurfpoolFullRpc {
                 }
                 responses.push(status);
             }
-            Ok(RpcResponse {
-                context: RpcResponseContext::new(context_slot),
-                value: responses,
-            })
+            Ok(read.respond(responses))
         })
     }
 
@@ -1802,11 +1794,8 @@ impl Full for SurfpoolFullRpc {
                     config.base.preflight_commitment.unwrap_or_default()
                 },
             };
-            context_slot(
-                &ctx.svm_locker,
-                Some(preflight_commitment),
-                config.base.min_context_slot,
-            )?;
+            ctx.svm_locker
+                .read_slot(Some(preflight_commitment), config.base.min_context_slot)?;
             // With or without preflight, a signature list that does not fit its message is refused
             // before any signature is read or any state is touched.
             require_signature_structure(&unsanitized_tx, "Transaction")?;
@@ -2003,40 +1992,29 @@ impl Full for SurfpoolFullRpc {
         };
 
         Box::pin(async move {
-            context_slot(&svm_locker, config.commitment, config.min_context_slot)?;
-            // With or without sigVerify, a signature list that does not fit its message is
-            // refused before any signature is read or any lookup table or account acquired; a
-            // well-formed unsigned transaction (zeroed placeholders) still simulates without it.
+            svm_locker.read_slot(config.commitment, config.min_context_slot)?;
             require_signature_structure(&unsanitized_tx, "Transaction")?;
-            // With sigVerify, Surfpool's signature rules run before any lookup table or account
-            // is acquired: a transaction they refuse loads nothing, from a datasource or a
-            // historical archive, and is answered as the refused simulation it is, at the slot
-            // a full simulation reports (the latest).
+            // Reject invalid signatures before acquiring lookup tables or historical accounts.
             let refusal = if config.sig_verify {
-                let (slot, verdict) = svm_locker.with_svm_reader(|svm_reader| {
-                    (
-                        svm_reader.get_latest_absolute_slot(),
-                        svm_reader.sigverify(&unsanitized_tx),
-                    )
-                });
-                verdict?.err().map(|refused| (slot, refused))
+                let (read, verdict) = svm_locker.with_svm_reader(|svm_reader| {
+                    let read = svm_reader.read_slot(config.commitment, config.min_context_slot)?;
+                    Ok::<_, jsonrpc_core::Error>((read, svm_reader.sigverify(&unsanitized_tx)?))
+                })?;
+                verdict.err().map(|refused| (read, refused))
             } else {
                 None
             };
-            if let Some((slot, refused)) = refusal {
-                return Ok(RpcResponse {
-                    context: RpcResponseContext::new(slot),
-                    value: get_simulate_transaction_result(
-                        refused.meta,
-                        None,
-                        Some(refused.err),
-                        None,
-                        config.inner_instructions,
-                        &unsanitized_tx.message,
-                        None,
-                        None,
-                    ),
-                });
+            if let Some((read, refused)) = refusal {
+                return Ok(read.respond(get_simulate_transaction_result(
+                    refused.meta,
+                    None,
+                    Some(refused.err),
+                    None,
+                    config.inner_instructions,
+                    &unsanitized_tx.message,
+                    None,
+                    None,
+                )));
             }
             let loaded_addresses = svm_locker
                 .get_loaded_addresses(&remote_ctx, &unsanitized_tx.message)
@@ -2046,36 +2024,38 @@ impl Full for SurfpoolFullRpc {
                 loaded_addresses.as_ref().map(|l| l.all_loaded_addresses()),
             );
 
-            let SvmAccessContext {
-                slot,
-                inner: _,
-                latest_blockhash,
-                latest_epoch_info,
-            } = svm_locker
+            svm_locker
                 .get_multiple_accounts(&remote_ctx, &transaction_pubkeys, None)
                 .await?;
 
             // Convert TransactionLoadedAddresses to LoadedAddresses before it gets consumed
             let loaded_addresses_data = loaded_addresses.as_ref().map(|la| la.loaded_addresses());
 
-            let replacement_blockhash = if config.replace_recent_blockhash {
-                unsanitized_tx
-                    .message
-                    .set_recent_blockhash(latest_blockhash);
-                Some(RpcBlockhash {
-                    blockhash: latest_blockhash.to_string(),
-                    // The latest blockhash was minted at the current block height.
-                    last_valid_block_height: latest_epoch_info.block_height
-                        + MAX_RECENT_BLOCKHASHES_STANDARD as u64,
-                })
-            } else {
-                None
-            };
-
-            // Clone the message before moving the transaction for later use in result formatting
-            let tx_message = unsanitized_tx.message.clone();
-
-            let simulation = svm_locker.simulate_transaction(unsanitized_tx, config.sig_verify)?;
+            // Like Agave's simulation bank: the context slot, the replacement blockhash and the
+            // simulated state come from one guard, taken once the accounts are loaded.
+            let (read, replacement_blockhash, tx_message, simulation) = svm_locker
+                .with_svm_reader(|svm_reader| {
+                    let read = svm_reader.read_slot(config.commitment, config.min_context_slot)?;
+                    let replacement_blockhash = config.replace_recent_blockhash.then(|| {
+                        let (blockhash, last_valid_block_height) =
+                            svm_reader.latest_blockhash_at(&config.commitment.unwrap_or_default());
+                        unsanitized_tx.message.set_recent_blockhash(blockhash);
+                        RpcBlockhash {
+                            blockhash: blockhash.to_string(),
+                            last_valid_block_height,
+                        }
+                    });
+                    // Clone the message before moving the transaction for result formatting
+                    let tx_message = unsanitized_tx.message.clone();
+                    let simulation =
+                        svm_reader.simulate_transaction(unsanitized_tx, config.sig_verify)?;
+                    Ok::<_, jsonrpc_core::Error>((
+                        read,
+                        replacement_blockhash,
+                        tx_message,
+                        simulation,
+                    ))
+                })?;
             let loaded_accounts_data_size = match &simulation {
                 Ok(info) => info.meta.loaded_accounts_data_size,
                 Err(info) => info.meta.loaded_accounts_data_size,
@@ -2128,10 +2108,7 @@ impl Full for SurfpoolFullRpc {
                 ),
             };
 
-            Ok(RpcResponse {
-                context: RpcResponseContext::new(slot),
-                value,
-            })
+            Ok(read.respond(value))
         })
     }
 
@@ -2254,8 +2231,9 @@ impl Full for SurfpoolFullRpc {
         };
 
         Box::pin(async move {
-            let committed_latest_slot =
-                context_slot(&svm_locker, Some(commitment), config.min_context_slot)?;
+            let committed_latest_slot = svm_locker
+                .read_slot(Some(commitment), config.min_context_slot)?
+                .slot();
             let effective_end_slot = end_slot
                 .map(|end| end.min(committed_latest_slot))
                 .unwrap_or(committed_latest_slot);
@@ -2382,8 +2360,9 @@ impl Full for SurfpoolFullRpc {
         };
 
         Box::pin(async move {
-            let committed_latest_slot =
-                context_slot(&svm_locker, Some(commitment), config.min_context_slot)?;
+            let committed_latest_slot = svm_locker
+                .read_slot(Some(commitment), config.min_context_slot)?
+                .slot();
             if let Some(reader) = svm_locker.archive_reader() {
                 return Ok(svm_locker.historical_blocks(
                     &reader,
@@ -2500,8 +2479,7 @@ impl Full for SurfpoolFullRpc {
         };
 
         Box::pin(async move {
-            context_slot(
-                &svm_locker,
+            svm_locker.read_slot(
                 config.as_ref().and_then(|config| config.commitment),
                 config.as_ref().and_then(|config| config.min_context_slot),
             )?;
@@ -2578,28 +2556,13 @@ impl Full for SurfpoolFullRpc {
         let config = config.unwrap_or_default();
         let commitment = config.commitment.unwrap_or_default();
 
-        let slot = context_slot(&svm_locker, Some(commitment), config.min_context_slot)?;
-
-        let (blockhash, last_valid_block_height) = svm_locker.with_svm_reader(|svm_reader| {
-            let blockhash = svm_reader
-                .blockhash_for_commitment(&commitment)
-                .unwrap_or_else(|| svm_reader.latest_blockhash());
-            let age = svm_reader.blockhash_age(&blockhash).unwrap_or(0);
-            let minted_at_block_height = svm_reader
-                .latest_epoch_info
-                .block_height
-                .saturating_sub(age);
-            (
-                blockhash,
-                minted_at_block_height + MAX_RECENT_BLOCKHASHES_STANDARD as u64,
-            )
-        });
-        Ok(RpcResponse {
-            context: RpcResponseContext::new(slot),
-            value: RpcBlockhash {
+        svm_locker.with_svm_reader(|svm_reader| {
+            let read = svm_reader.read_slot(Some(commitment), config.min_context_slot)?;
+            let (blockhash, last_valid_block_height) = svm_reader.latest_blockhash_at(&commitment);
+            Ok(read.respond(RpcBlockhash {
                 blockhash: blockhash.to_string(),
                 last_valid_block_height,
-            },
+            }))
         })
     }
 
@@ -2616,14 +2579,14 @@ impl Full for SurfpoolFullRpc {
 
         let svm_locker = meta.get_svm_locker()?;
 
-        let slot = context_slot(&svm_locker, config.commitment, config.min_context_slot)?;
-
-        let is_valid =
-            svm_locker.with_svm_reader(|svm_reader| svm_reader.check_blockhash_is_recent(&hash))?;
-
-        Ok(RpcResponse {
-            context: RpcResponseContext::new(slot),
-            value: is_valid,
+        svm_locker.with_svm_reader(|svm_reader| {
+            let read = svm_reader.read_slot(config.commitment, config.min_context_slot)?;
+            // Agave checks the blockhash queue of the bank at the commitment.
+            Ok(read.respond(
+                svm_reader.check_blockhash_is_recent(&hash)?
+                    && svm_reader
+                        .is_blockhash_visible_at(&hash, &config.commitment.unwrap_or_default()),
+            ))
         })
     }
 
@@ -2638,14 +2601,9 @@ impl Full for SurfpoolFullRpc {
 
         let config = config.unwrap_or_default();
         let svm_locker = meta.get_svm_locker()?;
-        let slot = context_slot(&svm_locker, config.commitment, config.min_context_slot)?;
-
-        let fee = svm_locker
-            .with_svm_reader(|svm_reader| svm_reader.estimate_fee_for_message(&message))?;
-
-        Ok(RpcResponse {
-            context: RpcResponseContext::new(slot),
-            value: fee,
+        svm_locker.with_svm_reader(|svm_reader| {
+            let read = svm_reader.read_slot(config.commitment, config.min_context_slot)?;
+            Ok(read.respond(svm_reader.estimate_fee_for_message(&message)?))
         })
     }
 
@@ -2659,15 +2617,10 @@ impl Full for SurfpoolFullRpc {
             commitment: CommitmentLevel::Processed,
         });
 
-        let slot = context_slot(
-            &meta.get_svm_locker()?,
-            Some(commitment_config),
-            config.min_context_slot,
-        )?;
-        Ok(RpcResponse {
-            context: RpcResponseContext::new(slot),
-            value: 0,
-        })
+        let read = meta
+            .get_svm_locker()?
+            .read_slot(Some(commitment_config), config.min_context_slot)?;
+        Ok(read.respond(0))
     }
 
     fn get_recent_prioritization_fees(
@@ -2900,7 +2853,7 @@ mod tests {
         runloops::start_block_production_runloop,
         surfnet::{
             BlockHeader, INITIAL_SLOT, LEGACY_FINALIZATION_SLOT_THRESHOLD,
-            remote::SurfnetRemoteClient,
+            remote::SurfnetRemoteClient, svm::MAX_RECENT_BLOCKHASHES_STANDARD,
         },
         tests::helpers::TestSetup,
         types::{SyntheticBlockhash, TransactionWithStatusMeta},
@@ -4016,7 +3969,7 @@ mod tests {
 
     /// With sigVerify, a transaction whose signature does not verify is refused before any of
     /// its accounts or lookup tables is acquired: the datasource is never asked, and the refusal
-    /// reports the slot a full simulation reports (the latest, not the finalized one). Without
+    /// reports the slot selected by the requested commitment, like a full simulation. Without
     /// sigVerify the same transaction's accounts are acquired as before.
     #[test_case(false ; "legacy")]
     #[test_case(true ; "v0 with an address lookup table")]
@@ -4081,34 +4034,51 @@ mod tests {
         };
         tx.signatures[0] = solana_signature::Signature::from([7u8; 64]);
         let encoded = bs58::encode(wincode::serialize(&tx).unwrap()).into_string();
-        let config = |sig_verify| {
+        let config = |sig_verify, commitment| {
             Some(RpcSimulateTransactionConfig {
                 sig_verify,
+                commitment,
                 ..RpcSimulateTransactionConfig::default()
             })
         };
 
-        let refused = setup
-            .rpc
-            .simulate_transaction(Some(setup.context.clone()), encoded.clone(), config(true))
-            .await
-            .unwrap();
-        assert_eq!(
-            serde_json::to_value(&refused.value.err).unwrap(),
-            serde_json::json!("SignatureFailure")
-        );
-        assert_eq!(refused.context.slot, latest);
-        assert_eq!(
-            *requests.lock().unwrap(),
-            vec![],
-            "the datasource was asked"
-        );
+        for commitment in [
+            CommitmentConfig::processed(),
+            CommitmentConfig::confirmed(),
+            CommitmentConfig::finalized(),
+        ] {
+            let refused = setup
+                .rpc
+                .simulate_transaction(
+                    Some(setup.context.clone()),
+                    encoded.clone(),
+                    config(true, Some(commitment)),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(&refused.value.err).unwrap(),
+                serde_json::json!("SignatureFailure")
+            );
+            assert_eq!(
+                refused.context.slot,
+                setup
+                    .context
+                    .svm_locker
+                    .get_slot_for_commitment(&commitment)
+            );
+            assert_eq!(
+                *requests.lock().unwrap(),
+                vec![],
+                "the datasource was asked"
+            );
+        }
 
         // Without sigVerify the accounts are acquired: here the datasource fails, and that is
         // what the simulation reports, never a signature failure.
         let unverified = setup
             .rpc
-            .simulate_transaction(Some(setup.context), encoded, config(false))
+            .simulate_transaction(Some(setup.context), encoded, config(false, None))
             .await;
         assert!(!requests.lock().unwrap().is_empty());
         assert!(
@@ -6929,6 +6899,129 @@ mod tests {
 
             assert_eq!(simulation_res.value.err, None);
         }
+    }
+
+    /// A validator reads the blockhash and the context slot from one bank, so the context slot
+    /// and `lastValidBlockHeight` keep one offset while blocks are produced.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn latest_blockhash_and_its_context_slot_come_from_one_read() {
+        let setup = TestSetup::new(SurfpoolFullRpc);
+        let locker = setup.context.svm_locker.clone();
+        for _ in 0..3 {
+            locker.confirm_current_block(&None).await.unwrap();
+        }
+        let ctx = || Some(setup.context.clone());
+        let processed = Some(RpcContextConfig {
+            commitment: Some(CommitmentConfig::processed()),
+            min_context_slot: None,
+        });
+        let offset = |response: RpcResponse<RpcBlockhash>| {
+            response.value.last_valid_block_height as i64 - response.context.slot as i64
+        };
+        let expected = offset(setup.rpc.get_latest_blockhash(ctx(), processed).unwrap());
+
+        let producer = tokio::spawn(async move {
+            for _ in 0..300 {
+                locker.confirm_current_block(&None).await.unwrap();
+            }
+        });
+        let mut offsets = std::collections::BTreeSet::new();
+        loop {
+            offsets.insert(offset(
+                setup.rpc.get_latest_blockhash(ctx(), processed).unwrap(),
+            ));
+            if producer.is_finished() {
+                break;
+            }
+        }
+        producer.await.unwrap();
+        assert_eq!(offsets, [expected].into());
+    }
+
+    /// A validator answers these from the bank its commitment selects (`get_bank_with_config`),
+    /// so the value and the context slot are the finalized bank's, not the tip's.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reads_answer_from_the_slot_their_commitment_names() {
+        use crate::rpc::{
+            bank_data::{BankData, SurfpoolBankDataRpc},
+            minimal::{Minimal, SurfpoolMinimalRpc},
+        };
+
+        let setup = TestSetup::new(SurfpoolFullRpc);
+        let locker = &setup.context.svm_locker;
+        for _ in 0..40 {
+            locker.confirm_current_block(&None).await.unwrap();
+        }
+        let ctx = || Some(setup.context.clone());
+        let finalized = Some(RpcContextConfig {
+            commitment: Some(CommitmentConfig::finalized()),
+            min_context_slot: None,
+        });
+        let finalized_slot = SurfpoolMinimalRpc.get_slot(ctx(), finalized).unwrap();
+        let tip_blockhash = locker.with_svm_reader(|svm| svm.latest_blockhash());
+
+        let epoch_info = SurfpoolMinimalRpc.get_epoch_info(ctx(), finalized).unwrap();
+        assert_eq!(
+            (epoch_info.absolute_slot, epoch_info.block_height),
+            (
+                finalized_slot,
+                SurfpoolMinimalRpc
+                    .get_block_height(ctx(), finalized)
+                    .unwrap()
+            )
+        );
+
+        let valid = setup
+            .rpc
+            .is_blockhash_valid(ctx(), tip_blockhash.to_string(), finalized)
+            .unwrap();
+        assert!(
+            !valid.value,
+            "the tip blockhash is not in the finalized bank"
+        );
+
+        let payer = Keypair::new();
+        let tx = Transaction::new_signed_with_payer(
+            &[transfer(&payer.pubkey(), &Pubkey::new_unique(), 1)],
+            Some(&payer.pubkey()),
+            &[&payer],
+            tip_blockhash,
+        );
+        let simulated = setup
+            .rpc
+            .simulate_transaction(
+                ctx(),
+                BASE64_STANDARD.encode(bincode::serialize(&tx).unwrap()),
+                Some(RpcSimulateTransactionConfig {
+                    replace_recent_blockhash: true,
+                    encoding: Some(UiTransactionEncoding::Base64),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        let latest = setup.rpc.get_latest_blockhash(ctx(), finalized).unwrap();
+        assert_eq!(
+            (
+                simulated.context.slot,
+                simulated.value.replacement_blockhash
+            ),
+            (finalized_slot, Some(latest.value))
+        );
+
+        let production = SurfpoolBankDataRpc
+            .get_block_production(
+                ctx(),
+                Some(solana_client::rpc_config::RpcBlockProductionConfig {
+                    commitment: Some(CommitmentConfig::finalized()),
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            (production.context.slot, production.value.range.last_slot),
+            (finalized_slot, finalized_slot)
+        );
     }
 
     /// Every method taking `minContextSlot` judges it against the slot its commitment names, and

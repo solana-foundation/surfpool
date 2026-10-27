@@ -8,7 +8,7 @@ use solana_client::{rpc_config::RpcSendTransactionConfig, rpc_custom_error::RpcC
 use solana_commitment_config::CommitmentConfig;
 use solana_message::VersionedMessage;
 use solana_pubkey::Pubkey;
-use solana_rpc_client_api::response::{Response as RpcResponse, RpcBlockhash, RpcResponseContext};
+use solana_rpc_client_api::response::{Response as RpcResponse, RpcBlockhash};
 use solana_signature::Signature;
 use solana_transaction::versioned::VersionedTransaction;
 use solana_transaction_status::{TransactionConfirmationStatus, UiTransactionEncoding};
@@ -20,7 +20,7 @@ use surfpool_types::{
 
 use super::{
     RunloopContext,
-    utils::{context_slot, decode_and_deserialize, require_signature_structure},
+    utils::{decode_and_deserialize, require_signature_structure},
 };
 use crate::{
     error::SurfpoolResult,
@@ -287,8 +287,7 @@ impl Jito for SurfpoolJitoRpc {
 
             let base_config = config.unwrap_or_default();
             // Bundles skip preflight, so they run against the processed slot.
-            context_slot(
-                &ctx.svm_locker,
+            ctx.svm_locker.read_slot(
                 Some(CommitmentConfig::processed()),
                 base_config.min_context_slot,
             )?;
@@ -372,11 +371,10 @@ impl Jito for SurfpoolJitoRpc {
                 .into());
             };
 
-            // We need a single `context.slot` for the outer RpcResponse. The most accurate slot
-            // is the one returned by the underlying `get_signature_statuses` call; if all
-            // requested bundles are unknown locally we fall back to the locker's latest slot so
-            // the response shape still matches Solana's contextualized RPC contract.
-            let mut last_context: Option<RpcResponseContext> = None;
+            // One context slot for every bundle, taken before any status is read.
+            let read = ctx
+                .svm_locker
+                .read_slot(Some(CommitmentConfig::processed()), None)?;
             let mut value: Vec<Option<JitoBundleStatus>> = Vec::with_capacity(bundle_ids.len());
 
             for bundle_id in bundle_ids {
@@ -396,8 +394,6 @@ impl Jito for SurfpoolJitoRpc {
                     None,
                 )
                 .await?;
-
-                last_context = Some(statuses.context.clone());
 
                 // Bundle txs are processed sequentially in one go; they share the same landing
                 // slot and confirmation level, so we take slot/status from the first status
@@ -433,14 +429,7 @@ impl Jito for SurfpoolJitoRpc {
                 }));
             }
 
-            let context = last_context.unwrap_or_else(|| {
-                let slot = ctx
-                    .svm_locker
-                    .with_svm_reader(|svm| svm.get_latest_absolute_slot());
-                RpcResponseContext::new(slot)
-            });
-
-            Ok(RpcResponse { context, value })
+            Ok(read.respond(value))
         })
     }
 
@@ -468,7 +457,6 @@ impl Jito for SurfpoolJitoRpc {
                 }
                 .into());
             };
-
             // Default config preserves Jito's wire-protocol shape: one None entry per
             // tx for both pre/post snapshot configs.
             let bundle_len = rpc_bundle_request.encoded_transactions.len();
@@ -600,9 +588,11 @@ impl Jito for SurfpoolJitoRpc {
             // Unlike `send_bundle` we never call `commit_sandbox`. The sandbox is
             // dropped at end-of-call regardless of bundle outcome — this is what
             // distinguishes simulate from send.
-            let bundle_sandbox = ctx
-                .svm_locker
-                .with_svm_reader(|svm_reader| svm_reader.clone_for_bundle_sandbox())?;
+            // The context slot is the processed slot of the state the sandbox clones.
+            let (read, bundle_sandbox) = ctx.svm_locker.with_svm_reader(|svm_reader| {
+                let read = svm_reader.read_slot(Some(CommitmentConfig::processed()), None)?;
+                Ok::<_, Error>((read, svm_reader.clone_for_bundle_sandbox()?))
+            })?;
             let BundleSandbox {
                 svm: sandbox_svm,
                 geyser_rx: _geyser_rx, // discarded on drop
@@ -852,17 +842,10 @@ impl Jito for SurfpoolJitoRpc {
             // pre-call state.
             drop(sandbox_locker);
 
-            let slot = ctx
-                .svm_locker
-                .with_svm_reader(|svm| svm.get_latest_absolute_slot());
-
-            Ok(RpcResponse {
-                context: RpcResponseContext::new(slot),
-                value: RpcSimulateBundleResult {
-                    summary,
-                    transaction_results,
-                },
-            })
+            Ok(read.respond(RpcSimulateBundleResult {
+                summary,
+                transaction_results,
+            }))
         })
     }
 }

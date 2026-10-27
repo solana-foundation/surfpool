@@ -1,8 +1,31 @@
-use solana_clock::Clock;
+use solana_clock::{Clock, Slot};
 use solana_epoch_info::EpochInfo;
 use solana_epoch_schedule::EpochSchedule;
 
 use crate::types::{TimeTravelConfig, TimeTravelError};
+
+/// The Clock sysvar at `slot` and `unix_timestamp`, filled in the way Agave's `Bank::update_clock`
+/// does: the epoch's start time carries over from `previous` while the epoch stays the same, and
+/// resets to `unix_timestamp` otherwise (a new epoch, or a warp with no previous Clock).
+pub fn clock_for_slot(
+    slot: Slot,
+    unix_timestamp: i64,
+    previous: Option<&Clock>,
+    epoch_schedule: &EpochSchedule,
+) -> Clock {
+    let epoch = epoch_schedule.get_epoch(slot);
+    let epoch_start_timestamp = match previous {
+        Some(previous) if previous.epoch == epoch => previous.epoch_start_timestamp,
+        _ => unix_timestamp,
+    };
+    Clock {
+        slot,
+        epoch_start_timestamp,
+        epoch,
+        leader_schedule_epoch: epoch_schedule.get_leader_schedule_epoch(slot),
+        unix_timestamp,
+    }
+}
 
 /// Time travel math functions for calculating clock updates based on different time travel configurations.
 ///
@@ -50,13 +73,12 @@ pub fn calculate_absolute_timestamp_clock(
     // timestamp_target is in milliseconds, we need to convert it to seconds
     let timestamp_target_seconds = timestamp_target / 1000;
 
-    Ok(Clock {
+    Ok(clock_for_slot(
         slot,
-        epoch_start_timestamp: timestamp_target_seconds as i64,
-        epoch: epoch_schedule.get_epoch(slot),
-        leader_schedule_epoch: 0,
-        unix_timestamp: timestamp_target_seconds as i64,
-    })
+        timestamp_target_seconds as i64,
+        None,
+        epoch_schedule,
+    ))
 }
 
 /// Calculates the new clock state when traveling to an absolute slot.
@@ -93,13 +115,12 @@ pub fn calculate_absolute_slot_clock(
     // timestamp_target is in milliseconds, we need to convert it to seconds
     let timestamp_target_seconds = timestamp_target / 1000;
 
-    Ok(Clock {
-        slot: new_absolute_slot,
-        epoch_start_timestamp: timestamp_target_seconds as i64,
-        epoch: epoch_schedule.get_epoch(new_absolute_slot),
-        leader_schedule_epoch: 0,
-        unix_timestamp: timestamp_target_seconds as i64,
-    })
+    Ok(clock_for_slot(
+        new_absolute_slot,
+        timestamp_target_seconds as i64,
+        None,
+        epoch_schedule,
+    ))
 }
 
 /// Calculates the new clock state when traveling to an absolute epoch.
@@ -142,13 +163,12 @@ pub fn calculate_absolute_epoch_clock(
     // timestamp_target is in milliseconds, we need to convert it to seconds
     let timestamp_target_seconds = timestamp_target / 1000;
 
-    Ok(Clock {
-        slot: new_absolute_slot,
-        epoch_start_timestamp: timestamp_target_seconds as i64,
-        epoch: new_epoch,
-        leader_schedule_epoch: 0,
-        unix_timestamp: timestamp_target_seconds as i64,
-    })
+    Ok(clock_for_slot(
+        new_absolute_slot,
+        timestamp_target_seconds as i64,
+        None,
+        epoch_schedule,
+    ))
 }
 
 /// Calculates the new clock state based on a time travel configuration.
@@ -537,7 +557,8 @@ mod tests {
     }
 
     /// Under a warmup schedule the first epochs are 32, 64 and 128 slots long, and every kind of
-    /// time travel follows the schedule rather than a fixed epoch length.
+    /// time travel follows the schedule rather than a fixed epoch length, leader schedule epoch
+    /// included.
     #[test]
     fn test_time_travel_follows_a_warmup_schedule() {
         let schedule = EpochSchedule::custom(432_000, 432_000, true);
@@ -553,7 +574,7 @@ mod tests {
                 &schedule,
             )
             .unwrap();
-            (clock.slot, clock.epoch)
+            (clock.slot, clock.epoch, clock.leader_schedule_epoch)
         };
 
         assert_eq!(
@@ -564,7 +585,7 @@ mod tests {
                     current_time + 100 * slot_time
                 )),
             ],
-            [(224, 3), (100, 2), (100, 2)]
+            [(224, 3, 4), (100, 2, 3), (100, 2, 3)]
         );
     }
 }

@@ -21,6 +21,7 @@ use solana_message::{
 use solana_program_option::COption;
 use solana_pubkey::Pubkey;
 use solana_runtime_transaction::transaction_meta::TransactionConfiguration;
+use solana_sdk_ids::sysvar;
 use solana_slot_hashes::SlotHashes;
 use solana_sysvar::last_restart_slot::LastRestartSlot;
 #[allow(deprecated)]
@@ -36,6 +37,25 @@ use crate::{
 };
 
 pub const LAMPORTS_PER_SOL: u64 = 1_000_000_000;
+
+/// Sysvars surfpool derives itself; an account write would desync them from the sysvar cache.
+const MANAGED_SYSVARS: [(Pubkey, &str); 5] = [
+    (sysvar::clock::ID, "Clock"),
+    (sysvar::slot_hashes::ID, "SlotHashes"),
+    (sysvar::recent_blockhashes::ID, "RecentBlockhashes"),
+    (sysvar::epoch_schedule::ID, "EpochSchedule"),
+    (sysvar::last_restart_slot::ID, "LastRestartSlot"),
+];
+
+pub fn reject_managed_sysvar(pubkey: &Pubkey) -> SurfpoolResult<()> {
+    match MANAGED_SYSVARS.iter().find(|(id, _)| id == pubkey) {
+        Some((_, name)) => Err(SurfpoolError::set_account(
+            *pubkey,
+            format!("the {name} sysvar is maintained by surfpool; use surfnet_timeTravel instead"),
+        )),
+        None => Ok(()),
+    }
+}
 
 /// A normal surfnet's backend: LiteSVM and the account database it loads from.
 #[derive(Clone)]
@@ -433,6 +453,7 @@ impl LocalBackend {
     }
 
     pub fn set_account(&mut self, pubkey: Pubkey, account: Account) -> SurfpoolResult<()> {
+        reject_managed_sysvar(&pubkey)?;
         self.set_account_in_db(pubkey, account.clone().into())?;
 
         self.svm.set_account(pubkey, account)?;

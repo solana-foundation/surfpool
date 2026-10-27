@@ -349,9 +349,7 @@ impl HistoricalFork {
     /// A fresh faucet signs each airdrop, including repeated requests in a frozen slot.
     /// Fund exactly the transfer plus the engine's fee: no unused faucet balance remains.
     pub(crate) fn prepare_airdrop(&mut self, pubkey: &Pubkey, lamports: u64) -> SurfpoolResult<()> {
-        if self.faucet.is_some() {
-            return Ok(());
-        }
+        self.faucet = None;
         let faucet = Arc::new(solana_keypair::Keypair::new());
         let (blockhash, _) = self.vm.latest_blockhash()?;
         let message = solana_message::Message::new_with_blockhash(
@@ -392,7 +390,9 @@ impl HistoricalFork {
         pubkey: &Pubkey,
         lamports: u64,
     ) -> SurfpoolResult<TransactionResult> {
-        self.prepare_airdrop(pubkey, lamports)?;
+        if self.faucet.is_none() {
+            self.prepare_airdrop(pubkey, lamports)?;
+        }
         let (_, tx) = self
             .faucet
             .take()
@@ -735,6 +735,12 @@ for line in sys.stdin:
         result = [{'loaded':False} for _ in op['peek']['pubkeys']]
     elif isinstance(op, dict) and op.get('command', {}).get('method') == 'accounts':
         result = [None for _ in op['command']['params']['pubkeys']]
+    elif isinstance(op, dict) and op.get('command', {}).get('method') == 'latestBlockhash':
+        result = {'blockhash':'11111111111111111111111111111111', 'lastValidBlockHeight':150}
+    elif isinstance(op, dict) and op.get('command', {}).get('method') == 'feeForMessage':
+        result = 5000
+    elif isinstance(op, dict) and op.get('command', {}).get('method') == 'setBalance':
+        result = None
     elif isinstance(op, dict) and op.get('command', {}).get('method') in ('send', 'rpcSend', 'overrideAccounts'):
         if op['command']['method'] == 'overrideAccounts':
             installs += 1
@@ -915,6 +921,36 @@ for line in sys.stdin:
                 2,
                 "retry a corrected chunk without reuploading the rest"
             );
+        }
+
+        #[test]
+        fn review_airdrop_preparation_replaces_an_interrupted_request() {
+            let (mut fork, dir) = ipc_fixture(0);
+            let previous = Pubkey::new_unique();
+            let recipient = Pubkey::new_unique();
+            fork.prepare_airdrop(&previous, 1_000_000).unwrap();
+            let abandoned_faucet = fork.airdrop_pubkey().unwrap();
+            // Pre-airdrop account capture can fail before the prepared transfer is sent.
+            fork.prepare_airdrop(&recipient, 2_000_000).unwrap();
+            assert_ne!(fork.airdrop_pubkey().unwrap(), abandoned_faucet);
+            let (_, tx) = fork.faucet.as_ref().unwrap();
+            assert!(tx.message.static_account_keys().contains(&recipient));
+            assert!(!tx.message.static_account_keys().contains(&previous));
+            assert_eq!(
+                fork.airdrop(&recipient, 2_000_000)
+                    .unwrap_err()
+                    .historical_code(),
+                Some("TEST_RUNTIME_REFUSAL")
+            );
+            assert_eq!(
+                ipc_requests(&dir)
+                    .iter()
+                    .filter(|r| r["op"]["command"]["method"] == "setBalance")
+                    .count(),
+                2,
+                "send must consume the latest preparation, not create a third"
+            );
+            assert!(fork.faucet.is_none());
         }
 
         #[tokio::test(flavor = "multi_thread")]

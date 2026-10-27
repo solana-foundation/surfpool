@@ -63,8 +63,11 @@ use uuid::Uuid;
 use super::{
     AccountFactory, AccountSource, CoupledAccount, GetAccountResult, GetTransactionResult,
     GeyserEvent, GeyserTransactionEvent, LocalSignatureStatusOrSubscription,
-    SignatureSubscriptionType, SurfnetSvm, backend::ArchiveReader, historical_archive,
-    remote::SurfnetRemoteClient, svm::AccountUpdatePolicy,
+    SignatureSubscriptionType, SurfnetSvm,
+    backend::ArchiveReader,
+    historical_archive,
+    remote::SurfnetRemoteClient,
+    svm::{AccountUpdatePolicy, ReadSlot},
 };
 use crate::{
     error::{AirdropError, SurfpoolError, SurfpoolResult},
@@ -4477,6 +4480,17 @@ impl SurfnetSvmLocker {
         self.with_svm_reader(|svm_reader| svm_reader.slot_for_commitment(commitment))
     }
 
+    /// Resolves `commitment` to a slot and refuses a `min_context_slot` above it.
+    /// Internally, this function calls [`SurfnetSvm::read_slot`] under a read guard. This
+    /// should be called before subsequent locker reads, so the context slot is valid for those reads.
+    pub fn read_slot(
+        &self,
+        commitment: Option<CommitmentConfig>,
+        min_context_slot: Option<Slot>,
+    ) -> jsonrpc_core::Result<ReadSlot> {
+        self.with_svm_reader(|svm| svm.read_slot(commitment, min_context_slot))
+    }
+
     /// Executes an airdrop via the underlying SVM.
     pub fn airdrop(
         &self,
@@ -4736,7 +4750,7 @@ impl SurfnetSvmLocker {
         &self,
         account_pubkey: &Pubkey,
         encoding: Option<UiAccountEncoding>,
-    ) -> Receiver<UiAccount> {
+    ) -> Receiver<(Slot, UiAccount)> {
         // Handles the locking/unlocking safely
         self.with_svm_writer(|svm_writer| {
             svm_writer.subscribe_for_account_updates(account_pubkey, encoding)
@@ -4749,7 +4763,7 @@ impl SurfnetSvmLocker {
         program_id: &Pubkey,
         encoding: Option<UiAccountEncoding>,
         filters: Option<Vec<RpcFilterType>>,
-    ) -> Receiver<RpcKeyedAccount> {
+    ) -> Receiver<(Slot, RpcKeyedAccount)> {
         self.with_svm_writer(|svm_writer| {
             svm_writer.subscribe_for_program_updates(program_id, encoding, filters)
         })
@@ -7162,11 +7176,35 @@ mod tests {
         // None value (skipped without remote)
         snapshot.insert(Pubkey::new_unique().to_string(), None);
 
+        // Clock sysvar (rejected: surfpool maintains it)
+        let clock_before = locker.with_svm_reader(|svm| svm.inner.clock());
+        snapshot.insert(
+            solana_sdk_ids::sysvar::clock::ID.to_string(),
+            Some(AccountSnapshot {
+                lamports: 1_169_280,
+                owner: solana_sdk_ids::sysvar::ID.to_string(),
+                executable: false,
+                rent_epoch: 0,
+                data: general_purpose::STANDARD.encode(
+                    bincode::serialize(&Clock {
+                        slot: 1,
+                        ..Default::default()
+                    })
+                    .unwrap(),
+                ),
+                parsed_data: None,
+            }),
+        );
+
         let loaded = locker
             .load_snapshot(&snapshot, None, CommitmentConfig::confirmed())
             .await
             .unwrap();
         assert_eq!(loaded, 1);
+        assert_eq!(
+            locker.with_svm_reader(|svm| svm.inner.clock()),
+            clock_before
+        );
 
         // Only the valid account should exist
         assert!(

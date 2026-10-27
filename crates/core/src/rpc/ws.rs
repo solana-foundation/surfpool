@@ -20,6 +20,7 @@ use solana_client::{
         RpcResponseContext, RpcSignatureResult,
     },
 };
+use solana_clock::Slot;
 use solana_commitment_config::CommitmentConfig;
 use solana_pubkey::Pubkey;
 use solana_rpc_client_api::response::{Response as RpcResponse, SlotInfo, SlotUpdate};
@@ -33,6 +34,15 @@ use crate::{
         GetTransactionResult, LocalSignatureStatusOrSubscription, SignatureSubscriptionType,
     },
 };
+
+/// A notification for an update produced at `slot`.
+#[allow(clippy::disallowed_methods)] // notifications carry the slot of their event, not a read
+fn notification<T>(slot: Slot, value: T) -> RpcResponse<T> {
+    RpcResponse {
+        context: RpcResponseContext::new(slot),
+        value,
+    }
+}
 
 /// Configuration for account subscription requests.
 ///
@@ -1123,18 +1133,16 @@ impl SurfpoolWsRpc {
         };
 
         let result = match (subscription_type, is_received_event) {
-            (SignatureSubscriptionType::Received, true) => sink.notify(Ok(RpcResponse {
-                context: RpcResponseContext::new(slot),
-                value: RpcSignatureResult::ReceivedSignature(
-                    ReceivedSignatureResult::ReceivedSignature,
-                ),
-            })),
-            _ => sink.notify(Ok(RpcResponse {
-                context: RpcResponseContext::new(slot),
-                value: RpcSignatureResult::ProcessedSignature(ProcessedSignatureResult {
+            (SignatureSubscriptionType::Received, true) => sink.notify(Ok(notification(
+                slot,
+                RpcSignatureResult::ReceivedSignature(ReceivedSignatureResult::ReceivedSignature),
+            ))),
+            _ => sink.notify(Ok(notification(
+                slot,
+                RpcSignatureResult::ProcessedSignature(ProcessedSignatureResult {
                     err: err.map(Into::into),
                 }),
-            })),
+            ))),
         };
 
         if let Err(error) = result {
@@ -1464,8 +1472,6 @@ impl Rpc for SurfpoolWsRpc {
                 return;
             }
         };
-        let slot = svm_locker.with_svm_reader(|svm| svm.get_latest_absolute_slot());
-
         self.tokio_handle.spawn(async move {
             if let Ok(mut guard) = account_active.write() {
                 guard.insert(sub_id.clone(), sink);
@@ -1488,7 +1494,7 @@ impl Rpc for SurfpoolWsRpc {
                     break;
                 }
 
-                let Ok(ui_account) = rx.try_recv() else {
+                let Ok((slot, ui_account)) = rx.try_recv() else {
                     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
                     continue;
                 };
@@ -1503,10 +1509,7 @@ impl Rpc for SurfpoolWsRpc {
                     break;
                 };
 
-                if let Err(e) = sink.notify(Ok(RpcResponse {
-                    context: RpcResponseContext::new(slot),
-                    value: ui_account,
-                })) {
+                if let Err(e) = sink.notify(Ok(notification(slot, ui_account))) {
                     log::error!("Failed to notify client about account update: {e}");
                     break;
                 }
@@ -1718,10 +1721,7 @@ impl Rpc for SurfpoolWsRpc {
                     break;
                 };
 
-                if let Err(e) = sink.notify(Ok(RpcResponse {
-                    context: RpcResponseContext::new(slot),
-                    value,
-                })) {
+                if let Err(e) = sink.notify(Ok(notification(slot, value))) {
                     log::error!("Failed to notify client about logs update: {e}");
                     break;
                 }
@@ -1847,8 +1847,6 @@ impl Rpc for SurfpoolWsRpc {
                 return;
             }
         };
-        let slot = svm_locker.with_svm_reader(|svm| svm.get_latest_absolute_slot());
-
         self.tokio_handle.spawn(async move {
             if let Ok(mut guard) = program_active.write() {
                 guard.insert(sub_id.clone(), sink);
@@ -1874,7 +1872,7 @@ impl Rpc for SurfpoolWsRpc {
                     break;
                 }
 
-                let Ok(keyed_account) = rx.try_recv() else {
+                let Ok((slot, keyed_account)) = rx.try_recv() else {
                     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
                     continue;
                 };
@@ -1889,10 +1887,7 @@ impl Rpc for SurfpoolWsRpc {
                     break;
                 };
 
-                if let Err(e) = sink.notify(Ok(RpcResponse {
-                    context: RpcResponseContext::new(slot),
-                    value: keyed_account,
-                })) {
+                if let Err(e) = sink.notify(Ok(notification(slot, keyed_account))) {
                     log::error!("Failed to notify client about program account update: {e}");
                     break;
                 }
@@ -2196,6 +2191,62 @@ mod tests {
     use solana_client::rpc_filter::{Memcmp, MemcmpEncodedBytes};
 
     use super::*;
+
+    /// Agave stamps each account notification with the slot of the bank that produced it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn account_notifications_carry_the_slot_of_their_update() {
+        use jsonrpc_core::futures::StreamExt;
+
+        let setup = crate::tests::helpers::TestSetup::new(crate::rpc::minimal::SurfpoolMinimalRpc);
+        let locker = setup.context.svm_locker.clone();
+        let rpc = SurfpoolWsRpc {
+            uid: atomic::AtomicUsize::new(0),
+            signature_subscription_map: Default::default(),
+            account_subscription_map: Default::default(),
+            program_subscription_map: Default::default(),
+            slot_subscription_map: Default::default(),
+            slots_updates_subscription_map: Default::default(),
+            logs_subscription_map: Default::default(),
+            snapshot_subscription_map: Default::default(),
+            tokio_handle: tokio::runtime::Handle::current(),
+        };
+        let pubkey = Pubkey::new_unique();
+        let (subscriber, _id_rx, mut notifications) = Subscriber::new_test("accountSubscribe");
+        rpc.account_subscribe(
+            Some(SurfpoolWebsocketMeta::new(setup.context.clone(), None)),
+            subscriber,
+            pubkey.to_string(),
+            None,
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        for _ in 0..3 {
+            locker.confirm_current_block(&None).await.unwrap();
+        }
+        let update_slot = locker.get_latest_absolute_slot();
+        locker
+            .with_svm_writer(|svm| {
+                svm.set_account(
+                    &pubkey,
+                    solana_account::Account {
+                        lamports: 1,
+                        ..Default::default()
+                    },
+                )
+            })
+            .unwrap();
+
+        let notification =
+            tokio::time::timeout(tokio::time::Duration::from_secs(5), notifications.next())
+                .await
+                .unwrap()
+                .unwrap();
+        let notification: serde_json::Value = serde_json::from_str(&notification).unwrap();
+        assert_eq!(
+            notification["params"]["result"]["context"]["slot"],
+            update_slot
+        );
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_program_subscribe_rejects_invalid_filters() {
