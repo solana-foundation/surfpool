@@ -8,7 +8,10 @@ mod overlay;
 mod postgres;
 #[cfg(feature = "sqlite")]
 mod sqlite;
+use std::sync::Arc;
+
 pub use backend::StorageBackend;
+pub(crate) use fifo_map::ProfileFifoMap;
 pub use hash_map::HashMap as StorageHashMap;
 pub use overlay::OverlayStorage;
 #[cfg(feature = "postgres")]
@@ -218,6 +221,41 @@ pub struct OverlayDelta<K, V> {
     pub writes: Vec<(K, V)>,
     pub deletes: Vec<K>,
     pub base_cleared: bool,
+}
+
+/// Copy-on-write in-memory storage: `clone_box` shares the map, and a write copies it only
+/// while a clone (such as a profiling sandbox) still holds it.
+impl<K, V, M> Storage<K, V> for Arc<M>
+where
+    M: Storage<K, V> + Clone + 'static,
+{
+    fn store(&mut self, key: K, value: V) -> StorageResult<()> {
+        Arc::make_mut(self).store(key, value)
+    }
+    fn clear(&mut self) -> StorageResult<()> {
+        Arc::make_mut(self).clear()
+    }
+    fn get(&self, key: &K) -> StorageResult<Option<V>> {
+        (**self).get(key)
+    }
+    fn take(&mut self, key: &K) -> StorageResult<Option<V>> {
+        Arc::make_mut(self).take(key)
+    }
+    fn keys(&self) -> StorageResult<Vec<K>> {
+        (**self).keys()
+    }
+    fn into_iter(&self) -> StorageResult<Box<dyn Iterator<Item = (K, V)> + '_>> {
+        (**self).into_iter()
+    }
+    fn contains_key(&self, key: &K) -> StorageResult<bool> {
+        (**self).contains_key(key)
+    }
+    fn count(&self) -> StorageResult<u64> {
+        (**self).count()
+    }
+    fn clone_box(&self) -> Box<dyn Storage<K, V>> {
+        Box::new(Arc::clone(self))
+    }
 }
 
 // Implement Clone for Box<dyn Storage<K, V>>

@@ -110,7 +110,7 @@ use crate::{
         },
         template_registry,
     },
-    storage::{OverlayStorage, Storage, StorageBackend},
+    storage::{OverlayStorage, ProfileFifoMap, Storage, StorageBackend},
     surfnet::{
         BlockSubscriptionData, LogsSubscriptionData, locker::is_supported_token_program,
         surfnet_lite_svm::SurfnetLiteSvm,
@@ -1270,17 +1270,18 @@ impl SurfnetSvm {
             storage_backend.open_store("profile_tag_map")?;
         // Ensure max_profiles is at least 1 to avoid creating a zero-capacity FifoMap
         let max_profiles = max(1, config.max_profiles);
-        // Use FifoMap for both profile stores to maintain FIFO eviction behavior
-        // (when no on-disk DB is provided)
+        // Without an on-disk DB, both profile stores are FIFO maps capped at max_profiles.
+        // ProfileFifoMap behind an Arc lets profiling sandboxes share the map, and a
+        // copy-on-write keeps the cap.
         let simulated_transaction_profiles_db: Box<dyn Storage<String, KeyedProfileResult>> =
             storage_backend
                 .open_store_with_default("simulated_transaction_profiles", move || {
-                    Box::new(FifoMap::<String, KeyedProfileResult>::new(max_profiles))
+                    Box::new(Arc::new(ProfileFifoMap(FifoMap::new(max_profiles))))
                 })?;
         let executed_transaction_profiles_db: Box<dyn Storage<String, KeyedProfileResult>> =
             storage_backend
                 .open_store_with_default("executed_transaction_profiles", move || {
-                    Box::new(FifoMap::<String, KeyedProfileResult>::new(max_profiles))
+                    Box::new(Arc::new(ProfileFifoMap(FifoMap::new(max_profiles))))
                 })?;
         let epoch_schedule = Self::default_epoch_schedule();
         let epoch_info = Self::default_epoch_info(&epoch_schedule);
