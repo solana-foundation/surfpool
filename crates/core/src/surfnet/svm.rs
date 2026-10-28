@@ -425,6 +425,24 @@ impl ReadSlot {
         self.0
     }
 
+    /// Surfpool keeps no account state per commitment and reads every account at the tip, so a
+    /// read that returns an account written after this slot answers for that write's slot.
+    /// Unlike Agave's, the context can then pass the commitment's slot, but it is never older
+    /// than the data it carries.
+    pub fn covering(self, svm: &SurfnetSvm, pubkeys: &[Pubkey]) -> Self {
+        pubkeys
+            .iter()
+            .filter_map(|pubkey| svm.account_update_slots.get(pubkey))
+            .fold(self, |read, &written| Self(read.0.max(written)))
+    }
+
+    /// [`Self::covering`] for a scan, whose answer depends on accounts it does not return.
+    pub fn covering_every_account(self, svm: &SurfnetSvm) -> Self {
+        svm.account_update_slots
+            .values()
+            .fold(self, |read, &written| Self(read.0.max(written)))
+    }
+
     /// Like Agave's `new_response(&bank, value)`: the response context is the slot read at.
     #[allow(clippy::disallowed_methods)] // the one sanctioned context for request/response handlers
     pub fn respond<T>(self, value: T) -> RpcResponse<T> {
