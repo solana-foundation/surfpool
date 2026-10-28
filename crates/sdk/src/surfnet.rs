@@ -187,7 +187,9 @@ impl SurfnetBuilder {
     /// Keys are base58 pubkeys. A `None` value fetches the account from the
     /// remote RPC, so it is skipped when running offline. Can be called
     /// multiple times, together with [`Self::snapshot_file`]: when two
-    /// snapshots hold the same pubkey, the one added last wins.
+    /// snapshots hold the same pubkey, the one added last wins. A snapshot
+    /// also wins over startup airdrops: restoring the payer, or one of
+    /// [`Self::airdrop_addresses`], keeps the restored balance.
     pub fn snapshot(mut self, accounts: BTreeMap<String, Option<AccountSnapshot>>) -> Self {
         self.snapshots.push(SnapshotSource::Accounts(accounts));
         self
@@ -232,7 +234,13 @@ impl SurfnetBuilder {
 
         let mut startup_airdrop_addresses = vec![payer.pubkey()];
         startup_airdrop_addresses.extend(airdrop_addresses);
-        let startup_airdrop_addresses_for_rpc = startup_airdrop_addresses.clone();
+        // Startup airdrops land before the snapshot loads, so an address the
+        // snapshot restores keeps its restored balance: only wait for the rest.
+        let startup_airdrop_addresses_for_rpc: Vec<Pubkey> = startup_airdrop_addresses
+            .iter()
+            .filter(|address| !matches!(snapshot.get(&address.to_string()), Some(Some(_))))
+            .copied()
+            .collect();
 
         // The default StartupPlanner::Runloop makes the runloop seal an empty
         // startup plan before announcing Ready, so wait_for_ready below
@@ -371,6 +379,19 @@ impl Surfnet {
     /// Access cheatcode helpers for direct state manipulation.
     pub fn cheatcodes(&self) -> Cheatcodes<'_> {
         Cheatcodes::new(&self.rpc_url)
+    }
+
+    /// Slots that arrived late, in [`BlockProductionMode::Clock`]: clock ticks
+    /// coalesced because block production fell behind (a starved CPU, a host
+    /// that slept). The chain stretched instead of bursting, so clients still
+    /// saw every slot, but each of those slots lasted longer than the slot
+    /// time. Read it before and after a run: a non-zero difference means the
+    /// run's timing was degraded and wall-clock-sensitive results may differ.
+    pub fn coalesced_slots(&self) -> u64 {
+        self.svm_locker.with_svm_reader(|svm| {
+            svm.coalesced_slots
+                .load(std::sync::atomic::Ordering::Relaxed)
+        })
     }
 
     /// Get a reference to the simnet events receiver for observing runtime events.

@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 
 use base64::{Engine, prelude::BASE64_STANDARD};
 use solana_client::rpc_request::RpcRequest;
-use surfpool_sdk::{AccountSnapshot, Pubkey, Surfnet, SurfnetError};
+use surfpool_sdk::{AccountSnapshot, Keypair, Pubkey, Signer, Surfnet, SurfnetError};
 
 fn account_snapshot(lamports: u64, owner: &Pubkey, data: &[u8]) -> AccountSnapshot {
     AccountSnapshot::new(
@@ -175,5 +175,31 @@ async fn snapshot_restores_last_restart_slot_offline() {
     assert_eq!(
         u64::from_le_bytes(data[..8].try_into().unwrap()),
         458_000_123
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn restored_balances_win_over_startup_airdrops() {
+    // The payer is airdropped at startup, then the snapshot restores it with a
+    // different balance: startup must not wait for the airdropped amount.
+    let payer = Keypair::new();
+    let payer_pubkey = payer.pubkey();
+    let system_program: Pubkey = "11111111111111111111111111111111".parse().unwrap();
+    let snapshot = BTreeMap::from([(
+        payer_pubkey.to_string(),
+        Some(account_snapshot(123_456_789, &system_program, &[])),
+    )]);
+
+    let surfnet = Surfnet::builder()
+        .offline(true)
+        .payer(payer)
+        .snapshot(snapshot)
+        .start()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        surfnet.rpc_client().get_balance(&payer_pubkey).unwrap(),
+        123_456_789
     );
 }
