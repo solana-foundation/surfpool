@@ -5268,7 +5268,15 @@ mod tests {
             .await
             .expect_err("setting the Clock must be rejected");
 
-        assert!(format!("{err:?}").contains("surfnet_timeTravel"), "{err:?}");
+        assert_eq!(err.code, jsonrpc_core::ErrorCode::InvalidParams);
+        assert_eq!(err.message, "Invalid params");
+        assert_eq!(
+            err.data,
+            Some(serde_json::json!(format!(
+                "Failed to set account {}: the Clock sysvar is maintained by surfpool; use surfnet_timeTravel instead",
+                solana_sdk_ids::sysvar::clock::ID
+            )))
+        );
         assert_eq!(clock(), before);
     }
 

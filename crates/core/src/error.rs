@@ -129,6 +129,14 @@ impl SurfpoolError {
         Self(error)
     }
 
+    pub fn managed_sysvar(pubkey: Pubkey, name: &str) -> Self {
+        let mut error = Error::new(jsonrpc_core::ErrorCode::InvalidParams);
+        error.data = Some(json!(format!(
+            "Failed to set account {pubkey}: the {name} sysvar is maintained by surfpool; use surfnet_timeTravel instead"
+        )));
+        Self(error)
+    }
+
     pub fn set_account<T>(pubkey: Pubkey, e: T) -> Self
     where
         T: ToString,

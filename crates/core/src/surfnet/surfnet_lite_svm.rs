@@ -40,10 +40,7 @@ const MANAGED_SYSVARS: [(Pubkey, &str); 5] = [
 
 pub fn reject_managed_sysvar(pubkey: &Pubkey) -> SurfpoolResult<()> {
     match MANAGED_SYSVARS.iter().find(|(id, _)| id == pubkey) {
-        Some((_, name)) => Err(SurfpoolError::set_account(
-            *pubkey,
-            format!("the {name} sysvar is maintained by surfpool; use surfnet_timeTravel instead"),
-        )),
+        Some((_, name)) => Err(SurfpoolError::managed_sysvar(*pubkey, name)),
         None => Ok(()),
     }
 }
