@@ -156,7 +156,9 @@ impl SurfnetBuilder {
     /// [`CheatcodeFilter::all`] locks the whole surfnet: every `surfnet_*`
     /// method, `requestAirdrop`, and the admin methods that stop the surfnet
     /// or load plugins, so it behaves like a plain validator RPC for every
-    /// client. [`CheatcodeFilter::list`] locks only those methods.
+    /// client. [`CheatcodeFilter::list`] locks only those methods;
+    /// [`Self::start`] fails with [`SurfnetError::Startup`] if one of them
+    /// isn't a cheatcode.
     ///
     /// Startup airdrops (the payer, [`Self::airdrop_addresses`]) still land,
     /// and [`Surfnet::stop`] still works: neither goes through RPC. To set up
@@ -217,6 +219,10 @@ impl SurfnetBuilder {
             cheatcode_lock,
             snapshots,
         } = self;
+        if let Some(lock) = &cheatcode_lock {
+            lock.validate()
+                .map_err(|e| SurfnetError::Startup(format!("cannot lock cheatcodes: {e}")))?;
+        }
         let payer = payer.unwrap_or_else(Keypair::new);
         let snapshot = merge_snapshots(snapshots)?;
 

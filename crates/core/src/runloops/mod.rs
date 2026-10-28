@@ -182,6 +182,10 @@ pub async fn start_local_surfnet_runloop(
     let Some(simnet) = config.simnets.first() else {
         return Ok(());
     };
+    if let Some(lock) = &config.rpc.cheatcode_lock {
+        lock.validate()
+            .map_err(|e| format!("cannot lock cheatcodes: {e}"))?;
+    }
     let startup_planner = config.startup_planner;
     let block_production_mode = simnet.block_production_mode.clone();
 

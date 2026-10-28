@@ -5,7 +5,7 @@
 
 use solana_client::rpc_request::RpcRequest;
 use solana_signer::Signer;
-use surfpool_sdk::{CheatcodeFilter, Keypair, Pubkey, Surfnet};
+use surfpool_sdk::{CheatcodeFilter, Keypair, Pubkey, Surfnet, SurfnetError};
 
 fn call(surfnet: &Surfnet, method: &'static str, params: serde_json::Value) -> Result<(), String> {
     surfnet
@@ -208,4 +208,19 @@ async fn locking_a_list_at_startup_leaves_the_rest() {
         "surfnet_timeTravel after re-enabling it",
     );
     surfnet.cheatcodes().fund_sol(&target, 5).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn locking_an_unknown_cheatcode_fails_startup() {
+    let result = Surfnet::builder()
+        .lock_cheatcodes(CheatcodeFilter::list(["surfnet_setAcount"]))
+        .start()
+        .await;
+    match result {
+        Err(SurfnetError::Startup(message)) => {
+            assert!(message.contains("surfnet_setAcount"), "{message}")
+        }
+        Err(other) => panic!("expected a startup error, got {other}"),
+        Ok(_) => panic!("a lock naming a typo must not start a surfnet"),
+    }
 }

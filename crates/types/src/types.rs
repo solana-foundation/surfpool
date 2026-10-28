@@ -1856,6 +1856,30 @@ impl CheatcodeFilter {
     {
         Self::List(methods.into_iter().map(Into::into).collect())
     }
+
+    /// Fails on `All` with anything but `"all"`, or a list naming a method
+    /// that isn't a cheatcode. A lock that names a typo would leave the
+    /// method it meant open, so a surfnet must not start with one.
+    pub fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::All(all) if all == "all" => Ok(()),
+            Self::All(other) => Err(format!(
+                "invalid cheatcode filter `{other}`: expected `all` or a list of cheatcode methods"
+            )),
+            Self::List(methods) => {
+                let unknown: Vec<&str> = methods
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|m| !SURFNET_CHEATCODE_METHODS.contains(m))
+                    .collect();
+                if unknown.is_empty() {
+                    Ok(())
+                } else {
+                    Err(format!("not cheatcode methods: {}", unknown.join(", ")))
+                }
+            }
+        }
+    }
 }
 
 /// Canonical list of the `surfnet_*` cheatcode JSON-RPC methods.
@@ -2200,6 +2224,25 @@ mod tests {
         }
         assert!(config.enable_all().is_err());
         assert!(config.enable_cheatcode("surfnet_setAccount").is_err());
+    }
+
+    #[test]
+    fn validate_rejects_unknown_cheatcodes() {
+        assert!(CheatcodeFilter::all().validate().is_ok());
+        assert!(
+            CheatcodeFilter::list(["surfnet_setAccount", "surfnet_timeTravel"])
+                .validate()
+                .is_ok()
+        );
+        let error = CheatcodeFilter::list(["surfnet_setAccount", "surfnet_setAcount", "getSlot"])
+            .validate()
+            .unwrap_err();
+        assert!(error.contains("surfnet_setAcount, getSlot"), "{error}");
+        assert!(
+            CheatcodeFilter::All("everything".into())
+                .validate()
+                .is_err()
+        );
     }
 
     #[test]
