@@ -4313,6 +4313,11 @@ impl SurfnetSvmLocker {
         })
     }
 
+    /// The notifier signalled after subscription notifications are sent.
+    pub(crate) fn subscription_wake(&self) -> Arc<tokio::sync::Notify> {
+        self.with_svm_reader(|svm_reader| svm_reader.subscription_wake.clone())
+    }
+
     /// Subscribes for snapshot import updates and returns a receiver of snapshot import notifications.
     /// This method spawns a background task that fetches the snapshot and loads it via `load_snapshot`.
     pub fn subscribe_for_snapshot_import_updates(
@@ -4329,9 +4334,14 @@ impl SurfnetSvmLocker {
         let snapshot_url = snapshot_url.to_string();
         let snapshot_id = snapshot_id.to_string();
 
+        let wake = self.subscription_wake();
+        let send = move |notification| {
+            let _ = tx.send(notification);
+            wake.notify_waiters();
+        };
         tokio::spawn(async move {
             // Send initial notification
-            let _ = tx.send(super::SnapshotImportNotification {
+            send(super::SnapshotImportNotification {
                 snapshot_id: snapshot_id.clone(),
                 status: super::SnapshotImportStatus::Started,
                 accounts_loaded: 0,
@@ -4343,7 +4353,7 @@ impl SurfnetSvmLocker {
             let snapshot_data = match SurfnetSvm::fetch_snapshot_from_url(&snapshot_url).await {
                 Ok(data) => data,
                 Err(e) => {
-                    let _ = tx.send(super::SnapshotImportNotification {
+                    send(super::SnapshotImportNotification {
                         snapshot_id,
                         status: super::SnapshotImportStatus::Failed,
                         accounts_loaded: 0,
@@ -4357,7 +4367,7 @@ impl SurfnetSvmLocker {
             let total_accounts = snapshot_data.len() as u64;
 
             // Send progress notification with total count
-            let _ = tx.send(super::SnapshotImportNotification {
+            send(super::SnapshotImportNotification {
                 snapshot_id: snapshot_id.clone(),
                 status: super::SnapshotImportStatus::InProgress,
                 accounts_loaded: 0,
@@ -4371,7 +4381,7 @@ impl SurfnetSvmLocker {
                 .await
             {
                 Ok(loaded_count) => {
-                    let _ = tx.send(super::SnapshotImportNotification {
+                    send(super::SnapshotImportNotification {
                         snapshot_id,
                         status: super::SnapshotImportStatus::Completed,
                         accounts_loaded: loaded_count as u64,
@@ -4380,7 +4390,7 @@ impl SurfnetSvmLocker {
                     });
                 }
                 Err(e) => {
-                    let _ = tx.send(super::SnapshotImportNotification {
+                    send(super::SnapshotImportNotification {
                         snapshot_id,
                         status: super::SnapshotImportStatus::Failed,
                         accounts_loaded: 0,

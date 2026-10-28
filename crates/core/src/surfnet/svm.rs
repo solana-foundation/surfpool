@@ -548,6 +548,9 @@ pub struct SurfnetSvm {
     pub logs_subscriptions: Vec<LogsSubscriptionData>,
     pub block_subscriptions: Vec<BlockSubscriptionData>,
     pub snapshot_subscriptions: Vec<super::SnapshotSubscriptionData>,
+    /// Signalled after subscription notifications are sent, so WebSocket tasks can wait for
+    /// them instead of polling their channels.
+    pub(crate) subscription_wake: Arc<tokio::sync::Notify>,
     pub updated_at: u64,
     pub slot_time: u64,
     pub start_time: SystemTime,
@@ -911,6 +914,7 @@ impl SurfnetSvm {
             logs_subscriptions: Vec::new(),
             block_subscriptions: Vec::new(),
             snapshot_subscriptions: Vec::new(),
+            subscription_wake: Arc::default(),
 
             updated_at: self.updated_at,
             slot_time: self.slot_time,
@@ -1358,6 +1362,7 @@ impl SurfnetSvm {
             logs_subscriptions: Vec::new(),
             block_subscriptions: Vec::new(),
             snapshot_subscriptions: Vec::new(),
+            subscription_wake: Arc::default(),
             updated_at,
             slot_time: config.slot_time,
             start_time: SystemTime::now(),
@@ -4068,6 +4073,7 @@ impl SurfnetSvm {
             if !remaining.is_empty() {
                 self.signature_subscriptions.insert(*signature, remaining);
             }
+            self.subscription_wake.notify_waiters();
         }
     }
 
@@ -4098,6 +4104,7 @@ impl SurfnetSvm {
                 self.account_subscriptions
                     .insert(*account_updated_pubkey, remaining);
             }
+            self.subscription_wake.notify_waiters();
         }
     }
 
@@ -4132,6 +4139,7 @@ impl SurfnetSvm {
             if !remaining.is_empty() {
                 self.program_subscriptions.insert(program_id, remaining);
             }
+            self.subscription_wake.notify_waiters();
         }
     }
 
@@ -4424,8 +4432,12 @@ impl SurfnetSvm {
     }
 
     pub fn notify_slot_subscribers(&mut self, slot: Slot, parent: Slot, root: Slot) {
+        if self.slot_subscriptions.is_empty() {
+            return;
+        }
         self.slot_subscriptions
             .retain(|tx| tx.send(SlotInfo { slot, parent, root }).is_ok());
+        self.subscription_wake.notify_waiters();
     }
 
     /// Registers a new sender for `slotsUpdatesSubscribe` notifications and
@@ -4453,6 +4465,7 @@ impl SurfnetSvm {
         let arc = Arc::new(update);
         self.slots_updates_subscriptions
             .retain(|tx| tx.send(arc.clone()).is_ok());
+        self.subscription_wake.notify_waiters();
     }
 
     /// Sends a slot status to Geyser plugins and mirrors it to `slotsUpdatesSubscribe`, so the
@@ -4627,6 +4640,7 @@ impl SurfnetSvm {
                     logs: logs.clone(),
                 };
                 let _ = tx.send((self.get_latest_absolute_slot(), message));
+                self.subscription_wake.notify_waiters();
             }
         }
     }
@@ -4708,6 +4722,7 @@ impl SurfnetSvm {
                 tx.send(update).is_ok()
             })
             .collect();
+        self.subscription_wake.notify_waiters();
     }
 
     /// Registers a snapshot subscription and returns a sender and receiver for notifications.
