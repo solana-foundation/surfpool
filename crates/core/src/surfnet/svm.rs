@@ -542,6 +542,10 @@ pub struct SurfnetSvm {
     pub updated_at: u64,
     pub slot_time: u64,
     pub start_time: SystemTime,
+    /// Clock-mode ticks the clock dropped because block production was
+    /// behind: each is a slot that came later than `slot_time` promised,
+    /// instead of arriving in a burst. Shared with the clock thread.
+    pub coalesced_slots: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub accounts_by_owner: Box<dyn Storage<String, Vec<String>>>,
     pub account_associated_data: Box<dyn Storage<String, SerializableAccountAdditionalData>>,
     pub token_accounts: Box<dyn Storage<String, TokenAccount>>,
@@ -892,6 +896,7 @@ impl SurfnetSvm {
             updated_at: self.updated_at,
             slot_time: self.slot_time,
             start_time: self.start_time,
+            coalesced_slots: self.coalesced_slots.clone(),
 
             total_supply: self.total_supply,
             circulating_supply: self.circulating_supply,
@@ -1312,6 +1317,7 @@ impl SurfnetSvm {
             updated_at,
             slot_time: config.slot_time,
             start_time: SystemTime::now(),
+            coalesced_slots: Default::default(),
             accounts_by_owner: accounts_by_owner_db,
             account_associated_data: account_associated_data_db,
             token_accounts: token_accounts_db,
