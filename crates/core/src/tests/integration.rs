@@ -4614,6 +4614,7 @@ fn boot_simnet_with_features(
             gossip_port: 0,
             tpu_port: 0,
             tpu_quic_port: 0,
+            ..RpcConfig::default()
         },
         subgraph: SubgraphConfig::default(),
         ..SurfpoolConfig::default()

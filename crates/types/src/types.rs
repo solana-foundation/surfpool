@@ -990,6 +990,9 @@ pub struct RpcConfig {
     pub gossip_port: u16,
     pub tpu_port: u16,
     pub tpu_quic_port: u16,
+    /// Cheatcodes locked before the RPC server accepts its first request.
+    #[serde(default)]
+    pub cheatcode_lock: CheatcodeLock,
 }
 
 impl RpcConfig {
@@ -1010,6 +1013,7 @@ impl Default for RpcConfig {
             gossip_port: DEFAULT_GOSSIP_PORT,
             tpu_port: DEFAULT_TPU_PORT,
             tpu_quic_port: DEFAULT_TPU_QUIC_PORT,
+            cheatcode_lock: CheatcodeLock::None,
         }
     }
 }
@@ -1814,6 +1818,10 @@ fn default_prometheus_addr() -> String {
 pub struct CheatcodeConfig {
     pub lockout: bool, // if true, allows disabling even the `surfnet_enableCheatcodes`/`surfnetdisableCheatcodes` methods
     pub filter: CheatcodeFilter,
+    /// Methods disabled with lockout. They stay disabled for the life of the
+    /// surfnet: nothing re-enables them, so locking is one-way.
+    #[serde(default)]
+    pub locked: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -1871,12 +1879,90 @@ pub const SURFNET_CHEATCODE_METHODS: [&str; 28] = [
     "surfnet_writeProgram",
 ];
 
+/// Standard RPC methods that act as cheatcodes on a surfnet: `requestAirdrop`
+/// mints SOL out of thin air. They are refused only once every cheatcode is
+/// locked; a surfnet that isn't locked keeps them, so wallets and tests that
+/// airdrop keep working after `surfnet_disableCheatcode`.
+pub const GATED_RPC_METHODS: [&str; 1] = ["requestAirdrop"];
+
+/// Whether `method` is subject to cheatcode gating.
+pub fn is_gated_method(method: &str) -> bool {
+    method.starts_with("surfnet_") || GATED_RPC_METHODS.contains(&method)
+}
+
+/// Cheatcodes to lock when a surfnet starts, before any client can connect.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CheatcodeLock {
+    /// Every cheatcode stays available.
+    #[default]
+    None,
+    /// Lock every cheatcode, the enable/disable methods, and `requestAirdrop`.
+    All,
+    /// Lock these `surfnet_*` methods; the rest stay available and can still
+    /// be disabled (and locked) at runtime. `requestAirdrop` stays available.
+    Methods(Vec<String>),
+}
+
 impl CheatcodeConfig {
     pub fn new() -> Arc<Mutex<Self>> {
         Arc::new(Mutex::new(CheatcodeConfig {
             lockout: false,
             filter: CheatcodeFilter::List(vec![]),
+            locked: vec![],
         }))
+    }
+
+    /// A config with `lock` already applied.
+    pub fn with_lock(lock: &CheatcodeLock) -> Arc<Mutex<Self>> {
+        let config = Self::new();
+        {
+            let mut guard = config.lock().unwrap();
+            match lock {
+                CheatcodeLock::None => {}
+                CheatcodeLock::All => guard.lock_all(),
+                CheatcodeLock::Methods(methods) => guard.lock_methods(methods),
+            }
+        }
+        config
+    }
+
+    /// Disable every gated method, permanently.
+    pub fn lock_all(&mut self) {
+        self.lockout = true;
+        self.filter = CheatcodeFilter::All("all".to_string());
+    }
+
+    /// Disable `methods`, permanently. Methods already locked are skipped.
+    pub fn lock_methods(&mut self, methods: &[String]) {
+        self.lockout = true;
+        for method in methods {
+            if let CheatcodeFilter::List(list) = &mut self.filter
+                && !list.contains(method)
+            {
+                list.push(method.clone());
+            }
+            if !self.locked.contains(method) {
+                self.locked.push(method.clone());
+            }
+        }
+    }
+
+    /// Whether `cheatcode` can never be re-enabled.
+    pub fn is_locked(&self, cheatcode: &str) -> bool {
+        match &self.filter {
+            CheatcodeFilter::All(_) if self.lockout => true,
+            _ => self.locked.iter().any(|c| c == cheatcode),
+        }
+    }
+
+    /// Re-enable every cheatcode that isn't locked.
+    pub fn enable_all(&mut self) -> Result<(), String> {
+        if self.lockout && matches!(self.filter, CheatcodeFilter::All(_)) {
+            return Err("All cheatcodes are locked".to_string());
+        }
+        self.filter = CheatcodeFilter::List(self.locked.clone());
+        Ok(())
     }
 
     pub fn lockout(&mut self) {
@@ -1885,9 +1971,18 @@ impl CheatcodeConfig {
 
     pub fn disable_all(&mut self, lockout: bool, available_cheatcodes: Vec<String>) {
         if lockout {
-            self.lockout = true;
+            self.lock_all();
+            return;
         }
-        self.filter = Self::filter_all_list(lockout, available_cheatcodes);
+        let mut filter = Self::filter_all_list(false, available_cheatcodes);
+        if let CheatcodeFilter::List(list) = &mut filter {
+            for method in &self.locked {
+                if !list.contains(method) {
+                    list.push(method.clone());
+                }
+            }
+        }
+        self.filter = filter;
     }
 
     pub fn disable_cheatcode(&mut self, cheatcode: &String) -> Result<(), String> {
@@ -1909,6 +2004,11 @@ impl CheatcodeConfig {
         }
     }
     pub fn enable_cheatcode(&mut self, cheatcode: &str) -> Result<(), String> {
+        if self.is_locked(cheatcode) {
+            return Err(format!(
+                "Cheatcode {cheatcode} is locked and cannot be re-enabled"
+            ));
+        }
         if let CheatcodeFilter::List(list) = &mut self.filter {
             if let Some(pos) = list.iter().position(|c| c == cheatcode) {
                 list.remove(pos);
@@ -2036,6 +2136,71 @@ mod tests {
 
         config.disable_all(false, available);
         assert!(!config.lockout);
+    }
+
+    #[test]
+    fn locked_methods_cannot_be_re_enabled() {
+        let config = CheatcodeConfig::new();
+        let mut config = config.lock().unwrap();
+        let set_account = "surfnet_setAccount".to_string();
+
+        config.lock_methods(std::slice::from_ref(&set_account));
+        assert!(config.is_cheatcode_disabled(&set_account));
+        assert!(config.enable_cheatcode(&set_account).is_err());
+
+        // Enabling everything leaves locked methods disabled.
+        config.enable_all().unwrap();
+        assert!(config.is_cheatcode_disabled(&set_account));
+        assert!(!config.is_cheatcode_disabled(&"surfnet_timeTravel".to_string()));
+    }
+
+    #[test]
+    fn disable_all_without_lockout_keeps_locks() {
+        let config = CheatcodeConfig::new();
+        let mut config = config.lock().unwrap();
+        config.lock_methods(&["surfnet_setAccount".to_string()]);
+
+        config.disable_all(false, vec!["surfnet_timeTravel".to_string()]);
+        config.enable_all().unwrap();
+        assert!(config.is_cheatcode_disabled(&"surfnet_setAccount".to_string()));
+        assert!(!config.is_cheatcode_disabled(&"surfnet_timeTravel".to_string()));
+    }
+
+    #[test]
+    fn lock_all_gates_airdrops_and_cannot_be_undone() {
+        let config = CheatcodeConfig::with_lock(&CheatcodeLock::All);
+        let mut config = config.lock().unwrap();
+
+        for method in [
+            "surfnet_setAccount",
+            "surfnet_enableCheatcode",
+            "requestAirdrop",
+        ] {
+            assert!(
+                config.is_cheatcode_disabled(&method.to_string()),
+                "{method}"
+            );
+            assert!(config.is_locked(method), "{method}");
+        }
+        assert!(config.enable_all().is_err());
+        assert!(config.enable_cheatcode("surfnet_setAccount").is_err());
+    }
+
+    #[test]
+    fn only_a_full_lock_gates_airdrops() {
+        let config = CheatcodeConfig::new();
+        let mut config = config.lock().unwrap();
+        let airdrop = "requestAirdrop".to_string();
+
+        config.disable_all(false, vec!["surfnet_setAccount".to_string()]);
+        assert!(!config.is_cheatcode_disabled(&airdrop));
+        config.lock_methods(&["surfnet_timeTravel".to_string()]);
+        assert!(!config.is_cheatcode_disabled(&airdrop));
+
+        config.lock_all();
+        assert!(config.is_cheatcode_disabled(&airdrop));
+        assert!(is_gated_method("requestAirdrop"));
+        assert!(!is_gated_method("getSlot"));
     }
 
     #[test]

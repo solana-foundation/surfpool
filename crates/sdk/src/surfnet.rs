@@ -15,8 +15,8 @@ use surfpool_core::surfnet::{
     svm::{SurfnetSvm, SurfnetSvmConfig},
 };
 use surfpool_types::{
-    BlockProductionMode, RpcConfig, SimnetCommand, SimnetConfig, SimnetEvent, SurfpoolConfig,
-    SvmFeatureConfig,
+    BlockProductionMode, CheatcodeLock, RpcConfig, SimnetCommand, SimnetConfig, SimnetEvent,
+    SurfpoolConfig, SvmFeatureConfig,
 };
 
 use crate::{
@@ -50,6 +50,7 @@ pub struct SurfnetBuilder {
     skip_blockhash_check: bool,
     payer: Option<Keypair>,
     feature_config: SvmFeatureConfig,
+    cheatcode_lock: CheatcodeLock,
 }
 
 impl Default for SurfnetBuilder {
@@ -64,6 +65,7 @@ impl Default for SurfnetBuilder {
             skip_blockhash_check: false,
             payer: None,
             feature_config: SvmFeatureConfig::default(),
+            cheatcode_lock: CheatcodeLock::None,
         }
     }
 }
@@ -137,6 +139,28 @@ impl SurfnetBuilder {
         self
     }
 
+    /// Lock every cheatcode (all `surfnet_*` methods and `requestAirdrop`)
+    /// before the surfnet accepts its first request. Nothing can unlock them,
+    /// so the surfnet behaves like a plain validator RPC for every client.
+    ///
+    /// Startup airdrops (the payer, [`Self::airdrop_addresses`]) still happen.
+    /// To set up state with cheatcodes first and lock afterwards, leave this
+    /// off and call [`Cheatcodes::lock_all`] once setup is done.
+    pub fn lock_cheatcodes(mut self) -> Self {
+        self.cheatcode_lock = CheatcodeLock::All;
+        self
+    }
+
+    /// Lock only these methods at startup, for good. The rest stay available.
+    pub fn lock_cheatcode_methods<I, S>(mut self, methods: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.cheatcode_lock = CheatcodeLock::Methods(methods.into_iter().map(Into::into).collect());
+        self
+    }
+
     /// Start the surfnet with the configured options.
     pub async fn start(self) -> SurfnetResult<Surfnet> {
         let SurfnetBuilder {
@@ -149,6 +173,7 @@ impl SurfnetBuilder {
             skip_blockhash_check,
             payer,
             feature_config,
+            cheatcode_lock,
         } = self;
         let payer = payer.unwrap_or_else(Keypair::new);
 
@@ -179,6 +204,7 @@ impl SurfnetBuilder {
                 bind_host: bind_host.clone(),
                 bind_port,
                 ws_port,
+                cheatcode_lock,
                 ..Default::default()
             },
             ..Default::default()

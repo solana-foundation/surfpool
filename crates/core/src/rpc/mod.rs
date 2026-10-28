@@ -14,7 +14,7 @@ use jsonrpc_core::{
 };
 use jsonrpc_pubsub::{PubSubMetadata, Session};
 use solana_clock::Slot;
-use surfpool_types::{CheatcodeConfig, SimnetCommand, types::RpcConfig};
+use surfpool_types::{CheatcodeConfig, SimnetCommand, is_gated_method, types::RpcConfig};
 
 use crate::{
     error::{SurfpoolError, SurfpoolResult},
@@ -136,7 +136,7 @@ impl SurfpoolMiddleware {
             simnet_commands_tx: simnet_commands_tx.clone(),
             config: config.clone(),
             remote_rpc_client: remote_rpc_client.clone(),
-            cheatcode_config: CheatcodeConfig::new(),
+            cheatcode_config: CheatcodeConfig::with_lock(&config.cheatcode_lock),
             plugin_commands_tx,
         }
     }
@@ -144,7 +144,7 @@ impl SurfpoolMiddleware {
     /// `Some` when the call must not reach the handler. Cheatcode gating sits above the method
     /// table rather than in it, so it has to run once per batch element, not once per request.
     fn disabled_cheatcode_error(&self, method_name: &str) -> Option<Error> {
-        if !method_name.starts_with("surfnet_") {
+        if !is_gated_method(method_name) {
             return None;
         }
 

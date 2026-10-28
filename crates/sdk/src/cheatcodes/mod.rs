@@ -430,6 +430,50 @@ impl<'a> Cheatcodes<'a> {
     }
 
     /// Internal helper for cheatcodes that return `()`.
+    /// Lock every cheatcode for the life of the surfnet: all `surfnet_*`
+    /// methods (including this one and `surfnet_enableCheatcode`) and
+    /// `requestAirdrop` are refused from now on, and nothing turns them back
+    /// on. Use it to hand a surfnet to untrusted code after setting it up.
+    ///
+    /// ```rust
+    /// use surfpool_sdk::{Pubkey, Surfnet};
+    ///
+    /// # async fn example() {
+    /// let surfnet = Surfnet::start().await.unwrap();
+    /// let cheats = surfnet.cheatcodes();
+    /// let player = Pubkey::new_unique();
+    /// cheats.fund_sol(&player, 1_000_000_000).unwrap();
+    ///
+    /// cheats.lock_all().unwrap();
+    /// assert!(cheats.fund_sol(&player, 2_000_000_000).is_err());
+    /// # }
+    /// ```
+    pub fn lock_all(&self) -> SurfnetResult<()> {
+        self.call_cheatcode(
+            "surfnet_disableCheatcode",
+            serde_json::json!(["all", { "lockout": true }]),
+        )
+    }
+
+    /// Lock these `surfnet_*` methods for the life of the surfnet. Other
+    /// cheatcodes, and `requestAirdrop`, keep working and can be locked later.
+    ///
+    /// ```rust
+    /// # async fn example() {
+    /// let surfnet = surfpool_sdk::Surfnet::start().await.unwrap();
+    /// surfnet
+    ///     .cheatcodes()
+    ///     .lock(&["surfnet_setAccount", "surfnet_timeTravel"])
+    ///     .unwrap();
+    /// # }
+    /// ```
+    pub fn lock(&self, methods: &[&str]) -> SurfnetResult<()> {
+        self.call_cheatcode(
+            "surfnet_disableCheatcode",
+            serde_json::json!([methods, { "lockout": true }]),
+        )
+    }
+
     fn call_cheatcode(&self, method: &'static str, params: serde_json::Value) -> SurfnetResult<()> {
         let client = self.rpc_client();
         client
