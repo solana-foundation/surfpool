@@ -813,6 +813,32 @@ impl SurfnetSvmLocker {
             let slot = svm.get_latest_absolute_slot();
 
             for (pubkey, account, fetched_from_remote) in accounts_to_load {
+                // Surfpool maintains LastRestartSlot and refuses account writes
+                // to it, but a snapshot is a datasource like any other: restore
+                // its value, as `initialize` does from a remote. Programs that
+                // check it (Phoenix halts on a mismatch) otherwise read 0 after
+                // an offline restore.
+                if pubkey == solana_sysvar::last_restart_slot::ID {
+                    match account.data.get(..8).map(|bytes| {
+                        u64::from_le_bytes(bytes.try_into().expect("8 bytes"))
+                    }) {
+                        Some(last_restart_slot) => {
+                            svm.inner.set_sysvar(
+                                &solana_sysvar::last_restart_slot::LastRestartSlot {
+                                    last_restart_slot,
+                                },
+                            );
+                            loaded_count += 1;
+                        }
+                        None => {
+                            let _ = svm.simnet_events_tx.warn(format!(
+                                "Skipping LastRestartSlot in snapshot: {} bytes of data, expected 8",
+                                account.data.len()
+                            ));
+                        }
+                    }
+                    continue;
+                }
                 let load_result = if fetched_from_remote {
                     svm.apply_account_update(
                         GetAccountResult::FoundAccount(

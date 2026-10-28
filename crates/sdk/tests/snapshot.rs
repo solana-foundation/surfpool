@@ -134,3 +134,46 @@ async fn missing_snapshot_file_fails_startup() {
         Ok(_) => panic!("expected a startup error, got a running surfnet"),
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn snapshot_restores_last_restart_slot_offline() {
+    // Surfpool maintains LastRestartSlot and refuses account writes to it; a
+    // snapshot that carries it must still set it, or programs that compare it
+    // against their own record (Phoenix) treat the restored market as halted.
+    let sysvar_owner: Pubkey = "Sysvar1111111111111111111111111111111111111"
+        .parse()
+        .unwrap();
+    let snapshot = BTreeMap::from([(
+        "SysvarLastRestartS1ot1111111111111111111111".to_string(),
+        Some(account_snapshot(
+            1_009_200,
+            &sysvar_owner,
+            &458_000_123u64.to_le_bytes(),
+        )),
+    )]);
+
+    let surfnet = Surfnet::builder()
+        .offline(true)
+        .snapshot(snapshot)
+        .start()
+        .await
+        .unwrap();
+
+    let account = surfnet
+        .rpc_client()
+        .send::<serde_json::Value>(
+            RpcRequest::GetAccountInfo,
+            serde_json::json!([
+                "SysvarLastRestartS1ot1111111111111111111111",
+                { "encoding": "base64", "commitment": "processed" }
+            ]),
+        )
+        .unwrap();
+    let data = BASE64_STANDARD
+        .decode(account["value"]["data"][0].as_str().unwrap())
+        .unwrap();
+    assert_eq!(
+        u64::from_le_bytes(data[..8].try_into().unwrap()),
+        458_000_123
+    );
+}
