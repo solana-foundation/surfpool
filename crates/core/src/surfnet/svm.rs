@@ -974,9 +974,29 @@ impl SurfnetSvm {
         for (_, template) in registry.templates.into_iter() {
             // Templates for programs with no IDL have nothing to register; they write through
             // `raw_layout` instead.
-            if let Some(idl) = template.idl {
-                let _ = self.register_idl(idl, None);
+            let Some(idl) = template.idl else {
+                continue;
+            };
+            // Templates of one program share its IDL, and a persistent store keeps the IDLs of
+            // earlier starts. Skip the IDL when it is already the one every lookup resolves to
+            // now: the versions sharing the newest slot not after the current one.
+            let slot = self.latest_epoch_info.absolute_slot;
+            let versions = self
+                .registered_idls
+                .get(&Pubkey::from_str_const(&idl.address).to_string())
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            let mut effective = versions.iter().skip_while(|v| v.0 > slot).peekable();
+            let newest = effective.peek().map(|v| v.0);
+            if newest.is_some()
+                && effective
+                    .take_while(|v| Some(v.0) == newest)
+                    .all(|v| v.1 == idl)
+            {
+                continue;
             }
+            let _ = self.register_idl(idl, None);
         }
     }
 
@@ -6612,6 +6632,27 @@ mod tests {
         assert!(svm.get_block_or_reconstruct(blocks[0] + 1).is_err());
         svm.confirm_current_block().unwrap();
         assert_eq!(read(&svm, &[open])[0].0, height + 1);
+    }
+
+    #[test]
+    fn test_builtin_idls_are_registered_once_across_restarts() {
+        let test_type = TestType::sqlite();
+        let TestType::OnDiskSqlite(database_url) = &test_type else {
+            unreachable!()
+        };
+        let config = SurfnetSvmConfig {
+            surfnet_id: "builtin-idls".to_string(),
+            ..SurfnetSvmConfig::default()
+        };
+        for _ in 0..2 {
+            let (mut svm, _events_rx, _geyser_rx) =
+                SurfnetSvm::new_with_db(Some(database_url), config.clone()).unwrap();
+            svm.confirm_current_block().unwrap();
+            for (program_id, versions) in svm.registered_idls.into_iter().unwrap() {
+                assert_eq!(versions.len(), 1, "{program_id}");
+            }
+            svm.shutdown();
+        }
     }
 
     #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
