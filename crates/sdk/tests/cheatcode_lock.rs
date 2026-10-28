@@ -5,7 +5,7 @@
 
 use solana_client::rpc_request::RpcRequest;
 use solana_signer::Signer;
-use surfpool_sdk::{Keypair, Pubkey, Surfnet};
+use surfpool_sdk::{CheatcodeFilter, Keypair, Pubkey, Surfnet};
 
 fn call(surfnet: &Surfnet, method: &'static str, params: serde_json::Value) -> Result<(), String> {
     surfnet
@@ -34,7 +34,11 @@ fn assert_rejected(result: Result<(), String>, what: &str) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn lock_cheatcodes_at_startup_refuses_every_cheatcode_and_airdrop() {
-    let surfnet = Surfnet::builder().lock_cheatcodes().start().await.unwrap();
+    let surfnet = Surfnet::builder()
+        .lock_cheatcodes(CheatcodeFilter::all())
+        .start()
+        .await
+        .unwrap();
     let target = Pubkey::new_unique();
 
     // Startup airdrops are not RPC calls and still land.
@@ -73,18 +77,29 @@ async fn lock_cheatcodes_at_startup_refuses_every_cheatcode_and_airdrop() {
         "surfnet_disableCheatcode",
     );
 
+    // Nor can it stop the surfnet or load code into it.
+    assert_refused(call(&surfnet, "exit", serde_json::json!([])), "exit");
+    assert_refused(
+        call(
+            &surfnet,
+            "loadPlugin",
+            serde_json::json!(["/tmp/plugin.json"]),
+        ),
+        "loadPlugin",
+    );
+
     // Standard methods still work.
     surfnet.rpc_client().get_slot().unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn lock_all_after_setup_is_one_way() {
+async fn lock_after_setup_is_one_way() {
     let surfnet = Surfnet::start().await.unwrap();
     let player = Keypair::new().pubkey();
     let cheats = surfnet.cheatcodes();
 
     cheats.fund_sol(&player, 1_000_000_000).unwrap();
-    cheats.lock_all().unwrap();
+    cheats.lock(CheatcodeFilter::all()).unwrap();
 
     assert_refused(
         cheats.fund_sol(&player, 2_000_000_000),
@@ -98,7 +113,7 @@ async fn lock_all_after_setup_is_one_way() {
         ),
         "requestAirdrop",
     );
-    assert_refused(cheats.lock_all(), "a second lock_all");
+    assert_refused(cheats.lock(CheatcodeFilter::all()), "a second lock");
     assert_refused(
         call(
             &surfnet,
@@ -119,7 +134,9 @@ async fn locked_methods_cannot_be_re_enabled() {
     let target = Pubkey::new_unique();
     let cheats = surfnet.cheatcodes();
 
-    cheats.lock(&["surfnet_setAccount"]).unwrap();
+    cheats
+        .lock(CheatcodeFilter::list(["surfnet_setAccount"]))
+        .unwrap();
     assert_refused(cheats.fund_sol(&target, 1), "surfnet_setAccount");
     // Only a fully locked surfnet refuses airdrops.
     call(
@@ -158,9 +175,9 @@ async fn locked_methods_cannot_be_re_enabled() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn lock_cheatcode_methods_at_startup_leaves_the_rest() {
+async fn locking_a_list_at_startup_leaves_the_rest() {
     let surfnet = Surfnet::builder()
-        .lock_cheatcode_methods(["surfnet_timeTravel"])
+        .lock_cheatcodes(CheatcodeFilter::list(["surfnet_timeTravel"]))
         .start()
         .await
         .unwrap();

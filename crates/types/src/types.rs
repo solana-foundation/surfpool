@@ -990,9 +990,10 @@ pub struct RpcConfig {
     pub gossip_port: u16,
     pub tpu_port: u16,
     pub tpu_quic_port: u16,
-    /// Cheatcodes locked before the RPC server accepts its first request.
+    /// Cheatcodes locked before the RPC server accepts its first request, as
+    /// if by `surfnet_disableCheatcode` with `{"lockout": true}`.
     #[serde(default)]
-    pub cheatcode_lock: CheatcodeLock,
+    pub cheatcode_lock: Option<CheatcodeFilter>,
 }
 
 impl RpcConfig {
@@ -1013,7 +1014,7 @@ impl Default for RpcConfig {
             gossip_port: DEFAULT_GOSSIP_PORT,
             tpu_port: DEFAULT_TPU_PORT,
             tpu_quic_port: DEFAULT_TPU_QUIC_PORT,
-            cheatcode_lock: CheatcodeLock::None,
+            cheatcode_lock: None,
         }
     }
 }
@@ -1841,6 +1842,22 @@ pub enum CheatcodeFilter {
     List(Vec<String>), // disables cheatcodes in a named list
 }
 
+impl CheatcodeFilter {
+    /// Every cheatcode: `"all"` on the wire.
+    pub fn all() -> Self {
+        Self::All("all".to_string())
+    }
+
+    /// These cheatcode methods, e.g. `["surfnet_setAccount"]`.
+    pub fn list<I, S>(methods: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self::List(methods.into_iter().map(Into::into).collect())
+    }
+}
+
 /// Canonical list of the `surfnet_*` cheatcode JSON-RPC methods.
 ///
 /// This is the single source of truth for downstream bindings (e.g. the
@@ -1879,29 +1896,23 @@ pub const SURFNET_CHEATCODE_METHODS: [&str; 28] = [
     "surfnet_writeProgram",
 ];
 
-/// Standard RPC methods that act as cheatcodes on a surfnet: `requestAirdrop`
-/// mints SOL out of thin air. They are refused only once every cheatcode is
-/// locked; a surfnet that isn't locked keeps them, so wallets and tests that
-/// airdrop keep working after `surfnet_disableCheatcode`.
-pub const GATED_RPC_METHODS: [&str; 1] = ["requestAirdrop"];
+/// Non-`surfnet_*` methods that a client handed a surfnet must not have:
+/// `requestAirdrop` mints SOL out of thin air, and the admin methods stop the
+/// surfnet or load code into it. They are refused only once every cheatcode
+/// is locked; a surfnet that isn't locked keeps them, so wallets and tests
+/// that airdrop, and `surfpool stop`, keep working after
+/// `surfnet_disableCheatcode`.
+pub const GATED_RPC_METHODS: [&str; 5] = [
+    "requestAirdrop",
+    "exit",
+    "loadPlugin",
+    "reloadPlugin",
+    "unloadPlugin",
+];
 
 /// Whether `method` is subject to cheatcode gating.
 pub fn is_gated_method(method: &str) -> bool {
     method.starts_with("surfnet_") || GATED_RPC_METHODS.contains(&method)
-}
-
-/// Cheatcodes to lock when a surfnet starts, before any client can connect.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum CheatcodeLock {
-    /// Every cheatcode stays available.
-    #[default]
-    None,
-    /// Lock every cheatcode, the enable/disable methods, and `requestAirdrop`.
-    All,
-    /// Lock these `surfnet_*` methods; the rest stay available and can still
-    /// be disabled (and locked) at runtime. `requestAirdrop` stays available.
-    Methods(Vec<String>),
 }
 
 impl CheatcodeConfig {
@@ -1913,21 +1924,24 @@ impl CheatcodeConfig {
         }))
     }
 
-    /// A config with `lock` already applied.
-    pub fn with_lock(lock: &CheatcodeLock) -> Arc<Mutex<Self>> {
+    /// A config with `lock` already applied: [`CheatcodeFilter::All`] locks
+    /// the whole surfnet (see [`Self::lock_all`]), a list locks those methods.
+    pub fn with_lock(lock: Option<&CheatcodeFilter>) -> Arc<Mutex<Self>> {
         let config = Self::new();
         {
             let mut guard = config.lock().unwrap();
             match lock {
-                CheatcodeLock::None => {}
-                CheatcodeLock::All => guard.lock_all(),
-                CheatcodeLock::Methods(methods) => guard.lock_methods(methods),
+                None => {}
+                Some(CheatcodeFilter::All(_)) => guard.lock_all(),
+                Some(CheatcodeFilter::List(methods)) => guard.lock_methods(methods),
             }
         }
         config
     }
 
-    /// Disable every gated method, permanently.
+    /// Disable every gated method, permanently: all `surfnet_*` methods and
+    /// the methods in [`GATED_RPC_METHODS`] (`requestAirdrop`, `exit`, plugin
+    /// loading).
     pub fn lock_all(&mut self) {
         self.lockout = true;
         self.filter = CheatcodeFilter::All("all".to_string());
@@ -2168,13 +2182,15 @@ mod tests {
 
     #[test]
     fn lock_all_gates_airdrops_and_cannot_be_undone() {
-        let config = CheatcodeConfig::with_lock(&CheatcodeLock::All);
+        let config = CheatcodeConfig::with_lock(Some(&CheatcodeFilter::all()));
         let mut config = config.lock().unwrap();
 
         for method in [
             "surfnet_setAccount",
             "surfnet_enableCheatcode",
             "requestAirdrop",
+            "exit",
+            "loadPlugin",
         ] {
             assert!(
                 config.is_cheatcode_disabled(&method.to_string()),
@@ -2200,7 +2216,9 @@ mod tests {
         config.lock_all();
         assert!(config.is_cheatcode_disabled(&airdrop));
         assert!(is_gated_method("requestAirdrop"));
+        assert!(is_gated_method("exit"));
         assert!(!is_gated_method("getSlot"));
+        assert!(!is_gated_method("listPlugins"));
     }
 
     #[test]

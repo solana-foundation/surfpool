@@ -136,7 +136,7 @@ impl SurfpoolMiddleware {
             simnet_commands_tx: simnet_commands_tx.clone(),
             config: config.clone(),
             remote_rpc_client: remote_rpc_client.clone(),
-            cheatcode_config: CheatcodeConfig::with_lock(&config.cheatcode_lock),
+            cheatcode_config: CheatcodeConfig::with_lock(config.cheatcode_lock.as_ref()),
             plugin_commands_tx,
         }
     }

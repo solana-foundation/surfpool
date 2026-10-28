@@ -243,7 +243,9 @@ pub trait SurfnetCheatcodes {
     /// With `{"lockout": true}`, the disabled methods are **locked**: they stay disabled for the
     /// life of the surfnet, and `surfnet_enableCheatcode` refuses to turn them back on, by name or
     /// with `"all"`. `"all"` with lockout locks the whole surfnet: `surfnet_enableCheatcode`, this
-    /// method, and `requestAirdrop` too, so it behaves like a plain validator RPC from then on.
+    /// method, `requestAirdrop`, and the admin methods that stop it or load plugins (`exit`,
+    /// `loadPlugin`, `reloadPlugin`, `unloadPlugin`), so it behaves like a plain validator RPC
+    /// from then on. Stop a locked surfnet through its process, not `surfpool stop`.
     /// Without lockout, `surfnet_enableCheatcode` and `surfnet_disableCheatcode` cannot be disabled.
     ///
     /// To lock cheatcodes before any client connects, start the surfnet with
