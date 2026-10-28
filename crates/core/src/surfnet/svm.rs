@@ -669,11 +669,14 @@ fn add_pubkey_to_index(
     key: String,
     pubkey_str: &str,
 ) -> SurfpoolResult<()> {
-    let mut accounts = index.get(&key).ok().flatten().unwrap_or_default();
-    if !accounts.iter().any(|pk| pk == pubkey_str) {
+    index.modify(key, &mut |accounts| {
+        let accounts = accounts.get_or_insert_with(Vec::new);
+        if accounts.iter().any(|pk| pk == pubkey_str) {
+            return false;
+        }
         accounts.push(pubkey_str.to_string());
-        index.store(key, accounts)?;
-    }
+        true
+    })?;
     Ok(())
 }
 
@@ -685,15 +688,16 @@ fn remove_pubkey_from_index(
     key: &str,
     pubkey_str: &str,
 ) -> SurfpoolResult<()> {
-    let key_owned = key.to_string();
-    if let Some(mut accounts) = index.get(&key_owned).ok().flatten() {
+    index.modify(key.to_string(), &mut |entry| {
+        let Some(accounts) = entry else {
+            return false;
+        };
         accounts.retain(|pk| pk != pubkey_str);
         if accounts.is_empty() {
-            index.take(&key_owned)?;
-        } else {
-            index.store(key_owned, accounts)?;
+            *entry = None;
         }
-    }
+        true
+    })?;
     Ok(())
 }
 

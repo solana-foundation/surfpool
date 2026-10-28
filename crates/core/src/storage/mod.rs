@@ -196,6 +196,21 @@ pub trait Storage<K, V>: Send + Sync {
     /// Default implementation does nothing.
     fn shutdown(&self) {}
 
+    /// Updates the value at `key` with `f`, which returns whether it changed the value.
+    /// A changed `Some` is stored and a changed `None` removes the entry.
+    /// The default implementation is `get`, then `store` or `take`; in-memory
+    /// storages override it to update the value in place.
+    fn modify(&mut self, key: K, f: &mut dyn FnMut(&mut Option<V>) -> bool) -> StorageResult<()> {
+        let mut value = self.get(&key)?;
+        if !f(&mut value) {
+            return Ok(());
+        }
+        match value {
+            Some(value) => self.store(key, value),
+            None => self.take(&key).map(|_| ()),
+        }
+    }
+
     // Enable cloning of boxed trait objects
     fn clone_box(&self) -> Box<dyn Storage<K, V>>;
 
@@ -252,6 +267,9 @@ where
     }
     fn count(&self) -> StorageResult<u64> {
         (**self).count()
+    }
+    fn modify(&mut self, key: K, f: &mut dyn FnMut(&mut Option<V>) -> bool) -> StorageResult<()> {
+        Arc::make_mut(self).modify(key, f)
     }
     fn clone_box(&self) -> Box<dyn Storage<K, V>> {
         Box::new(Arc::clone(self))
