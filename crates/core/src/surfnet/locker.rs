@@ -214,7 +214,7 @@ impl SurfnetSvmLocker {
     /// slot, epoch info, and blockhash along with the closure's result.
     fn with_contextualized_svm_reader<T, F>(&self, reader: F) -> SvmAccessContext<T>
     where
-        F: Fn(&SurfnetSvm) -> T + Send + Sync,
+        F: FnOnce(&SurfnetSvm) -> T + Send + Sync,
         T: Send + 'static,
     {
         let read_lock = self.0.clone();
@@ -3948,7 +3948,7 @@ impl SurfnetSvmLocker {
             Ok::<_, SurfpoolError>(filtered)
         })?;
 
-        Ok(self.with_contextualized_svm_reader(|_| res.clone()))
+        Ok(self.with_contextualized_svm_reader(move |_| res))
     }
 
     pub fn encode_ui_account(
