@@ -415,6 +415,16 @@ fn json_to_txtx_value(json: &serde_json::Value) -> SurfpoolResult<Value> {
 
 pub type AccountOwner = Pubkey;
 
+/// The sysvars Surfpool rewrites through `set_sysvar` as blocks advance and the clock travels,
+/// outside [`SurfnetSvm::record_account_write`]. Reads cover them as written at the tip.
+const REWRITTEN_SYSVARS: [Pubkey; 5] = [
+    solana_sdk_ids::sysvar::clock::ID,
+    solana_sdk_ids::sysvar::epoch_schedule::ID,
+    solana_sdk_ids::sysvar::last_restart_slot::ID,
+    solana_sdk_ids::sysvar::recent_blockhashes::ID,
+    solana_sdk_ids::sysvar::slot_hashes::ID,
+];
+
 /// The slot a read at some commitment answers for, with its `minContextSlot` already judged.
 /// Only [`SurfnetSvm::read_slot`] makes one.
 #[derive(Clone, Copy, Debug)]
@@ -430,17 +440,22 @@ impl ReadSlot {
     /// Unlike Agave's, the context can then pass the commitment's slot, but it is never older
     /// than the data it carries.
     pub fn covering(self, svm: &SurfnetSvm, pubkeys: &[Pubkey]) -> Self {
+        let tip = svm.get_latest_absolute_slot();
         pubkeys
             .iter()
-            .filter_map(|pubkey| svm.account_update_slots.get(pubkey))
-            .fold(self, |read, &written| Self(read.0.max(written)))
+            .filter_map(|pubkey| {
+                if REWRITTEN_SYSVARS.contains(pubkey) {
+                    Some(tip)
+                } else {
+                    svm.account_update_slots.get(pubkey).copied()
+                }
+            })
+            .fold(self, |read, written| Self(read.0.max(written)))
     }
 
     /// [`Self::covering`] for a scan, whose answer depends on accounts it does not return.
     pub fn covering_every_account(self, svm: &SurfnetSvm) -> Self {
-        svm.account_update_slots
-            .values()
-            .fold(self, |read, &written| Self(read.0.max(written)))
+        Self(self.0.max(svm.latest_account_write_slot))
     }
 
     /// Like Agave's `new_response(&bank, value)`: the response context is the slot read at.
@@ -612,6 +627,9 @@ pub struct SurfnetSvm {
     /// [`Self::subscribe_startup_status`].
     startup_status_watch_tx: tokio::sync::watch::Sender<SurfnetStartupStatus>,
     pub account_update_slots: HashMap<Pubkey, Slot>,
+    /// The latest slot in `account_update_slots`, so a scan covers every write without walking
+    /// it. Both change only through [`Self::record_account_write`].
+    pub latest_account_write_slot: Slot,
     pub streamed_accounts: Box<dyn Storage<String, bool>>,
     pub recent_blockhashes: VecDeque<(SyntheticBlockhash, i64)>,
     pub scheduled_overrides: Box<dyn Storage<u64, Vec<OverrideInstance>>>,
@@ -947,6 +965,7 @@ impl SurfnetSvm {
             // subscribers.
             startup_status_watch_tx: tokio::sync::watch::channel(self.startup_status.clone()).0,
             account_update_slots: self.account_update_slots.clone(),
+            latest_account_write_slot: self.latest_account_write_slot,
             recent_blockhashes: self.recent_blockhashes.clone(),
             offline_accounts: OverlayStorage::wrap(self.offline_accounts.clone_box()),
             genesis_slot: self.genesis_slot,
@@ -1139,7 +1158,7 @@ impl SurfnetSvm {
         self.transactions_processed = svm.transactions_processed;
         self.write_version = svm.write_version;
         for (k, v) in svm.account_update_slots.drain() {
-            self.account_update_slots.insert(k, v);
+            self.record_account_write(k, v);
         }
         self.perf_samples = svm.perf_samples.clone();
         self.recent_blockhashes = svm.recent_blockhashes.clone();
@@ -1376,6 +1395,7 @@ impl SurfnetSvm {
             startup_status: SurfnetStartupStatus::default(),
             startup_status_watch_tx: tokio::sync::watch::channel(SurfnetStartupStatus::default()).0,
             account_update_slots: HashMap::new(),
+            latest_account_write_slot: 0,
             streamed_accounts: streamed_accounts_db,
             recent_blockhashes: VecDeque::new(),
             scheduled_overrides: scheduled_overrides_db,
@@ -2333,8 +2353,7 @@ impl SurfnetSvm {
             .set_account(*pubkey, account.clone())
             .map_err(|e| SurfpoolError::set_account(*pubkey, e))?;
 
-        self.account_update_slots
-            .insert(*pubkey, self.get_latest_absolute_slot());
+        self.record_account_write(*pubkey, self.get_latest_absolute_slot());
 
         // Update the account registries and indexes
         self.update_account_registries(pubkey, before.as_ref(), &account)?;
@@ -2351,6 +2370,13 @@ impl SurfnetSvm {
         Ok(())
     }
 
+    /// Records that `pubkey` was written at `slot`, so reads cover the write: see
+    /// [`ReadSlot::covering`].
+    pub(crate) fn record_account_write(&mut self, pubkey: Pubkey, slot: Slot) {
+        self.account_update_slots.insert(pubkey, slot);
+        self.latest_account_write_slot = self.latest_account_write_slot.max(slot);
+    }
+
     /// Applies an account mutation forged by a scenario and publishes it to subscribers.
     /// Upstream account hydration deliberately uses a different path and remains silent.
     pub(crate) fn set_scenario_override_account(
@@ -2364,7 +2390,7 @@ impl SurfnetSvm {
         }
 
         self.set_account(pubkey, account.clone())?;
-        self.account_update_slots.insert(*pubkey, slot);
+        self.record_account_write(*pubkey, slot);
 
         let write_version = self.increment_write_version();
         let _ = self.geyser_events_tx.send(GeyserEvent::UpdateAccount(
@@ -2916,7 +2942,7 @@ impl SurfnetSvm {
             let (tx_with_status_meta, mutated_account_keys) = tx_data.as_ref();
 
             for pubkey in mutated_account_keys {
-                self.account_update_slots.insert(*pubkey, current_slot);
+                self.record_account_write(*pubkey, current_slot);
             }
 
             self.notify_logs_subscribers(

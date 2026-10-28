@@ -2337,7 +2337,7 @@ impl SurfnetSvmLocker {
             if before.ne(&after) {
                 // Reads at an older commitment already return this write: see `ReadSlot::covering`.
                 let slot = svm_writer.get_latest_absolute_slot();
-                svm_writer.account_update_slots.insert(*pubkey, slot);
+                svm_writer.record_account_write(*pubkey, slot);
                 if let Some(after) = &after {
                     let _ = svm_writer.update_account_registries(pubkey, before.as_ref(), after);
                     svm_writer.notify_account_subscribers(pubkey, after);
@@ -2514,7 +2514,7 @@ impl SurfnetSvmLocker {
                     // Reads at an older commitment already return this write: see
                     // `ReadSlot::covering`.
                     let slot = svm_writer.get_latest_absolute_slot();
-                    svm_writer.account_update_slots.insert(*pubkey, slot);
+                    svm_writer.record_account_write(*pubkey, slot);
                     let after = after.unwrap_or_default();
                     svm_writer.update_account_registries(pubkey, before.as_ref(), &after)?;
                     let write_version = svm_writer.increment_write_version();

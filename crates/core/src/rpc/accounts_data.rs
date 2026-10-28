@@ -1904,6 +1904,38 @@ mod tests {
         }
     }
 
+    /// Surfpool rewrites the clock with every block, outside the recorded writes, so a read of
+    /// it answers for the tip: never for a slot older than the `Clock.slot` it returns.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn clock_reads_never_answer_for_a_slot_older_than_the_clock() {
+        let setup = TestSetup::new(SurfpoolAccountsDataRpc);
+        setup
+            .context
+            .svm_locker
+            .confirm_current_block(&None)
+            .await
+            .unwrap();
+
+        for commitment in [CommitmentConfig::confirmed(), CommitmentConfig::finalized()] {
+            let read = setup
+                .rpc
+                .get_account_info(
+                    Some(setup.context.clone()),
+                    solana_sdk_ids::sysvar::clock::ID.to_string(),
+                    Some(RpcAccountInfoConfig {
+                        commitment: Some(commitment),
+                        encoding: Some(solana_account_decoder::UiAccountEncoding::Base64),
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap();
+            let data = read.value.unwrap().data.decode().unwrap();
+            let clock_slot = u64::from_le_bytes(data[..8].try_into().unwrap());
+            assert_eq!(read.context.slot, clock_slot, "{commitment:?}");
+        }
+    }
+
     /// A transaction's writes are covered as soon as it is processed, before its block confirms.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_processed_transfer_is_never_read_at_an_older_slot() {
