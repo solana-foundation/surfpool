@@ -2309,6 +2309,8 @@ impl SurfnetSvmLocker {
             .zip(accounts_before.iter().zip(accounts_after.iter()))
         {
             if before.ne(&after) {
+                let slot = svm_writer.get_latest_absolute_slot();
+                svm_writer.record_account_write(*pubkey, slot);
                 if let Some(after) = &after {
                     let _ = svm_writer.update_account_registries(pubkey, before.as_ref(), after);
                     svm_writer.notify_account_subscribers(pubkey, after);
@@ -2482,6 +2484,8 @@ impl SurfnetSvmLocker {
             {
                 if before.ne(&after) {
                     mutated_account_pubkeys.insert(*pubkey);
+                    let slot = svm_writer.get_latest_absolute_slot();
+                    svm_writer.record_account_write(*pubkey, slot);
                     let after = after.unwrap_or_default();
                     svm_writer.update_account_registries(pubkey, before.as_ref(), &after)?;
                     let write_version = svm_writer.increment_write_version();
@@ -4027,6 +4031,28 @@ impl SurfnetSvmLocker {
         min_context_slot: Option<Slot>,
     ) -> jsonrpc_core::Result<ReadSlot> {
         self.with_svm_reader(|svm| svm.read_slot(commitment, min_context_slot))
+    }
+
+    /// [`ReadSlot::covering`] under a read guard. Call it after the locker reads `pubkeys`, so
+    /// the context covers every write those reads could have returned.
+    pub fn read_slot_covering(&self, read: ReadSlot, pubkeys: &[Pubkey]) -> ReadSlot {
+        self.with_svm_reader(|svm| read.covering(svm, pubkeys))
+    }
+
+    /// [`ReadSlot::covering_encoded`] under a read guard. Call it after encoding `pubkeys`, so
+    /// the context also covers the mints a `jsonParsed` encoding read.
+    pub fn read_slot_covering_encoded(
+        &self,
+        read: ReadSlot,
+        pubkeys: &[Pubkey],
+        encoding: Option<UiAccountEncoding>,
+    ) -> ReadSlot {
+        self.with_svm_reader(|svm| read.covering_encoded(svm, pubkeys, encoding))
+    }
+
+    /// [`ReadSlot::covering_every_account`] under a read guard, after the scan.
+    pub fn read_slot_covering_every_account(&self, read: ReadSlot) -> ReadSlot {
+        self.with_svm_reader(|svm| read.covering_every_account(svm))
     }
 
     /// Executes an airdrop via the underlying SVM.

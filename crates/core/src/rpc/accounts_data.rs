@@ -396,6 +396,7 @@ impl AccountsData for SurfpoolAccountsDataRpc {
             } else {
                 None
             };
+            let read = svm_locker.read_slot_covering_encoded(read, &[pubkey], config.encoding);
 
             Ok(read.respond(ui_account))
         })
@@ -466,6 +467,7 @@ impl AccountsData for SurfpoolAccountsDataRpc {
                     ui_accounts.push(None);
                 }
             }
+            let read = svm_locker.read_slot_covering_encoded(read, &pubkeys, config.encoding);
 
             Ok(read.respond(ui_accounts))
         })
@@ -543,6 +545,7 @@ impl AccountsData for SurfpoolAccountsDataRpc {
             } = svm_locker
                 .get_account(&remote_ctx, &mint_pubkey, None)
                 .await?;
+            let read = svm_locker.read_slot_covering(read, &[pubkey, mint_pubkey]);
 
             let mint_account = mint_account_result.map_account()?;
 
@@ -595,6 +598,7 @@ impl AccountsData for SurfpoolAccountsDataRpc {
             } = svm_locker
                 .get_account(&remote_ctx, &mint_pubkey, None)
                 .await?;
+            let read = svm_locker.read_slot_covering(read, &[mint_pubkey]);
 
             let mint_account = mint_account_result.map_account()?;
 
@@ -1745,21 +1749,146 @@ mod tests {
         println!("✅ Account order preserved with remote: [1M lamports, None, 3M lamports]");
     }
 
-    /// On a validator, account and token reads report the slot of the bank their commitment
-    /// selects, the same bank `getSlot` reports.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn account_reads_answer_for_the_slot_their_commitment_names() {
+    /// The context slots of `getSlot` and of every account and token read at `commitment`, in
+    /// this order: `getSlot`; `getAccountInfo`, `getMultipleAccounts` and `getBalance` of
+    /// `pubkey`; `getTokenAccountBalance` of `holder`; `getTokenSupply` and
+    /// `getTokenLargestAccounts` of `mint`; then `getLargestAccounts` and `getSupply`.
+    async fn read_slots(
+        setup: &TestSetup<SurfpoolAccountsDataRpc>,
+        pubkey: &str,
+        mint: &Pubkey,
+        holder: &Pubkey,
+        commitment: CommitmentConfig,
+    ) -> [u64; 9] {
         use solana_client::rpc_config::{RpcLargestAccountsConfig, RpcSupplyConfig};
 
         use crate::rpc::accounts_scan::{AccountsScan, SurfpoolAccountsScanRpc};
 
+        let pubkey = pubkey.to_string();
+        let context_config = RpcContextConfig {
+            commitment: Some(commitment),
+            min_context_slot: None,
+        };
+        let account_config = RpcAccountInfoConfig {
+            commitment: Some(commitment),
+            ..Default::default()
+        };
+
+        [
+            SurfpoolMinimalRpc
+                .get_slot(Some(setup.context.clone()), Some(context_config))
+                .unwrap(),
+            setup
+                .rpc
+                .get_account_info(
+                    Some(setup.context.clone()),
+                    pubkey.clone(),
+                    Some(account_config.clone()),
+                )
+                .await
+                .unwrap()
+                .context
+                .slot,
+            setup
+                .rpc
+                .get_multiple_accounts(
+                    Some(setup.context.clone()),
+                    vec![pubkey.clone()],
+                    Some(account_config),
+                )
+                .await
+                .unwrap()
+                .context
+                .slot,
+            SurfpoolMinimalRpc
+                .get_balance(
+                    Some(setup.context.clone()),
+                    pubkey.clone(),
+                    Some(context_config),
+                )
+                .await
+                .unwrap()
+                .context
+                .slot,
+            setup
+                .rpc
+                .get_token_account_balance(
+                    Some(setup.context.clone()),
+                    holder.to_string(),
+                    Some(commitment),
+                )
+                .await
+                .unwrap()
+                .context
+                .slot,
+            setup
+                .rpc
+                .get_token_supply(
+                    Some(setup.context.clone()),
+                    mint.to_string(),
+                    Some(commitment),
+                )
+                .await
+                .unwrap()
+                .context
+                .slot,
+            SurfpoolAccountsScanRpc
+                .get_token_largest_accounts(
+                    Some(setup.context.clone()),
+                    mint.to_string(),
+                    Some(commitment),
+                )
+                .await
+                .unwrap()
+                .context
+                .slot,
+            SurfpoolAccountsScanRpc
+                .get_largest_accounts(
+                    Some(setup.context.clone()),
+                    Some(RpcLargestAccountsConfig {
+                        commitment: Some(commitment),
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap()
+                .context
+                .slot,
+            SurfpoolAccountsScanRpc
+                .get_supply(
+                    Some(setup.context.clone()),
+                    Some(RpcSupplyConfig {
+                        commitment: Some(commitment),
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap()
+                .context
+                .slot,
+        ]
+    }
+
+    /// On a validator, account and token reads report the slot of the bank their commitment
+    /// selects, the same bank `getSlot` reports.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn account_reads_answer_for_the_slot_their_commitment_names() {
         let setup = TestSetup::new(SurfpoolAccountsDataRpc);
         let (mint, holder, _) = set_scaled_mint(&setup, 6);
-        let latest = setup.context.svm_locker.get_latest_absolute_slot();
         let depth = setup
             .context
             .svm_locker
             .with_svm_reader(|svm| svm.finalization_slot_threshold());
+        // Age the writes past every commitment, so no read returns data newer than its slot.
+        for _ in 0..=depth {
+            setup
+                .context
+                .svm_locker
+                .confirm_current_block(&None)
+                .await
+                .unwrap();
+        }
+        let latest = setup.context.svm_locker.get_latest_absolute_slot();
         let pubkey = Pubkey::new_unique().to_string();
 
         for (commitment, expected_slot) in [
@@ -1767,110 +1896,185 @@ mod tests {
             (CommitmentConfig::confirmed(), latest - 1),
             (CommitmentConfig::finalized(), latest - depth),
         ] {
-            let context_config = RpcContextConfig {
-                commitment: Some(commitment),
-                min_context_slot: None,
-            };
-            let account_config = RpcAccountInfoConfig {
-                commitment: Some(commitment),
-                ..Default::default()
-            };
+            assert_eq!(
+                read_slots(&setup, &pubkey, &mint, &holder, commitment).await,
+                [expected_slot; 9],
+                "{commitment:?}"
+            );
+        }
+    }
 
-            let slots = [
-                SurfpoolMinimalRpc
-                    .get_slot(Some(setup.context.clone()), Some(context_config))
-                    .unwrap(),
-                setup
+    /// Surfpool rewrites the clock with every block, outside the recorded writes, so a read of
+    /// it answers for the tip: never for a slot older than the `Clock.slot` it returns.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn clock_reads_never_answer_for_a_slot_older_than_the_clock() {
+        let setup = TestSetup::new(SurfpoolAccountsDataRpc);
+        setup
+            .context
+            .svm_locker
+            .confirm_current_block(&None)
+            .await
+            .unwrap();
+
+        for commitment in [CommitmentConfig::confirmed(), CommitmentConfig::finalized()] {
+            let read = setup
+                .rpc
+                .get_account_info(
+                    Some(setup.context.clone()),
+                    solana_sdk_ids::sysvar::clock::ID.to_string(),
+                    Some(RpcAccountInfoConfig {
+                        commitment: Some(commitment),
+                        encoding: Some(solana_account_decoder::UiAccountEncoding::Base64),
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap();
+            let data = read.value.unwrap().data.decode().unwrap();
+            let clock_slot = u64::from_le_bytes(data[..8].try_into().unwrap());
+            assert_eq!(read.context.slot, clock_slot, "{commitment:?}");
+        }
+    }
+
+    /// A transaction's writes are covered as soon as it is processed, before its block confirms.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_processed_transfer_is_never_read_at_an_older_slot() {
+        let setup = TestSetup::new(SurfpoolAccountsDataRpc);
+        let locker = &setup.context.svm_locker;
+        let payer = Keypair::new();
+        let recipient = Pubkey::new_unique();
+        locker
+            .airdrop(&payer.pubkey(), 1_000_000_000)
+            .unwrap()
+            .unwrap();
+        let transfer = Transaction::new_signed_with_payer(
+            &[solana_system_interface::instruction::transfer(
+                &payer.pubkey(),
+                &recipient,
+                1_000_000,
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            locker.with_svm_reader(|svm| svm.latest_blockhash()),
+        );
+        let (status_tx, _status_rx) = crossbeam_channel::unbounded();
+        locker
+            .process_transaction(&None, transfer.into(), status_tx, false, true)
+            .await
+            .unwrap();
+        let landed = locker.get_latest_absolute_slot();
+
+        let read = setup
+            .rpc
+            .get_account_info(
+                Some(setup.context.clone()),
+                recipient.to_string(),
+                Some(RpcAccountInfoConfig {
+                    commitment: Some(CommitmentConfig::finalized()),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read.value.unwrap().lamports, 1_000_000);
+        assert_eq!(read.context.slot, landed);
+    }
+
+    /// Surfpool reads every account at the tip, so a read that returns an account written after
+    /// its commitment's slot answers for the write's slot instead: never for a slot older than
+    /// its data (#900). Reads of untouched accounts keep their commitment's slot.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn account_reads_never_answer_for_a_slot_older_than_their_data() {
+        let setup = TestSetup::new(SurfpoolAccountsDataRpc);
+        let (mint, holder, _) = set_scaled_mint(&setup, 6);
+        let written = setup.context.svm_locker.get_latest_absolute_slot();
+        let pubkey = Pubkey::new_unique().to_string();
+
+        for commitment in [CommitmentConfig::confirmed(), CommitmentConfig::finalized()] {
+            let slot = setup
+                .context
+                .svm_locker
+                .get_slot_for_commitment(&commitment);
+            assert!(slot < written, "{commitment:?}");
+            assert_eq!(
+                read_slots(&setup, &pubkey, &mint, &holder, commitment).await,
+                [
+                    slot, slot, slot, slot, written, written, written, written, written
+                ],
+                "{commitment:?}"
+            );
+        }
+    }
+
+    /// A `jsonParsed` token account carries amounts parsed with its mint, so a read of it covers
+    /// the mint's writes as well as its own. Other encodings don't read the mint.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn parsed_token_reads_cover_their_mint() {
+        use solana_account_decoder::{UiAccountData, UiAccountEncoding};
+        use spl_token_2022_interface::{
+            extension::StateWithExtensionsMut, state::Mint as Token2022Mint,
+        };
+
+        let setup = TestSetup::new(SurfpoolAccountsDataRpc);
+        let locker = &setup.context.svm_locker;
+        let (mint, holder, _) = set_scaled_mint(&setup, 6);
+        let depth = locker.with_svm_reader(|svm| svm.finalization_slot_threshold());
+        // Age the holder past every commitment, then write only its mint.
+        for _ in 0..=depth {
+            locker.confirm_current_block(&None).await.unwrap();
+        }
+        locker.with_svm_writer(|svm| {
+            let mut account = svm.get_account(&mint).unwrap().unwrap();
+            let mut state =
+                StateWithExtensionsMut::<Token2022Mint>::unpack(&mut account.data).unwrap();
+            state.base.decimals = 9;
+            state.pack_base();
+            svm.set_account(&mint, account).unwrap();
+        });
+        let written = locker.get_latest_absolute_slot();
+
+        for commitment in [CommitmentConfig::confirmed(), CommitmentConfig::finalized()] {
+            let slot = locker.get_slot_for_commitment(&commitment);
+            assert!(slot < written, "{commitment:?}");
+            for (encoding, expected_slot) in [
+                (UiAccountEncoding::JsonParsed, written),
+                (UiAccountEncoding::Base64, slot),
+            ] {
+                let config = RpcAccountInfoConfig {
+                    commitment: Some(commitment),
+                    encoding: Some(encoding),
+                    ..Default::default()
+                };
+                let single = setup
                     .rpc
                     .get_account_info(
                         Some(setup.context.clone()),
-                        pubkey.clone(),
-                        Some(account_config.clone()),
+                        holder.to_string(),
+                        Some(config.clone()),
                     )
                     .await
-                    .unwrap()
-                    .context
-                    .slot,
-                setup
+                    .unwrap();
+                let multiple = setup
                     .rpc
                     .get_multiple_accounts(
                         Some(setup.context.clone()),
-                        vec![pubkey.clone()],
-                        Some(account_config),
+                        vec![holder.to_string()],
+                        Some(config),
                     )
                     .await
-                    .unwrap()
-                    .context
-                    .slot,
-                SurfpoolMinimalRpc
-                    .get_balance(
-                        Some(setup.context.clone()),
-                        pubkey.clone(),
-                        Some(context_config),
-                    )
-                    .await
-                    .unwrap()
-                    .context
-                    .slot,
-                setup
-                    .rpc
-                    .get_token_account_balance(
-                        Some(setup.context.clone()),
-                        holder.to_string(),
-                        Some(commitment),
-                    )
-                    .await
-                    .unwrap()
-                    .context
-                    .slot,
-                setup
-                    .rpc
-                    .get_token_supply(
-                        Some(setup.context.clone()),
-                        mint.to_string(),
-                        Some(commitment),
-                    )
-                    .await
-                    .unwrap()
-                    .context
-                    .slot,
-                SurfpoolAccountsScanRpc
-                    .get_token_largest_accounts(
-                        Some(setup.context.clone()),
-                        mint.to_string(),
-                        Some(commitment),
-                    )
-                    .await
-                    .unwrap()
-                    .context
-                    .slot,
-                SurfpoolAccountsScanRpc
-                    .get_largest_accounts(
-                        Some(setup.context.clone()),
-                        Some(RpcLargestAccountsConfig {
-                            commitment: Some(commitment),
-                            ..Default::default()
-                        }),
-                    )
-                    .await
-                    .unwrap()
-                    .context
-                    .slot,
-                SurfpoolAccountsScanRpc
-                    .get_supply(
-                        Some(setup.context.clone()),
-                        Some(RpcSupplyConfig {
-                            commitment: Some(commitment),
-                            ..Default::default()
-                        }),
-                    )
-                    .await
-                    .unwrap()
-                    .context
-                    .slot,
-            ];
-
-            assert_eq!(slots, [expected_slot; 9], "{commitment:?}");
+                    .unwrap();
+                assert_eq!(
+                    [single.context.slot, multiple.context.slot],
+                    [expected_slot; 2],
+                    "{commitment:?} {encoding:?}"
+                );
+                if encoding == UiAccountEncoding::JsonParsed {
+                    let UiAccountData::Json(parsed) = single.value.unwrap().data else {
+                        panic!("{commitment:?}: the holder was not parsed");
+                    };
+                    assert_eq!(parsed.parsed["info"]["tokenAmount"]["decimals"], 9);
+                }
+            }
         }
     }
 }

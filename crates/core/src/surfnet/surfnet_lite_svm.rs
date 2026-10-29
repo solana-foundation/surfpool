@@ -30,7 +30,7 @@ use crate::{
 pub const LAMPORTS_PER_SOL: u64 = 1_000_000_000;
 
 /// Sysvars surfpool derives itself; an account write would desync them from the sysvar cache.
-const MANAGED_SYSVARS: [(Pubkey, &str); 5] = [
+pub(crate) const MANAGED_SYSVARS: [(Pubkey, &str); 5] = [
     (sysvar::clock::ID, "Clock"),
     (sysvar::slot_hashes::ID, "SlotHashes"),
     (sysvar::recent_blockhashes::ID, "RecentBlockhashes"),
