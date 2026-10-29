@@ -17,8 +17,8 @@ use surfpool_core::surfnet::{
     svm::{SurfnetSvm, SurfnetSvmConfig},
 };
 use surfpool_types::{
-    AccountSnapshot, BlockProductionMode, CheatcodeFilter, RpcConfig, SimnetCommand, SimnetConfig,
-    SimnetEvent, SurfpoolConfig, SvmFeatureConfig,
+    AccountSnapshot, BlockProductionMode, CheatcodeFilter, DEFAULT_PROFILING_MAP_CAPACITY,
+    RpcConfig, SimnetCommand, SimnetConfig, SimnetEvent, SurfpoolConfig, SvmFeatureConfig,
 };
 
 use crate::{
@@ -54,6 +54,8 @@ pub struct SurfnetBuilder {
     feature_config: SvmFeatureConfig,
     cheatcode_lock: Option<CheatcodeFilter>,
     snapshots: Vec<SnapshotSource>,
+    instruction_profiling: bool,
+    max_profiles: usize,
 }
 
 /// Accounts to preload at startup, in the order they were added to the builder.
@@ -76,11 +78,33 @@ impl Default for SurfnetBuilder {
             feature_config: SvmFeatureConfig::default(),
             cheatcode_lock: None,
             snapshots: vec![],
+            instruction_profiling: true,
+            max_profiles: DEFAULT_PROFILING_MAP_CAPACITY,
         }
     }
 }
 
 impl SurfnetBuilder {
+    /// Profile every instruction of every transaction. Default: `true`.
+    ///
+    /// Each profile re-executes the transaction instruction by instruction
+    /// and keeps the accounts it touched before and after. That is what
+    /// `surfnet_getTransactionProfile` serves, and it costs CPU and memory
+    /// per transaction: turn it off for surfnets that run many transactions
+    /// over large accounts.
+    pub fn instruction_profiling(mut self, enabled: bool) -> Self {
+        self.instruction_profiling = enabled;
+        self
+    }
+
+    /// How many transaction profiles to keep, executed and simulated each,
+    /// oldest dropped first. Default: [`DEFAULT_PROFILING_MAP_CAPACITY`].
+    /// At least 1.
+    pub fn max_profiles(mut self, max: usize) -> Self {
+        self.max_profiles = max.max(1);
+        self
+    }
+
     /// Run in offline mode (no mainnet RPC fallback). Default: `true`.
     pub fn offline(mut self, offline: bool) -> Self {
         self.offline_mode = offline;
@@ -220,6 +244,8 @@ impl SurfnetBuilder {
             feature_config,
             cheatcode_lock,
             snapshots,
+            instruction_profiling,
+            max_profiles,
         } = self;
         if let Some(lock) = &cheatcode_lock {
             lock.validate()
@@ -256,6 +282,8 @@ impl SurfnetBuilder {
                 airdrop_token_amount: airdrop_lamports,
                 skip_blockhash_check,
                 snapshot,
+                instruction_profiling_enabled: instruction_profiling,
+                max_profiles,
                 ..Default::default()
             }],
             rpc: RpcConfig {
