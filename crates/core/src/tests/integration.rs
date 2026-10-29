@@ -11086,7 +11086,7 @@ async fn test_instruction_profiling_does_not_mutate_state(test_type: TestType) {
     // NOW THE CRITICAL PART: Verify that instruction profiling didn't leak state
     // Even though the first instruction was profiled successfully, its effects
     // should NOT be persisted because:
-    // 1. The instruction profiling uses clone_for_profiling() with OverlayStorage
+    // 1. Instruction profiling simulates each prefix, which never commits
     // 2. The overall transaction failed, so no state changes are committed
     //
     // Note: Failed transactions in Solana still deduct fees from the fee payer.
@@ -11105,8 +11105,8 @@ async fn test_instruction_profiling_does_not_mutate_state(test_type: TestType) {
 
     // THE KEY ASSERTION: Recipient should NOT have received funds
     // This proves that the first instruction's transfer (which was profiled successfully)
-    // was NOT committed to the actual state. The instruction profiling used
-    // clone_for_profiling() so its mutations were isolated.
+    // was NOT committed to the actual state. Instruction profiling simulates each
+    // prefix, so its mutations were never committed.
     assert_eq!(
         initial_recipient_account.as_ref().map(|a| a.lamports),
         final_recipient_account.as_ref().map(|a| a.lamports),
