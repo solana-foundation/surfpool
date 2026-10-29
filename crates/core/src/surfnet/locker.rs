@@ -4065,6 +4065,17 @@ impl SurfnetSvmLocker {
         self.with_svm_reader(|svm| read.covering(svm, pubkeys))
     }
 
+    /// [`ReadSlot::covering_encoded`] under a read guard. Call it after encoding `pubkeys`, so
+    /// the context also covers the mints a `jsonParsed` encoding read.
+    pub fn read_slot_covering_encoded(
+        &self,
+        read: ReadSlot,
+        pubkeys: &[Pubkey],
+        encoding: Option<UiAccountEncoding>,
+    ) -> ReadSlot {
+        self.with_svm_reader(|svm| read.covering_encoded(svm, pubkeys, encoding))
+    }
+
     /// [`ReadSlot::covering_every_account`] under a read guard, after the scan.
     pub fn read_slot_covering_every_account(&self, read: ReadSlot) -> ReadSlot {
         self.with_svm_reader(|svm| read.covering_every_account(svm))

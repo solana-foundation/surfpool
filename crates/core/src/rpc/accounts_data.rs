@@ -375,7 +375,6 @@ impl AccountsData for SurfpoolAccountsDataRpc {
                 inner: account_update,
                 ..
             } = svm_locker.get_account(&remote_ctx, &pubkey, None).await?;
-            let read = svm_locker.read_slot_covering(read, &[pubkey]);
 
             #[cfg(feature = "prometheus")]
             if let Some(m) = crate::telemetry::metrics() {
@@ -397,6 +396,7 @@ impl AccountsData for SurfpoolAccountsDataRpc {
             } else {
                 None
             };
+            let read = svm_locker.read_slot_covering_encoded(read, &[pubkey], config.encoding);
 
             Ok(read.respond(ui_account))
         })
@@ -438,7 +438,6 @@ impl AccountsData for SurfpoolAccountsDataRpc {
             } = svm_locker
                 .get_multiple_accounts(&remote_ctx, &pubkeys, None)
                 .await?;
-            let read = svm_locker.read_slot_covering(read, &pubkeys);
 
             #[cfg(feature = "prometheus")]
             if let Some(m) = crate::telemetry::metrics() {
@@ -468,6 +467,7 @@ impl AccountsData for SurfpoolAccountsDataRpc {
                     ui_accounts.push(None);
                 }
             }
+            let read = svm_locker.read_slot_covering_encoded(read, &pubkeys, config.encoding);
 
             Ok(read.respond(ui_accounts))
         })
@@ -2003,6 +2003,78 @@ mod tests {
                 ],
                 "{commitment:?}"
             );
+        }
+    }
+
+    /// A `jsonParsed` token account carries amounts parsed with its mint, so a read of it covers
+    /// the mint's writes as well as its own. Other encodings don't read the mint.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn parsed_token_reads_cover_their_mint() {
+        use solana_account_decoder::{UiAccountData, UiAccountEncoding};
+        use spl_token_2022_interface::{
+            extension::StateWithExtensionsMut, state::Mint as Token2022Mint,
+        };
+
+        let setup = TestSetup::new(SurfpoolAccountsDataRpc);
+        let locker = &setup.context.svm_locker;
+        let (mint, holder, _) = set_scaled_mint(&setup, 6);
+        let depth = locker.with_svm_reader(|svm| svm.finalization_slot_threshold());
+        // Age the holder past every commitment, then write only its mint.
+        for _ in 0..=depth {
+            locker.confirm_current_block(&None).await.unwrap();
+        }
+        locker.with_svm_writer(|svm| {
+            let mut account = svm.get_account(&mint).unwrap().unwrap();
+            let mut state =
+                StateWithExtensionsMut::<Token2022Mint>::unpack(&mut account.data).unwrap();
+            state.base.decimals = 9;
+            state.pack_base();
+            svm.set_account(&mint, account).unwrap();
+        });
+        let written = locker.get_latest_absolute_slot();
+
+        for commitment in [CommitmentConfig::confirmed(), CommitmentConfig::finalized()] {
+            let slot = locker.get_slot_for_commitment(&commitment);
+            assert!(slot < written, "{commitment:?}");
+            for (encoding, expected_slot) in [
+                (UiAccountEncoding::JsonParsed, written),
+                (UiAccountEncoding::Base64, slot),
+            ] {
+                let config = RpcAccountInfoConfig {
+                    commitment: Some(commitment),
+                    encoding: Some(encoding),
+                    ..Default::default()
+                };
+                let single = setup
+                    .rpc
+                    .get_account_info(
+                        Some(setup.context.clone()),
+                        holder.to_string(),
+                        Some(config.clone()),
+                    )
+                    .await
+                    .unwrap();
+                let multiple = setup
+                    .rpc
+                    .get_multiple_accounts(
+                        Some(setup.context.clone()),
+                        vec![holder.to_string()],
+                        Some(config),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    [single.context.slot, multiple.context.slot],
+                    [expected_slot; 2],
+                    "{commitment:?} {encoding:?}"
+                );
+                if encoding == UiAccountEncoding::JsonParsed {
+                    let UiAccountData::Json(parsed) = single.value.unwrap().data else {
+                        panic!("{commitment:?}: the holder was not parsed");
+                    };
+                    assert_eq!(parsed.parsed["info"]["tokenAmount"]["decimals"], 9);
+                }
+            }
         }
     }
 }

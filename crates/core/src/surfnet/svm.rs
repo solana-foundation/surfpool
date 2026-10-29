@@ -448,6 +448,25 @@ impl ReadSlot {
             .fold(self, |read, written| Self(read.0.max(written)))
     }
 
+    /// [`Self::covering`] for a read that encodes `pubkeys` as `encoding`. A `jsonParsed` token
+    /// account carries amounts parsed with its mint, so the read covers the mint's writes too.
+    pub fn covering_encoded(
+        self,
+        svm: &SurfnetSvm,
+        pubkeys: &[Pubkey],
+        encoding: Option<UiAccountEncoding>,
+    ) -> Self {
+        let read = self.covering(svm, pubkeys);
+        if encoding != Some(UiAccountEncoding::JsonParsed) {
+            return read;
+        }
+        let mints: Vec<Pubkey> = pubkeys
+            .iter()
+            .filter_map(|pubkey| svm.token_account_mint(pubkey))
+            .collect();
+        read.covering(svm, &mints)
+    }
+
     /// [`Self::covering`] for a scan, whose answer depends on accounts it does not return.
     pub fn covering_every_account(self, svm: &SurfnetSvm) -> Self {
         Self(self.0.max(svm.latest_account_write_slot))
@@ -4216,21 +4235,21 @@ impl SurfnetSvm {
         pubkey: &Pubkey,
         token_mint: Option<Pubkey>,
     ) -> Option<AccountAdditionalDataV3> {
-        let token_mint = if let Some(mint) = token_mint {
-            Some(mint)
-        } else {
-            self.token_accounts
-                .get(&pubkey.to_string())
-                .ok()
-                .flatten()
-                .map(|ta| ta.mint())
-        };
-
         token_mint
+            .or_else(|| self.token_account_mint(pubkey))
             .and_then(|mint| self.mint_additional_data(&mint))
             .map(|data| AccountAdditionalDataV3 {
                 spl_token_additional_data: Some(data),
             })
+    }
+
+    /// The mint of `pubkey`, if it is a token account.
+    fn token_account_mint(&self, pubkey: &Pubkey) -> Option<Pubkey> {
+        self.token_accounts
+            .get(&pubkey.to_string())
+            .ok()
+            .flatten()
+            .map(|ta| ta.mint())
     }
 
     /// The cached UI-amount inputs of `mint`, with the rate-based extensions
