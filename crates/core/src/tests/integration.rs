@@ -75,10 +75,10 @@ use spl_token_2022_interface::{
 };
 use surfpool_types::{
     AccountSnapshot, CheatcodeConfig, CheatcodeControlConfig, CheatcodeFilter,
-    DEFAULT_SLOT_TIME_MS, Idl, RpcProfileDepth, RpcProfileResultConfig, SimnetCommand, SimnetEvent,
-    StartupPlanner, SurfnetStartupPhase, SurfnetStartupStatus, SurfnetStartupTask,
-    SurfnetStartupTaskState, SurfpoolConfig, SvmFeatureConfig, UiAccountChange,
-    UiAccountProfileState, UiKeyedProfileResult,
+    DEFAULT_SLOT_TIME_MS, Idl, RpcProfileDepth, RpcProfileResultConfig, SerialVmMutationResult,
+    SerialVmMutationTask, SimnetCommand, SimnetEvent, StartupPlanner, SurfnetStartupPhase,
+    SurfnetStartupStatus, SurfnetStartupTask, SurfnetStartupTaskState, SurfpoolConfig,
+    SvmFeatureConfig, UiAccountChange, UiAccountProfileState, UiKeyedProfileResult,
     types::{
         BlockProductionMode, RpcConfig, SimnetConfig, SubgraphConfig, TransactionStatusEvent,
         UuidOrSignature,
@@ -7132,6 +7132,12 @@ async fn test_get_signatures_for_address_local_then_remote(test_type: TestType) 
         "local airdrops must produce distinct signatures"
     );
     // local_sigs[0] is the newer local signature; local_sigs[1] is the older one.
+    // The default `finalized` commitment lists only finalized signatures. The datasource
+    // signatures are older, so they are finalized by then too.
+    local_rpc
+        .poll_for_signature_with_commitment(&local_sigs[0], CommitmentConfig::finalized())
+        .await
+        .expect("local airdrop should finalize");
 
     // Scenario A: `before` is a local-only signature.
     // Pre-fix surfpool forwarded `before=local_sigs[0]` to the datasource, which had never seen
@@ -7808,7 +7814,9 @@ async fn test_remote_get_multiple_accounts_ordering(test_type: TestType) {
 #[test_case(TestType::in_memory(), false; "legacy with sqlite")]
 #[tokio::test(flavor = "multi_thread")]
 async fn finalization_follows_the_alpenglow_feature(test_type: TestType, alpenglow: bool) {
-    use solana_client::rpc_config::{RpcTransactionConfig, RpcTransactionLogsFilter};
+    use solana_client::rpc_config::{
+        RpcSignaturesForAddressConfig, RpcTransactionConfig, RpcTransactionLogsFilter,
+    };
     use solana_transaction_status::TransactionConfirmationStatus;
 
     use crate::{
@@ -7884,8 +7892,41 @@ async fn finalization_follows_the_alpenglow_feature(test_type: TestType, alpengl
         assert_eq!(status.slot, transaction_slot);
         assert_eq!(status.confirmation_status, expected);
         assert_eq!(status.confirmations, confirmations);
-        let signatures = locker.get_signatures_for_address_local(&payer.pubkey(), None);
-        assert_eq!(signatures.inner()[0].confirmation_status, expected);
+        // At the default `finalized` commitment, the signature is listed once finalized.
+        let signatures = locker
+            .get_signatures_for_address_local(&payer.pubkey(), None)
+            .unwrap();
+        assert_eq!(
+            signatures
+                .inner()
+                .first()
+                .and_then(|s| s.confirmation_status.clone()),
+            expected
+                .clone()
+                .filter(|s| *s == TransactionConfirmationStatus::Finalized)
+        );
+        // Until then, Agave cannot find it as a boundary at that commitment.
+        let until = RpcSignaturesForAddressConfig {
+            until: Some(signature.to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            locker
+                .get_signatures_for_address_local(&payer.pubkey(), Some(&until))
+                .map(|_| ())
+                .map_err(|e| {
+                    let e = jsonrpc_core::Error::from(e);
+                    (e.code, e.message)
+                }),
+            if expected == Some(TransactionConfirmationStatus::Finalized) {
+                Ok(())
+            } else {
+                Err((
+                    jsonrpc_core::ErrorCode::ServerError(-32020),
+                    format!("Transaction {signature} not found"),
+                ))
+            }
+        );
         let transactions = locker
             .get_transactions_for_address_local(
                 &payer.pubkey(),
@@ -8006,7 +8047,15 @@ async fn test_ws_signature_subscribe(subscription_type: SignatureSubscriptionTyp
     use crossbeam_channel::unbounded;
     use solana_system_interface::instruction as system_instruction;
 
-    let (svm_instance, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+    let (mut svm_instance, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+    // Leave epoch 0, where the epoch slot index equals the absolute slot (#896).
+    svm_instance
+        .travel_to(svm_instance.latest_epoch_info.slots_in_epoch + 100)
+        .unwrap();
+    assert_ne!(
+        svm_instance.latest_epoch_info.slot_index,
+        svm_instance.latest_epoch_info.absolute_slot
+    );
 
     let svm_locker = SurfnetSvmLocker::new(svm_instance);
 
@@ -8028,6 +8077,7 @@ async fn test_ws_signature_subscribe(subscription_type: SignatureSubscriptionTyp
         recent_blockhash,
     );
     let signature = tx.signatures[0];
+    let transaction_slot = svm_locker.get_latest_absolute_slot();
 
     // subscribe with processed commitment
     let notification_rx =
@@ -8064,9 +8114,9 @@ async fn test_ws_signature_subscribe(subscription_type: SignatureSubscriptionTyp
         error_opt.is_none(),
         "Transaction should succeed without error"
     );
-    println!(
-        "✓ Received {} signature notification at slot {}",
-        subscription_type, slot
+    assert_eq!(
+        slot, transaction_slot,
+        "{subscription_type} notification must carry the absolute slot"
     );
 }
 
@@ -12720,6 +12770,246 @@ async fn assert_skip_sig_verify_updates_state(test_type: TestType, saturate_even
         final_payer_balance.value > airdrop_amount - transfer_amount - LAMPORTS_PER_SOL / 10,
         "Payer balance ({}) should not have decreased by more than transfer + reasonable fees",
         final_payer_balance.value,
+    );
+}
+
+// Agave's RPC forwards a skip-preflight send without consulting the status cache and the bank
+// drops the duplicate, so the client gets the signature back; with preflight, the simulation
+// rejects it as AlreadyProcessed.
+#[test_case(TestType::sqlite(); "with on-disk sqlite db")]
+#[test_case(TestType::in_memory(); "with in-memory sqlite db")]
+#[test_case(TestType::no_db(); "with no db")]
+#[cfg_attr(feature = "postgres", test_case(TestType::postgres(); "with postgres db"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_send_transaction_resend_of_processed_transaction(test_type: TestType) {
+    let payer = Keypair::new();
+    let recipient = Pubkey::new_unique();
+    let bind_host = "127.0.0.1";
+    let bind_port = get_free_port().unwrap();
+    let ws_port = get_free_port().unwrap();
+    let config = SurfpoolConfig {
+        simnets: vec![SimnetConfig {
+            airdrop_addresses: vec![payer.pubkey()],
+            airdrop_token_amount: LAMPORTS_PER_SOL,
+            block_production_mode: BlockProductionMode::Manual,
+            offline_mode: true,
+            ..SimnetConfig::default()
+        }],
+        rpc: RpcConfig {
+            bind_host: bind_host.to_string(),
+            bind_port,
+            ws_port,
+            ..RpcConfig::default()
+        },
+        ..SurfpoolConfig::default()
+    };
+
+    let (surfnet_svm, simnet_events_rx, geyser_events_rx) = test_type.initialize_svm();
+    let (simnet_commands_tx, simnet_commands_rx) = unbounded();
+    let svm_locker = SurfnetSvmLocker::new(surfnet_svm);
+    let _runloop = spawn_runloop(
+        svm_locker.clone(),
+        config,
+        (simnet_commands_tx.clone(), simnet_commands_rx),
+        geyser_events_rx,
+    )
+    .expect("the runloop should start");
+    wait_for_ready(&simnet_events_rx).expect("the surfnet should start");
+
+    let url = format!("http://{bind_host}:{bind_port}");
+    let full_client = http::connect::<FullClient>(&url)
+        .await
+        .expect("Failed to connect to Surfpool");
+    let minimal_client = http::connect::<MinimalClient>(&url)
+        .await
+        .expect("Failed to connect to Surfpool");
+
+    let transfer = |lamports| {
+        Transaction::new_signed_with_payer(
+            &[system_instruction::transfer(
+                &payer.pubkey(),
+                &recipient,
+                lamports,
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            svm_locker.latest_absolute_blockhash(),
+        )
+    };
+    let encode = |tx: &Transaction| {
+        bs58::encode(bincode::serialize(&VersionedTransaction::from(tx.clone())).unwrap())
+            .into_string()
+    };
+    let send_config = |skip_preflight, preflight_commitment, skip_sig_verify| {
+        Some(SurfpoolRpcSendTransactionConfig {
+            base: RpcSendTransactionConfig {
+                skip_preflight,
+                preflight_commitment,
+                ..Default::default()
+            },
+            skip_sig_verify,
+        })
+    };
+    let skip_preflight = send_config(true, None, None);
+    let processed_preflight = send_config(false, Some(CommitmentLevel::Processed), None);
+    let tx = transfer(LAMPORTS_PER_SOL / 10);
+    let signature = tx.signatures[0].to_string();
+    let data = encode(&tx);
+
+    full_client
+        .send_transaction(data.clone(), None)
+        .await
+        .expect("the first send should succeed");
+    let observed_state = async || {
+        let payer = minimal_client.get_balance(payer.pubkey().to_string(), None);
+        let recipient = minimal_client.get_balance(recipient.to_string(), None);
+        let transaction_count = minimal_client.get_transaction_count(None);
+        (
+            payer.await.unwrap().value,
+            recipient.await.unwrap().value,
+            transaction_count.await.unwrap(),
+        )
+    };
+    let state_after_first_send = observed_state().await;
+
+    let resent = full_client
+        .send_transaction(data.clone(), skip_preflight.clone())
+        .await
+        .expect("a skip-preflight resend should return the signature");
+    assert_eq!(resent, signature);
+
+    // The finalized preflight bank has not processed it yet, so the simulation passes.
+    let resent = full_client
+        .send_transaction(data.clone(), None)
+        .await
+        .expect("a finalized-preflight resend should return the signature");
+    assert_eq!(resent, signature);
+
+    let simulation_error = async |data, config| {
+        let Err(jsonrpc_core_client::RpcError::JsonRpcError(err)) =
+            full_client.send_transaction(data, config).await
+        else {
+            panic!("the preflight resend should fail the simulation");
+        };
+        assert_eq!(err.code, jsonrpc_core::ErrorCode::ServerError(-32002));
+        let simulation = err
+            .data
+            .expect("the error should carry the simulation result");
+        assert_eq!(simulation["loadedAccountsDataSize"], 0);
+        (err.message, simulation["err"].clone())
+    };
+    assert_eq!(
+        simulation_error(data, processed_preflight.clone()).await,
+        (
+            "Transaction simulation failed: This transaction has already been processed"
+                .to_string(),
+            "AlreadyProcessed".into()
+        )
+    );
+
+    assert_eq!(
+        observed_state().await,
+        state_after_first_send,
+        "the resends should neither execute nor move lamports"
+    );
+
+    // Another message under the processed signature is a new transaction to the status cache.
+    let mut reusing_signature = transfer(LAMPORTS_PER_SOL / 20);
+    reusing_signature.signatures = tx.signatures.clone();
+    let reusing_data = encode(&reusing_signature);
+    full_client
+        .send_transaction(reusing_data.clone(), send_config(true, None, Some(true)))
+        .await
+        .expect("a send without signature verification should succeed");
+    assert_eq!(
+        observed_state().await.1,
+        state_after_first_send.1 + LAMPORTS_PER_SOL / 20,
+        "a different message reusing the signature should execute"
+    );
+
+    // Agave verifies the signatures before the preflight simulation checks the status cache.
+    assert_eq!(
+        simulation_error(reusing_data, processed_preflight.clone()).await,
+        (
+            "Transaction simulation failed: Transaction did not pass signature verification"
+                .to_string(),
+            "SignatureFailure".into()
+        )
+    );
+
+    // Hold the runloop so both sends queue before either executes.
+    let in_flight = transfer(LAMPORTS_PER_SOL / 40);
+    let in_flight_data = encode(&in_flight);
+    let balance_before_in_flight = observed_state().await.1;
+    let (release_tx, release_rx) = crossbeam_channel::bounded::<()>(1);
+    simnet_commands_tx
+        .send(SimnetCommand::ProcessSerialVmMutation(
+            SerialVmMutationTask::new(move || {
+                Box::pin(async move {
+                    let _ = release_rx.recv_timeout(Duration::from_secs(5));
+                    SerialVmMutationResult::NoBlock
+                })
+            }),
+        ))
+        .unwrap();
+    let wait_for_queue = async |done: fn(usize) -> bool| {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !done(simnet_commands_tx.len()) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+    };
+    wait_for_queue(|len| len == 0)
+        .await
+        .expect("the runloop should take the hold");
+    // Release on every path, so a send that fails before queuing reports instead of hanging.
+    let release = async {
+        let queued = wait_for_queue(|len| len >= 2).await;
+        let _ = release_tx.send(());
+        queued
+    };
+    let (first, second, queued) = tokio::join!(
+        full_client.send_transaction(in_flight_data.clone(), skip_preflight.clone()),
+        full_client.send_transaction(in_flight_data.clone(), skip_preflight),
+        release,
+    );
+    let in_flight_signature = in_flight.signatures[0].to_string();
+    queued.expect("both sends should queue while the runloop is held");
+    assert_eq!(
+        (
+            first.unwrap(),
+            second.expect("an in-flight duplicate should return the signature")
+        ),
+        (in_flight_signature.clone(), in_flight_signature)
+    );
+    assert_eq!(
+        observed_state().await.1,
+        balance_before_in_flight + LAMPORTS_PER_SOL / 40,
+        "the in-flight duplicate should not execute"
+    );
+
+    // Agave checks the transaction's age before the status cache.
+    let blockhash = in_flight.message.recent_blockhash;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while svm_locker
+            .with_svm_reader(|svm_reader| svm_reader.check_blockhash_is_recent(&blockhash))
+            .unwrap()
+        {
+            simnet_commands_tx
+                .send(SimnetCommand::SlotForward(None))
+                .unwrap();
+            wait_for_queue(|len| len == 0).await.unwrap();
+        }
+    })
+    .await
+    .expect("the blockhash should expire");
+    assert_eq!(
+        simulation_error(in_flight_data, processed_preflight).await,
+        (
+            "Transaction simulation failed: Blockhash not found".to_string(),
+            "BlockhashNotFound".into()
+        )
     );
 }
 

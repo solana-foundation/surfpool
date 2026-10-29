@@ -136,6 +136,14 @@ impl SurfpoolError {
         Self(error)
     }
 
+    pub fn managed_sysvar(pubkey: Pubkey, name: &str) -> Self {
+        let mut error = Error::new(jsonrpc_core::ErrorCode::InvalidParams);
+        error.data = Some(json!(format!(
+            "Failed to set account {pubkey}: the {name} sysvar is maintained by surfpool; use surfnet_timeTravel instead"
+        )));
+        Self(error)
+    }
+
     pub fn set_account<T>(pubkey: Pubkey, e: T) -> Self
     where
         T: ToString,
@@ -567,6 +575,15 @@ impl SurfpoolError {
     pub fn invalid_token_account_state(state: &str) -> Self {
         let error = Error::invalid_params(format!("Invalid token account state {state}"));
         Self(error)
+    }
+
+    pub fn filter_transaction_not_found(signature: &str) -> Self {
+        Self(
+            RpcCustomError::FilterTransactionNotFound {
+                signature: signature.to_string(),
+            }
+            .into(),
+        )
     }
 
     pub fn tag_not_found(tag: &str) -> Self {

@@ -25,7 +25,6 @@ use solana_epoch_schedule::EpochSchedule;
 use solana_hash::Hash;
 use solana_message::VersionedMessage;
 use solana_pubkey::Pubkey;
-use solana_signature::Signature;
 use solana_sysvar::rent::Rent;
 use solana_transaction::versioned::VersionedTransaction;
 use solana_transaction_error::TransactionError;
@@ -37,9 +36,9 @@ use crate::{
     surfnet::GetAccountResult,
 };
 
-/// Whether Surfpool's transaction store holds a signature as processed. The store stays
+/// Whether Surfpool's transaction store holds the same transaction message as processed. The store stays
 /// Surfpool's; the backend's admission rules consult it at their own point in the order.
-pub type IsProcessed<'a> = &'a dyn Fn(&Signature) -> bool;
+pub type IsProcessed<'a> = &'a dyn Fn(&VersionedTransaction) -> bool;
 
 /// How a transaction is admitted before it executes or simulates.
 #[derive(Clone, Copy)]
@@ -122,7 +121,7 @@ pub(crate) fn verify_signatures(
     is_processed: IsProcessed<'_>,
 ) -> Result<(), litesvm::types::FailedTransactionMetadata> {
     use litesvm::types::{FailedTransactionMetadata, TransactionMetadata};
-    let (Some(&signature), None) = (tx.signatures.first(), signature_structure_error(tx)) else {
+    let (Some(_), None) = (tx.signatures.first(), signature_structure_error(tx)) else {
         return Err(FailedTransactionMetadata {
             err: TransactionError::SanitizeFailure,
             meta: TransactionMetadata::default(),
@@ -136,7 +135,7 @@ pub(crate) fn verify_signatures(
         });
     }
 
-    if is_processed(&signature) {
+    if is_processed(tx) {
         return Err(FailedTransactionMetadata {
             err: TransactionError::AlreadyProcessed,
             meta: TransactionMetadata::default(),
@@ -345,8 +344,8 @@ impl Backend {
         }
     }
 
-    /// Instruction prefixes have invalidated signatures and execute only on a discarded
-    /// profiling fork. Live sends, including bundle admission, never use this path.
+    /// Instruction prefixes and unsigned scenario instructions execute only on a discarded
+    /// sandbox fork. Live sends, including bundle admission, never use this path.
     pub(crate) fn send_profile_prefix(
         &mut self,
         tx: VersionedTransaction,
@@ -552,6 +551,7 @@ mod tests {
     use solana_hash::Hash;
     use solana_keypair::Keypair;
     use solana_message::{Message, VersionedMessage, v0};
+    use solana_signature::Signature;
     use solana_signer::Signer;
     use solana_system_interface::instruction::transfer;
 

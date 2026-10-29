@@ -32,7 +32,7 @@ use solana_transaction_status::RewardsAndNumPartitions;
 use surfpool_types::{
     BlockProductionMode, ClockCommand, ClockEvent, ClockState, DEFAULT_MAINNET_RPC_URL,
     DataIndexingCommand, SimnetCommand, SimnetConfig, SimnetEvent, SimnetEventsTx, StartupPlanner,
-    SurfnetStartupTask, SurfpoolConfig,
+    SurfnetStartupTask, SurfpoolConfig, TransactionConfirmationStatus, TransactionStatusEvent,
 };
 type PluginConstructor = unsafe fn() -> *mut dyn GeyserPlugin;
 use txtx_addon_kit::helpers::fs::FileLocation;
@@ -223,9 +223,13 @@ pub async fn start_local_surfnet_runloop(
     };
 
     svm_locker.initialize(&remote_rpc_client).await?;
-    if let Some(genesis_hash) = simnet.genesis_hash {
-        svm_locker.with_svm_writer(|svm| svm.cached_genesis_hash = Some(genesis_hash));
-    }
+    // Before the RPC servers start: `sendTransaction`'s preflight reads the skip flag.
+    svm_locker.with_svm_writer(|svm_writer| {
+        svm_writer.skip_signature_verification = simnet.skip_signature_verification;
+        if let Some(genesis_hash) = simnet.genesis_hash {
+            svm_writer.cached_genesis_hash = Some(genesis_hash);
+        }
+    });
 
     if let Some(remote_client) = &remote_rpc_client {
         svm_locker
@@ -575,6 +579,13 @@ pub async fn start_block_production_runloop(
                        let skip_sig_verify = skip_sig_verify_override.unwrap_or(global_skip_sig_verify);
                        let sigverify = !skip_sig_verify;
                        let signature = transaction.signatures[0];
+                       // A duplicate of a send that was still queued or executing when this one
+                       // passed the RPC: the bank drops it, and Agave's RPC returns the signature.
+                       if svm_locker.with_svm_reader(|svm_reader| svm_reader.processed_slot(&transaction).is_some()) {
+                           svm_locker.mark_transaction_complete(&signature);
+                           let _ = status_tx.try_send(TransactionStatusEvent::Success(TransactionConfirmationStatus::Processed));
+                           continue
+                       }
                        let result = svm_locker.process_transaction(&remote_client_with_commitment, transaction, status_tx, skip_preflight, sigverify).await;
                        svm_locker.mark_transaction_complete(&signature);
                        if let Err(e) = result {

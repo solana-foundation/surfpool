@@ -704,12 +704,17 @@ mod tests {
     use super::{Pins, Position, query};
 
     #[cfg(unix)]
+    mod scenarios;
+
+    #[cfg(unix)]
     mod security_admission {
         use super::*;
 
         // A deterministic IPC peer exercises Surfpool's real admission paths without native
         // execution or provider traffic. Every request is retained to prove refusal ordering.
-        fn ipc_fixture(count: usize) -> (super::super::HistoricalFork, tempfile::TempDir) {
+        pub(super) fn ipc_fixture(
+            count: usize,
+        ) -> (super::super::HistoricalFork, tempfile::TempDir) {
             use std::sync::Arc;
 
             use super::super::{HistoricalFork, HistoricalLaunch, HistoricalVm, StateView, client};
@@ -731,7 +736,9 @@ for line in sys.stdin:
         print(json.dumps({'id':req['id'],'result':None}), flush=True)
         break
     with open(log, 'a') as out: out.write(json.dumps(req) + '\n')
-    if isinstance(op, dict) and 'archive' in op:
+    if op == 'fork': result = {'branch':1}
+    elif op == 'close': result = None
+    elif isinstance(op, dict) and 'archive' in op:
         kind = op['archive']['kind']
         if kind == 'tokenAccountsByOwner': result = {'accounts':keys}
         elif kind == 'tokenHolders': result = {'holders':[], 'touched':keys, 'mintAtParent':False, 'complete':True}
@@ -754,6 +761,9 @@ for line in sys.stdin:
         result = 5000
     elif isinstance(op, dict) and op.get('command', {}).get('method') == 'setBalance':
         result = None
+    elif isinstance(op, dict) and op.get('command', {}).get('method') == 'rpcSend' and req['branch'] == 1:
+        result = {'output':{'normalizedError':None,'logs':[],'computeUnits':0,
+                  'fee':'5000','returnData':None,'instructionTrace':{'groups':[]}}}
     elif isinstance(op, dict) and op.get('command', {}).get('method') in ('send', 'rpcSend', 'overrideAccounts'):
         if op['command']['method'] == 'overrideAccounts':
             installs += 1
@@ -803,7 +813,7 @@ for line in sys.stdin:
             (fork, dir)
         }
 
-        fn ipc_requests(dir: &tempfile::TempDir) -> Vec<serde_json::Value> {
+        pub(super) fn ipc_requests(dir: &tempfile::TempDir) -> Vec<serde_json::Value> {
             match std::fs::read_to_string(dir.path().join("requests.jsonl")) {
                 Ok(lines) => lines
                     .lines()

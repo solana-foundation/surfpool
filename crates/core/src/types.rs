@@ -460,7 +460,8 @@ impl TransactionWithStatusMeta {
         accounts_after: &[Option<Account>],
         pre_token_accounts_with_indexes: &[(usize, TokenAccount)],
         post_token_accounts_with_indexes: &[(usize, TokenAccount)],
-        token_mints: Vec<MintAccount>,
+        pre_token_mints: Vec<Option<MintAccount>>,
+        post_token_mints: Vec<MintAccount>,
         pre_token_program_ids: &[Pubkey],
         post_token_program_ids: &[Pubkey],
         loaded_addresses: LoadedAddresses,
@@ -486,24 +487,26 @@ impl TransactionWithStatusMeta {
                 pre_token_balances: Some(
                     pre_token_accounts_with_indexes
                         .iter()
-                        .zip(token_mints.clone())
+                        .zip(pre_token_mints)
                         .zip(pre_token_program_ids)
-                        .map(|(((i, a), mint), token_program)| TransactionTokenBalance {
-                            account_index: *i as u8,
-                            mint: a.mint().to_string(),
-                            ui_token_amount: token_amount_to_ui_amount_v3(
-                                a.amount(),
-                                &SplTokenAdditionalDataV2::with_decimals(mint.decimals()),
-                            ),
-                            owner: a.owner().to_string(),
-                            program_id: token_program.to_string(),
+                        .filter_map(|(((i, a), mint), token_program)| {
+                            Some(TransactionTokenBalance {
+                                account_index: *i as u8,
+                                mint: a.mint().to_string(),
+                                ui_token_amount: token_amount_to_ui_amount_v3(
+                                    a.amount(),
+                                    &SplTokenAdditionalDataV2::with_decimals(mint?.decimals()),
+                                ),
+                                owner: a.owner().to_string(),
+                                program_id: token_program.to_string(),
+                            })
                         })
                         .collect(),
                 ),
                 post_token_balances: Some(
                     post_token_accounts_with_indexes
                         .iter()
-                        .zip(token_mints)
+                        .zip(post_token_mints)
                         .zip(post_token_program_ids)
                         .map(|(((i, a), mint), token_program)| TransactionTokenBalance {
                             account_index: *i as u8,
@@ -534,7 +537,7 @@ impl TransactionWithStatusMeta {
         accounts_before: &[Option<Account>],
         accounts_after: &[Option<Account>],
         pre_token_accounts_with_indexes: &[(usize, TokenAccount)],
-        token_mints: Vec<MintAccount>,
+        token_mints: Vec<Option<MintAccount>>,
         token_program_ids: &[Pubkey],
         loaded_addresses: LoadedAddresses,
     ) -> Self {
@@ -554,15 +557,17 @@ impl TransactionWithStatusMeta {
             .iter()
             .zip(token_mints)
             .zip(token_program_ids)
-            .map(|(((i, a), mint), token_program)| TransactionTokenBalance {
-                account_index: *i as u8,
-                mint: a.mint().to_string(),
-                ui_token_amount: token_amount_to_ui_amount_v3(
-                    a.amount(),
-                    &SplTokenAdditionalDataV2::with_decimals(mint.decimals()),
-                ),
-                owner: a.owner().to_string(),
-                program_id: token_program.to_string(),
+            .filter_map(|(((i, a), mint), token_program)| {
+                Some(TransactionTokenBalance {
+                    account_index: *i as u8,
+                    mint: a.mint().to_string(),
+                    ui_token_amount: token_amount_to_ui_amount_v3(
+                        a.amount(),
+                        &SplTokenAdditionalDataV2::with_decimals(mint?.decimals()),
+                    ),
+                    owner: a.owner().to_string(),
+                    program_id: token_program.to_string(),
+                })
             })
             .collect();
 

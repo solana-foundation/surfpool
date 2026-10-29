@@ -1,5 +1,5 @@
 [workspace.package]
-version = "1.6.1"
+version = "1.7.0"
 edition = "2024"
 description = "Surfpool is where developers start their Solana journey."
 license = "Apache-2.0"
@@ -97,7 +97,7 @@ mustache = "0.9.0"
 notify = { version = "8.0.0", default-features = false }
 npm_rs = "1.0.0"
 once_cell = { version = "1.19.0", default-features = false }
-phoenix-rise-accounts = "0.6.12"
+phoenix-rise-accounts = "0.6.15"
 ratatui = { version = "0.29.0", features = [
     "crossterm",
 ], default-features = false }
@@ -183,19 +183,19 @@ wincode = "0.6"
 zip = { version = "0.6", features = ["deflate"], default-features = false }
 sha2 = { version = "0.10" }
 
-surfpool-core = { path = "crates/core", default-features = false, version = "1.6.1"}
-surfpool-sdk = { path = "crates/sdk", default-features = false, version = "1.6.1" }
-surfpool-db = { path = "crates/db", version = "1.6.1" }
-surfpool-mcp = { path = "crates/mcp", default-features = false, version = "1.6.1" }
-surfpool-types = { path = "crates/types", default-features = false, version = "1.6.1" }
+surfpool-core = { path = "crates/core", default-features = false, version = "1.7.0"}
+surfpool-sdk = { path = "crates/sdk", default-features = false, version = "1.7.0" }
+surfpool-db = { path = "crates/db", version = "1.7.0" }
+surfpool-mcp = { path = "crates/mcp", default-features = false, version = "1.7.0" }
+surfpool-types = { path = "crates/types", default-features = false, version = "1.7.0" }
 surfpool-studio-ui = { path = "crates/studio", default-features = false, version = "0.1.1" }
 
-txtx-addon-kit = "0.4.15"
-txtx-addon-network-svm = { version = "0.3.23" }
-txtx-addon-network-svm-types = { version = "0.3.20" }
-txtx-core = { version = "0.4.18" }
-txtx-gql = { version = "0.3.11" }
-txtx-supervisor-ui = { version = "0.2.11", default-features = false }
+txtx-addon-kit = "0.4.16"
+txtx-addon-network-svm = { version = "0.3.24" }
+txtx-addon-network-svm-types = { version = "0.3.21" }
+txtx-core = { version = "0.4.19" }
+txtx-gql = { version = "0.3.12" }
+txtx-supervisor-ui = { version = "0.2.12", default-features = false }
 
 [patch.crates-io]
 # Local

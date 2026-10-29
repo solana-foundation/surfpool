@@ -1074,7 +1074,7 @@ pub trait Full {
     ///   - `before`: Start search before this signature.
     ///   - `until`: Search until this signature (exclusive).
     ///   - `limit`: Maximum number of results to return (default: 1,000; max: 1,000).
-    ///   - `commitment`: The level of commitment desired (e.g., finalized).
+    ///   - `commitment`: `confirmed` or `finalized` (default); `processed` is rejected.
     ///   - `minContextSlot`: The minimum slot that the query should be evaluated at.
     ///
     /// ## Returns
@@ -1084,7 +1084,7 @@ pub trait Full {
     /// - `err`: If the transaction failed, an error object; otherwise `null`.
     /// - `memo`: Optional memo attached to the transaction.
     /// - `blockTime`: Approximate production time of the block containing the transaction (Unix timestamp).
-    /// - `confirmationStatus`: One of `processed`, `confirmed`, or `finalized`.
+    /// - `confirmationStatus`: `confirmed` or `finalized`.
     ///
     /// ## Example Request
     /// ```json
@@ -1808,14 +1808,41 @@ impl Full for SurfpoolFullRpc {
             let signature = unsanitized_tx.signatures[0];
 
             if !config.base.skip_preflight {
-                let blockhash_visible = ctx.svm_locker.with_svm_reader(|svm_reader| {
-                    svm_reader.is_blockhash_visible_at(
-                        tx_message.recent_blockhash(),
-                        &preflight_commitment,
+                // Agave verifies the signatures, then simulates at the preflight bank: lifetime
+                // (blockhash or durable nonce) first, then a status cache that holds only the
+                // slots up to the bank's own. A duplicate that bank cannot see yet passes, and the
+                // runloop drops it. A transaction's full lifetime check (its nonce account may
+                // still be on the datasource) runs in the runloop after its accounts load; here it
+                // only decides a duplicate, whose accounts are local since it ran.
+                let preflight_error = ctx.svm_locker.with_svm_reader(|svm_reader| {
+                    let sigverify = !config
+                        .skip_sig_verify
+                        .unwrap_or(svm_reader.skip_signature_verification);
+                    let duplicate =
+                        svm_reader
+                            .processed_slot(&unsanitized_tx)
+                            .is_some_and(|slot| {
+                                slot <= svm_reader.slot_for_commitment(&preflight_commitment)
+                            });
+                    Ok::<_, SurfpoolError>(
+                        if sigverify && unsanitized_tx.verify_with_results().contains(&false) {
+                            Some(TransactionError::SignatureFailure)
+                        } else if !svm_reader.is_blockhash_visible_at(
+                            tx_message.recent_blockhash(),
+                            &preflight_commitment,
+                        ) || (duplicate
+                            && !svm_reader.inner.is_historical()
+                            && !svm_reader.validate_transaction_blockhash(&unsanitized_tx)?)
+                        {
+                            Some(TransactionError::BlockhashNotFound)
+                        } else if duplicate {
+                            Some(TransactionError::AlreadyProcessed)
+                        } else {
+                            None
+                        },
                     )
-                });
-                if !blockhash_visible {
-                    let error = TransactionError::BlockhashNotFound;
+                })?;
+                if let Some(error) = preflight_error {
                     return Err(Error {
                         data: Some(
                             serde_json::to_value(get_simulate_transaction_result(
@@ -1826,7 +1853,7 @@ impl Full for SurfpoolFullRpc {
                                 false,
                                 &tx_message,
                                 None,
-                                None,
+                                Some(0),
                             ))
                             .map_err(|e| {
                                 Error::invalid_params(format!(
@@ -2469,8 +2496,14 @@ impl Full for SurfpoolFullRpc {
         };
 
         Box::pin(async move {
+            let commitment = config.as_ref().and_then(|config| config.commitment);
+            if !commitment.unwrap_or_default().is_at_least_confirmed() {
+                return Err(Error::invalid_params(
+                    "Method does not support commitment below `confirmed`",
+                ));
+            }
             svm_locker.read_slot(
-                config.as_ref().and_then(|config| config.commitment),
+                commitment,
                 config.as_ref().and_then(|config| config.min_context_slot),
             )?;
             let signatures = svm_locker

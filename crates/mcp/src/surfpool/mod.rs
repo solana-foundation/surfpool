@@ -20,8 +20,10 @@ use surfpool_core::{
     scenarios::{
         TemplateRegistry,
         protocols::{
-            phoenix_eternal::v1::state_builder::{
-                PHOENIX_PERP_ASSET_MAP, build_phoenix_collateral_scenario, phoenix_markets,
+            phoenix_eternal::v1::{
+                market::phoenix_markets,
+                state_builder::PHOENIX_PERP_ASSET_MAP,
+                trader::{MarginView, TraderPositions, trader_positions},
             },
             pump::v1::graduation_builder::{
                 build_pump_graduation_scenario, pump_graduation_addresses,
@@ -159,22 +161,35 @@ pub struct GetTemplateParams {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct CreatePhoenixCollateralScenarioParams {
-    #[schemars(description = "Phoenix Eternal Trader account pubkey.")]
-    pub trader: String,
-    #[schemars(
-        description = "Exact signed collateral target in quote lots, encoded as a decimal string."
-    )]
-    pub target_quote_lots: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
 pub struct ListPhoenixMarketsParams {
     #[schemars(
         description = "The port of the target running local surfnet instance (e.g., 8899, 18899, 28899, etc.). Omit to use the default port, 8899."
     )]
     pub surfnet_port: Option<u16>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ListPhoenixTraderPositionsParams {
+    #[schemars(description = "The address of the trader's Phoenix Trader account.")]
+    pub trader: String,
+    #[schemars(
+        description = "The port of the target running local surfnet instance (e.g., 8899, 18899, 28899, etc.). Omit to use the default port, 8899."
+    )]
+    pub surfnet_port: Option<u16>,
+    #[schemars(
+        description = "Markets to move for marginAfterMoves, each { symbol, targetTicks } with targetTicks a decimal string or a number, the ticks phoenix-market-move takes. Omit for none."
+    )]
+    #[serde(default)]
+    pub moves: Vec<PhoenixMove>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PhoenixMove {
+    pub symbol: String,
+    /// A decimal string or a JSON number.
+    pub target_ticks: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -488,23 +503,6 @@ impl Surfpool {
             .and_then(Value::as_str)
             .map(str::to_string)
             .ok_or_else(|| format!("Studio's config at {endpoint} has no rpc_url"))
-    }
-
-    async fn build_phoenix_collateral_scenario_from_surfnet(
-        &self,
-        studio_url: &str,
-        params: &CreatePhoenixCollateralScenarioParams,
-    ) -> Result<Scenario, String> {
-        let trader = Pubkey::from_str(params.trader.trim())
-            .map_err(|error| format!("Invalid Trader pubkey: {error}"))?;
-        // Studio plays the scenario on its own surfnet, so the Trader is checked there.
-        let rpc_url = self.studio_rpc_url(studio_url).await?;
-        let accounts = self.fetch_accounts_at(&rpc_url, &[trader]).await?;
-        let trader_account = accounts[0]
-            .as_ref()
-            .ok_or_else(|| format!("Phoenix Trader account {trader} was not found"))?;
-        build_phoenix_collateral_scenario(trader, trader_account, &params.target_quote_lots)
-            .map_err(|error| error.to_string())
     }
 
     async fn stage_scenario(&self, scenario: Scenario) -> Result<CallToolResult, McpError> {
@@ -1163,28 +1161,6 @@ impl Surfpool {
         self.stage_scenario(preparation.scenario).await
     }
 
-    #[tool(
-        description = "Creates an editable Phoenix Eternal Trader collateral-stress scenario. Requires a Trader pubkey and exact signed quote lots as a decimal string. The Trader is read from the surfnet Studio plays scenarios on. Only lowers collateral: Play skips a target above the trader's current quoteLotCollateral with a warning, since raising it needs a real deposit. quoteLotCollateral excludes the unrealized PnL and funding Phoenix adds for effective collateral, so lowering it by N quote lots lowers effective collateral by N. Makes a single-override scenario; build a multi-slot cascade with create_scenario instead. This prepares risk state; it does not execute liquidation."
-    )]
-    async fn create_phoenix_collateral_scenario(
-        &self,
-        Parameters(params): Parameters<CreatePhoenixCollateralScenarioParams>,
-    ) -> Result<CallToolResult, McpError> {
-        let studio_url = format!(
-            "http://127.0.0.1:{}",
-            CHANGE_TO_DEFAULT_STUDIO_PORT_ONCE_SUPERVISOR_MERGED
-        );
-        let scenario = match self
-            .build_phoenix_collateral_scenario_from_surfnet(&studio_url, &params)
-            .await
-        {
-            Ok(scenario) => scenario,
-            Err(error) => return Ok(scenario_tool_error(error)),
-        };
-
-        self.stage_scenario(scenario).await
-    }
-
     async fn list_phoenix_markets_at(&self, rpc_url: &str) -> Result<serde_json::Value, String> {
         let perp_asset_map = PHOENIX_PERP_ASSET_MAP;
         let maps = self.fetch_accounts_at(rpc_url, &[perp_asset_map]).await?;
@@ -1206,8 +1182,8 @@ impl Surfpool {
                         "markTicks": market.mark_ticks,
                         "tickSize": market.tick_size,
                         "baseLotDecimals": market.base_lot_decimals,
-                        "maintenanceRiskFactorBps": market.maintenance_risk_factor_bps,
-                        "backstopRiskFactorBps": market.backstop_risk_factor_bps,
+                        "maintenanceRiskFactorBps": market.risk_factors[0],
+                        "backstopRiskFactorBps": market.risk_factors[1],
                     })
                 })
                 .collect::<Vec<_>>(),
@@ -1226,6 +1202,60 @@ impl Surfpool {
                 "http://127.0.0.1:{}",
                 params.surfnet_port.unwrap_or(DEFAULT_RPC_PORT)
             ))
+            .await
+        {
+            Ok(payload) => Ok(CallToolResult::success(vec![Content::text(
+                payload.to_string(),
+            )])),
+            Err(error) => Ok(scenario_tool_error(error)),
+        }
+    }
+
+    async fn list_phoenix_trader_positions_at(
+        &self,
+        rpc_url: &str,
+        trader: &str,
+        moves: &[PhoenixMove],
+    ) -> Result<serde_json::Value, String> {
+        let trader = Pubkey::from_str(trader.trim())
+            .map_err(|_| format!("'{trader}' is not a valid Phoenix Trader account address"))?;
+        let moves = moves
+            .iter()
+            .map(|moved| {
+                let ticks = match &moved.target_ticks {
+                    serde_json::Value::String(text) => text.trim().parse().ok(),
+                    serde_json::Value::Number(number) => number.as_u64(),
+                    _ => None,
+                };
+                ticks
+                    .map(|ticks| (moved.symbol.clone(), ticks))
+                    .ok_or_else(|| {
+                        format!("targetTicks of {} must be a whole number", moved.symbol)
+                    })
+            })
+            .collect::<Result<Vec<(String, u64)>, String>>()?;
+        let positions = trader_positions(SurfnetRemoteClient::new(rpc_url), trader, &moves)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(trader_positions_json(&trader, &positions))
+    }
+
+    #[tool(
+        description = "Lists the markets where one Phoenix Eternal trader holds a position, as Phoenix's Hawkeye program reports them on a copy of the surfnet's state, sorted by symbol. Each position comes with its market symbol, its orderbook address, its side (long or short), its size in base lots (baseLots) and its maintenance margin in quote lots (maintenanceMarginQuoteLots), both decimal strings. Hawkeye reads positions where Phoenix keeps them, so this is right even when the Trader account's own copy is not; never decode the Trader account yourself. hot is true when Phoenix's active trader index lists the trader, such as one with resting orders. margin is Hawkeye's view as phoenix-trader-cancel-orders leaves the trader, a hot trader's orders canceled: collateral, effectiveCollateral, maintenanceMargin, backstopMargin and highRiskMargin in quote lots as decimal strings, and liquidatable. refusal is why phoenix-trader-cancel-orders or phoenix-trader-collateral would refuse the trader, or null. phoenix-trader-collateral takes the effective collateral wanted in USDC, a quote lot being a millionth of a USDC. Given moves, marginAfterMoves is the same view once those markets move to targetTicks and uncross the way phoenix-market-move and phoenix-market-uncross play them, for a trader that should cross into liquidation at a later slot."
+    )]
+    async fn list_phoenix_trader_positions(
+        &self,
+        Parameters(params): Parameters<ListPhoenixTraderPositionsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        match self
+            .list_phoenix_trader_positions_at(
+                &format!(
+                    "http://127.0.0.1:{}",
+                    params.surfnet_port.unwrap_or(DEFAULT_RPC_PORT)
+                ),
+                &params.trader,
+                &params.moves,
+            )
             .await
         {
             Ok(payload) => Ok(CallToolResult::success(vec![Content::text(
@@ -1511,6 +1541,39 @@ impl ServerHandler for Surfpool {
     ) -> Result<InitializeResult, McpError> {
         Ok(self.get_info())
     }
+}
+
+fn trader_positions_json(trader: &Pubkey, held: &TraderPositions) -> serde_json::Value {
+    let margin = |view: &MarginView| {
+        serde_json::json!({
+            "collateral": view.collateral_quote_lots.to_string(),
+            "effectiveCollateral": view.effective_collateral_quote_lots.to_string(),
+            "maintenanceMargin": view.maintenance_margin_quote_lots.to_string(),
+            "backstopMargin": view.backstop_margin_quote_lots.to_string(),
+            "highRiskMargin": view.high_risk_margin_quote_lots.to_string(),
+            "liquidatable": view.is_liquidatable != 0,
+        })
+    };
+    serde_json::json!({
+        "trader": trader.to_string(),
+        "positions": held
+            .positions
+            .iter()
+            .map(|position| {
+                serde_json::json!({
+                    "symbol": position.symbol,
+                    "orderbook": position.orderbook.to_string(),
+                    "side": if position.base_lots > 0 { "long" } else { "short" },
+                    "baseLots": position.base_lots.unsigned_abs().to_string(),
+                    "maintenanceMarginQuoteLots": position.maintenance_margin_quote_lots.to_string(),
+                })
+            })
+            .collect::<Vec<_>>(),
+        "hot": held.hot,
+        "margin": margin(&held.margin),
+        "marginAfterMoves": held.margin_after_moves.as_ref().map(margin),
+        "refusal": held.refusal,
+    })
 }
 
 fn unlisted_phoenix_symbols(
@@ -1970,11 +2033,122 @@ mod tests {
         assert!(errors[2].contains("'BONK'") && errors[2].contains("list_phoenix_markets"));
     }
 
+    #[test]
+    fn trader_positions_keep_the_contract_studio_reads() {
+        use surfpool_core::scenarios::protocols::phoenix_eternal::v1::trader::TraderPosition;
+
+        let trader = Pubkey::new_unique();
+        let orderbook = Pubkey::new_unique();
+        let position = |symbol: &str, base_lots| TraderPosition {
+            symbol: symbol.to_string(),
+            orderbook,
+            base_lots,
+            maintenance_margin_quote_lots: 12_345_678_901,
+        };
+        let mut view = MarginView::default();
+        view.collateral_quote_lots = -5_030_916_850;
+        view.effective_collateral_quote_lots = 41_872_811;
+        view.maintenance_margin_quote_lots = 11_473_811;
+        view.backstop_margin_quote_lots = 4_589_524;
+        view.high_risk_margin_quote_lots = 2_294_761;
+        view.is_liquidatable = 1;
+        let mut held = TraderPositions {
+            positions: vec![position("ETH", 250), position("SOL", -1_000)],
+            hot: true,
+            margin: view,
+            margin_after_moves: None,
+            refusal: None,
+        };
+        let payload = trader_positions_json(&trader, &held);
+        assert_eq!(
+            payload,
+            serde_json::json!({
+                "trader": trader.to_string(),
+                "positions": [
+                    {
+                        "symbol": "ETH",
+                        "orderbook": orderbook.to_string(),
+                        "side": "long",
+                        "baseLots": "250",
+                        "maintenanceMarginQuoteLots": "12345678901",
+                    },
+                    {
+                        "symbol": "SOL",
+                        "orderbook": orderbook.to_string(),
+                        "side": "short",
+                        "baseLots": "1000",
+                        "maintenanceMarginQuoteLots": "12345678901",
+                    },
+                ],
+                "hot": true,
+                "margin": {
+                    "collateral": "-5030916850",
+                    "effectiveCollateral": "41872811",
+                    "maintenanceMargin": "11473811",
+                    "backstopMargin": "4589524",
+                    "highRiskMargin": "2294761",
+                    "liquidatable": true,
+                },
+                "marginAfterMoves": null,
+                "refusal": null,
+            })
+        );
+        held.margin_after_moves = Some(view);
+        let payload = trader_positions_json(&trader, &held);
+        assert_eq!(payload["marginAfterMoves"], payload["margin"]);
+        let params: ListPhoenixTraderPositionsParams = serde_json::from_value(serde_json::json!({
+            "trader": trader.to_string(),
+            "moves": [{ "symbol": "SOL", "targetTicks": "10446" }, { "symbol": "BTC", "targetTicks": 78545 }],
+        }))
+        .unwrap();
+        assert_eq!(params.moves[0].target_ticks, "10446");
+        assert_eq!(params.moves[1].target_ticks, 78545);
+    }
+
+    #[tokio::test]
+    async fn trader_positions_accept_surrounding_address_whitespace() {
+        let surfpool = Surfpool::new();
+        let trader = Pubkey::new_unique().to_string();
+        let rpc_url = "not-a-url";
+        let expected = surfpool
+            .list_phoenix_trader_positions_at(rpc_url, &trader, &[])
+            .await
+            .unwrap_err();
+        assert!(!expected.contains("is not a valid Phoenix Trader account address"));
+
+        for input in [format!(" {trader} "), format!("\t{trader}\r\n")] {
+            let error = surfpool
+                .list_phoenix_trader_positions_at(rpc_url, &input, &[])
+                .await
+                .unwrap_err();
+            assert_eq!(error, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn trader_positions_refuse_an_invalid_address_before_any_call() {
+        let result = Surfpool::new()
+            .list_phoenix_trader_positions(Parameters(ListPhoenixTraderPositionsParams {
+                trader: "not-an-address".to_string(),
+                surfnet_port: None,
+                moves: Vec::new(),
+            }))
+            .await
+            .unwrap();
+        let payload = json_of(&result);
+        assert!(
+            payload["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("'not-an-address' is not a valid")),
+            "{payload}"
+        );
+    }
+
     #[tokio::test]
     async fn create_scenario_rejects_a_missing_dynamic_ref_value() {
         let surfpool = Surfpool::new();
         let template = TemplateRegistry::new()
-            .get("phoenix-direct-mark-risk-shock")
+            .get("phoenix-market-move")
             .expect("template")
             .clone();
         let mut scenario = surfpool_types::Scenario::new(

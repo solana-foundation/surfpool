@@ -1642,12 +1642,52 @@ impl SurfnetSvmLocker {
         &self,
         pubkey: &Pubkey,
         config: Option<&RpcSignaturesForAddressConfig>,
-    ) -> SvmAccessContext<Vec<RpcConfirmedTransactionStatusWithSignature>> {
+    ) -> SurfpoolContextualizedResult<Vec<RpcConfirmedTransactionStatusWithSignature>> {
+        self.get_signatures_for_address_local_with_boundaries(pubkey, config)
+            .map(|results| {
+                let (signatures, _, _) = results.inner;
+                SvmAccessContext::new(
+                    results.slot,
+                    results.latest_epoch_info,
+                    results.latest_blockhash,
+                    signatures,
+                )
+            })
+    }
+
+    /// The local signatures, and whether `before` and `until` are local signatures.
+    #[allow(clippy::type_complexity)]
+    fn get_signatures_for_address_local_with_boundaries(
+        &self,
+        pubkey: &Pubkey,
+        config: Option<&RpcSignaturesForAddressConfig>,
+    ) -> SurfpoolContextualizedResult<(Vec<RpcConfirmedTransactionStatusWithSignature>, bool, bool)>
+    {
         let before = config.and_then(|c| c.before.as_ref());
         let until = config.and_then(|c| c.until.as_ref());
         let limit = config.and_then(|c| c.limit).unwrap_or(1000);
+        let commitment = config.and_then(|c| c.commitment).unwrap_or_default();
 
-        self.with_contextualized_svm_reader(move |svm_reader| {
+        let results = self.with_contextualized_svm_reader(move |svm_reader| {
+            // As in Agave, only slots visible at the commitment are listed.
+            let highest_slot = svm_reader.slot_for_commitment(&commitment);
+
+            // Agave's blockstore does not find a boundary above that slot, and the datasource
+            // never has a local signature, so Agave rejects it as FilterTransactionNotFound.
+            let is_local = |sig: Option<&String>| -> SurfpoolResult<bool> {
+                let Some(sig) = sig else {
+                    return Ok(false);
+                };
+                match svm_reader.transactions.get(sig)? {
+                    Some(status) if status.expect_processed().0.slot > highest_slot => {
+                        Err(SurfpoolError::filter_transaction_not_found(sig))
+                    }
+                    status => Ok(status.is_some()),
+                }
+            };
+            let before_is_local = is_local(before)?;
+            let until_is_local = is_local(until)?;
+
             let sigs: Vec<_> = svm_reader
                 .transactions
                 .into_iter()
@@ -1665,11 +1705,13 @@ impl SurfnetSvmLocker {
                             return None;
                         };
 
-                        if !transaction_involves_address(
-                            &transaction,
-                            &meta.loaded_addresses,
-                            pubkey,
-                        ) {
+                        if slot > highest_slot
+                            || !transaction_involves_address(
+                                &transaction,
+                                &meta.loaded_addresses,
+                                pubkey,
+                            )
+                        {
                             return None;
                         }
 
@@ -1760,8 +1802,19 @@ impl SurfnetSvmLocker {
             };
 
             // Apply the pagination window first, then enforce the RPC limit on that slice.
-            sigs[window].iter().take(limit).cloned().collect()
-        })
+            Ok::<_, SurfpoolError>((
+                sigs[window].iter().take(limit).cloned().collect(),
+                before_is_local,
+                until_is_local,
+            ))
+        });
+        let inner = results.inner?;
+        Ok(SvmAccessContext::new(
+            results.slot,
+            results.latest_epoch_info,
+            results.latest_blockhash,
+            inner,
+        ))
     }
 
     pub async fn get_signatures_for_address_local_then_remote(
@@ -1770,7 +1823,7 @@ impl SurfnetSvmLocker {
         pubkey: &Pubkey,
         config: Option<&RpcSignaturesForAddressConfig>,
     ) -> SurfpoolContextualizedResult<Vec<RpcConfirmedTransactionStatusWithSignature>> {
-        let results = self.get_signatures_for_address_local(pubkey, config);
+        let results = self.get_signatures_for_address_local_with_boundaries(pubkey, config)?;
         let limit = config.and_then(|c| c.limit).unwrap_or(1000);
         let first_local_slot = self.with_svm_reader(|svm| svm.genesis_slot);
 
@@ -1778,25 +1831,9 @@ impl SurfnetSvmLocker {
             slot,
             latest_blockhash,
             latest_epoch_info,
-            inner: mut combined_results,
+            inner: (mut combined_results, before_is_local, until_is_local),
         } = results;
         if combined_results.len() < limit {
-            let (before_is_local, until_is_local) =
-                self.with_svm_reader(|svm_reader| -> StorageResult<(bool, bool)> {
-                    let is_local = |sig: &String| -> StorageResult<bool> {
-                        Ok(svm_reader.transactions.get(sig)?.is_some())
-                    };
-                    let before_local = match config.and_then(|c| c.before.as_ref()) {
-                        Some(sig) => is_local(sig)?,
-                        None => false,
-                    };
-                    let until_local = match config.and_then(|c| c.until.as_ref()) {
-                        Some(sig) => is_local(sig)?,
-                        None => false,
-                    };
-                    Ok((before_local, until_local))
-                })?;
-
             let remaining_limit = limit - combined_results.len();
             if let Some(remote_config) = signatures_for_address_remote_config(
                 config,
@@ -1835,7 +1872,7 @@ impl SurfnetSvmLocker {
         } else if let Some(reader) = self.archive_reader() {
             self.get_signatures_for_address_local_then_archive(&reader, pubkey, config)?
         } else {
-            self.get_signatures_for_address_local(pubkey, config)
+            self.get_signatures_for_address_local(pubkey, config)?
         };
 
         Ok(results)
@@ -1855,7 +1892,7 @@ impl SurfnetSvmLocker {
             latest_blockhash,
             latest_epoch_info,
             inner: mut combined,
-        } = self.get_signatures_for_address_local(pubkey, config);
+        } = self.get_signatures_for_address_local(pubkey, config)?;
         let limit = config.and_then(|c| c.limit).unwrap_or(1000);
         if combined.len() < limit {
             let (before_is_local, until_is_local) =
@@ -2604,10 +2641,8 @@ impl SurfnetSvmLocker {
                     .get(&a.mint().to_string())
                     .ok()
                     .flatten()
-                    .ok_or(SurfpoolError::token_mint_not_found(a.mint()))
             })
-            .collect::<Result<Vec<_>, SurfpoolError>>()
-            .unwrap_or_default();
+            .collect();
 
         if do_propagate {
             let meta_canonical = convert_transaction_metadata_from_canonical(&meta);
@@ -2699,6 +2734,18 @@ impl SurfnetSvmLocker {
         let cus = transaction_metadata.compute_units_consumed;
         let logs = transaction_metadata.logs.clone();
         let signature = transaction.signatures[0];
+        // Read before the registries take the transaction's writes, as Agave reads each pre token
+        // balance's mint from the state before execution.
+        let pre_token_mints = token_accounts_before
+            .iter()
+            .map(|(_, a)| {
+                svm_writer
+                    .token_mints
+                    .get(&a.mint().to_string())
+                    .ok()
+                    .flatten()
+            })
+            .collect();
 
         let post_execution_capture = {
             let accounts_after = pubkeys_from_message
@@ -2795,7 +2842,7 @@ impl SurfnetSvmLocker {
                 }
             }
 
-            let token_mints = token_accounts_after
+            let post_token_mints = token_accounts_after
                 .iter()
                 .map(|(_, a)| {
                     svm_writer
@@ -2820,7 +2867,8 @@ impl SurfnetSvmLocker {
                     &accounts_after,
                     token_accounts_before,
                     &token_accounts_after,
-                    token_mints,
+                    pre_token_mints,
+                    post_token_mints,
                     token_programs,
                     &post_token_program_ids,
                     loaded_addresses.clone().unwrap_or_default(),
@@ -6800,8 +6848,12 @@ mod tests {
         )
         .await;
 
-        let SvmAccessContext { inner: sigs, .. } =
-            locker.get_signatures_for_address_local(&payer_pubkey, None);
+        for _ in 0..locker.with_svm_reader(|svm| svm.finalization_slot_threshold()) {
+            locker.confirm_current_block(&None).await.unwrap();
+        }
+        let SvmAccessContext { inner: sigs, .. } = locker
+            .get_signatures_for_address_local(&payer_pubkey, None)
+            .unwrap();
 
         let row_with_memo = sigs
             .iter()
@@ -7248,6 +7300,11 @@ mod tests {
                 ),
             )
             .unwrap();
+        // Finalize the slot, so that the default commitment lists it.
+        svm.latest_epoch_info.absolute_slot = svm
+            .latest_epoch_info
+            .absolute_slot
+            .max(slot + svm.finalization_slot_threshold());
     }
 
     fn seed_signature_history(
@@ -7285,6 +7342,7 @@ mod tests {
     ) -> Vec<String> {
         locker
             .get_signatures_for_address_local(pubkey, config)
+            .unwrap()
             .inner
             .iter()
             .map(|s| s.signature.clone())
@@ -7566,7 +7624,9 @@ mod tests {
             // No block header stored — should not panic
         });
 
-        let result = locker.get_signatures_for_address_local(&pubkey, None);
+        let result = locker
+            .get_signatures_for_address_local(&pubkey, None)
+            .unwrap();
 
         // Both transactions should be returned regardless
         assert_eq!(result.inner.len(), 2);
@@ -8158,8 +8218,8 @@ mod tests {
         assert_eq!(result.inner, expected_hash);
     }
 
-    /// A token account the transaction closes is not in its post token balances: a validator
-    /// reads them from the accounts after execution, where a closed account no longer exists.
+    /// A token account the transaction closes is in its pre token balances only: a validator
+    /// reads the post ones from the accounts after execution, where it no longer exists.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_closed_token_account_has_no_post_token_balance() {
         use crossbeam_channel::unbounded;
@@ -8170,6 +8230,13 @@ mod tests {
         let locker = SurfnetSvmLocker::new(svm);
         let owner = Keypair::new();
         let (mint, token_account) = (Pubkey::new_unique(), Pubkey::new_unique());
+        // `missing_mint` is never created, so its token account's mint cannot be loaded.
+        let (missing_mint, source, destination, closed_later) = (
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        );
         let _ = locker
             .airdrop(&owner.pubkey(), 1_000_000_000)
             .expect("airdrop should succeed");
@@ -8191,56 +8258,140 @@ mod tests {
             let mut mint_data = vec![0; Mint::LEN];
             Mint {
                 is_initialized: true,
+                decimals: 6,
                 ..Default::default()
             }
             .pack_into_slice(&mut mint_data);
             account(&mint, mint_data);
-            let mut token_data = vec![0; TokenAccount::LEN];
-            TokenAccount {
-                mint,
-                owner: owner.pubkey(),
-                state: AccountState::Initialized,
-                ..Default::default()
+            for (pubkey, mint) in [
+                (&token_account, mint),
+                (&source, mint),
+                (&destination, missing_mint),
+                (&closed_later, mint),
+            ] {
+                let mut token_data = vec![0; TokenAccount::LEN];
+                TokenAccount {
+                    mint,
+                    owner: owner.pubkey(),
+                    state: AccountState::Initialized,
+                    ..Default::default()
+                }
+                .pack_into_slice(&mut token_data);
+                account(pubkey, token_data);
             }
-            .pack_into_slice(&mut token_data);
-            account(&token_account, token_data);
         });
+        let process = async |instruction| {
+            let message = Message::new_with_blockhash(
+                &[instruction],
+                Some(&owner.pubkey()),
+                &locker.latest_absolute_blockhash(),
+            );
+            let tx = VersionedTransaction::try_new(VersionedMessage::Legacy(message), &[&owner])
+                .expect("transaction should sign");
+            let signature = tx.signatures[0];
+            let (status_tx, _status_rx) = unbounded();
+            locker
+                .process_transaction(&None, tx, status_tx, true, true)
+                .await
+                .expect("transaction processing should succeed");
+            locker.with_svm_reader(|svm| {
+                let (transaction, _) = svm
+                    .transactions
+                    .get(&signature.to_string())
+                    .unwrap()
+                    .expect("the transaction status should be stored")
+                    .expect_processed()
+                    .clone();
+                transaction.meta
+            })
+        };
+        let decimals = |balances: Option<Vec<TransactionTokenBalance>>| {
+            balances.map(|balances| {
+                balances
+                    .iter()
+                    .map(|balance| balance.ui_token_amount.decimals)
+                    .collect::<Vec<_>>()
+            })
+        };
 
-        let close = spl_token_interface::instruction::close_account(
+        let close = |token_account| {
+            spl_token_interface::instruction::close_account(
+                &spl_token_interface::ID,
+                &token_account,
+                &owner.pubkey(),
+                &owner.pubkey(),
+                &[],
+            )
+            .unwrap()
+        };
+
+        let meta = process(close(token_account)).await;
+        assert_eq!(
+            (
+                meta.status,
+                decimals(meta.pre_token_balances),
+                meta.post_token_balances
+            ),
+            (Ok(()), Some(vec![6]), Some(vec![]))
+        );
+
+        // A failed transaction keeps the balances of the token accounts whose mint loads.
+        let transfer = spl_token_interface::instruction::transfer(
             &spl_token_interface::ID,
-            &token_account,
-            &owner.pubkey(),
+            &source,
+            &destination,
             &owner.pubkey(),
             &[],
+            1,
         )
         .unwrap();
-        let message = Message::new_with_blockhash(
-            &[close],
-            Some(&owner.pubkey()),
-            &locker.latest_absolute_blockhash(),
-        );
-        let tx = VersionedTransaction::try_new(VersionedMessage::Legacy(message), &[&owner])
-            .expect("transaction should sign");
-        let signature = tx.signatures[0];
-        let (status_tx, _status_rx) = unbounded();
-        locker
-            .process_transaction(&None, tx, status_tx, true, true)
-            .await
-            .expect("transaction processing should succeed");
-
-        let meta = locker.with_svm_reader(|svm| {
-            let (transaction, _) = svm
-                .transactions
-                .get(&signature.to_string())
-                .unwrap()
-                .unwrap()
-                .expect_processed()
-                .clone();
-            transaction.meta
-        });
+        let meta = process(transfer).await;
         assert_eq!(
-            (meta.status, meta.post_token_balances),
+            (meta.status.is_err(), decimals(meta.pre_token_balances)),
+            (true, Some(vec![6]))
+        );
+
+        // A mint that fails to load leaves its entry out instead of losing the status.
+        locker.with_svm_writer(|svm| svm.token_mints = Box::new(FailingMints));
+        let meta = process(close(closed_later)).await;
+        assert_eq!(
+            (meta.status, meta.pre_token_balances),
             (Ok(()), Some(vec![]))
         );
+    }
+
+    use crate::{
+        storage::{Storage, StorageError, StorageResult},
+        types::MintAccount,
+    };
+
+    #[derive(Clone)]
+    struct FailingMints;
+
+    impl Storage<String, MintAccount> for FailingMints {
+        fn store(&mut self, _: String, _: MintAccount) -> StorageResult<()> {
+            Ok(())
+        }
+        fn clear(&mut self) -> StorageResult<()> {
+            Ok(())
+        }
+        fn get(&self, _: &String) -> StorageResult<Option<MintAccount>> {
+            Err(StorageError::LockError)
+        }
+        fn take(&mut self, _: &String) -> StorageResult<Option<MintAccount>> {
+            Err(StorageError::LockError)
+        }
+        fn keys(&self) -> StorageResult<Vec<String>> {
+            Err(StorageError::LockError)
+        }
+        fn into_iter(&self) -> StorageResult<Box<dyn Iterator<Item = (String, MintAccount)> + '_>> {
+            Err(StorageError::LockError)
+        }
+        fn count(&self) -> StorageResult<u64> {
+            Err(StorageError::LockError)
+        }
+        fn clone_box(&self) -> Box<dyn Storage<String, MintAccount>> {
+            Box::new(self.clone())
+        }
     }
 }

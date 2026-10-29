@@ -32,7 +32,7 @@ use solana_client::{
         RpcResponseContext,
     },
 };
-use solana_clock::{Clock, Slot};
+use solana_clock::Slot;
 use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_epoch_info::EpochInfo;
 use solana_epoch_schedule::EpochSchedule;
@@ -46,7 +46,6 @@ use solana_pubkey::Pubkey;
 use solana_rpc_client_api::response::{SlotInfo, SlotTransactionStats, SlotUpdate};
 use solana_sdk_ids::{bpf_loader, system_program};
 use solana_signature::Signature;
-use solana_slot_hashes::{MAX_ENTRIES as MAX_SLOT_HASHES_ENTRIES, SlotHashes};
 use solana_system_interface::instruction as system_instruction;
 use solana_transaction::versioned::VersionedTransaction;
 use solana_transaction_error::TransactionError;
@@ -94,7 +93,10 @@ use crate::{
     rpc::utils::convert_transaction_metadata_from_canonical,
     scenarios::{
         TemplateRegistry, account_data_values,
-        protocols::phoenix_eternal::v1::state_builder::prepare_phoenix_override, template_registry,
+        protocols::phoenix_eternal::v1::state_builder::{
+            prepare_phoenix_override, write_all_or_none,
+        },
+        template_registry,
     },
     storage::{OverlayStorage, Storage, StorageBackend, historical_lease::HistoricalStoreLease},
     surfnet::{
@@ -311,7 +313,7 @@ fn json_integer_digits(json: &serde_json::Value, target: &str) -> SurfpoolResult
 }
 
 /// Converts JSON into a txtx [`Value`] using the expected IDL type
-fn json_to_txtx_value_for_idl_type(
+pub(crate) fn json_to_txtx_value_for_idl_type(
     json: &serde_json::Value,
     idl_type: &IdlType,
     idl_types: &[IdlTypeDef],
@@ -611,6 +613,8 @@ pub struct SurfnetSvm {
     pub instruction_profiling_enabled: bool,
     pub max_profiles: usize,
     pub skip_blockhash_check: bool,
+    /// The simnet's `skip_signature_verification`, which a send's `skip_sig_verify` overrides.
+    pub skip_signature_verification: bool,
     pub runbook_executions: Vec<RunbookExecutionStatusReport>,
     /// The startup state machine. Kept private so that every mutation goes
     /// through [`Self::seal_startup_plan`] and its sibling wrappers, which
@@ -974,6 +978,7 @@ impl SurfnetSvm {
             instruction_profiling_enabled: self.instruction_profiling_enabled,
             max_profiles: self.max_profiles,
             skip_blockhash_check: self.skip_blockhash_check,
+            skip_signature_verification: self.skip_signature_verification,
             runbook_executions: self.runbook_executions.clone(),
             startup_status: self.startup_status.clone(),
             // Same rule as the dummy event channels above: the sandbox gets a
@@ -1474,6 +1479,7 @@ impl SurfnetSvm {
             instruction_profiling_enabled: config.instruction_profiling_enabled,
             max_profiles: config.max_profiles,
             skip_blockhash_check: config.skip_blockhash_check,
+            skip_signature_verification: false,
             runbook_executions: Vec::new(),
             startup_status: SurfnetStartupStatus::default(),
             startup_status_watch_tx,
@@ -2145,15 +2151,20 @@ impl SurfnetSvm {
     ) -> SurfpoolResult<Result<(), FailedTransactionMetadata>> {
         // The backend's signature rules; whether a signature was processed is Surfpool's store.
         self.inner
-            .verify_transaction(tx, &|signature| self.signature_is_processed(signature))
+            .verify_transaction(tx, &|tx| self.processed_slot(tx).is_some())
     }
 
-    /// Whether Surfpool's transaction store holds the signature as processed.
-    fn signature_is_processed(&self, signature: &Signature) -> bool {
-        matches!(
-            self.transactions.get(&signature.to_string()),
-            Ok(Some(SurfnetTransactionStatus::Processed(_)))
-        )
+    /// The slot that processed `tx`. Agave's status cache keys by message hash, so a stored
+    /// transaction under the same signature counts only if its message is the same.
+    pub(crate) fn processed_slot(&self, tx: &VersionedTransaction) -> Option<Slot> {
+        match self.transactions.get(&tx.signatures[0].to_string()) {
+            Ok(Some(SurfnetTransactionStatus::Processed(processed)))
+                if processed.0.transaction.message.hash() == tx.message.hash() =>
+            {
+                Some(processed.0.slot)
+            }
+            _ => None,
+        }
     }
 
     /// Sets an account in the local SVM state and notifies listeners.
@@ -2632,10 +2643,11 @@ impl SurfnetSvm {
             // use the separate disposable profiling path, never a live send.
             self.transactions_processed += 1;
             let transactions = &self.transactions;
-            let is_processed = |signature: &Signature| {
+            let is_processed = |tx: &VersionedTransaction| {
                 matches!(
-                    transactions.get(&signature.to_string()),
-                    Ok(Some(SurfnetTransactionStatus::Processed(_)))
+                    transactions.get(&tx.signatures[0].to_string()),
+                    Ok(Some(SurfnetTransactionStatus::Processed(processed)))
+                        if processed.0.transaction.message.hash() == tx.message.hash()
                 )
             };
             let admission = Admission {
@@ -2815,7 +2827,7 @@ impl SurfnetSvm {
         tx: VersionedTransaction,
         sigverify: bool,
     ) -> SurfpoolResult<Result<SimulatedTransactionInfo, FailedTransactionMetadata>> {
-        let is_processed = |signature: &Signature| self.signature_is_processed(signature);
+        let is_processed = |tx: &VersionedTransaction| self.processed_slot(tx).is_some();
         let admission = Admission {
             sigverify: sigverify.then_some(&is_processed as IsProcessed<'_>),
             skip_blockhash_check: self.skip_blockhash_check,
@@ -2834,7 +2846,6 @@ impl SurfnetSvm {
     pub(super) fn confirm_transactions(&mut self) -> Result<(Vec<Signature>, u64), SurfpoolError> {
         let mut confirmed_transactions = vec![];
         let mut num_failed: u64 = 0;
-        let slot = self.latest_epoch_info.slot_index;
         let current_slot = self.latest_epoch_info.absolute_slot;
 
         while let Some((tx, status_tx, error)) =
@@ -2857,7 +2868,7 @@ impl SurfnetSvm {
             self.notify_signature_subscribers(
                 SignatureSubscriptionType::confirmed(),
                 &signature,
-                slot,
+                current_slot,
                 error,
             );
 
@@ -3573,28 +3584,22 @@ impl SurfnetSvm {
 
                 match prepare_phoenix_override(
                     self,
+                    &override_instance.template_id,
                     &account_pubkey,
                     &account,
                     &account_values,
                     remote_ctx,
-                    // Only an account core has just refetched counts as fresh.
-                    fetch_from_upstream && settled_this_slot.contains(&account_pubkey),
                     target_slot,
                 )
                 .await
                 {
                     Ok(Some(writes)) => {
-                        for (pubkey, written) in writes {
-                            if let Err(e) =
-                                self.set_scenario_override_account(&pubkey, written, target_slot)
-                            {
-                                warn!(
-                                    "Failed to set {} for override {}: {}",
-                                    pubkey, override_instance.id, e
-                                );
-                                break;
-                            }
-                            settled_this_slot.insert(pubkey);
+                        match write_all_or_none(self, writes, target_slot) {
+                            Ok(written) => settled_this_slot.extend(written),
+                            Err(e) => warn!(
+                                "Skipping override {} for {}: {}",
+                                override_instance.id, account_pubkey, e
+                            ),
                         }
                         continue;
                     }
@@ -5049,13 +5054,14 @@ mod tests {
     use borsh::BorshSerialize;
     // use test_log::test; // uncomment to get logs from litesvm
     use solana_account::Account;
+    use solana_clock::Clock;
     use solana_hash::Hash;
     use solana_keypair::Keypair;
     use solana_loader_v3_interface::get_program_data_address;
     use solana_message::VersionedMessage;
     use solana_program_pack::Pack;
     use solana_signer::Signer;
-    use solana_slot_hashes::MAX_ENTRIES as MAX_SLOT_HASHES_ENTRIES;
+    use solana_slot_hashes::{MAX_ENTRIES as MAX_SLOT_HASHES_ENTRIES, SlotHashes};
     use solana_system_interface::instruction as system_instruction;
     use solana_transaction::Transaction;
     use solana_transaction_error::TransactionError;
