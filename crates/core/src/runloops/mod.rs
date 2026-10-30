@@ -40,7 +40,7 @@ use txtx_addon_kit::helpers::fs::FileLocation;
 use crate::{
     PluginInfo,
     rpc::{
-        self, RunloopContext, SurfpoolMiddleware, SurfpoolWebsocketMeta,
+        self, RpcActivity, RunloopContext, SurfpoolMiddleware, SurfpoolWebsocketMeta,
         SurfpoolWebsocketMiddleware, accounts_data::AccountsData, accounts_scan::AccountsScan,
         admin::AdminRpc, bank_data::BankData, full::Full, jito::Jito, minimal::Minimal,
         surfnet_cheatcodes::SurfnetCheatcodes, ws::Rpc,
@@ -182,6 +182,12 @@ pub async fn start_local_surfnet_runloop(
     let Some(simnet) = config.simnets.first() else {
         return Ok(());
     };
+    if simnet.expiry == Some(0) {
+        return Err(
+            "expiry must be at least 1 second; leave it unset for a surfnet that never expires"
+                .into(),
+        );
+    }
     let startup_planner = config.startup_planner;
     let block_production_mode = simnet.block_production_mode.clone();
 
@@ -253,7 +259,7 @@ pub async fn start_local_surfnet_runloop(
         svm.announce_open_slot();
     });
 
-    let (_rpc_handle, _ws_handle, shutdown_rpc_servers) = start_rpc_servers_runloop(
+    let (_rpc_handle, _ws_handle, shutdown_rpc_servers, rpc_activity) = start_rpc_servers_runloop(
         &config,
         &simnet_commands_tx,
         svm_locker.clone(),
@@ -355,11 +361,20 @@ pub async fn start_local_surfnet_runloop(
         svm_locker,
         block_production_mode,
         &remote_rpc_client,
-        simnet_config.expiry.map(|e| e * 1000),
+        simnet_config.expiry.map(|secs| IdleExpiry {
+            after: Duration::from_secs(secs),
+            activity: rpc_activity,
+        }),
         &simnet_config,
         Some(shutdown_rpc_servers),
     )
     .await
+}
+
+/// Shuts the surfnet down once no client has used it for `after`.
+pub struct IdleExpiry {
+    pub after: Duration,
+    pub activity: RpcActivity,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -371,7 +386,7 @@ pub async fn start_block_production_runloop(
     svm_locker: SurfnetSvmLocker,
     mut block_production_mode: BlockProductionMode,
     remote_rpc_client: &Option<SurfnetRemoteClient>,
-    expiry_duration_ms: Option<u64>,
+    idle_expiry: Option<IdleExpiry>,
     simnet_config: &SimnetConfig,
     mut shutdown_rpc_servers: Option<Box<dyn FnOnce() + Send>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -381,8 +396,12 @@ pub async fn start_block_production_runloop(
             solana_commitment_config::CommitmentConfig::confirmed(),
         )
     });
-    let mut next_scheduled_expiry_check: Option<u64> =
-        expiry_duration_ms.map(|expiry_val| Utc::now().timestamp_millis() as u64 + expiry_val);
+    // Idle expiry runs on its own timer, so neither the block production mode nor a paused
+    // clock decides whether an unused surfnet stays up.
+    let idle_expiry_check = match &idle_expiry {
+        Some(expiry) => crossbeam_channel::tick(expiry.after.min(Duration::from_secs(1))),
+        None => crossbeam_channel::never(),
+    };
     let global_skip_sig_verify = simnet_config.skip_signature_verification;
     let ix_profiling_initially_enabled = simnet_config.instruction_profiling_enabled;
     // A queued token asks the next runloop iteration to produce one follow-up
@@ -403,22 +422,14 @@ pub async fn start_block_production_runloop(
                         if block_production_mode.eq(&BlockProductionMode::Clock) {
                             do_produce_block = true;
                         }
-
-                        if let Some(expiry_ms) = expiry_duration_ms {
-                            if let Some(scheduled_time_ref) = &mut next_scheduled_expiry_check {
-                                let now_ms = Utc::now().timestamp_millis() as u64;
-                                if now_ms >= *scheduled_time_ref {
-                                    let svm = svm_locker.0.read().await;
-                                    if svm.updated_at + expiry_ms < now_ms {
-                                        let _ = simnet_commands_tx.send(SimnetCommand::Terminate(None));
-                                    } else {
-                                        *scheduled_time_ref = svm.updated_at + expiry_ms;
-                                    }
-                                }
-                            }
-                        }
                     }
                 }
+            },
+            recv(idle_expiry_check) -> _ => {
+                if idle_expiry.as_ref().is_some_and(|expiry| expiry.activity.idle_for() >= expiry.after) {
+                    let _ = simnet_commands_tx.send(SimnetCommand::Terminate(None));
+                }
+                continue
             },
             recv(simnet_commands_rx) -> msg => if let Ok(event) = msg {
                 match event {
@@ -1049,13 +1060,16 @@ const WS_CLOSE_GRACE: Duration = Duration::from_secs(1);
 
 type WsSessionCloser = Arc<dyn Fn() + Send + Sync>;
 
-#[derive(Clone, Default)]
-struct WsSessions(Arc<Mutex<HashMap<SessionId, WsSessionCloser>>>);
+#[derive(Clone)]
+struct WsSessions(Arc<Mutex<HashMap<SessionId, WsSessionCloser>>>, RpcActivity);
 
 impl SessionStats for WsSessions {
-    fn open_session(&self, _id: SessionId) {}
+    fn open_session(&self, _id: SessionId) {
+        self.1.session_opened();
+    }
     fn close_session(&self, id: SessionId) {
         self.0.lock().unwrap().remove(&id);
+        self.1.session_closed();
     }
 }
 
@@ -1120,9 +1134,14 @@ fn spawn_rpc_server_thread<S: RpcServer>(
     Ok((handle, close_handle))
 }
 
-/// The HTTP and WebSocket server threads, and the closure that closes
-/// both servers.
-type RpcServerHandles = (JoinHandle<()>, JoinHandle<()>, Box<dyn FnOnce() + Send>);
+/// The HTTP and WebSocket server threads, the closure that closes
+/// both servers, and the record of when a client last used them.
+type RpcServerHandles = (
+    JoinHandle<()>,
+    JoinHandle<()>,
+    Box<dyn FnOnce() + Send>,
+    RpcActivity,
+);
 
 fn start_rpc_servers_runloop(
     config: &SurfpoolConfig,
@@ -1154,6 +1173,7 @@ fn start_rpc_servers_runloop(
         remote_rpc_client,
         plugin_commands_tx,
     );
+    let activity = middleware.activity.clone();
 
     let (rpc_handle, rpc_close_handle) =
         start_http_rpc_server_runloop(config, middleware.clone(), simnet_events_tx.clone())?;
@@ -1174,7 +1194,7 @@ fn start_rpc_servers_runloop(
         ws_close_handle.close();
     });
 
-    Ok((rpc_handle, ws_handle, shutdown_rpc_servers))
+    Ok((rpc_handle, ws_handle, shutdown_rpc_servers, activity))
 }
 
 fn start_http_rpc_server_runloop(
@@ -1261,7 +1281,7 @@ fn start_ws_rpc_server_runloop(
             .to_delegate(),
         );
 
-        let sessions = WsSessions::default();
+        let sessions = WsSessions(Default::default(), middleware.activity.clone());
         let tracked_sessions = sessions.clone();
         let server = WsServerBuilder::new(rpc_io)
             .session_meta_extractor(move |ctx: &RequestContext| {
@@ -1426,6 +1446,149 @@ mod clock_runloop_tests {
             simnet_events_rx.recv_timeout(Duration::from_secs(2)).err(),
             Some(RecvTimeoutError::Disconnected),
             "the clock thread should end with the runloop that owned its channels"
+        );
+    }
+}
+
+#[cfg(test)]
+mod idle_expiry_tests {
+    use surfpool_types::SimnetConfig;
+
+    use super::*;
+    use crate::tests::helpers::TestSetup;
+
+    type Runloop = JoinHandle<Result<(), String>>;
+
+    /// A Clock mode runloop fed a tick every 10 ms, as the clock thread would.
+    fn start_runloop(idle_expiry: Option<IdleExpiry>) -> (Runloop, Sender<SimnetCommand>) {
+        let svm_locker = TestSetup::new(()).context.svm_locker;
+        let (commands_tx, commands_rx) = unbounded();
+        let (clock_events_tx, clock_events_rx) = unbounded();
+        let (clock_commands_tx, _clock_commands_rx) = unbounded();
+        std::thread::spawn(move || {
+            while clock_events_tx.send(ClockEvent::Tick).is_ok() {
+                sleep(Duration::from_millis(10));
+            }
+        });
+        let runloop_commands_tx = commands_tx.clone();
+        let runloop = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("runloop test runtime should start")
+                .block_on(async {
+                    start_block_production_runloop(
+                        clock_events_rx,
+                        clock_commands_tx,
+                        commands_rx,
+                        runloop_commands_tx,
+                        svm_locker,
+                        BlockProductionMode::Clock,
+                        &None,
+                        idle_expiry,
+                        &SimnetConfig::default(),
+                        None,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())
+                })
+        });
+        (runloop, commands_tx)
+    }
+
+    fn after_50ms(activity: &RpcActivity) -> Option<IdleExpiry> {
+        Some(IdleExpiry {
+            after: Duration::from_millis(50),
+            activity: activity.clone(),
+        })
+    }
+
+    /// Whether the runloop stopped on its own within `timeout`. Stops it either way.
+    fn expires_within(
+        runloop: Runloop,
+        commands_tx: &Sender<SimnetCommand>,
+        timeout: Duration,
+    ) -> bool {
+        let deadline = Instant::now() + timeout;
+        while !runloop.is_finished() && Instant::now() < deadline {
+            sleep(Duration::from_millis(10));
+        }
+        let expired = runloop.is_finished();
+        let _ = commands_tx.send(SimnetCommand::Terminate(None));
+        runloop
+            .join()
+            .expect("runloop thread should not panic")
+            .expect("runloop should stop cleanly");
+        expired
+    }
+
+    #[test]
+    fn an_idle_surfnet_expires_in_clock_mode() {
+        let (runloop, commands_tx) = start_runloop(after_50ms(&RpcActivity::default()));
+
+        assert!(
+            expires_within(runloop, &commands_tx, Duration::from_secs(3)),
+            "a surfnet nobody calls should expire"
+        );
+    }
+
+    #[test]
+    fn a_paused_surfnet_still_expires() {
+        let (runloop, commands_tx) = start_runloop(after_50ms(&RpcActivity::default()));
+        commands_tx
+            .send(SimnetCommand::CommandClock(None, ClockCommand::Pause))
+            .unwrap();
+
+        assert!(
+            expires_within(runloop, &commands_tx, Duration::from_secs(3)),
+            "pausing the clock should not keep an idle surfnet alive"
+        );
+    }
+
+    #[test]
+    fn requests_keep_a_surfnet_alive() {
+        let activity = RpcActivity::default();
+        let (runloop, commands_tx) = start_runloop(after_50ms(&activity));
+
+        let busy_until = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < busy_until {
+            activity.request();
+            sleep(Duration::from_millis(10));
+        }
+        assert!(!runloop.is_finished(), "a surfnet in use should stay up");
+
+        assert!(
+            expires_within(runloop, &commands_tx, Duration::from_secs(3)),
+            "a surfnet should expire once its requests stop"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_zero_expiry_is_refused() {
+        let (commands_tx, commands_rx) = unbounded();
+        let (_geyser_events_tx, geyser_events_rx) = unbounded();
+        let config = SurfpoolConfig {
+            simnets: vec![SimnetConfig {
+                offline_mode: true,
+                expiry: Some(0),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let error = start_local_surfnet_runloop(
+            TestSetup::new(()).context.svm_locker,
+            config,
+            commands_tx,
+            commands_rx,
+            geyser_events_rx,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "expiry must be at least 1 second; leave it unset for a surfnet that never expires"
         );
     }
 }

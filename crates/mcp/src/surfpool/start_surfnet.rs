@@ -91,7 +91,7 @@ pub fn run_headless(surfnet_id: u16, rpc_port: u16, ws_port: u16) -> StartSurfne
     config.rpc.ws_port = ws_port;
 
     let simnet_config = SimnetConfig {
-        expiry: Some(15 * 60 * 1000),
+        expiry: Some(15 * 60),
         ..Default::default()
     };
 

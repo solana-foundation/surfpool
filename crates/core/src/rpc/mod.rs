@@ -2,6 +2,7 @@ use std::{
     collections::HashSet,
     future::Future,
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use blake3::Hash;
@@ -113,6 +114,53 @@ impl State for Option<RunloopContext> {
 
 impl Metadata for RunloopContext {}
 
+/// When a client last used the surfnet: its last JSON-RPC request, over HTTP or WebSocket, or
+/// the opening or closing of a WebSocket session. An open session counts as use while it lasts.
+#[derive(Clone)]
+pub struct RpcActivity(Arc<Mutex<ClientUse>>);
+
+struct ClientUse {
+    last_used_at: Instant,
+    open_sessions: usize,
+}
+
+impl Default for RpcActivity {
+    fn default() -> Self {
+        Self(Arc::new(Mutex::new(ClientUse {
+            last_used_at: Instant::now(),
+            open_sessions: 0,
+        })))
+    }
+}
+
+impl RpcActivity {
+    pub fn request(&self) {
+        self.0.lock().unwrap().last_used_at = Instant::now();
+    }
+
+    pub fn session_opened(&self) {
+        let mut client_use = self.0.lock().unwrap();
+        client_use.last_used_at = Instant::now();
+        client_use.open_sessions += 1;
+    }
+
+    pub fn session_closed(&self) {
+        let mut client_use = self.0.lock().unwrap();
+        client_use.last_used_at = Instant::now();
+        client_use.open_sessions = client_use.open_sessions.saturating_sub(1);
+    }
+
+    /// How long no client has used the surfnet; zero while a WebSocket session is open.
+    pub fn idle_for(&self) -> Duration {
+        let client_use = self.0.lock().unwrap();
+        if client_use.open_sessions > 0 {
+            Duration::ZERO
+        } else {
+            client_use.last_used_at.elapsed()
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct SurfpoolMiddleware {
     pub surfnet_svm: SurfnetSvmLocker,
@@ -121,6 +169,7 @@ pub struct SurfpoolMiddleware {
     pub remote_rpc_client: Option<SurfnetRemoteClient>,
     pub cheatcode_config: Arc<Mutex<CheatcodeConfig>>,
     pub plugin_commands_tx: Sender<PluginCommand>,
+    pub activity: RpcActivity,
 }
 
 impl SurfpoolMiddleware {
@@ -138,6 +187,7 @@ impl SurfpoolMiddleware {
             remote_rpc_client: remote_rpc_client.clone(),
             cheatcode_config: CheatcodeConfig::new(),
             plugin_commands_tx,
+            activity: RpcActivity::default(),
         }
     }
 
@@ -269,6 +319,7 @@ impl Middleware<Option<RunloopContext>> for SurfpoolMiddleware {
         F: FnOnce(Request, Option<RunloopContext>) -> X + Send,
         X: Future<Output = Option<Response>> + Send + 'static,
     {
+        self.activity.request();
         let meta = Some(RunloopContext {
             id: None,
             svm_locker: self.surfnet_svm.clone(),
@@ -432,6 +483,7 @@ impl Middleware<Option<SurfpoolWebsocketMeta>> for SurfpoolWebsocketMiddleware {
         F: FnOnce(Request, Option<SurfpoolWebsocketMeta>) -> X + Send,
         X: Future<Output = Option<Response>> + Send + 'static,
     {
+        self.surfpool_middleware.activity.request();
         let runloop_context = RunloopContext {
             id: None,
             svm_locker: self.surfpool_middleware.surfnet_svm.clone(),
@@ -764,6 +816,50 @@ mod tests {
                 "error": {"code": -32600, "message": "Only method calls are supported"},
                 "id": null
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn every_json_rpc_request_counts_as_use() {
+        let (surfnet_svm, _events_rx, _) = SurfnetSvm::default();
+        let (simnet_commands_tx, _rx) = crossbeam_channel::unbounded();
+        let (plugin_commands_tx, _rx) = crossbeam_channel::unbounded();
+        let middleware = SurfpoolMiddleware::new(
+            SurfnetSvmLocker::new(surfnet_svm),
+            &simnet_commands_tx,
+            &RpcConfig::default(),
+            &None,
+            plugin_commands_tx,
+        );
+        let activity = middleware.activity.clone();
+        let mut http = MetaIoHandler::with_middleware(middleware.clone());
+        http.add_method_with_meta("getSlot", |_params, _meta| async { Ok(Value::from(45)) });
+        let mut websocket =
+            MetaIoHandler::with_middleware(SurfpoolWebsocketMiddleware::new(middleware, None));
+        websocket.add_method_with_meta("getSlot", |_params, _meta| async { Ok(Value::from(45)) });
+        let request = r#"{"jsonrpc":"2.0","id":1,"method":"getSlot"}"#;
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        http.handle_request(request, None).await;
+        assert!(activity.idle_for() < Duration::from_millis(30));
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        websocket.handle_request(request, None).await;
+        assert!(activity.idle_for() < Duration::from_millis(30));
+    }
+
+    #[test]
+    fn an_open_websocket_session_counts_as_use_until_it_closes() {
+        let activity = RpcActivity::default();
+
+        activity.session_opened();
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(activity.idle_for(), Duration::ZERO);
+
+        activity.session_closed();
+        assert!(
+            activity.idle_for() < Duration::from_millis(30),
+            "idleness should start when the last session closes"
         );
     }
 }
