@@ -546,6 +546,11 @@ pub struct SurfnetSvm {
     /// behind: each is a slot that came later than `slot_time` promised,
     /// instead of arriving in a burst. Shared with the clock thread.
     pub coalesced_slots: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Whether blocks are produced in `BlockProductionMode::Clock`, so a
+    /// dropped tick is a late slot. Set by block production, read by the
+    /// clock thread: ticks dropped in other modes produce no block and
+    /// aren't counted in `coalesced_slots`.
+    pub clock_driven: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub accounts_by_owner: Box<dyn Storage<String, Vec<String>>>,
     pub account_associated_data: Box<dyn Storage<String, SerializableAccountAdditionalData>>,
     pub token_accounts: Box<dyn Storage<String, TokenAccount>>,
@@ -897,6 +902,7 @@ impl SurfnetSvm {
             slot_time: self.slot_time,
             start_time: self.start_time,
             coalesced_slots: self.coalesced_slots.clone(),
+            clock_driven: self.clock_driven.clone(),
 
             total_supply: self.total_supply,
             circulating_supply: self.circulating_supply,
@@ -1252,18 +1258,20 @@ impl SurfnetSvm {
             storage_backend.open_store("registered_idls")?;
         let profile_tag_map_db: Box<dyn Storage<String, Vec<UuidOrSignature>>> =
             storage_backend.open_store("profile_tag_map")?;
+        // Ensure max_profiles is at least 1 to avoid creating a zero-capacity FifoMap
+        let max_profiles = max(1, config.max_profiles);
+        // Use FifoMap for both profile stores to maintain FIFO eviction behavior
+        // (when no on-disk DB is provided)
         let simulated_transaction_profiles_db: Box<dyn Storage<String, KeyedProfileResult>> =
-            storage_backend.open_store("simulated_transaction_profiles")?;
-        let executed_transaction_profiles_db: Box<dyn Storage<String, KeyedProfileResult>> = {
-            // Ensure max_profiles is at least 1 to avoid creating a zero-capacity FifoMap
-            let max_profiles = max(1, config.max_profiles);
-            storage_backend.open_store_with_default(
-                "executed_transaction_profiles",
-                // Use FifoMap for executed_transaction_profiles to maintain FIFO eviction behavior
-                // (when no on-disk DB is provided)
-                move || Box::new(FifoMap::<String, KeyedProfileResult>::new(max_profiles)),
-            )?
-        };
+            storage_backend
+                .open_store_with_default("simulated_transaction_profiles", move || {
+                    Box::new(FifoMap::<String, KeyedProfileResult>::new(max_profiles))
+                })?;
+        let executed_transaction_profiles_db: Box<dyn Storage<String, KeyedProfileResult>> =
+            storage_backend
+                .open_store_with_default("executed_transaction_profiles", move || {
+                    Box::new(FifoMap::<String, KeyedProfileResult>::new(max_profiles))
+                })?;
         let epoch_schedule = Self::default_epoch_schedule();
         let epoch_info = Self::default_epoch_info(&epoch_schedule);
         let default_genesis_slot = epoch_info.absolute_slot;
@@ -1318,6 +1326,7 @@ impl SurfnetSvm {
             slot_time: config.slot_time,
             start_time: SystemTime::now(),
             coalesced_slots: Default::default(),
+            clock_driven: Default::default(),
             accounts_by_owner: accounts_by_owner_db,
             account_associated_data: account_associated_data_db,
             token_accounts: token_accounts_db,

@@ -6,7 +6,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex, RwLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread::{JoinHandle, sleep},
     time::{Duration, Instant},
@@ -277,11 +277,13 @@ pub async fn start_local_surfnet_runloop(
         }
     };
 
-    let coalesced_slots = svm_locker.with_svm_reader(|svm| svm.coalesced_slots.clone());
+    let (coalesced_slots, clock_driven) =
+        svm_locker.with_svm_reader(|svm| (svm.coalesced_slots.clone(), svm.clock_driven.clone()));
     let (clock_event_rx, clock_command_tx) = start_clock_runloop(
         simnet_config.slot_time,
         Some(simnet_events_tx_cc.clone()),
         coalesced_slots,
+        clock_driven,
     );
 
     // Emit TransactionProcessed events for each stored transaction before Ready
@@ -401,7 +403,12 @@ pub async fn start_block_production_runloop(
     // Whether the clock is paused as this loop sees it: a tick the clock thread queued before
     // it read a Pause is no slot, and a pause is acknowledged only after no tick can follow.
     let mut clock_paused = false;
+    let clock_driven = svm_locker.with_svm_reader(|svm| svm.clock_driven.clone());
     loop {
+        clock_driven.store(
+            block_production_mode.eq(&BlockProductionMode::Clock),
+            Ordering::Relaxed,
+        );
         let mut do_produce_block = false;
 
         select! {
@@ -713,11 +720,14 @@ pub async fn start_block_production_runloop(
 /// the chain stretches, and every slot stays visible to a client polling at
 /// the slot rate. Queued ticks would instead replay as a burst of slots once
 /// production caught up, moving the chain several slots between two polls.
-/// Each dropped tick is counted in `coalesced_slots`.
+/// Each tick dropped while `clock_driven` is set (blocks are produced in
+/// `BlockProductionMode::Clock`) is counted in `coalesced_slots`. In other
+/// modes ticks produce no block, so a dropped one isn't a late slot.
 pub fn start_clock_runloop(
     mut slot_time: u64,
     simnet_events_tx: Option<SimnetEventsTx>,
     coalesced_slots: Arc<AtomicU64>,
+    clock_driven: Arc<AtomicBool>,
 ) -> (Receiver<ClockEvent>, Sender<ClockCommand>) {
     // One tick in flight at most: a tick sent while the last is unconsumed is
     // coalesced into it.
@@ -782,6 +792,9 @@ pub fn start_clock_runloop(
                 Ok(()) => {}
                 Err(TrySendError::Full(_)) => dropped += 1,
                 Err(TrySendError::Disconnected(_)) => break,
+            }
+            if !clock_driven.load(Ordering::Relaxed) {
+                dropped = 0;
             }
             if dropped > 0 {
                 coalesced_slots.fetch_add(dropped, Ordering::Relaxed);
@@ -1460,12 +1473,33 @@ mod absent_after_hydration_tests {
 mod clock_runloop_tests {
     use super::*;
 
+    fn clock_driven() -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(true))
+    }
+
+    /// Outside `Clock` mode a tick produces no block, so one dropped while
+    /// the consumer is busy isn't a late slot.
+    #[test]
+    fn ticks_dropped_outside_clock_mode_are_not_counted() {
+        let coalesced = Arc::new(AtomicU64::new(0));
+        let (ticks, _commands) = start_clock_runloop(
+            10,
+            None,
+            coalesced.clone(),
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        sleep(Duration::from_millis(100));
+        assert!(ticks.recv_timeout(Duration::from_millis(5)).is_ok());
+        assert_eq!(coalesced.load(Ordering::Relaxed), 0);
+    }
+
     /// A consumer that falls behind finds one tick waiting, not a backlog to
     /// replay as a burst, and the ticks it missed are counted.
     #[test]
     fn a_stalled_consumer_gets_one_tick_and_the_rest_are_counted() {
         let coalesced = Arc::new(AtomicU64::new(0));
-        let (ticks, _commands) = start_clock_runloop(10, None, coalesced.clone());
+        let (ticks, _commands) = start_clock_runloop(10, None, coalesced.clone(), clock_driven());
 
         sleep(Duration::from_millis(200));
         assert!(ticks.recv_timeout(Duration::from_millis(5)).is_ok());
@@ -1485,7 +1519,7 @@ mod clock_runloop_tests {
     #[test]
     fn a_consumer_that_keeps_up_sees_every_tick_on_cadence() {
         let coalesced = Arc::new(AtomicU64::new(0));
-        let (ticks, _commands) = start_clock_runloop(20, None, coalesced.clone());
+        let (ticks, _commands) = start_clock_runloop(20, None, coalesced.clone(), clock_driven());
 
         let start = Instant::now();
         for _ in 0..20 {
@@ -1503,7 +1537,7 @@ mod clock_runloop_tests {
     #[test]
     fn pausing_does_not_count_as_coalesced() {
         let coalesced = Arc::new(AtomicU64::new(0));
-        let (ticks, commands) = start_clock_runloop(10, None, coalesced.clone());
+        let (ticks, commands) = start_clock_runloop(10, None, coalesced.clone(), clock_driven());
 
         commands.send(ClockCommand::Pause).unwrap();
         sleep(Duration::from_millis(100));
