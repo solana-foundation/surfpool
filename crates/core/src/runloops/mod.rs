@@ -14,7 +14,7 @@ use agave_geyser_plugin_interface::geyser_plugin_interface::{
     ReplicaEntryInfoVersions, ReplicaTransactionInfoV3, ReplicaTransactionInfoVersions, SlotStatus,
 };
 use chrono::{Local, Utc};
-use crossbeam_channel::{Receiver, Sender, bounded, select, unbounded};
+use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded, select, unbounded};
 use itertools::Itertools;
 use jsonrpc_core::MetaIoHandler;
 use jsonrpc_http_server::{DomainsValidation, ServerBuilder};
@@ -737,7 +737,9 @@ pub fn start_clock_runloop(
                         let _ = simnet_events_tx.clock_update(ClockCommand::Pause);
                     }
                 }
-                Err(_e) => {}
+                Err(TryRecvError::Empty) => {}
+                // The block production runloop owned the sender and has stopped.
+                Err(TryRecvError::Disconnected) => break,
             }
             sleep(Duration::from_millis(slot_time));
             if enabled {
@@ -1401,6 +1403,29 @@ mod absent_after_hydration_tests {
             absent_after_hydration(&locker, &results),
             vec![missing],
             "an account kept offline on purpose is not a surprise; a missing one is"
+        );
+    }
+}
+
+#[cfg(test)]
+mod clock_runloop_tests {
+    use crossbeam_channel::RecvTimeoutError;
+
+    use super::*;
+
+    #[test]
+    fn the_clock_thread_ends_once_its_runloop_drops_the_channels() {
+        let (simnet_events_tx, simnet_events_rx) = SimnetEventsTx::unbounded();
+        let (clock_event_rx, clock_command_tx) = start_clock_runloop(1, Some(simnet_events_tx));
+
+        drop(clock_event_rx);
+        drop(clock_command_tx);
+
+        // The clock thread holds the only events sender, so the channel closes when it ends.
+        assert_eq!(
+            simnet_events_rx.recv_timeout(Duration::from_secs(2)).err(),
+            Some(RecvTimeoutError::Disconnected),
+            "the clock thread should end with the runloop that owned its channels"
         );
     }
 }
