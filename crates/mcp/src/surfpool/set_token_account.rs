@@ -129,6 +129,10 @@ struct TokenDetails {
     decimals: u32,
 }
 
+fn scale_token_amount(amount: u64, decimals: u32) -> Option<u64> {
+    10u64.checked_pow(decimals)?.checked_mul(amount)
+}
+
 impl SetTokenAccountsResponse {
     pub fn success(details: Vec<SetAccountSuccess>) -> Self {
         Self {
@@ -226,9 +230,12 @@ pub async fn run(
         Err(e) => return SetTokenAccountsResponse::error(e),
     };
 
-    let amount_in_smallest_unit = amount_to_set
-        .checked_mul(10u64.pow(token_details.decimals))
-        .unwrap_or(amount_to_set);
+    let Some(amount_in_smallest_unit) = scale_token_amount(amount_to_set, token_details.decimals)
+    else {
+        return SetTokenAccountsResponse::error(
+            "Requested token amount exceeds the supported base-unit range".to_string(),
+        );
+    };
 
     let request_payload = if token_details.is_sol {
         let update_params = AccountUpdate {
@@ -373,6 +380,13 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn scales_amounts_and_rejects_overflow() {
+        assert_eq!(scale_token_amount(1, 6), Some(1_000_000));
+        assert_eq!(scale_token_amount(u64::MAX, 6), None);
+        assert_eq!(scale_token_amount(1, 20), None);
+    }
 
     fn canned_rpc() -> (String, JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind canned rpc");
