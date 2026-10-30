@@ -705,6 +705,7 @@ pub fn start_clock_runloop(
 
     let _handle = hiro_system_kit::thread_named("clock").spawn(move || {
         let mut enabled = true;
+        let mut next_tick = Instant::now();
 
         loop {
             match clock_command_rx.try_recv() {
@@ -739,7 +740,10 @@ pub fn start_clock_runloop(
                 }
                 Err(_e) => {}
             }
-            sleep(Duration::from_millis(slot_time));
+            // Sleep until a deadline, not for a whole slot: a late wake-up then shortens the
+            // next wait, so ticks keep pace with wall time instead of drifting behind it.
+            next_tick += Duration::from_millis(slot_time);
+            sleep(next_tick.saturating_duration_since(Instant::now()));
             if enabled {
                 let _ = clock_event_tx.send(ClockEvent::Tick);
             }
@@ -1401,6 +1405,34 @@ mod absent_after_hydration_tests {
             absent_after_hydration(&locker, &results),
             vec![missing],
             "an account kept offline on purpose is not a surprise; a missing one is"
+        );
+    }
+}
+
+#[cfg(test)]
+mod clock_runloop_tests {
+    use super::*;
+
+    #[test]
+    #[cfg_attr(feature = "ignore_tests_ci", ignore = "flaky CI tests")]
+    fn the_clock_ticks_once_per_slot_time_of_wall_time() {
+        let slot_time = 1;
+        let (clock_event_rx, _clock_command_tx) = start_clock_runloop(slot_time, None);
+        let window = Duration::from_secs(2);
+        let started = Instant::now();
+        let mut ticks = 0;
+        while let Some(remaining) = window.checked_sub(started.elapsed()) {
+            if clock_event_rx.recv_timeout(remaining).is_ok() {
+                ticks += 1;
+            }
+        }
+
+        // Every sleep overshoots a little. Unless the next tick makes up for it, the
+        // overshoot adds up, and a 1 ms clock falls tens of ticks behind in 2 s.
+        let due = window.as_millis() as u64 / slot_time;
+        assert!(
+            ticks + due / 100 >= due,
+            "{ticks} ticks in {window:?}, {due} due"
         );
     }
 }
