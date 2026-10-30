@@ -85,7 +85,7 @@ use crate::{
     },
     types::{
         GeyserAccountUpdate, OfflineAccountConfig, RemoteRpcResult, SurfnetTransactionStatus,
-        TimeTravelConfig, TokenAccount, TransactionLoadedAddresses, TransactionWithStatusMeta,
+        TimeTravelConfig, TransactionLoadedAddresses, TransactionWithStatusMeta,
     },
 };
 
@@ -2031,44 +2031,12 @@ impl SurfnetSvmLocker {
             capture
         };
 
-        let (accounts_before, token_accounts_before, token_programs) =
-            self.with_svm_reader(|svm_reader| {
-                let accounts_before = transaction_accounts
-                    .iter()
-                    .map(|p| svm_reader.inner.get_account(p))
-                    .collect::<Result<Vec<Option<Account>>, SurfpoolError>>()?;
-
-                let token_accounts_before = transaction_accounts
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, p)| {
-                        svm_reader
-                            .token_accounts
-                            .get(&p.to_string())
-                            .ok()
-                            .flatten()
-                            .map(|a| (i, a))
-                    })
-                    .collect::<Vec<_>>();
-
-                let token_programs = token_accounts_before
-                    .iter()
-                    .map(|(i, ta)| {
-                        svm_reader
-                            .get_account(&transaction_accounts[*i])
-                            .map(|res| res.map(|a| a.owner).unwrap_or(ta.token_program_id()))
-                    })
-                    .collect::<Result<Vec<_>, SurfpoolError>>()?;
-
-                Ok::<
-                    (
-                        Vec<Option<Account>>,
-                        Vec<(usize, TokenAccount)>,
-                        Vec<Pubkey>,
-                    ),
-                    SurfpoolError,
-                >((accounts_before, token_accounts_before, token_programs))
-            })?;
+        let accounts_before = self.with_svm_reader(|svm_reader| {
+            transaction_accounts
+                .iter()
+                .map(|p| svm_reader.inner.get_account(p))
+                .collect::<Result<Vec<Option<Account>>, SurfpoolError>>()
+        })?;
 
         let loaded_addresses = tx_loaded_addresses.as_ref().map(|l| l.loaded_addresses());
 
@@ -2079,8 +2047,6 @@ impl SurfnetSvmLocker {
                     &transaction_accounts,
                     &tx_loaded_addresses,
                     &accounts_before,
-                    &token_accounts_before,
-                    &token_programs,
                     pre_execution_capture.clone(),
                     &status_tx,
                 )
@@ -2105,8 +2071,6 @@ impl SurfnetSvmLocker {
                 &transaction_accounts,
                 &loaded_addresses,
                 &accounts_before,
-                &token_accounts_before,
-                &token_programs,
                 pre_execution_capture,
                 &status_tx,
                 do_propagate,
@@ -2129,8 +2093,6 @@ impl SurfnetSvmLocker {
         transaction_accounts: &[Pubkey],
         loaded_addresses: &Option<TransactionLoadedAddresses>,
         accounts_before: &[Option<Account>],
-        token_accounts_before: &[(usize, TokenAccount)],
-        token_programs: &[Pubkey],
         pre_execution_capture: ExecutionCapture,
         status_tx: &Sender<TransactionStatusEvent>,
     ) -> SurfpoolResult<Option<Vec<ProfileResult>>> {
@@ -2203,8 +2165,6 @@ impl SurfnetSvmLocker {
                     transaction_accounts,
                     &loaded_addresses.as_ref().map(|l| l.loaded_addresses()),
                     accounts_before,
-                    token_accounts_before,
-                    token_programs,
                     pre_execution_capture_cursor,
                     status_tx,
                     do_propagate,
@@ -2242,7 +2202,7 @@ impl SurfnetSvmLocker {
         status_tx: Sender<TransactionStatusEvent>,
         do_propagate: bool,
     ) -> ProfileResult {
-        let FailedTransactionMetadata { err, meta } = failed_transaction_metadata;
+        let FailedTransactionMetadata { err, meta, .. } = failed_transaction_metadata;
 
         let cus = meta.compute_units_consumed;
         let log_messages = meta.logs.clone();
@@ -2285,14 +2245,12 @@ impl SurfnetSvmLocker {
         transaction: VersionedTransaction,
         pubkeys_from_message: &[Pubkey],
         accounts_before: &[Option<Account>],
-        token_accounts_before: &[(usize, TokenAccount)],
-        token_programs: &[Pubkey],
         loaded_addresses: &Option<LoadedAddresses>,
         pre_execution_capture: ExecutionCapture,
         status_tx: Sender<TransactionStatusEvent>,
         do_propagate: bool,
     ) -> SurfpoolResult<ProfileResult> {
-        let FailedTransactionMetadata { err, meta } = failed_transaction_metadata;
+        let FailedTransactionMetadata { err, meta, .. } = failed_transaction_metadata;
 
         let cus = meta.compute_units_consumed;
         let log_messages = meta.logs.clone();
@@ -2320,17 +2278,6 @@ impl SurfnetSvmLocker {
             }
         }
 
-        let token_mints = token_accounts_before
-            .iter()
-            .map(|(_, a)| {
-                svm_writer
-                    .token_mints
-                    .get(&a.mint().to_string())
-                    .ok()
-                    .flatten()
-            })
-            .collect();
-
         if do_propagate {
             let meta_canonical = convert_transaction_metadata_from_canonical(&meta);
             svm_writer
@@ -2343,18 +2290,13 @@ impl SurfnetSvmLocker {
 
             let slot = svm_writer.get_latest_absolute_slot();
             let transaction_index = svm_writer.transactions_queued_for_confirmation.len();
-            let transaction_with_status_meta = TransactionWithStatusMeta::from_failure(
+            let transaction_with_status_meta = TransactionWithStatusMeta::new(
                 slot,
                 transaction.clone(),
-                &FailedTransactionMetadata {
-                    err: err.clone(),
-                    meta: meta.clone(),
-                },
+                Err(err.clone()),
+                meta,
                 accounts_before,
                 &accounts_after,
-                token_accounts_before,
-                token_mints,
-                token_programs,
                 loaded_addresses.clone().unwrap_or_default(),
             );
             svm_writer.transactions.store(
@@ -2412,8 +2354,6 @@ impl SurfnetSvmLocker {
         pubkeys_from_message: &[Pubkey],
         loaded_addresses: &Option<LoadedAddresses>,
         accounts_before: &[Option<Account>],
-        token_accounts_before: &[(usize, TokenAccount)],
-        token_programs: &[Pubkey],
         pre_execution_capture: ExecutionCapture,
         status_tx: &Sender<TransactionStatusEvent>,
         do_propagate: bool,
@@ -2421,18 +2361,6 @@ impl SurfnetSvmLocker {
         let cus = transaction_metadata.compute_units_consumed;
         let logs = transaction_metadata.logs.clone();
         let signature = transaction.signatures[0];
-        // Read before the registries take the transaction's writes, as Agave reads each pre token
-        // balance's mint from the state before execution.
-        let pre_token_mints = token_accounts_before
-            .iter()
-            .map(|(_, a)| {
-                svm_writer
-                    .token_mints
-                    .get(&a.mint().to_string())
-                    .ok()
-                    .flatten()
-            })
-            .collect();
 
         let post_execution_capture = {
             let accounts_after = pubkeys_from_message
@@ -2502,44 +2430,11 @@ impl SurfnetSvmLocker {
                 }
             }
 
-            let mut token_accounts_after = vec![];
-            let mut post_execution_capture = BTreeMap::new();
-            let mut post_token_program_ids = vec![];
-
-            for (i, (pubkey, account)) in pubkeys_from_message
+            let post_execution_capture: ExecutionCapture = pubkeys_from_message
                 .iter()
-                .zip(accounts_after.iter())
-                .enumerate()
-            {
-                let token_account = svm_writer
-                    .token_accounts
-                    .get(&pubkey.to_string())
-                    .ok()
-                    .flatten();
-                post_execution_capture.insert(*pubkey, account.clone());
-
-                if let Some(token_account) = token_account {
-                    token_accounts_after.push((i, token_account));
-                    post_token_program_ids.push(
-                        account
-                            .as_ref()
-                            .map(|a| a.owner)
-                            .unwrap_or(spl_token_interface::id()),
-                    );
-                }
-            }
-
-            let post_token_mints = token_accounts_after
-                .iter()
-                .map(|(_, a)| {
-                    svm_writer
-                        .token_mints
-                        .get(&a.mint().to_string())
-                        .ok()
-                        .flatten()
-                        .ok_or(SurfpoolError::token_mint_not_found(a.mint()))
-                })
-                .collect::<Result<Vec<_>, SurfpoolError>>()?;
+                .copied()
+                .zip(accounts_after.iter().cloned())
+                .collect();
 
             if do_propagate {
                 let slot = svm_writer.get_latest_absolute_slot();
@@ -2549,15 +2444,10 @@ impl SurfnetSvmLocker {
                 let transaction_with_status_meta = TransactionWithStatusMeta::new(
                     slot,
                     transaction.clone(),
+                    Ok(()),
                     transaction_metadata,
                     accounts_before,
                     &accounts_after,
-                    token_accounts_before,
-                    &token_accounts_after,
-                    pre_token_mints,
-                    post_token_mints,
-                    token_programs,
-                    &post_token_program_ids,
                     loaded_addresses.clone().unwrap_or_default(),
                 );
                 svm_writer.transactions.store(
@@ -2624,8 +2514,6 @@ impl SurfnetSvmLocker {
         transaction_accounts: &[Pubkey],
         loaded_addresses: &Option<LoadedAddresses>,
         accounts_before: &[Option<Account>],
-        token_accounts_before: &[(usize, TokenAccount)],
-        token_programs: &[Pubkey],
         pre_execution_capture: ExecutionCapture,
         status_tx: &Sender<TransactionStatusEvent>,
         do_propagate: bool,
@@ -2655,8 +2543,6 @@ impl SurfnetSvmLocker {
                 transaction_accounts,
                 loaded_addresses,
                 accounts_before,
-                token_accounts_before,
-                token_programs,
                 pre_execution_capture,
                 status_tx,
                 do_propagate,
@@ -2669,8 +2555,6 @@ impl SurfnetSvmLocker {
                     transaction,
                     transaction_accounts,
                     accounts_before,
-                    token_accounts_before,
-                    token_programs,
                     loaded_addresses,
                     pre_execution_capture,
                     status_tx.clone(),
@@ -7298,8 +7182,7 @@ mod tests {
         let owner = Keypair::new();
         let (mint, token_account) = (Pubkey::new_unique(), Pubkey::new_unique());
         // `missing_mint` is never created, so its token account's mint cannot be loaded.
-        let (missing_mint, source, destination, closed_later) = (
-            Pubkey::new_unique(),
+        let (missing_mint, source, destination) = (
             Pubkey::new_unique(),
             Pubkey::new_unique(),
             Pubkey::new_unique(),
@@ -7334,7 +7217,6 @@ mod tests {
                 (&token_account, mint),
                 (&source, mint),
                 (&destination, missing_mint),
-                (&closed_later, mint),
             ] {
                 let mut token_data = vec![0; TokenAccount::LEN];
                 TokenAccount {
@@ -7417,48 +7299,5 @@ mod tests {
             (meta.status.is_err(), decimals(meta.pre_token_balances)),
             (true, Some(vec![6]))
         );
-
-        // A mint that fails to load leaves its entry out instead of losing the status.
-        locker.with_svm_writer(|svm| svm.token_mints = Box::new(FailingMints));
-        let meta = process(close(closed_later)).await;
-        assert_eq!(
-            (meta.status, meta.pre_token_balances),
-            (Ok(()), Some(vec![]))
-        );
-    }
-
-    use crate::{
-        storage::{Storage, StorageError, StorageResult},
-        types::MintAccount,
-    };
-
-    #[derive(Clone)]
-    struct FailingMints;
-
-    impl Storage<String, MintAccount> for FailingMints {
-        fn store(&mut self, _: String, _: MintAccount) -> StorageResult<()> {
-            Ok(())
-        }
-        fn clear(&mut self) -> StorageResult<()> {
-            Ok(())
-        }
-        fn get(&self, _: &String) -> StorageResult<Option<MintAccount>> {
-            Err(StorageError::LockError)
-        }
-        fn take(&mut self, _: &String) -> StorageResult<Option<MintAccount>> {
-            Err(StorageError::LockError)
-        }
-        fn keys(&self) -> StorageResult<Vec<String>> {
-            Err(StorageError::LockError)
-        }
-        fn into_iter(&self) -> StorageResult<Box<dyn Iterator<Item = (String, MintAccount)> + '_>> {
-            Err(StorageError::LockError)
-        }
-        fn count(&self) -> StorageResult<u64> {
-            Err(StorageError::LockError)
-        }
-        fn clone_box(&self) -> Box<dyn Storage<String, MintAccount>> {
-            Box::new(self.clone())
-        }
     }
 }
