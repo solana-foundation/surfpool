@@ -58,6 +58,7 @@ use solana_sdk_ids::{bpf_loader, system_program};
 use solana_signature::Signature;
 use solana_slot_hashes::{MAX_ENTRIES as MAX_SLOT_HASHES_ENTRIES, SlotHashes};
 use solana_system_interface::instruction as system_instruction;
+use solana_sysvar::slot_history::SlotHistory;
 use solana_transaction::versioned::VersionedTransaction;
 use solana_transaction_error::TransactionError;
 use solana_transaction_status::{
@@ -1742,17 +1743,21 @@ impl SurfnetSvm {
     /// is by now, lands on the open slot: only its time changes. If the landing can't be
     /// recorded, nothing changes in memory.
     pub(crate) fn apply_time_travel(&mut self, clock: Clock) -> SurfpoolResult<EpochInfo> {
-        let previous = std::mem::replace(&mut self.updated_at, clock.unix_timestamp as u64 * 1_000);
-        if let Err(e) = self.travel_to(clock.slot.max(self.get_latest_absolute_slot())) {
-            self.updated_at = previous;
-            return Err(e);
-        }
+        let slot = clock.slot.max(self.get_latest_absolute_slot());
         let clock = Clock {
-            slot: self.latest_epoch_info.absolute_slot,
-            epoch: self.latest_epoch_info.epoch,
+            slot,
+            epoch: self.inner.get_sysvar::<EpochSchedule>().get_epoch(slot),
             ..clock
         };
+        let previous = std::mem::replace(&mut self.updated_at, clock.unix_timestamp as u64 * 1_000);
+        let previous_clock = self.inner.get_sysvar::<Clock>();
+        // The Clock is set before the landing is announced, so Geyser streams the landing's.
         self.inner.set_sysvar(&clock);
+        if let Err(e) = self.travel_to(slot) {
+            self.updated_at = previous;
+            self.inner.set_sysvar(&previous_clock);
+            return Err(e);
+        }
         self.simnet_events_tx.system_clock_updated(clock);
         Ok(self.latest_epoch_info.clone())
     }
@@ -3194,6 +3199,19 @@ impl SurfnetSvm {
             },
         });
 
+        // Agave writes SlotHistory and RecentBlockhashes as it freezes a block. Yellowstone
+        // publishes a block only once it has seen them, along with the slot's Clock and SlotHashes.
+        let mut slot_history = self.inner.get_sysvar::<SlotHistory>();
+        slot_history.add(slot);
+        self.inner.set_sysvar(&slot_history);
+        self.stream_sysvars(
+            slot,
+            [
+                solana_sdk_ids::sysvar::slot_history::ID,
+                solana_sdk_ids::sysvar::recent_blockhashes::ID,
+            ],
+        );
+
         // The block's entry goes before its metadata: Yellowstone drops the metadata of an empty
         // block whose entry arrives after it.
         let entry_hash = solana_hash::Hash::from_str(&self.chain_tip.hash)
@@ -4396,14 +4414,37 @@ impl SurfnetSvm {
 
     /// Announces the open slot on its parent block, as Agave does when it creates the slot's
     /// bank: at startup, after each block, after a time travel and a reset. A skipped slot gets
-    /// none.
+    /// none. Geyser first receives the Clock and SlotHashes sysvars as the open slot's account
+    /// writes, as Agave writes them while it creates the bank.
     pub fn announce_open_slot(&mut self) {
         let slot = self.get_latest_absolute_slot();
         let parent = self.parent_slot(slot);
         let root = self.slot_for_commitment(&CommitmentConfig::finalized());
         self.notify_slot_subscribers(slot, parent, root);
+        self.stream_sysvars(
+            slot,
+            [
+                solana_sdk_ids::sysvar::clock::ID,
+                solana_sdk_ids::sysvar::slot_hashes::ID,
+            ],
+        );
         let timestamp = Utc::now().timestamp_millis().max(0) as u64;
         self.emit_slot_status(slot, Some(parent), GeyserSlotStatus::CreatedBank, timestamp);
+    }
+
+    /// Sends the current accounts of `sysvars` to Geyser plugins as account writes in `slot`.
+    fn stream_sysvars(&mut self, slot: Slot, sysvars: [Pubkey; 2]) {
+        for pubkey in sysvars {
+            let Some(account) = self.inner.get_account_no_db(&pubkey) else {
+                continue;
+            };
+            let write_version = self.increment_write_version();
+            self.geyser_events_tx
+                .send(GeyserEvent::UpdateAccount(
+                    GeyserAccountUpdate::block_update(pubkey, account, slot, write_version),
+                ))
+                .ok();
+        }
     }
 
     pub fn write_simulated_profile_result(
@@ -7421,6 +7462,58 @@ mod tests {
         let streamed: Vec<_> = blocks.iter().map(|block| block.block_time).collect();
         assert_eq!(streamed, expected);
         assert_blocks_read_as_streamed(&svm, &blocks);
+    }
+
+    /// Yellowstone gRPC v16 publishes a block only once Geyser has written its Clock,
+    /// SlotHashes, SlotHistory and RecentBlockhashes in that slot; without them its slot, block
+    /// and confirmed streams stay empty. A time travel's landing gets its own Clock.
+    #[test]
+    fn geyser_writes_the_sysvars_of_each_block() {
+        use solana_sdk_ids::sysvar::{clock, recent_blockhashes, slot_hashes, slot_history};
+        let sysvar_writes = |events: &[GeyserEvent], slot: Slot| -> Vec<(Pubkey, Account)> {
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    GeyserEvent::UpdateAccount(update) if update.slot == slot => {
+                        Some((update.pubkey, update.account.clone()))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let (mut svm, _events_rx, geyser_rx) = SurfnetSvm::default();
+        svm.announce_open_slot();
+        let slot = svm.get_latest_absolute_slot();
+        svm.confirm_current_block().unwrap();
+
+        let events: Vec<_> = geyser_rx.try_iter().collect();
+        let written: Vec<Pubkey> = sysvar_writes(&events, slot)
+            .into_iter()
+            .map(|(pubkey, _)| pubkey)
+            .collect();
+        assert_eq!(
+            written,
+            [
+                clock::ID,
+                slot_hashes::ID,
+                slot_history::ID,
+                recent_blockhashes::ID
+            ]
+        );
+        assert_eq!(svm.inner.get_sysvar::<SlotHistory>().next_slot, slot + 1);
+
+        let landing = svm.get_latest_absolute_slot() + 100;
+        let clock = svm.inner.get_sysvar::<Clock>();
+        svm.apply_time_travel(Clock {
+            slot: landing,
+            ..clock
+        })
+        .unwrap();
+        let events: Vec<_> = geyser_rx.try_iter().collect();
+        let (pubkey, account) = &sysvar_writes(&events, landing)[0];
+        assert_eq!(*pubkey, clock::ID);
+        let streamed: Clock = bincode::deserialize(&account.data).unwrap();
+        assert_eq!(streamed.slot, landing);
     }
 
     /// A forward time travel skips the slots it jumps, as a leader's missed slots are: the
