@@ -696,6 +696,9 @@ pub async fn start_block_production_runloop(
     Ok(())
 }
 
+/// The most missed ticks the clock sends back to back to catch up, one minute at 400 ms slots.
+const MAX_CLOCK_CATCH_UP_SLOTS: u32 = 150;
+
 pub fn start_clock_runloop(
     mut slot_time: u64,
     simnet_events_tx: Option<SimnetEventsTx>,
@@ -743,7 +746,13 @@ pub fn start_clock_runloop(
             // Sleep until a deadline, not for a whole slot: a late wake-up then shortens the
             // next wait, so ticks keep pace with wall time instead of drifting behind it.
             next_tick += Duration::from_millis(slot_time);
-            sleep(next_tick.saturating_duration_since(Instant::now()));
+            let now = Instant::now();
+            // A stall this long is a stopped process (docker pause, SIGSTOP, a debugger), not a
+            // late wake-up: resume from now instead of producing every missed block at once.
+            if now > next_tick + Duration::from_millis(slot_time) * MAX_CLOCK_CATCH_UP_SLOTS {
+                next_tick = now;
+            }
+            sleep(next_tick.saturating_duration_since(now));
             if enabled {
                 let _ = clock_event_tx.send(ClockEvent::Tick);
             }
@@ -1410,7 +1419,7 @@ mod absent_after_hydration_tests {
 }
 
 #[cfg(test)]
-mod clock_runloop_tests {
+mod clock_schedule_tests {
     use super::*;
 
     #[test]
