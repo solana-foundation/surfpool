@@ -18,7 +18,10 @@ use surfpool_types::{
     SimnetCommand, TransactionStatusEvent,
 };
 
-use super::{RunloopContext, utils::decode_and_deserialize};
+use super::{
+    RunloopContext,
+    utils::{decode_and_deserialize, sanitize_transaction},
+};
 use crate::{
     error::SurfpoolResult,
     rpc::full::SurfpoolFullRpc,
@@ -302,10 +305,11 @@ impl Jito for SurfpoolJitoRpc {
 
             let mut decoded_txs: Vec<VersionedTransaction> = Vec::with_capacity(transactions.len());
             for (idx, tx_data) in transactions.iter().enumerate() {
-                let (_, tx) = decode_and_deserialize::<VersionedTransaction>(
+                let tx = decode_and_deserialize::<VersionedTransaction>(
                     tx_data.clone(),
                     binary_encoding,
                 )
+                .and_then(|(_, tx)| sanitize_transaction(tx))
                 .map_err(|e| Error {
                     code: e.code,
                     message: format!(
@@ -568,6 +572,14 @@ impl Jito for SurfpoolJitoRpc {
                         idx + 1
                     )));
                 }
+                let tx = sanitize_transaction(tx).map_err(|e| Error {
+                    message: format!(
+                        "Failed to decode bundle transaction {}: {}",
+                        idx + 1,
+                        e.message
+                    ),
+                    ..e
+                })?;
                 decoded_txs.push(tx);
             }
 
@@ -1256,7 +1268,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        rpc::full::Full, runloops::start_block_production_runloop, tests::helpers::TestSetup,
+        rpc::full::Full,
+        runloops::start_block_production_runloop,
+        tests::helpers::{TestSetup, UNSANITARY_TRANSACTION_ERROR, unsanitary_transactions},
     };
 
     const LAMPORTS_PER_SOL: u64 = 1_000_000_000;
@@ -3027,6 +3041,66 @@ mod tests {
             "expected explicit no-signatures rejection (got {})",
             err.message,
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn simulate_bundle_refuses_a_transaction_naming_an_account_it_does_not_carry() {
+        let setup = TestSetup::new(SurfpoolJitoRpc);
+        let recent_blockhash = setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm| svm.latest_blockhash());
+        let [unknown_account, _] = unsanitary_transactions(&Keypair::new(), recent_blockhash);
+        use base64::Engine;
+        let tx_b64 = base64::engine::general_purpose::STANDARD
+            .encode(bincode::serialize(&unknown_account).unwrap());
+
+        let error = setup
+            .rpc
+            .simulate_bundle(
+                Some(setup.context.clone()),
+                RpcBundleRequest {
+                    encoded_transactions: vec![tx_b64],
+                },
+                None,
+            )
+            .await
+            .expect_err("an unsanitary bundle transaction must be refused");
+
+        assert_eq!(error.code, jsonrpc_core::ErrorCode::InvalidParams);
+        assert_eq!(
+            error.message,
+            format!("Failed to decode bundle transaction 1: {UNSANITARY_TRANSACTION_ERROR}")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn send_bundle_refuses_an_unsanitary_transaction_before_the_runloop_sees_it() {
+        // With no runloop listening, a bundle that got past decoding fails with NodeUnhealthy.
+        let (commands_tx, commands_rx) = crossbeam_channel::unbounded();
+        drop(commands_rx);
+        let setup = TestSetup::new_with_mempool(SurfpoolJitoRpc, commands_tx);
+        let recent_blockhash = setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm| svm.latest_blockhash());
+
+        for transaction in unsanitary_transactions(&Keypair::new(), recent_blockhash) {
+            let error = setup
+                .rpc
+                .send_bundle(
+                    Some(setup.context.clone()),
+                    vec![bs58::encode(bincode::serialize(&transaction).unwrap()).into_string()],
+                    None,
+                )
+                .await
+                .expect_err("an unsanitary bundle transaction must be refused");
+            assert_eq!(error.code, jsonrpc_core::ErrorCode::InvalidParams);
+            assert_eq!(
+                error.message,
+                format!("Failed to decode bundle transaction 1: {UNSANITARY_TRANSACTION_ERROR}")
+            );
+        }
     }
 
     /// Pins the partial-config behavior. Reviewer @copilot flagged that
