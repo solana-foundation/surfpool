@@ -6,6 +6,7 @@ import type {
     CheatcodeControlConfig,
     ConfidentialBalanceKeys,
     DeriveConfidentialKeysResponse,
+    EpochStakeEntry,
     ExportSnapshotConfig,
     GetConfidentialBalanceResponse,
     GetStreamedAccountsResponse,
@@ -111,6 +112,9 @@ export type SurfnetDisableCheatcodeApi = {
 // Accounts
 export type SurfnetSetAccountApi = {
     setAccount(pubkey: Address, update: AccountUpdate): null;
+};
+export type SurfnetSetEpochStakesApi = {
+    setEpochStakes(stakes: readonly EpochStakeEntry[]): null;
 };
 export type SurfnetSetTokenAccountApi = {
     setTokenAccount(owner: Address, mint: Address, update: TokenAccountUpdate, tokenProgram?: Address): null;
@@ -218,6 +222,7 @@ export type SurfnetCheatcodesApi = SurfnetCloneProgramAccountApi &
     SurfnetResetNetworkApi &
     SurfnetResumeClockApi &
     SurfnetSetAccountApi &
+    SurfnetSetEpochStakesApi &
     SurfnetSetProgramAuthorityApi &
     SurfnetSetSupplyApi &
     SurfnetSetTokenAccountApi &
