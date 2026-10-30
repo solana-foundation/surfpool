@@ -912,6 +912,8 @@ pub struct SimnetConfig {
     pub block_production_mode: BlockProductionMode,
     pub airdrop_addresses: Vec<Pubkey>,
     pub airdrop_token_amount: u64,
+    /// Seconds without a JSON-RPC request or an open WebSocket session after which the surfnet
+    /// shuts down. Unset, it never does.
     pub expiry: Option<u64>,
     pub instruction_profiling_enabled: bool,
     pub max_profiles: usize,
