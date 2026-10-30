@@ -1887,7 +1887,20 @@ impl CheatcodeConfig {
         if lockout {
             self.lockout = true;
         }
-        self.filter = Self::filter_all_list(lockout, available_cheatcodes);
+        // Disabling never re-enables: keep what is already disabled, such as a locked-out
+        // `surfnet_enableCheatcode`, which the non-lockout list leaves out.
+        match Self::filter_all_list(lockout, available_cheatcodes) {
+            CheatcodeFilter::List(cheatcodes) => {
+                if let CheatcodeFilter::List(disabled) = &mut self.filter {
+                    for cheatcode in cheatcodes {
+                        if !disabled.contains(&cheatcode) {
+                            disabled.push(cheatcode);
+                        }
+                    }
+                }
+            }
+            all => self.filter = all,
+        }
     }
 
     pub fn disable_cheatcode(&mut self, cheatcode: &String) -> Result<(), String> {
@@ -1929,8 +1942,7 @@ impl CheatcodeConfig {
     }
 
     pub fn filter_all_list(lockout: bool, available_cheatcodes: Vec<String>) -> CheatcodeFilter {
-        // when lockout == true, it's important to disable surfnet_disableCheatcode as well
-        // since calling surfnet_disableCheatcode with lockout == false will override the current config, which is a bug
+        // when lockout == true, surfnet_disableCheatcode and surfnet_enableCheatcode are disabled as well
         if lockout {
             CheatcodeFilter::All("all".to_string())
         } else {
@@ -2036,6 +2048,29 @@ mod tests {
 
         config.disable_all(false, available);
         assert!(!config.lockout);
+    }
+
+    #[test]
+    fn disabling_all_cheatcodes_keeps_a_locked_out_enable_disabled() {
+        let config = CheatcodeConfig::new();
+        let mut config = config.lock().unwrap();
+        let available: Vec<String> = SURFNET_CHEATCODE_METHODS
+            .iter()
+            .map(|method| method.to_string())
+            .collect();
+
+        // The operator locks out enabling cheatcodes and setting accounts.
+        config.lockout();
+        for cheatcode in ["surfnet_setAccount", "surfnet_enableCheatcode"] {
+            config.disable_cheatcode(&cheatcode.to_string()).unwrap();
+        }
+        // Any caller can still disable everything, without lockout.
+        config.disable_all(false, available);
+
+        assert!(
+            config.is_cheatcode_disabled(&"surfnet_enableCheatcode".to_string()),
+            "disabling all cheatcodes must not re-enable a locked-out surfnet_enableCheatcode"
+        );
     }
 
     #[test]
