@@ -89,15 +89,31 @@ pub struct Invocation {
 }
 
 impl Invocation {
-    fn label(&self) -> &str {
-        self.name.as_deref().unwrap_or(&self.program_id)
+    fn label(&self) -> String {
+        printable(self.name.as_deref().unwrap_or(&self.program_id))
+    }
+
+    /// Compute units the logs put on this invocation: what it consumed or, when the logs end
+    /// before its `consumed` line, what its CPIs did.
+    fn attributed(&self) -> u64 {
+        self.consumed
+            .unwrap_or_else(|| self.invocations.iter().map(Invocation::attributed).sum())
     }
 
     /// Compute units spent in this program itself, outside the CPIs it made.
     fn self_consumed(&self) -> u64 {
-        let in_cpis: u64 = self.invocations.iter().filter_map(|i| i.consumed).sum();
-        self.consumed.unwrap_or(0).saturating_sub(in_cpis)
+        let in_cpis: u64 = self.invocations.iter().map(Invocation::attributed).sum();
+        self.consumed
+            .map_or(0, |consumed| consumed.saturating_sub(in_cpis))
     }
+}
+
+/// Program names and errors come from the RPC: control characters in them could rewrite the
+/// terminal, so they print as U+FFFD.
+fn printable(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
+        .collect()
 }
 
 /// Builds the invocation tree from the runtime's `Program <id> invoke [n]`, `Program <id>
@@ -192,7 +208,7 @@ impl TransactionProfile {
     /// Compute units the logs don't attribute to any top-level invocation: builtin programs,
     /// and anything cut from truncated logs.
     fn unattributed(&self) -> u64 {
-        let attributed: u64 = self.invocations.iter().filter_map(|i| i.consumed).sum();
+        let attributed: u64 = self.invocations.iter().map(Invocation::attributed).sum();
         self.compute_units_consumed
             .unwrap_or(0)
             .saturating_sub(attributed)
@@ -283,7 +299,8 @@ impl TransactionProfile {
     pub fn folded(&self) -> String {
         fn walk(invocations: &[Invocation], stack: &str, out: &mut String) {
             for invocation in invocations {
-                let frame = format!("{stack}{}", invocation.label());
+                // `;` separates frames, so a name can't contain one.
+                let frame = format!("{stack}{}", invocation.label().replace(';', ":"));
                 let own = invocation.self_consumed();
                 if own > 0 {
                     let _ = writeln!(out, "{frame} {own}");
@@ -332,7 +349,7 @@ fn push_rows(invocations: &[Invocation], indent: &str, total: Option<u64>, rows:
                 .map(|units| format!("{} CU", thousands(units)))
                 .unwrap_or_else(|| "—".to_string()),
             share,
-            error: invocation.error.clone(),
+            error: invocation.error.as_deref().map(printable),
             unfinished: invocation.unfinished,
         });
         push_rows(
@@ -565,6 +582,57 @@ mod tests {
         assert_eq!(top_level[0].program_id, UNKNOWN);
         assert_eq!(top_level[0].consumed, Some(701));
         assert!(top_level[0].invocations.is_empty());
+    }
+
+    #[test]
+    fn a_cpi_under_a_caller_cut_from_the_logs_is_counted_once() {
+        let profile = TransactionProfile::from_rpc(
+            "sig",
+            &json!({
+                "slot": 1,
+                "meta": {
+                    "err": null,
+                    "computeUnitsConsumed": 1000,
+                    "logMessages": [
+                        "Program L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95 invoke [1]",
+                        "Program TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA invoke [2]",
+                        "Program TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA consumed 200 of 199000 compute units",
+                        "Program TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA success",
+                        "Log truncated",
+                    ],
+                },
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(profile.unattributed(), 800);
+        assert_eq!(
+            profile.folded(),
+            format!("{UNKNOWN};SPL Token 200\nbuiltin programs 800\n")
+        );
+    }
+
+    #[test]
+    fn names_and_errors_from_the_rpc_cannot_steer_the_terminal_or_the_flame_graph() {
+        let profile = TransactionProfile {
+            signature: "sig".to_string(),
+            slot: 1,
+            err: json!({"InstructionError": [0, {"Custom": 1}]}),
+            compute_units_consumed: Some(100),
+            logs_truncated: false,
+            invocations: vec![Invocation {
+                program_id: UNKNOWN.to_string(),
+                name: Some("evil\u{1b}[2J;caller".to_string()),
+                consumed: Some(100),
+                error: Some("custom\u{1b}]0;title\u{7}\nerror".to_string()),
+                ..Default::default()
+            }],
+        };
+
+        let rendered = profile.render(false);
+        assert!(!rendered.contains(['\u{1b}', '\u{7}']), "{rendered:?}");
+        assert!(rendered.contains("evil\u{FFFD}[2J;caller"));
+        assert_eq!(profile.folded(), "evil\u{FFFD}[2J:caller 100\n");
     }
 
     #[test]
