@@ -7108,6 +7108,23 @@ mod tests {
         );
     }
 
+    /// Garbage collection rebuilds LiteSVM as a block closes, just before the block records its
+    /// slot in SlotHistory, so the blocks recorded before it must survive the rebuild.
+    #[test]
+    fn slot_history_survives_garbage_collection() {
+        let (mut svm, _events_rx, _geyser_rx) = TestType::in_memory().initialize_svm();
+        let gc_slot = svm.garbage_collection_interval_slots();
+        svm.latest_epoch_info.absolute_slot = gc_slot - 1;
+        svm.latest_epoch_info.slot_index = gc_slot - 1;
+        svm.confirm_current_block().unwrap();
+        let mut expected = svm.inner.get_sysvar::<SlotHistory>();
+        expected.add(gc_slot);
+
+        svm.confirm_current_block().unwrap();
+
+        assert!(svm.inner.get_sysvar::<SlotHistory>() == expected);
+    }
+
     #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
     #[test_case(TestType::in_memory(); "with in-memory sqlite db")]
     #[test_case(TestType::no_db(); "with no db")]
