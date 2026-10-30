@@ -3,7 +3,10 @@ use std::{
     sync::OnceLock,
 };
 
-use surfpool_types::{OverrideInstance, OverrideTemplate, YamlOverrideTemplateCollection};
+use surfpool_types::{
+    KeepAliveAddress, OverrideInstance, OverrideTemplate, PropertyKind, RawEncoding,
+    YamlOverrideTemplateCollection,
+};
 
 pub const PYTH_V2_IDL_CONTENT: &str = include_str!("./protocols/pyth/v2/idl.json");
 pub const PYTH_V2_OVERRIDES_CONTENT: &str = include_str!("./protocols/pyth/v2/overrides.yaml");
@@ -73,6 +76,9 @@ pub const PHOENIX_ETERNAL_OVERRIDES_CONTENT: &str =
 pub struct TemplateRegistry {
     /// Map of template ID to template
     pub templates: BTreeMap<String, OverrideTemplate>,
+    /// Keep-alive templates, which override templates import. [`TemplateRegistry::get`] finds them
+    /// so overrides can apply them, but they are never listed: users do not pick them.
+    pub keep_alive_templates: BTreeMap<String, OverrideTemplate>,
 }
 
 /// The bundled template registry, parsed once and reused by scenario execution.
@@ -87,12 +93,23 @@ pub(crate) fn account_data_values(
     instance: &OverrideInstance,
     template: Option<&OverrideTemplate>,
 ) -> (HashMap<String, serde_json::Value>, usize, usize) {
-    let pda_refs = instance.account.get_pda_seed_references();
+    let mut pda_refs = instance.account.get_pda_seed_references();
+    pda_refs.extend(
+        template
+            .into_iter()
+            .flat_map(OverrideTemplate::keep_alive_pda_seeds),
+    );
+    // Keep-alive inputs only name the account a keep-alive writes, so they count as selectors.
     let constant_refs: HashSet<&str> = template
         .into_iter()
-        .flat_map(|template| template.properties.iter())
-        .filter(|property| property.is_constant_ref())
-        .map(|property| property.path.as_str())
+        .flat_map(|template| {
+            template
+                .properties
+                .iter()
+                .filter(|property| property.is_constant_ref())
+                .map(|property| property.path.as_str())
+                .chain(template.keep_alive_inputs())
+        })
         .collect();
     let values = instance
         .values
@@ -117,7 +134,96 @@ impl TemplateRegistry {
         default.load_spl_token_overrides();
         default.load_pump_overrides();
         default.load_phoenix_overrides();
+        if let Err(e) = default.check_keep_alive_imports() {
+            panic!("unable to load the override templates: {e}");
+        }
         default
+    }
+
+    /// Loads a protocol's keep-alive file: plain override templates that other templates import
+    /// and users never list or pick. IDs must be unused.
+    pub fn load_keep_alive(
+        &mut self,
+        idl: Option<anchor_lang_idl::types::Idl>,
+        content: &str,
+        protocol_name: &str,
+    ) {
+        let what = format!("{protocol_name} keep-alive");
+        let collection = serde_yaml::from_str::<YamlOverrideTemplateCollection>(content)
+            .unwrap_or_else(|e| panic!("unable to load {what}: {e}"));
+        let templates = Self::build_templates(idl, collection, &what);
+        for template in &templates {
+            if self.templates.contains_key(&template.id)
+                || self.keep_alive_templates.contains_key(&template.id)
+            {
+                panic!("unable to load {what}: '{}' is already an ID", template.id);
+            }
+            if !template.keep_alive.is_empty() {
+                panic!(
+                    "unable to load {what}: '{}' is a keep-alive template and cannot import keep-alive",
+                    template.id
+                );
+            }
+        }
+        for template in templates {
+            self.keep_alive_templates
+                .insert(template.id.clone(), template);
+        }
+    }
+
+    /// A keep-alive template by ID.
+    pub fn keep_alive_template(&self, id: &str) -> Option<&OverrideTemplate> {
+        self.keep_alive_templates.get(id)
+    }
+
+    /// Fails on a keep-alive import the registry cannot apply: its template must be a loaded
+    /// keep-alive template that has every property it sets, and an input address must name a
+    /// pubkey input of the importing template.
+    pub fn check_keep_alive_imports(&self) -> Result<(), String> {
+        for template in self.templates.values() {
+            for import in &template.keep_alive {
+                let fail = |reason: String| {
+                    Err(format!(
+                        "template '{}' imports keep-alive '{}': {reason}",
+                        template.id, import.template
+                    ))
+                };
+                import.validate().or_else(fail)?;
+                let Some(keep_alive) = self.keep_alive_templates.get(&import.template) else {
+                    return fail("no keep-alive file defines it".to_string());
+                };
+                for (path, value) in &import.values {
+                    let Some(property) = keep_alive.properties.iter().find(|p| &p.path == path)
+                    else {
+                        return fail(format!("it has no property '{path}'"));
+                    };
+                    // A slot encoding writes the current slot plus the value, so `$slot` would
+                    // write twice the slot.
+                    let is_placeholder = value.as_str().is_some_and(|v| v.trim().starts_with('$'));
+                    if is_placeholder && matches!(property.encoding, Some(RawEncoding::Slot { .. }))
+                    {
+                        return fail(format!(
+                            "'{path}' is slot-encoded and already tracks the slot: give it a lead, \
+                             not {value}"
+                        ));
+                    }
+                }
+                if let KeepAliveAddress::Input(name) = &import.address {
+                    let is_pubkey_input = template.properties.iter().any(|property| {
+                        &property.path == name
+                            && matches!(
+                                &property.kind,
+                                PropertyKind::Input { value_type }
+                                    if *value_type == anchor_lang_idl::types::IdlType::Pubkey
+                            )
+                    });
+                    if !is_pubkey_input {
+                        return fail(format!("'{name}' is not a pubkey input of the template"));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn load_pyth_overrides(&mut self) {
@@ -254,49 +360,8 @@ impl TemplateRegistry {
                 Ok(c) => c,
                 Err(e) => panic!("unable to load {} overrides: {}", protocol_name, e),
             };
-
-        match (idl.is_some(), collection.raw_layout) {
-            (true, true) => panic!(
-                "unable to load {protocol_name} overrides: a collection cannot contain both an IDL and raw_layout"
-            ),
-            (false, false) => panic!(
-                "unable to load {protocol_name} overrides: an IDL-less collection must set raw_layout: true"
-            ),
-            _ => {}
-        }
-        let requires_raw_layout = idl.is_none();
-
-        // Convert all templates in the collection
-        let templates = collection
-            .to_override_templates(idl)
-            .unwrap_or_else(|e| panic!("unable to load {} overrides: {}", protocol_name, e));
-
-        // Validate the entire collection before mutating the registry, so one malformed entry
-        // cannot leave its valid siblings partially registered.
-        if requires_raw_layout {
-            for template in &templates {
-                template
-                    .validate_raw_layout()
-                    .unwrap_or_else(|e| {
-                        panic!(
-                            "unable to load {protocol_name} overrides: invalid raw-layout template '{}': {e}",
-                            template.id
-                        )
-                    });
-                for property in &template.properties {
-                    if property
-                        .description
-                        .as_deref()
-                        .is_none_or(|description| description.trim().is_empty())
-                    {
-                        panic!(
-                            "unable to load {protocol_name} overrides: raw-layout property '{}:{}' must define a description",
-                            template.id, property.path
-                        );
-                    }
-                }
-            }
-        }
+        let templates =
+            Self::build_templates(idl, collection, &format!("{protocol_name} overrides"));
 
         // Register each template
         for template in templates {
@@ -305,9 +370,59 @@ impl TemplateRegistry {
         }
     }
 
+    /// Converts and validates a whole collection before anything is registered, so one malformed
+    /// entry cannot leave its valid siblings partially registered.
+    fn build_templates(
+        idl: Option<anchor_lang_idl::types::Idl>,
+        collection: YamlOverrideTemplateCollection,
+        what: &str,
+    ) -> Vec<OverrideTemplate> {
+        match (idl.is_some(), collection.raw_layout) {
+            (true, true) => panic!(
+                "unable to load {what}: a collection cannot contain both an IDL and raw_layout"
+            ),
+            (false, false) => {
+                panic!("unable to load {what}: an IDL-less collection must set raw_layout: true")
+            }
+            _ => {}
+        }
+        let requires_raw_layout = idl.is_none();
+
+        // Convert all templates in the collection
+        let templates = collection
+            .to_override_templates(idl)
+            .unwrap_or_else(|e| panic!("unable to load {what}: {e}"));
+
+        if requires_raw_layout {
+            for template in &templates {
+                template.validate_raw_layout().unwrap_or_else(|e| {
+                    panic!(
+                        "unable to load {what}: invalid raw-layout template '{}': {e}",
+                        template.id
+                    )
+                });
+                for property in &template.properties {
+                    if property
+                        .description
+                        .as_deref()
+                        .is_none_or(|description| description.trim().is_empty())
+                    {
+                        panic!(
+                            "unable to load {what}: raw-layout property '{}:{}' must define a description",
+                            template.id, property.path
+                        );
+                    }
+                }
+            }
+        }
+        templates
+    }
+
     /// Get a template by ID
     pub fn get(&self, template_id: &str) -> Option<&OverrideTemplate> {
-        self.templates.get(template_id)
+        self.templates
+            .get(template_id)
+            .or_else(|| self.keep_alive_templates.get(template_id))
     }
 
     /// Get all templates
@@ -732,6 +847,220 @@ templates:
             )
             .expect_err("a write beyond the loaded account must be rejected");
         assert!(error.contains("exceeds the 15 byte account"), "{error}");
+    }
+
+    const KEEP_ALIVE_OVERRIDES: &str = r#"
+protocol: Example
+version: v1
+account_type: State
+raw_layout: true
+keep_alive:
+  - template: example-fresh
+    address: { type: override }
+    values: { slot: $slot, ms: $unix_ms }
+templates:
+  - id: example-price
+    name: Price
+    description: Example price
+    address: { type: pubkey }
+    properties:
+      - { path: price, offset: 0, encoding: u64, description: Price }
+  - id: example-vault
+    name: Vault
+    description: Example vault
+    keep_alive:
+      - template: example-fresh
+        address: { type: input, value: oracle }
+        values: { slot: $slot }
+    address: { type: pubkey }
+    properties:
+      - { path: balance, offset: 0, encoding: u64, description: Balance }
+      - { path: oracle, type: input, value_type: pubkey, description: The market's oracle }
+"#;
+
+    const KEEP_ALIVE: &str = r#"
+protocol: Example
+version: v1
+raw_layout: true
+templates:
+  - id: example-fresh
+    name: Fresh quote
+    description: What the maker republishes
+    address: { type: pubkey }
+    properties:
+      - { path: slot, offset: 8, encoding: u64, description: Published slot }
+      - { path: ms, offset: 16, encoding: u64, description: Published time }
+"#;
+
+    fn keep_alive_registry(overrides: &str) -> TemplateRegistry {
+        let mut registry = TemplateRegistry::default();
+        registry.load_raw_layout_overrides(overrides, "example");
+        registry.load_keep_alive(None, KEEP_ALIVE, "example");
+        registry
+    }
+
+    #[test]
+    fn keep_alive_templates_are_applied_but_never_listed() {
+        let registry = keep_alive_registry(KEEP_ALIVE_OVERRIDES);
+        registry.check_keep_alive_imports().unwrap();
+
+        assert!(
+            registry.get("example-fresh").is_some(),
+            "overrides find it to apply it"
+        );
+        assert_eq!(registry.count(), 2, "users never pick it");
+        assert!(!registry.contains("example-fresh"));
+        assert!(registry.all().iter().all(|t| t.id != "example-fresh"));
+        assert!(
+            registry
+                .by_protocol("Example")
+                .iter()
+                .all(|t| t.id != "example-fresh")
+        );
+    }
+
+    #[test]
+    fn a_keep_alive_input_is_never_written() {
+        let registry = keep_alive_registry(KEEP_ALIVE_OVERRIDES);
+        let instance = OverrideInstance::new(
+            "example-vault".to_string(),
+            0,
+            surfpool_types::AccountAddress::Pubkey("11111111111111111111111111111111".to_string()),
+        )
+        .with_values(HashMap::from([
+            ("balance".to_string(), serde_json::json!(1)),
+            (
+                "oracle".to_string(),
+                serde_json::json!("11111111111111111111111111111111"),
+            ),
+        ]));
+        let (values, _, _) = account_data_values(&instance, registry.get("example-vault"));
+        assert_eq!(values.keys().collect::<Vec<_>>(), ["balance"]);
+    }
+
+    #[test]
+    fn a_keep_alive_pda_seed_is_never_written() {
+        let registry = keep_alive_registry(&KEEP_ALIVE_OVERRIDES.replace(
+            "address: { type: input, value: oracle }",
+            "address: { type: pda, program_id: \"11111111111111111111111111111111\", seeds: [{ type: property_ref, value: oracle }] }",
+        ));
+        registry.check_keep_alive_imports().unwrap();
+        let instance = OverrideInstance::new(
+            "example-vault".to_string(),
+            0,
+            surfpool_types::AccountAddress::Pubkey("11111111111111111111111111111111".to_string()),
+        )
+        .with_values(HashMap::from([
+            ("balance".to_string(), serde_json::json!(1)),
+            (
+                "oracle".to_string(),
+                serde_json::json!("11111111111111111111111111111111"),
+            ),
+        ]));
+        let (values, _, _) = account_data_values(&instance, registry.get("example-vault"));
+        assert_eq!(values.keys().collect::<Vec<_>>(), ["balance"]);
+    }
+
+    #[test]
+    fn a_keep_alive_pda_seed_that_is_a_field_is_still_written() {
+        let registry = keep_alive_registry(&KEEP_ALIVE_OVERRIDES.replace(
+            "address: { type: input, value: oracle }",
+            "address: { type: pda, program_id: \"11111111111111111111111111111111\", seeds: [{ type: property_ref, value: balance }] }",
+        ));
+        registry.check_keep_alive_imports().unwrap();
+        let instance = OverrideInstance::new(
+            "example-vault".to_string(),
+            0,
+            surfpool_types::AccountAddress::Pubkey("11111111111111111111111111111111".to_string()),
+        )
+        .with_values(HashMap::from([(
+            "balance".to_string(),
+            serde_json::json!(1),
+        )]));
+        let (values, _, _) = account_data_values(&instance, registry.get("example-vault"));
+        assert_eq!(values.keys().collect::<Vec<_>>(), ["balance"]);
+    }
+
+    #[test]
+    fn imports_the_registry_cannot_apply_are_refused() {
+        let refused = |overrides: String, expected: &str| {
+            let error = keep_alive_registry(&overrides)
+                .check_keep_alive_imports()
+                .expect_err(&overrides);
+            assert!(error.contains(expected), "{error}");
+        };
+        refused(
+            KEEP_ALIVE_OVERRIDES.replace(
+                "template: example-fresh\n    address",
+                "template: nowhere\n    address",
+            ),
+            "imports keep-alive 'nowhere': no keep-alive file defines it",
+        );
+        refused(
+            KEEP_ALIVE_OVERRIDES.replace("values: { slot: $slot }", "values: { size: 1 }"),
+            "it has no property 'size'",
+        );
+        refused(
+            KEEP_ALIVE_OVERRIDES.replace("value: oracle }", "value: market }"),
+            "'market' is not a pubkey input of the template",
+        );
+        refused(
+            KEEP_ALIVE_OVERRIDES.replace("value_type: pubkey", "value_type: u64"),
+            "'oracle' is not a pubkey input of the template",
+        );
+        refused(
+            KEEP_ALIVE_OVERRIDES.replace("values: { slot: $slot }", "values: { slot: $later }"),
+            "unknown placeholder",
+        );
+    }
+
+    #[test]
+    fn a_placeholder_on_a_slot_encoded_field_is_refused() {
+        let mut registry = TemplateRegistry::default();
+        registry.load_raw_layout_overrides(KEEP_ALIVE_OVERRIDES, "example");
+        registry.load_keep_alive(
+            None,
+            &KEEP_ALIVE.replace(
+                "{ path: slot, offset: 8, encoding: u64",
+                "{ path: slot, offset: 8, encoding: { slot: { lead: 0 } }",
+            ),
+            "example",
+        );
+        let error = registry.check_keep_alive_imports().unwrap_err();
+        assert!(
+            error.contains("'slot' is slot-encoded and already tracks the slot"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn invalid_keep_alive_files_are_refused() {
+        let refused = |file: String, expected: &str| {
+            let error = std::panic::catch_unwind(|| {
+                let mut registry = TemplateRegistry::default();
+                registry.load_raw_layout_overrides(KEEP_ALIVE_OVERRIDES, "example");
+                registry.load_keep_alive(None, &file, "example");
+            })
+            .expect_err(&file);
+            let message = error.downcast_ref::<String>().cloned().unwrap_or_default();
+            assert!(message.contains(expected), "{message}");
+        };
+        refused(
+            KEEP_ALIVE.replace("id: example-fresh", "id: example-price"),
+            "'example-price' is already an ID",
+        );
+        refused(
+            KEEP_ALIVE.replace(
+                "    address: { type: pubkey }",
+                "    keep_alive:\n      - { template: example-fresh, address: { type: override }, values: { slot: $slot } }\n    address: { type: pubkey }",
+            ),
+            "'example-fresh' is a keep-alive template and cannot import keep-alive",
+        );
+    }
+
+    #[test]
+    fn the_bundled_registry_resolves_every_keep_alive_import() {
+        TemplateRegistry::new().check_keep_alive_imports().unwrap();
     }
 
     #[test]

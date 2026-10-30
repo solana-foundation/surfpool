@@ -37,7 +37,8 @@ padding included - because the account is re-encoded with Borsh. An out-of-range
 non-numeric segment on an array is a hard error, never a silent write elsewhere.
 
 An override is applied once. Its resulting account state remains in later slots until a transaction
-or another override writes that account again.
+or another override writes that account again. The exception is [keep-alive](#keep-alive), which
+rewrites the fields a protocol's own off-chain actor would every slot.
 
 ### Kamino integration tests
 
@@ -79,6 +80,48 @@ Each collection uses exactly one write model: an IDL-backed collection cannot se
 compiled into Surfpool's built-in template registry; there is no runtime raw-layout registration
 endpoint.
 
+### Keep-alive
+
+Some accounts are rewritten every slot by the protocol's own off-chain actor, such as a market maker
+republishing its quote. Nobody runs those actors against a surfnet, so a template can import
+keep-alive templates: ordinary override templates in a separate file of the protocol, loaded with
+`TemplateRegistry::load_keep_alive` and never offered in Studio or MCP. A template imports them in its
+`keep_alive` list, or a whole file at its top level; a template's own list replaces the file's, and
+`keep_alive: []` turns it off.
+
+```yaml
+templates:
+  - id: example-vault-balance
+    properties:
+      - path: balance
+        offset: 64
+        encoding: u64
+      - path: oracle
+        type: input
+        value_type: pubkey
+        description: The oracle of the vault's market
+    keep_alive:
+      - template: example-oracle-fresh
+        address: { type: input, value: oracle }
+        values: { publication_slot: $slot, publication_time: $unix_ms }
+```
+
+| `address` | Writes |
+|---|---|
+| `{ type: override }` | the account the importing override writes |
+| `{ type: input, value: oracle }` | the pubkey given in that `input` property (`value_type: pubkey`, never written) |
+| `{ type: pubkey, value: <address> }` | a fixed account |
+| `{ type: pda, program_id, seeds }` | a derived account; seeds resolve against the override's values |
+
+`$slot`, `$slot±N` and `$unix_s`/`ms`/`us`/`ns` in `values` are filled from the slot and its Clock
+time; other values are written as given.
+
+Keep-alive starts in the slot the importing override plays and rewrites its fields every slot, after
+that slot's overrides, until the network is reset. An override of one of those fields therefore
+never takes effect. An account not yet in the surfnet is fetched from the remote first, unless it is
+marked offline. Keep-alive is kept in memory only: after a restart on a persistent database it stops
+until an importing override plays again.
+
 ### Override Templates
 Directly using the `surfnet_registerScenario` endpoint requires building out a map of account keys that are specific to the schema of the account that is being written to.
 This is a cumbersome process in most cases.
@@ -96,6 +139,7 @@ The following steps can be followed to natively support a protocol:
     1. This file is what will populate Surfpool Studio's UI with the protocol details. The Pyth override file linked above produces the following in the UI:
    ![Pyth Overrides](../../../..//doc/assets/pyth-overrides.png)
  4. Update the [registry.rs](./registry.rs) file. A small amount of code has to be written to wire together the template registry, the `overrides.yaml`, and the `idl.json`. See the `load_pyth_overrides` and `load_jupiter_overrides` functions for examples.
+ 5. If the protocol's own off-chain actor rewrites accounts every slot, add a keep-alive file with the templates it writes, load it with `load_keep_alive`, and import them from the override templates. See [Keep-alive](#keep-alive).
 
 If any part of these instructions are beyond your skill level or availability, but you'd like to see a specific protocol supported, feel free to [Open an Issue to Support a new Protocol](https://github.com/solana-foundation/surfpool/issues/new?template=native-scenario-support-for-protocol.md)!
 Opening an issue to signal interest is a big help.

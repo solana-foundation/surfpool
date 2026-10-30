@@ -29,6 +29,7 @@ use crate::{
     types::{GeyserAccountUpdate, TransactionWithStatusMeta},
 };
 
+pub mod keep_alive;
 pub mod locker;
 pub mod noop_program;
 pub mod remote;

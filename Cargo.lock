@@ -12253,6 +12253,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_with",
+ "serde_yaml",
  "solana-account 4.7.0",
  "solana-account-decoder-client-types",
  "solana-clock 3.2.1",

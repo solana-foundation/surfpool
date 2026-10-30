@@ -472,6 +472,10 @@ pub struct OverrideTemplate {
     /// re-encoding through an IDL.
     #[serde(default)]
     pub raw_layout: bool,
+    /// Keep-alive templates the surfnet applies every slot, from the slot an override of this
+    /// template plays until the network is reset.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keep_alive: Vec<KeepAliveImport>,
 }
 
 impl OverrideTemplate {
@@ -512,6 +516,7 @@ impl OverrideTemplate {
             tags: Vec::new(),
             llm_context: None,
             raw_layout: false,
+            keep_alive: Vec::new(),
         }
     }
 
@@ -750,6 +755,7 @@ impl YamlOverrideTemplateFile {
             tags: self.tags,
             llm_context: self.llm_context,
             raw_layout: false,
+            keep_alive: Vec::new(),
         })
     }
 }
@@ -1034,6 +1040,10 @@ pub struct YamlOverrideTemplateCollection {
     /// Selects offset-and-encoding writes for programs with no usable IDL.
     #[serde(default)]
     pub raw_layout: bool,
+    /// Keep-alive imports every template in this file inherits. A template's own `keep_alive`
+    /// list replaces it.
+    #[serde(default)]
+    pub keep_alive: Vec<YamlKeepAliveImport>,
     /// The templates
     pub templates: Vec<YamlOverrideTemplateEntry>,
 }
@@ -1054,6 +1064,9 @@ pub struct YamlOverrideTemplateEntry {
     /// Optional context/instructions specifically for LLMs using this template
     #[serde(default)]
     pub llm_context: Option<String>,
+    /// Replaces the keep-alive list the template inherits from its file; `[]` turns it off.
+    #[serde(default)]
+    pub keep_alive: Option<Vec<YamlKeepAliveImport>>,
 }
 
 // ========================================
@@ -1223,6 +1236,16 @@ impl OverrideTemplate {
                     return Err(format!(
                         "raw-layout selector '{}' references unknown constant '{}'",
                         property.path, constant
+                    ));
+                }
+                continue;
+            }
+            // Inputs are given to the override, never written to the account.
+            if matches!(property.kind, PropertyKind::Input { .. }) {
+                if property.offset.is_some() || property.encoding.is_some() {
+                    return Err(format!(
+                        "raw-layout input '{}' must not define an offset or encoding",
+                        property.path
                     ));
                 }
                 continue;
@@ -1499,10 +1522,236 @@ impl YamlOverrideTemplateCollection {
                     tags: self.tags.clone(),
                     llm_context: entry.llm_context,
                     raw_layout: self.raw_layout,
+                    keep_alive: entry
+                        .keep_alive
+                        .unwrap_or_else(|| self.keep_alive.clone())
+                        .into_iter()
+                        .map(Into::into)
+                        .collect(),
                 })
             })
             .collect()
     }
+}
+
+// ========================================
+// Keep-alive
+// ========================================
+
+/// A keep-alive import as YAML writes it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct YamlKeepAliveImport {
+    pub template: String,
+    pub address: YamlKeepAliveAddress,
+    pub values: HashMap<String, serde_json::Value>,
+}
+
+/// Where a keep-alive import writes, as YAML writes it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum YamlKeepAliveAddress {
+    /// The account the importing override writes.
+    Override,
+    /// The pubkey the importing override is given in its `input` property `value`.
+    Input {
+        value: String,
+    },
+    Pubkey {
+        value: String,
+    },
+    Pda {
+        program_id: String,
+        seeds: Vec<YamlPdaSeed>,
+    },
+}
+
+impl From<YamlKeepAliveImport> for KeepAliveImport {
+    fn from(yaml: YamlKeepAliveImport) -> Self {
+        let address = match yaml.address {
+            YamlKeepAliveAddress::Override => KeepAliveAddress::Override,
+            YamlKeepAliveAddress::Input { value } => KeepAliveAddress::Input(value),
+            YamlKeepAliveAddress::Pubkey { value } => {
+                KeepAliveAddress::Account(AccountAddress::Pubkey(value))
+            }
+            YamlKeepAliveAddress::Pda { program_id, seeds } => {
+                KeepAliveAddress::Account(AccountAddress::Pda {
+                    program_id,
+                    seeds: seeds.into_iter().map(Into::into).collect(),
+                })
+            }
+        };
+        KeepAliveImport {
+            template: yaml.template,
+            address,
+            values: yaml.values,
+        }
+    }
+}
+
+/// A keep-alive template a template imports. Keep-alive covers what a protocol's own off-chain
+/// actor writes every slot, such as a market maker republishing its quote: from the slot an override
+/// of the importing template plays until the network is reset, the surfnet applies `template` with
+/// `values` to `address` every slot, as an ordinary override.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct KeepAliveImport {
+    /// The keep-alive template applied.
+    pub template: String,
+    pub address: KeepAliveAddress,
+    /// The template's values. Strings starting with `$` are filled in every slot; see
+    /// [`resolve_keep_alive_value`].
+    pub values: HashMap<String, serde_json::Value>,
+}
+
+/// Where a keep-alive import writes.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeepAliveAddress {
+    /// The account the importing override writes.
+    Override,
+    /// The pubkey the importing override is given in this `input` property, which is never
+    /// written: the client that picks the account supplies it, such as a market's oracle.
+    Input(String),
+    /// A fixed or derived address. PDA seeds resolve against the importing override's values.
+    Account(AccountAddress),
+}
+
+impl KeepAliveImport {
+    /// The account to write, given the account the importing override wrote and its values.
+    pub fn account(
+        &self,
+        written: Pubkey,
+        values: &HashMap<String, serde_json::Value>,
+    ) -> Option<Pubkey> {
+        match &self.address {
+            KeepAliveAddress::Override => Some(written),
+            KeepAliveAddress::Input(name) => values
+                .get(name)?
+                .as_str()
+                .and_then(|address| Pubkey::from_str(address).ok()),
+            KeepAliveAddress::Account(address) => address.resolve(Some(values)),
+        }
+    }
+
+    /// The values with their placeholders filled in for `clock`.
+    pub fn values_at(
+        &self,
+        clock: &KeepAliveClock,
+    ) -> Result<HashMap<String, serde_json::Value>, String> {
+        self.values
+            .iter()
+            .map(|(path, value)| {
+                resolve_keep_alive_value(value, clock)
+                    .map(|value| (path.clone(), value))
+                    .map_err(|e| format!("'{path}': {e}"))
+            })
+            .collect()
+    }
+
+    /// Checks what can be checked without the templates: the values and a fixed address.
+    pub fn validate(&self) -> Result<(), String> {
+        let template = &self.template;
+        if self.values.is_empty() {
+            return Err(format!("keep-alive '{template}' writes nothing"));
+        }
+        let program_or_address = match &self.address {
+            KeepAliveAddress::Account(AccountAddress::Pubkey(address)) => Some(address),
+            KeepAliveAddress::Account(AccountAddress::Pda { program_id, .. }) => Some(program_id),
+            _ => None,
+        };
+        if let Some(address) = program_or_address {
+            Pubkey::from_str(address).map_err(|e| {
+                format!("keep-alive '{template}': invalid address '{address}': {e}")
+            })?;
+        }
+        let clock = KeepAliveClock {
+            slot: 0,
+            unix_time_ms: 0,
+        };
+        self.values_at(&clock)
+            .map_err(|e| format!("keep-alive '{template}': {e}"))?;
+        Ok(())
+    }
+}
+
+impl OverrideTemplate {
+    /// The input properties keep-alive imports read addresses from. They are never written.
+    pub fn keep_alive_inputs(&self) -> impl Iterator<Item = &str> {
+        self.keep_alive
+            .iter()
+            .filter_map(|import| match &import.address {
+                KeepAliveAddress::Input(name) => Some(name.as_str()),
+                _ => None,
+            })
+    }
+
+    /// The seeds keep-alive PDAs are derived from that are not fields of this template. Like the
+    /// override's own PDA seeds, they only name an account and are never written.
+    pub fn keep_alive_pda_seeds(&self) -> Vec<String> {
+        self.keep_alive
+            .iter()
+            .filter_map(|import| match &import.address {
+                KeepAliveAddress::Account(address) => Some(address.get_pda_seed_references()),
+                _ => None,
+            })
+            .flatten()
+            .filter(|seed| {
+                !self
+                    .properties
+                    .iter()
+                    .any(|p| &p.path == seed && p.is_field())
+            })
+            .collect()
+    }
+}
+
+/// The slot and block time keep-alive values are filled in for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeepAliveClock {
+    pub slot: Slot,
+    /// Unix time in milliseconds the slot's Clock sysvar is set from; its `unix_timestamp` is this
+    /// in seconds.
+    pub unix_time_ms: u64,
+}
+
+/// A keep-alive value with its placeholder filled in for `clock`: `$slot`, `$slot+N`, `$slot-N`,
+/// `$unix_s`, `$unix_ms`, `$unix_us` and `$unix_ns` become integers. Any other value is returned
+/// as given.
+pub fn resolve_keep_alive_value(
+    value: &serde_json::Value,
+    clock: &KeepAliveClock,
+) -> Result<serde_json::Value, String> {
+    let Some(text) = value
+        .as_str()
+        .and_then(|text| text.trim().strip_prefix('$'))
+    else {
+        return Ok(value.clone());
+    };
+    let ms = clock.unix_time_ms;
+    let resolved = match text {
+        "unix_s" => Some(ms / 1_000),
+        "unix_ms" => Some(ms),
+        "unix_us" => ms.checked_mul(1_000),
+        "unix_ns" => ms.checked_mul(1_000_000),
+        _ => {
+            let rest = text
+                .strip_prefix("slot")
+                .ok_or_else(|| format!("unknown placeholder '${text}'"))?;
+            match rest.chars().next() {
+                None => Some(clock.slot),
+                Some('+') => rest[1..]
+                    .parse::<u64>()
+                    .ok()
+                    .and_then(|lead| clock.slot.checked_add(lead)),
+                Some('-') => rest[1..]
+                    .parse::<u64>()
+                    .ok()
+                    .map(|lag| clock.slot.saturating_sub(lag)),
+                _ => return Err(format!("unknown placeholder '${text}'")),
+            }
+        }
+    }
+    .ok_or_else(|| format!("'${text}' does not fit a u64"))?;
+    Ok(serde_json::Value::from(resolved))
 }
 
 /// YAML representation of an override template with embedded IDL
@@ -1552,6 +1801,7 @@ impl YamlOverrideTemplate {
             tags: self.tags,
             llm_context: self.llm_context,
             raw_layout: false,
+            keep_alive: Vec::new(),
         })
     }
 }
@@ -1664,7 +1914,181 @@ mod tests {
             tags: Vec::new(),
             llm_context: None,
             raw_layout: true,
+            keep_alive: Vec::new(),
         }
+    }
+
+    fn keep_alive(yaml: &str) -> super::KeepAliveImport {
+        serde_yaml::from_str::<super::YamlKeepAliveImport>(yaml)
+            .expect("keep-alive yaml")
+            .into()
+    }
+
+    #[test]
+    fn keep_alive_placeholders_become_the_slot_and_block_time() {
+        use super::{KeepAliveClock, resolve_keep_alive_value as resolve};
+        let clock = KeepAliveClock {
+            slot: 1_000,
+            unix_time_ms: 1_800_000_000_123,
+        };
+        let at = |text: &str| resolve(&json!(text), &clock);
+        assert_eq!(at("$slot").unwrap(), json!(1_000));
+        assert_eq!(at("$slot+200").unwrap(), json!(1_200));
+        assert_eq!(at("$slot-1").unwrap(), json!(999));
+        assert_eq!(at("$unix_s").unwrap(), json!(1_800_000_000u64));
+        assert_eq!(at("$unix_ms").unwrap(), json!(1_800_000_000_123u64));
+        assert_eq!(at("$unix_us").unwrap(), json!(1_800_000_000_123_000u64));
+        assert_eq!(at("$unix_ns").unwrap(), json!(1_800_000_000_123_000_000u64));
+        assert!(at("$tomorrow").is_err());
+        assert!(at("$slot*2").is_err());
+        assert_eq!(
+            resolve(&json!(7), &clock).unwrap(),
+            json!(7),
+            "plain values stay"
+        );
+        assert_eq!(at("plain").unwrap(), json!("plain"));
+    }
+
+    #[test]
+    fn a_keep_alive_import_writes_the_override_an_input_or_a_given_address() {
+        use solana_pubkey::Pubkey;
+        let (written, oracle, fixed) = (
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        );
+        let values = HashMap::from([
+            ("oracle".to_string(), json!(oracle.to_string())),
+            ("seed".to_string(), json!(fixed.to_string())),
+        ]);
+        let at = |address: &str| {
+            keep_alive(&format!(
+                "template: t\naddress: {address}\nvalues: {{ slot: $slot }}\n"
+            ))
+            .account(written, &values)
+        };
+        assert_eq!(at("{ type: override }"), Some(written));
+        assert_eq!(at("{ type: input, value: oracle }"), Some(oracle));
+        assert_eq!(at("{ type: input, value: missing }"), None, "not given");
+        assert_eq!(
+            at(&format!("{{ type: pubkey, value: \"{fixed}\" }}")),
+            Some(fixed)
+        );
+        let program = Pubkey::new_unique();
+        assert_eq!(
+            at(&format!(
+                "{{ type: pda, program_id: \"{program}\", seeds: [{{ type: property_ref, value: seed }}] }}"
+            )),
+            Some(Pubkey::find_program_address(&[fixed.as_ref()], &program).0),
+            "seeds resolve against the importing override's values"
+        );
+    }
+
+    #[test]
+    fn keep_alive_values_are_filled_in_for_the_clock() {
+        let import = keep_alive(
+            "template: t\naddress: { type: override }\nvalues: { slot: $slot+200, ms: $unix_ms, fixed: 3 }\n",
+        );
+        let values = import
+            .values_at(&super::KeepAliveClock {
+                slot: 10,
+                unix_time_ms: 5_000,
+            })
+            .unwrap();
+        assert_eq!(values["slot"], json!(210));
+        assert_eq!(values["ms"], json!(5_000));
+        assert_eq!(values["fixed"], json!(3));
+    }
+
+    #[test]
+    fn a_file_level_keep_alive_is_inherited_unless_a_template_sets_its_own() {
+        let file: super::YamlOverrideTemplateCollection = serde_yaml::from_str(
+            r#"
+protocol: Example
+version: v1
+raw_layout: true
+keep_alive:
+  - { template: fresh, address: { type: override }, values: { slot: $slot } }
+templates:
+  - id: inherits
+    name: Inherits
+    description: Inherits
+    address: { type: pubkey }
+  - id: replaces
+    name: Replaces
+    description: Replaces
+    keep_alive:
+      - { template: tick, address: { type: input, value: oracle }, values: { slot: $slot } }
+    address: { type: pubkey }
+  - id: opts-out
+    name: Opts out
+    description: Opts out
+    keep_alive: []
+    address: { type: pubkey }
+"#,
+        )
+        .expect("override file");
+        let templates = file.to_override_templates(None).unwrap();
+        let imported = |index: usize| -> Vec<&str> {
+            templates[index]
+                .keep_alive
+                .iter()
+                .map(|import| import.template.as_str())
+                .collect()
+        };
+        assert_eq!(imported(0), ["fresh"]);
+        assert_eq!(imported(1), ["tick"]);
+        assert!(imported(2).is_empty());
+        assert_eq!(
+            templates[1].keep_alive_inputs().collect::<Vec<_>>(),
+            ["oracle"]
+        );
+    }
+
+    #[test]
+    fn invalid_keep_alive_imports_are_refused() {
+        let refused = |yaml: &str, expected: &str| {
+            let error = keep_alive(yaml).validate().expect_err(yaml);
+            assert!(error.contains(expected), "{error}");
+        };
+        refused(
+            "template: t\naddress: { type: override }\nvalues: {}\n",
+            "writes nothing",
+        );
+        refused(
+            "template: t\naddress: { type: override }\nvalues: { slot: $later }\n",
+            "unknown placeholder",
+        );
+        refused(
+            "template: t\naddress: { type: pubkey, value: nope }\nvalues: { slot: 1 }\n",
+            "invalid address",
+        );
+        refused(
+            "template: t\naddress: { type: pda, program_id: nope, seeds: [] }\nvalues: { slot: 1 }\n",
+            "invalid address",
+        );
+    }
+
+    #[test]
+    fn a_raw_layout_input_is_never_written() {
+        use super::{PropertyKind, RawEncoding};
+
+        let mut input = Property::field("oracle".to_string());
+        input.kind = PropertyKind::Input {
+            value_type: anchor_lang_idl::types::IdlType::Pubkey,
+        };
+        let mut price = Property::field("price".to_string());
+        price.offset = Some(0);
+        price.encoding = Some(RawEncoding::U64);
+        raw_template(vec![price, input.clone()])
+            .validate_raw_layout()
+            .expect("an input needs no offset");
+
+        input.offset = Some(8);
+        let error = raw_template(vec![input])
+            .validate_raw_layout()
+            .expect_err("an input with an offset");
+        assert!(error.contains("must not define an offset"), "{error}");
     }
 
     /// The encoding layer must never route a value through f64: a 2^88-scaled price is a 29-digit

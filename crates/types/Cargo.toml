@@ -50,6 +50,7 @@ txtx-addon-network-svm-types = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
+serde_yaml = "0.9"
 test-case = { workspace = true }
 
 [features]
