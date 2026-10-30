@@ -68,7 +68,10 @@ pub fn calculate_absolute_timestamp_clock(
         return Err(TimeTravelError::ZeroSlotsInEpoch);
     }
 
-    let slot = epoch_info.absolute_slot + (timestamp_target - current_updated_at) / slot_time;
+    let slot = epoch_info
+        .absolute_slot
+        .checked_add((timestamp_target - current_updated_at) / slot_time)
+        .ok_or(TimeTravelError::ArithmeticOverflow)?;
 
     // timestamp_target is in milliseconds, we need to convert it to seconds
     let timestamp_target_seconds = timestamp_target / 1000;
@@ -109,8 +112,12 @@ pub fn calculate_absolute_slot_clock(
     }
 
     let time_jump_in_absolute_slots = new_absolute_slot - current_absolute_slot;
-    let time_jump_in_ms = time_jump_in_absolute_slots.saturating_mul(slot_time);
-    let timestamp_target = current_updated_at.saturating_add(time_jump_in_ms);
+    let time_jump_in_ms = time_jump_in_absolute_slots
+        .checked_mul(slot_time)
+        .ok_or(TimeTravelError::ArithmeticOverflow)?;
+    let timestamp_target = current_updated_at
+        .checked_add(time_jump_in_ms)
+        .ok_or(TimeTravelError::ArithmeticOverflow)?;
 
     // timestamp_target is in milliseconds, we need to convert it to seconds
     let timestamp_target_seconds = timestamp_target / 1000;
@@ -157,8 +164,12 @@ pub fn calculate_absolute_epoch_clock(
         .get_first_slot_in_epoch(new_epoch)
         .max(current_absolute_slot);
     let time_jump_in_absolute_slots = new_absolute_slot.saturating_sub(current_absolute_slot);
-    let time_jump_in_ms = time_jump_in_absolute_slots * slot_time;
-    let timestamp_target = current_updated_at + time_jump_in_ms;
+    let time_jump_in_ms = time_jump_in_absolute_slots
+        .checked_mul(slot_time)
+        .ok_or(TimeTravelError::ArithmeticOverflow)?;
+    let timestamp_target = current_updated_at
+        .checked_add(time_jump_in_ms)
+        .ok_or(TimeTravelError::ArithmeticOverflow)?;
 
     // timestamp_target is in milliseconds, we need to convert it to seconds
     let timestamp_target_seconds = timestamp_target / 1000;
@@ -277,6 +288,21 @@ mod tests {
     }
 
     #[test]
+    fn test_calculate_absolute_timestamp_clock_rejects_slot_overflow() {
+        let epoch_info = create_test_epoch_info(1, 1000, 433_000);
+
+        let result = calculate_absolute_timestamp_clock(
+            u64::MAX,
+            1_000_000_000,
+            1,
+            &epoch_info,
+            &schedule(),
+        );
+
+        assert!(matches!(result, Err(TimeTravelError::ArithmeticOverflow)));
+    }
+
+    #[test]
     fn test_calculate_absolute_timestamp_clock_epoch_transition() {
         let epoch_info = create_test_epoch_info(1, 431_000, 863_000); // Near end of epoch 1
         let current_time = 1_000_000_000;
@@ -342,6 +368,15 @@ mod tests {
             clock.unix_timestamp,
             (current_time + (target_slot - epoch_info.absolute_slot) * slot_time) as i64 / 1_000
         );
+    }
+
+    #[test]
+    fn test_calculate_absolute_slot_clock_rejects_timestamp_overflow() {
+        let result = calculate_absolute_slot_clock(u64::MAX, 0, 0, 2, &schedule());
+        assert!(matches!(result, Err(TimeTravelError::ArithmeticOverflow)));
+
+        let result = calculate_absolute_slot_clock(1, 0, u64::MAX, 1, &schedule());
+        assert!(matches!(result, Err(TimeTravelError::ArithmeticOverflow)));
     }
 
     #[test]
@@ -414,6 +449,13 @@ mod tests {
                 as i64
                 / 1_000
         );
+    }
+
+    #[test]
+    fn test_calculate_absolute_epoch_clock_rejects_timestamp_overflow() {
+        let result = calculate_absolute_epoch_clock(2, 1, 432_000, u64::MAX - 10, 250, &schedule());
+
+        assert!(matches!(result, Err(TimeTravelError::ArithmeticOverflow)));
     }
 
     #[test]
