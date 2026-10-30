@@ -12,7 +12,7 @@ use surfpool_types::{
 };
 
 const SOL_DECIMALS: u32 = 9;
-const DEFAULT_TOKEN_AMOUNT: u64 = 100_000_000_000;
+const DEFAULT_TOKEN_AMOUNT: u64 = 100_000;
 const SOL_SYMBOL: &str = "SOL";
 
 #[derive(Serialize)]
@@ -438,5 +438,23 @@ mod tests {
                 "{mint}: {success:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn funds_sol_with_default_amount_when_amount_is_omitted() {
+        let (url, server) = canned_rpc();
+        let response = run(url, SeededAccount::new(None), None, None, None, None).await;
+        server.join().expect("canned rpc thread");
+
+        let success = response
+            .success
+            .unwrap_or_else(|| panic!("default SOL funding failed: {:?}", response.error));
+        assert!(matches!(
+            success.as_slice(),
+            [SetAccountSuccess::Sol(SolAccountUpdated {
+                lamports: 100_000_000_000_000,
+                ..
+            })]
+        ));
     }
 }
