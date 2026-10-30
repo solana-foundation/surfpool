@@ -2,9 +2,10 @@ use std::{
     collections::HashMap,
     str::FromStr,
     sync::{Arc, RwLock, atomic},
+    time::Duration,
 };
 
-use crossbeam_channel::TryRecvError;
+use crossbeam_channel::{Receiver, TryRecvError};
 use jsonrpc_core::{Error, ErrorCode, Result};
 use jsonrpc_derive::rpc;
 use jsonrpc_pubsub::{
@@ -26,6 +27,7 @@ use solana_pubkey::Pubkey;
 use solana_rpc_client_api::response::{Response as RpcResponse, SlotInfo, SlotUpdate};
 use solana_signature::Signature;
 use solana_transaction_status::UiTransactionEncoding;
+use tokio::sync::Notify;
 
 use super::{State, SurfnetRpcContext, SurfpoolWebsocketMeta};
 use crate::{
@@ -34,6 +36,34 @@ use crate::{
         GetTransactionResult, LocalSignatureStatusOrSubscription, SignatureSubscriptionType,
     },
 };
+
+/// How long a subscription task waits for a notification before it re-checks whether its
+/// subscription is still active.
+const SUBSCRIPTION_RECHECK: Duration = Duration::from_millis(50);
+
+/// `try_recv`, after waiting up to `timeout` for the SVM to signal `wake` if the channel is empty
+/// (or for `timeout` if it is disconnected, as the polling loops did).
+async fn recv_within<T>(
+    rx: &Receiver<T>,
+    wake: &Notify,
+    timeout: Duration,
+) -> std::result::Result<T, TryRecvError> {
+    let notified = wake.notified();
+    tokio::pin!(notified);
+    // Registered before the check, so a send between the check and the wait still wakes us.
+    notified.as_mut().enable();
+    match rx.try_recv() {
+        Err(TryRecvError::Empty) => {
+            let _ = tokio::time::timeout(timeout, notified).await;
+            rx.try_recv()
+        }
+        Err(TryRecvError::Disconnected) => {
+            tokio::time::sleep(timeout).await;
+            Err(TryRecvError::Disconnected)
+        }
+        received => received,
+    }
+}
 
 /// A notification for an update produced at `slot`.
 #[allow(clippy::disallowed_methods)] // notifications carry the slot of their event, not a read
@@ -1329,15 +1359,15 @@ impl Rpc for SurfpoolWsRpc {
                     return;
                 }
             };
+            let wake = svm_locker.subscription_wake();
 
             loop {
-                let (slot, some_err) = match rx.try_recv() {
+                let (slot, some_err) = match recv_within(&rx, &wake, SUBSCRIPTION_RECHECK).await {
                     Ok(msg) => msg,
                     Err(e) => {
                         match e {
                             TryRecvError::Empty => {
                                 // no update yet, continue
-                                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
                                 continue;
                             }
                             TryRecvError::Disconnected => {
@@ -1484,6 +1514,7 @@ impl Rpc for SurfpoolWsRpc {
 
             // subscribe to account updates
             let rx = svm_locker.subscribe_for_account_updates(&pubkey, config.encoding);
+            let wake = svm_locker.subscription_wake();
 
             loop {
                 // if the subscription has been removed, break the loop
@@ -1496,8 +1527,8 @@ impl Rpc for SurfpoolWsRpc {
                     break;
                 }
 
-                let Ok((slot, ui_account)) = rx.try_recv() else {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                let Ok((slot, ui_account)) = recv_within(&rx, &wake, SUBSCRIPTION_RECHECK).await
+                else {
                     continue;
                 };
 
@@ -1594,6 +1625,7 @@ impl Rpc for SurfpoolWsRpc {
             }
 
             let rx = svm_locker.subscribe_for_slot_updates();
+            let wake = svm_locker.subscription_wake();
 
             loop {
                 // if the subscription has been removed, break the loop
@@ -1606,8 +1638,7 @@ impl Rpc for SurfpoolWsRpc {
                     break;
                 }
 
-                let Ok(slot_info) = rx.try_recv() else {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                let Ok(slot_info) = recv_within(&rx, &wake, SUBSCRIPTION_RECHECK).await else {
                     continue;
                 };
 
@@ -1696,6 +1727,7 @@ impl Rpc for SurfpoolWsRpc {
             }
 
             let rx = svm_locker.subscribe_for_logs_updates(&commitment, &mentions);
+            let wake = svm_locker.subscription_wake();
 
             loop {
                 // if the subscription has been removed, break the loop
@@ -1708,8 +1740,7 @@ impl Rpc for SurfpoolWsRpc {
                     break;
                 }
 
-                let Ok((slot, value)) = rx.try_recv() else {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                let Ok((slot, value)) = recv_within(&rx, &wake, SUBSCRIPTION_RECHECK).await else {
                     continue;
                 };
 
@@ -1862,6 +1893,7 @@ impl Rpc for SurfpoolWsRpc {
                 config.encoding,
                 config.filters,
             );
+            let wake = svm_locker.subscription_wake();
 
             loop {
                 // if the subscription has been removed, break the loop
@@ -1874,8 +1906,8 @@ impl Rpc for SurfpoolWsRpc {
                     break;
                 }
 
-                let Ok((slot, keyed_account)) = rx.try_recv() else {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                let Ok((slot, keyed_account)) = recv_within(&rx, &wake, SUBSCRIPTION_RECHECK).await
+                else {
                     continue;
                 };
 
@@ -1976,6 +2008,7 @@ impl Rpc for SurfpoolWsRpc {
             }
 
             let rx = svm_locker.subscribe_for_slots_updates();
+            let wake = svm_locker.subscription_wake();
 
             loop {
                 // if the subscription has been removed, break the loop
@@ -1988,8 +2021,7 @@ impl Rpc for SurfpoolWsRpc {
                     break;
                 }
 
-                let Ok(slot_update) = rx.try_recv() else {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                let Ok(slot_update) = recv_within(&rx, &wake, SUBSCRIPTION_RECHECK).await else {
                     continue;
                 };
 
@@ -2125,6 +2157,7 @@ impl Rpc for SurfpoolWsRpc {
             // Subscribe to snapshot import updates
             // The locker will send the Started notification through the channel
             let rx = svm_locker.subscribe_for_snapshot_import_updates(&snapshot_url, &snapshot_id);
+            let wake = svm_locker.subscription_wake();
 
             loop {
                 // if the subscription has been removed, break the loop
@@ -2137,8 +2170,8 @@ impl Rpc for SurfpoolWsRpc {
                     break;
                 }
 
-                let Ok(notification) = rx.try_recv() else {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                let Ok(notification) = recv_within(&rx, &wake, Duration::from_millis(100)).await
+                else {
                     continue;
                 };
 
@@ -2248,6 +2281,78 @@ mod tests {
             notification["params"]["result"]["context"]["slot"],
             update_slot
         );
+    }
+
+    /// The task wakes on each update instead of on its next poll, and exits on unsubscribe.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn account_subscription_wakes_on_update_and_ends_on_unsubscribe() {
+        use jsonrpc_core::futures::StreamExt;
+
+        let setup = crate::tests::helpers::TestSetup::new(crate::rpc::minimal::SurfpoolMinimalRpc);
+        let locker = setup.context.svm_locker.clone();
+        // A runtime of its own, so its only task is the subscription's.
+        let subscription_runtime = tokio::runtime::Runtime::new().unwrap();
+        let rpc = SurfpoolWsRpc {
+            uid: atomic::AtomicUsize::new(0),
+            signature_subscription_map: Default::default(),
+            account_subscription_map: Default::default(),
+            program_subscription_map: Default::default(),
+            slot_subscription_map: Default::default(),
+            slots_updates_subscription_map: Default::default(),
+            logs_subscription_map: Default::default(),
+            snapshot_subscription_map: Default::default(),
+            tokio_handle: subscription_runtime.handle().clone(),
+        };
+        let pubkey = Pubkey::new_unique();
+        let (subscriber, id_rx, mut notifications) = Subscriber::new_test("accountSubscribe");
+        rpc.account_subscribe(
+            Some(SurfpoolWebsocketMeta::new(setup.context.clone(), None)),
+            subscriber,
+            pubkey.to_string(),
+            None,
+        );
+        let sub_id = id_rx.await.unwrap().unwrap();
+        let subscribed =
+            || locker.with_svm_reader(|svm| svm.account_subscriptions.contains_key(&pubkey));
+        while !subscribed() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let set_lamports = |lamports| {
+            locker
+                .with_svm_writer(|svm| {
+                    svm.set_account(
+                        &pubkey,
+                        solana_account::Account {
+                            lamports,
+                            ..Default::default()
+                        },
+                    )
+                })
+                .unwrap()
+        };
+
+        // Each update follows the previous notification, which is when a polling task sleeps.
+        let mut fastest = Duration::MAX;
+        for lamports in 1..=4 {
+            let sent = std::time::Instant::now();
+            set_lamports(lamports);
+            tokio::time::timeout(Duration::from_secs(5), notifications.next())
+                .await
+                .unwrap()
+                .unwrap();
+            if lamports > 1 {
+                fastest = fastest.min(sent.elapsed());
+            }
+        }
+        assert!(fastest < Duration::from_millis(25), "{fastest:?}");
+
+        rpc.account_unsubscribe(None, sub_id).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while subscription_runtime.metrics().num_alive_tasks() > 0 {
+            assert!(std::time::Instant::now() < deadline, "task still running");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        subscription_runtime.shutdown_background();
     }
 
     #[tokio::test(flavor = "multi_thread")]

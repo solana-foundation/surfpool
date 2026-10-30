@@ -214,7 +214,7 @@ impl SurfnetSvmLocker {
     /// slot, epoch info, and blockhash along with the closure's result.
     fn with_contextualized_svm_reader<T, F>(&self, reader: F) -> SvmAccessContext<T>
     where
-        F: Fn(&SurfnetSvm) -> T + Send + Sync,
+        F: FnOnce(&SurfnetSvm) -> T + Send + Sync,
         T: Send + 'static,
     {
         let read_lock = self.0.clone();
@@ -2073,26 +2073,12 @@ impl SurfnetSvmLocker {
         let loaded_addresses = tx_loaded_addresses.as_ref().map(|l| l.loaded_addresses());
 
         let ix_profiles = if self.is_instruction_profiling_enabled() {
-            match self
-                .generate_instruction_profiles(
-                    &transaction,
-                    &transaction_accounts,
-                    &tx_loaded_addresses,
-                    &accounts_before,
-                    &token_accounts_before,
-                    &token_programs,
-                    pre_execution_capture.clone(),
-                    &status_tx,
-                )
-                .await
-            {
-                Ok(profiles) => profiles,
-                Err(e) => {
-                    self.simnet_events_tx()
-                        .error(format!("Failed to generate instruction profiles: {}", e));
-                    None
-                }
-            }
+            self.generate_instruction_profiles(
+                &transaction,
+                &transaction_accounts,
+                &tx_loaded_addresses,
+                pre_execution_capture.clone(),
+            )
         } else {
             None
         };
@@ -2122,22 +2108,17 @@ impl SurfnetSvmLocker {
         ))
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn generate_instruction_profiles(
+    fn generate_instruction_profiles(
         &self,
         transaction: &VersionedTransaction,
         transaction_accounts: &[Pubkey],
         loaded_addresses: &Option<TransactionLoadedAddresses>,
-        accounts_before: &[Option<Account>],
-        token_accounts_before: &[(usize, TokenAccount)],
-        token_programs: &[Pubkey],
         pre_execution_capture: ExecutionCapture,
-        status_tx: &Sender<TransactionStatusEvent>,
-    ) -> SurfpoolResult<Option<Vec<ProfileResult>>> {
+    ) -> Option<Vec<ProfileResult>> {
         let instructions = transaction.message.instructions();
         let ix_count = instructions.len();
         if ix_count == 0 {
-            return Ok(None);
+            return None;
         }
         // Extract account categories from original transaction
 
@@ -2161,7 +2142,7 @@ impl SurfnetSvmLocker {
 
             let Some(partial_tx) = partial_transaction_res else {
                 debug!("Unable to create partial transaction");
-                return Ok(None);
+                return None;
             };
 
             let mut previous_execution_captures = ExecutionCapture::new();
@@ -2173,10 +2154,6 @@ impl SurfnetSvmLocker {
                 previous_log_count += result.log_messages.as_ref().map(|m| m.len()).unwrap_or(0);
             }
 
-            let skip_preflight = true;
-            let sigverify = false;
-            let do_propagate = false;
-
             let mut pre_execution_capture_cursor = pre_execution_capture.clone();
             // If a pre-execution capture was provided, any pubkeys that are in the capture
             // that we just took should be replaced with those from the pre-execution capture.
@@ -2187,35 +2164,50 @@ impl SurfnetSvmLocker {
                     pre_execution_capture_cursor.insert(pubkey, pre_account);
                 }
             }
-            let mut svm_clone = self.with_svm_reader(|svm_reader| svm_reader.clone_for_profiling());
-
-            let (dummy_simnet_tx, _) = SimnetEventsTx::channel(1);
-            let (dummy_geyser_tx, _) = crossbeam_channel::bounded(1);
-            svm_clone.simnet_events_tx = dummy_simnet_tx;
-            svm_clone.geyser_events_tx = dummy_geyser_tx;
-
-            let svm_locker = SurfnetSvmLocker::new(svm_clone);
-            let mut profile_result = svm_locker
-                .process_transaction_internal(
-                    partial_tx,
-                    skip_preflight,
-                    sigverify,
-                    transaction_accounts,
-                    &loaded_addresses.as_ref().map(|l| l.loaded_addresses()),
-                    accounts_before,
-                    token_accounts_before,
-                    token_programs,
-                    pre_execution_capture_cursor,
-                    status_tx,
-                    do_propagate,
-                )
-                .await?;
+            // Simulating runs the prefix against the live state without committing it, so no
+            // sandbox copy of the SVM is needed.
+            let mut profile_result = self.with_svm_reader(|svm_reader| {
+                match svm_reader.simulate_transaction(partial_tx, false) {
+                    Ok(SimulatedTransactionInfo {
+                        meta,
+                        post_accounts,
+                    }) => {
+                        // A committed run would store the writable accounts (dropping those left
+                        // with no lamports) and leave the others unchanged.
+                        let mut post_accounts =
+                            post_accounts.into_iter().collect::<HashMap<_, _>>();
+                        let post_execution_capture = ix_required_accounts
+                            .iter()
+                            .map(|pubkey| {
+                                let account = match post_accounts.remove(pubkey) {
+                                    Some(account) => {
+                                        (account.lamports() > 0).then(|| account.into())
+                                    }
+                                    None => svm_reader.inner.get_account_no_db(pubkey),
+                                };
+                                (*pubkey, account)
+                            })
+                            .collect();
+                        ProfileResult::new(
+                            pre_execution_capture_cursor,
+                            post_execution_capture,
+                            meta.compute_units_consumed,
+                            Some(meta.logs),
+                            None,
+                        )
+                    }
+                    Err(FailedTransactionMetadata { err, meta }) => ProfileResult::new(
+                        pre_execution_capture_cursor,
+                        BTreeMap::new(),
+                        meta.compute_units_consumed,
+                        Some(meta.logs),
+                        Some(err.to_string()),
+                    ),
+                }
+            });
 
             profile_result
                 .pre_execution_capture
-                .retain(|pubkey, _| ix_required_accounts.contains(pubkey));
-            profile_result
-                .post_execution_capture
                 .retain(|pubkey, _| ix_required_accounts.contains(pubkey));
 
             profile_result.compute_units_consumed = profile_result
@@ -2230,7 +2222,7 @@ impl SurfnetSvmLocker {
             ix_profile_results.push(profile_result);
         }
 
-        Ok(Some(ix_profile_results))
+        Some(ix_profile_results)
     }
 
     fn handle_simulation_failure(
@@ -3772,7 +3764,7 @@ impl SurfnetSvmLocker {
             Ok::<_, SurfpoolError>(filtered)
         })?;
 
-        Ok(self.with_contextualized_svm_reader(|_| res.clone()))
+        Ok(self.with_contextualized_svm_reader(move |_| res))
     }
 
     pub fn encode_ui_account(
@@ -4125,6 +4117,11 @@ impl SurfnetSvmLocker {
         })
     }
 
+    /// The notifier signalled after subscription notifications are sent.
+    pub(crate) fn subscription_wake(&self) -> Arc<tokio::sync::Notify> {
+        self.with_svm_reader(|svm_reader| svm_reader.subscription_wake.clone())
+    }
+
     /// Subscribes for snapshot import updates and returns a receiver of snapshot import notifications.
     /// This method spawns a background task that fetches the snapshot and loads it via `load_snapshot`.
     pub fn subscribe_for_snapshot_import_updates(
@@ -4141,9 +4138,14 @@ impl SurfnetSvmLocker {
         let snapshot_url = snapshot_url.to_string();
         let snapshot_id = snapshot_id.to_string();
 
+        let wake = self.subscription_wake();
+        let send = move |notification| {
+            let _ = tx.send(notification);
+            wake.notify_waiters();
+        };
         tokio::spawn(async move {
             // Send initial notification
-            let _ = tx.send(super::SnapshotImportNotification {
+            send(super::SnapshotImportNotification {
                 snapshot_id: snapshot_id.clone(),
                 status: super::SnapshotImportStatus::Started,
                 accounts_loaded: 0,
@@ -4155,7 +4157,7 @@ impl SurfnetSvmLocker {
             let snapshot_data = match SurfnetSvm::fetch_snapshot_from_url(&snapshot_url).await {
                 Ok(data) => data,
                 Err(e) => {
-                    let _ = tx.send(super::SnapshotImportNotification {
+                    send(super::SnapshotImportNotification {
                         snapshot_id,
                         status: super::SnapshotImportStatus::Failed,
                         accounts_loaded: 0,
@@ -4169,7 +4171,7 @@ impl SurfnetSvmLocker {
             let total_accounts = snapshot_data.len() as u64;
 
             // Send progress notification with total count
-            let _ = tx.send(super::SnapshotImportNotification {
+            send(super::SnapshotImportNotification {
                 snapshot_id: snapshot_id.clone(),
                 status: super::SnapshotImportStatus::InProgress,
                 accounts_loaded: 0,
@@ -4183,7 +4185,7 @@ impl SurfnetSvmLocker {
                 .await
             {
                 Ok(loaded_count) => {
-                    let _ = tx.send(super::SnapshotImportNotification {
+                    send(super::SnapshotImportNotification {
                         snapshot_id,
                         status: super::SnapshotImportStatus::Completed,
                         accounts_loaded: loaded_count as u64,
@@ -4192,7 +4194,7 @@ impl SurfnetSvmLocker {
                     });
                 }
                 Err(e) => {
-                    let _ = tx.send(super::SnapshotImportNotification {
+                    send(super::SnapshotImportNotification {
                         snapshot_id,
                         status: super::SnapshotImportStatus::Failed,
                         accounts_loaded: 0,

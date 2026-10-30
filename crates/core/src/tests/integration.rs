@@ -10747,6 +10747,24 @@ async fn test_profile_transaction_does_not_mutate_state(test_type: TestType) {
         plugin_commands_tx,
     };
 
+    // Storage that profiling must leave untouched (profiling only records its own result).
+    let storage_snapshot = |svm: &SurfnetSvm| {
+        let mut owners: Vec<_> = svm.accounts_by_owner.into_iter().unwrap().collect();
+        owners.sort();
+        let mut transactions = svm.transactions.keys().unwrap();
+        transactions.sort();
+        let mut idls = svm.registered_idls.keys().unwrap();
+        idls.sort();
+        (
+            owners,
+            transactions,
+            idls,
+            svm.executed_transaction_profiles.keys().unwrap(),
+        )
+    };
+    let initial_storage = svm_locker.with_svm_reader(storage_snapshot);
+    let mut first_profile: Option<UiKeyedProfileResult> = None;
+
     // Profile the transaction multiple times to ensure no state leakage
     for i in 0..3 {
         let response: JsonRpcResult<RpcResponse<UiKeyedProfileResult>> = rpc_server
@@ -10765,13 +10783,20 @@ async fn test_profile_transaction_does_not_mutate_state(test_type: TestType) {
             response.err()
         );
 
-        let profile_result = response.unwrap().value;
+        let mut profile_result = response.unwrap().value;
         assert!(
             profile_result.transaction_profile.error_message.is_none(),
             "Profile {} had unexpected error: {:?}",
             i,
             profile_result.transaction_profile.error_message
         );
+        match &first_profile {
+            Some(first) => {
+                profile_result.key = first.key;
+                assert_eq!(&profile_result, first, "Profile {i} differs from the first");
+            }
+            None => first_profile = Some(profile_result.clone()),
+        }
 
         // The profile should show the transaction would succeed
         assert!(
@@ -10782,6 +10807,11 @@ async fn test_profile_transaction_does_not_mutate_state(test_type: TestType) {
     }
 
     // Verify state is UNCHANGED after profiling
+    assert_eq!(
+        svm_locker.with_svm_reader(storage_snapshot),
+        initial_storage,
+        "Profiling must not change the live storage"
+    );
     let final_transactions_processed = svm_locker.with_svm_reader(|svm| svm.transactions_processed);
     let final_payer_account = svm_locker
         .with_svm_reader(|svm| svm.get_account(&payer.pubkey()))
@@ -10978,7 +11008,7 @@ async fn test_instruction_profiling_does_not_mutate_state(test_type: TestType) {
     // NOW THE CRITICAL PART: Verify that instruction profiling didn't leak state
     // Even though the first instruction was profiled successfully, its effects
     // should NOT be persisted because:
-    // 1. The instruction profiling uses clone_for_profiling() with OverlayStorage
+    // 1. Instruction profiling simulates each prefix, which never commits
     // 2. The overall transaction failed, so no state changes are committed
     //
     // Note: Failed transactions in Solana still deduct fees from the fee payer.
@@ -10997,8 +11027,8 @@ async fn test_instruction_profiling_does_not_mutate_state(test_type: TestType) {
 
     // THE KEY ASSERTION: Recipient should NOT have received funds
     // This proves that the first instruction's transfer (which was profiled successfully)
-    // was NOT committed to the actual state. The instruction profiling used
-    // clone_for_profiling() so its mutations were isolated.
+    // was NOT committed to the actual state. Instruction profiling simulates each
+    // prefix, so its mutations were never committed.
     assert_eq!(
         initial_recipient_account.as_ref().map(|a| a.lamports),
         final_recipient_account.as_ref().map(|a| a.lamports),

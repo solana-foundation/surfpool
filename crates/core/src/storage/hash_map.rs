@@ -45,4 +45,17 @@ where
     fn count(&self) -> super::StorageResult<u64> {
         Ok(self.len() as u64)
     }
+
+    fn modify(
+        &mut self,
+        key: K,
+        f: &mut dyn FnMut(&mut Option<V>) -> bool,
+    ) -> super::StorageResult<()> {
+        let mut value = self.remove(&key);
+        f(&mut value);
+        if let Some(value) = value {
+            self.insert(key, value);
+        }
+        Ok(())
+    }
 }
