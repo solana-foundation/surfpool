@@ -1555,6 +1555,7 @@ pub enum TimeTravelError {
     PastEpoch { target: u64, current: u64 },
     ZeroSlotTime,
     ZeroSlotsInEpoch,
+    ArithmeticOverflow,
 }
 
 impl std::fmt::Display for TimeTravelError {
@@ -1586,6 +1587,12 @@ impl std::fmt::Display for TimeTravelError {
             }
             TimeTravelError::ZeroSlotsInEpoch => {
                 write!(f, "Cannot calculate time travel with zero slots in epoch")
+            }
+            TimeTravelError::ArithmeticOverflow => {
+                write!(
+                    f,
+                    "Cannot calculate time travel because the target is too large"
+                )
             }
         }
     }
