@@ -237,6 +237,13 @@ impl HistoricalFork {
         }
     }
 
+    pub(crate) fn send_simulated(
+        &self,
+        tx: &VersionedTransaction,
+    ) -> SurfpoolResult<TransactionResult> {
+        self.vm.send_simulated(tx)
+    }
+
     /// Simulates through SVM Replay, which verifies signatures when `sig_verify` and returns the
     /// post-execution images of every account the transaction loads.
     pub(crate) fn simulate(
@@ -707,6 +714,12 @@ mod tests {
     mod scenarios;
 
     #[cfg(unix)]
+    mod clock;
+
+    #[cfg(unix)]
+    mod slot_stream;
+
+    #[cfg(unix)]
     mod security_admission {
         use super::*;
 
@@ -764,7 +777,11 @@ for line in sys.stdin:
     elif isinstance(op, dict) and op.get('command', {}).get('method') == 'rpcSend' and req['branch'] == 1:
         result = {'output':{'normalizedError':None,'logs':[],'computeUnits':0,
                   'fee':'5000','returnData':None,'instructionTrace':{'groups':[]}}}
-    elif isinstance(op, dict) and op.get('command', {}).get('method') in ('send', 'rpcSend', 'overrideAccounts'):
+    elif isinstance(op, dict) and op.get('command', {}).get('method') == 'rpcSimulate' and os.path.exists(os.path.join(os.path.dirname(log), 'reject-expired')):
+        result = {'output':{'normalizedError':json.dumps('BlockhashNotFound'),
+                  'logs':[],'computeUnits':0,'fee':None,'returnData':None,
+                  'instructionTrace':{'groups':[]}}}
+    elif isinstance(op, dict) and op.get('command', {}).get('method') in ('send', 'rpcSend', 'rpcSimulate', 'overrideAccounts'):
         if op['command']['method'] == 'overrideAccounts':
             installs += 1
             if len(keys) == 1 and installs > 1:
@@ -822,6 +839,45 @@ for line in sys.stdin:
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => vec![],
                 Err(error) => panic!("cannot read IPC transcript: {error}"),
             }
+        }
+
+        #[test]
+        fn unsigned_bundle_steps_require_engine_lifetime_admission() {
+            let (fork, dir) = ipc_fixture(0);
+            let error = fork
+                .send_simulated(&solana_transaction::versioned::VersionedTransaction::default())
+                .unwrap_err();
+            assert_eq!(error.historical_code(), Some("TEST_RUNTIME_REFUSAL"));
+            let requests = ipc_requests(&dir);
+            assert_eq!(requests.len(), 1, "refusal must prevent an unverified send");
+            assert_eq!(requests[0]["op"]["command"]["method"], "rpcSimulate");
+            assert_eq!(requests[0]["op"]["command"]["params"]["sigVerify"], false);
+            assert_eq!(
+                requests[0]["op"]["command"]["params"]["replaceRecentBlockhash"],
+                false
+            );
+        }
+
+        #[test]
+        fn unsigned_bundle_preserves_engine_lifetime_rejection_without_sending() {
+            let (fork, dir) = ipc_fixture(0);
+            std::fs::write(dir.path().join("reject-expired"), b"").unwrap();
+            let tx = solana_transaction::versioned::VersionedTransaction {
+                signatures: vec![Default::default()],
+                ..Default::default()
+            };
+            let failure = fork.send_simulated(&tx).unwrap().unwrap_err();
+            assert_eq!(
+                failure.err,
+                solana_transaction_error::TransactionError::BlockhashNotFound
+            );
+            let requests = ipc_requests(&dir);
+            assert_eq!(
+                requests.len(),
+                1,
+                "rejection must prevent an unverified send"
+            );
+            assert_eq!(requests[0]["op"]["command"]["method"], "rpcSimulate");
         }
 
         #[test]

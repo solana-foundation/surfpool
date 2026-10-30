@@ -591,7 +591,7 @@ impl Jito for SurfpoolJitoRpc {
             // The context slot is the processed slot of the state the sandbox clones.
             let (read, bundle_sandbox) = ctx.svm_locker.with_svm_reader(|svm_reader| {
                 let read = svm_reader.read_slot(Some(CommitmentConfig::processed()), None)?;
-                Ok::<_, Error>((read, svm_reader.clone_for_bundle_sandbox()?))
+                Ok::<_, Error>((read, svm_reader.clone_for_bundle_simulation()?))
             })?;
             let BundleSandbox {
                 svm: sandbox_svm,
@@ -711,9 +711,7 @@ impl Jito for SurfpoolJitoRpc {
                         tx,
                         &status_tx,
                         skip_preflight,
-                        // sigverify=false: we already verified above when the
-                        // caller asked for it. Avoids double-work on the hot path.
-                        false,
+                        sigverify,
                         true, // do_propagate -> status_rx receives typed errors
                     )
                     .await;
@@ -749,13 +747,8 @@ impl Jito for SurfpoolJitoRpc {
                                 Ok(TransactionStatusEvent::ExecutionFailure((err, _meta))) => {
                                     Some(err)
                                 }
-                                // VerificationFailure → SignatureFailure: matches
-                                // svm::sigverify and the single-tx simulate path
-                                // in full.rs. Unreachable in our flow (we run the
-                                // inner call with sigverify=false after pre-passing
-                                // it ourselves, so the locker's sigverify gate
-                                // can't fire), but kept for exhaustiveness against
-                                // future locker changes.
+                                // Match the single-transaction simulation's typed
+                                // signature error if the inner verifier refuses.
                                 Ok(TransactionStatusEvent::VerificationFailure(_)) => Some(
                                     solana_transaction_error::TransactionError::SignatureFailure,
                                 ),

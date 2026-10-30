@@ -2,6 +2,92 @@ use super::*;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs the same staged backend and cached history as the other historical SDK tests"]
+async fn historical_bundle_simulation_preserves_isolation_and_signature_checks() {
+    use base64::Engine;
+    use serde_json::{Value, json};
+    use solana_client::rpc_request::RpcRequest;
+
+    let mut surfnet = Surfnet::builder()
+        .historical(options())
+        .start()
+        .await
+        .unwrap();
+    let recipient = Keypair::new();
+    let destination = Keypair::new().pubkey();
+    define(&surfnet, &recipient.pubkey(), 1_000_000);
+    define(&surfnet, &destination, 1_000_000);
+    let client = surfnet.rpc_client();
+    let blockhash = client.get_latest_blockhash().unwrap();
+    let encode = |tx: &Transaction| {
+        base64::engine::general_purpose::STANDARD.encode(bincode::serialize(tx).unwrap())
+    };
+    let first = Transaction::new_signed_with_payer(
+        &[transfer(
+            &surfnet.payer().pubkey(),
+            &recipient.pubkey(),
+            2_000_000,
+        )],
+        Some(&surfnet.payer().pubkey()),
+        &[surfnet.payer()],
+        blockhash,
+    );
+    let second = Transaction::new_signed_with_payer(
+        &[transfer(&recipient.pubkey(), &destination, 2_000_000)],
+        Some(&recipient.pubkey()),
+        &[&recipient],
+        blockhash,
+    );
+    let simulate = |transactions: Vec<String>, config: Value| {
+        client.send::<Value>(
+            RpcRequest::Custom {
+                method: "simulateBundle",
+            },
+            json!([{ "encodedTransactions": transactions }, config]),
+        )
+    };
+    let valid = simulate(
+        vec![encode(&first), encode(&second)],
+        json!({"skipSigVerify":false}),
+    );
+    let mut unsigned = first.clone();
+    unsigned.signatures[0] = Default::default();
+    let accepted_unsigned = simulate(vec![encode(&unsigned)], json!({"skipSigVerify":true}));
+    let rejected_unsigned = simulate(vec![encode(&unsigned)], json!({"skipSigVerify":false}));
+    let slot = client.get_slot().unwrap();
+    surfnet.cheatcodes().time_travel_to_slot(slot + 1).unwrap();
+    let replacement_hash = client.get_latest_blockhash().unwrap();
+    assert_ne!(replacement_hash, blockhash);
+    let replaced = simulate(
+        vec![encode(&first)],
+        json!({"skipSigVerify":true,"replaceRecentBlockhash":true}),
+    );
+    let live_balance = client.get_balance(&recipient.pubkey()).unwrap();
+    let live_destination = client.get_balance(&destination).unwrap();
+    surfnet.stop().unwrap();
+    let valid = valid.expect("valid historical bundles simulate");
+    assert_eq!(valid["value"]["summary"], "succeeded", "{valid}");
+    let accepted_unsigned = accepted_unsigned.unwrap();
+    assert_eq!(
+        accepted_unsigned["value"]["summary"], "succeeded",
+        "{accepted_unsigned}"
+    );
+    let rejected_unsigned = rejected_unsigned.unwrap();
+    assert_eq!(
+        rejected_unsigned["value"]["transactionResults"][0]["err"], "SignatureFailure",
+        "{rejected_unsigned}"
+    );
+    let replaced = replaced.unwrap();
+    assert_eq!(replaced["value"]["summary"], "succeeded", "{replaced}");
+    assert_eq!(
+        replaced["value"]["transactionResults"][0]["replacementBlockhash"]["blockhash"],
+        replacement_hash.to_string()
+    );
+    assert_eq!(live_balance, 1_000_000);
+    assert_eq!(live_destination, 1_000_000);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs the same staged backend and cached history as the other historical SDK tests"]
 async fn review_repeated_airdrops_and_absolute_time_travel() {
     let mut surfnet = Surfnet::builder()
         .historical(options())

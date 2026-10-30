@@ -192,7 +192,7 @@ pub(super) fn seal_startup_plan(
 /// Everything the planner learned about the project before sealing: the task
 /// list to seal, the work to dispatch, and the context the artifact watcher
 /// needs to re-execute runbooks later.
-struct StartupPlan {
+pub(super) struct StartupPlan {
     progress_tx: Sender<BlockEvent>,
     progress_rx: Receiver<BlockEvent>,
     futures: RunbookExecutionFutures,
@@ -208,7 +208,7 @@ struct StartupPlan {
 /// Inspects the project, scaffolds runbooks as the execution mode requires,
 /// and assembles the startup plan. Never touches the startup machine: a
 /// failure leaves it in Planning-unsealed for the caller to fail explicitly.
-async fn plan_startup(
+pub(super) async fn plan_startup(
     cmd: &StartSimnet,
     simnet_events_tx: &SimnetEventsTx,
 ) -> Result<StartupPlan, String> {
@@ -343,7 +343,13 @@ pub(super) async fn plan_and_dispatch_startup(
     cmd: &StartSimnet,
     simnet_events_tx: &SimnetEventsTx,
     simnet_commands_tx: &Sender<SimnetCommand>,
+    prepared: Option<Result<StartupPlan, String>>,
 ) -> Result<Receiver<BlockEvent>, StartupPlanFailure> {
+    let plan = match prepared {
+        Some(plan) => plan,
+        None => plan_startup(cmd, simnet_events_tx).await,
+    }
+    .map_err(StartupPlanFailure::Planning)?;
     let StartupPlan {
         progress_tx,
         progress_rx,
@@ -355,9 +361,7 @@ pub(super) async fn plan_and_dispatch_startup(
         in_memory_runbook_data,
         runbook_input,
         dev_skill_install,
-    } = plan_startup(cmd, simnet_events_tx)
-        .await
-        .map_err(StartupPlanFailure::Planning)?;
+    } = plan;
 
     // Seal before dispatching anything: from here on, only the registered
     // tasks' transitions can move readiness.

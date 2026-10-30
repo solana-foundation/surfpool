@@ -23,8 +23,8 @@ use solana_client::{
     rpc_filter::RpcFilterType,
     rpc_request::{MAX_GET_CONFIRMED_SIGNATURES_FOR_ADDRESS2_LIMIT, TokenAccountsFilter},
     rpc_response::{
-        RpcAccountBalance, RpcConfirmedTransactionStatusWithSignature, RpcKeyedAccount,
-        RpcLogsResponse, RpcTokenAccountBalance,
+        RpcAccountBalance, RpcBlockUpdate, RpcConfirmedTransactionStatusWithSignature,
+        RpcKeyedAccount, RpcLogsResponse, RpcTokenAccountBalance,
     },
 };
 use solana_clock::{Clock, Slot, UnixTimestamp};
@@ -2241,7 +2241,9 @@ impl SurfnetSvmLocker {
         sigverify: bool,
         do_propagate: bool,
     ) -> SurfpoolResult<KeyedProfileResult> {
-        if self.is_historical() && !sigverify {
+        if !sigverify
+            && self.with_svm_reader(|svm| svm.inner.is_historical() && !svm.disposable_simulation)
+        {
             return Err(super::backend::engine_owned(
                 "skipping signatures for a live send",
             ));
@@ -4756,9 +4758,9 @@ impl SurfnetSvmLocker {
     /// One tick of a resumed historical clock: one local slot inside SVM Replay, its time
     /// moving by the slot time as Surfpool's own blocks do. A tick never warps epochs.
     pub fn advance_historical_tick(&self) -> SurfpoolResult<EpochInfo> {
-        let (updated_at, slot_time) =
-            self.with_svm_reader(|svm_reader| (svm_reader.updated_at, svm_reader.slot_time));
-        self.advance_historical(1, Some(updated_at + slot_time), false)
+        self.with_svm_writer(|svm| {
+            svm.advance_historical(1, Some(svm.updated_at + svm.slot_time), false)
+        })
     }
 
     /// Subscribes for signature updates (confirmed/finalized) and returns a receiver of events.
@@ -4827,6 +4829,18 @@ impl SurfnetSvmLocker {
     ) -> Receiver<(Slot, RpcLogsResponse)> {
         self.with_svm_writer(|svm_writer| {
             svm_writer.subscribe_for_logs_updates(commitment_level, filter)
+        })
+    }
+
+    /// Subscribes for `blockSubscribe` notifications and returns a receiver of block updates.
+    pub fn subscribe_for_block_updates(
+        &self,
+        commitment_level: CommitmentLevel,
+        mentions: Option<Pubkey>,
+        config: RpcBlockConfig,
+    ) -> Arc<Receiver<RpcBlockUpdate>> {
+        self.with_svm_writer(|svm_writer| {
+            svm_writer.subscribe_for_block_updates(commitment_level, mentions, config)
         })
     }
 

@@ -6,9 +6,9 @@ use locker::SurfnetSvmLocker;
 use solana_account::Account;
 use solana_account_decoder::{UiAccount, UiAccountEncoding};
 use solana_client::{
-    rpc_config::RpcTransactionLogsFilter,
+    rpc_config::{RpcBlockConfig, RpcTransactionLogsFilter},
     rpc_filter::RpcFilterType,
-    rpc_response::{RpcKeyedAccount, RpcLogsResponse},
+    rpc_response::{RpcBlockUpdate, RpcKeyedAccount, RpcLogsResponse},
 };
 use solana_clock::Slot;
 use solana_commitment_config::CommitmentLevel;
@@ -54,6 +54,8 @@ pub type AccountFactory = Box<dyn Fn(SurfnetSvmLocker) -> GetAccountResult + Sen
 /// Mirrors `agave_geyser_plugin_interface::geyser_plugin_interface::SlotStatus`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GeyserSlotStatus {
+    /// Slot is open on its parent block
+    CreatedBank,
     /// Slot is being processed
     Processed,
     /// Slot has been rooted (finalized)
@@ -210,6 +212,16 @@ pub type LogsSubscriptionData = (
     CommitmentLevel,
     RpcTransactionLogsFilter,
     Sender<(Slot, RpcLogsResponse)>,
+);
+
+/// A `blockSubscribe` subscription: its commitment, the account its blocks must mention, if any,
+/// how to encode them, and its receiver, gone once the subscriber unsubscribes.
+pub type BlockSubscriptionData = (
+    CommitmentLevel,
+    Option<Pubkey>,
+    RpcBlockConfig,
+    Sender<RpcBlockUpdate>,
+    std::sync::Weak<Receiver<RpcBlockUpdate>>,
 );
 
 pub type SnapshotSubscriptionData = Sender<SnapshotImportNotification>;

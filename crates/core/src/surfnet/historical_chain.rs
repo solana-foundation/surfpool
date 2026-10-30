@@ -18,7 +18,7 @@ use solana_rpc_client_api::response::{RpcPerfSample, SlotTransactionStats, SlotU
 use solana_signature::Signature;
 
 use super::{
-    BlockHeader, BlockIdentifier, GeyserEvent, GeyserSlotStatus,
+    BlockHeader, BlockIdentifier, GeyserSlotStatus,
     backend::HistoricalSession,
     svm::{
         HISTORICAL_JOURNAL_CHECKPOINT, HISTORICAL_REVISION_CHECKPOINT, HISTORICAL_SLOT_CHECKPOINT,
@@ -467,6 +467,7 @@ impl SurfnetSvm {
             SurfpoolError::internal("a historical fork's current block is not open")
         })?;
         header.hash = blockhash.to_string();
+        let parent_of_closed = header.parent_slot;
         // The closed block is one performance sample of the fork's own transactions, as each
         // produced block is in normal mode; archived history has no local samples.
         let num_transactions = header.signatures.len() as u64;
@@ -514,14 +515,19 @@ impl SurfnetSvm {
         for slot in scheduled {
             complete_without_datasource(self.materialize_overrides_for_slot(&None, slot))?;
         }
-        self.publish_historical_slot(parent_slot, new_slot)?;
+        self.publish_historical_slot(parent_slot, new_slot, parent_of_closed)?;
         let _ = self.simnet_events_tx.system_clock_updated(clock);
         Ok(self.latest_epoch_info.clone())
     }
 
     /// The slot lifecycle Surfpool publishes for each block, for a historical advance from
     /// `parent` to `slot`. Local transactions finalize immediately, so `parent` is the root.
-    fn publish_historical_slot(&mut self, parent: Slot, slot: Slot) -> SurfpoolResult<()> {
+    fn publish_historical_slot(
+        &mut self,
+        parent: Slot,
+        slot: Slot,
+        parent_of_closed: Slot,
+    ) -> SurfpoolResult<()> {
         let timestamp = Utc::now().timestamp_millis().max(0) as u64;
         // A failed store read is reported, never published as a block of zero transactions;
         // an absent block has none.
@@ -552,26 +558,14 @@ impl SurfnetSvm {
                 max_transactions_per_entry: transactions,
             },
         });
-        self.notify_slots_updates_subscribers(SlotUpdate::CreatedBank {
-            slot,
+        self.emit_slot_status(parent, None, GeyserSlotStatus::Confirmed, timestamp);
+        self.emit_slot_status(
             parent,
+            Some(parent_of_closed),
+            GeyserSlotStatus::Rooted,
             timestamp,
-        });
-        self.notify_slots_updates_subscribers(SlotUpdate::OptimisticConfirmation {
-            slot: parent,
-            timestamp,
-        });
-        self.notify_slots_updates_subscribers(SlotUpdate::Root {
-            slot: parent,
-            timestamp,
-        });
-        for status in [GeyserSlotStatus::Confirmed, GeyserSlotStatus::Rooted] {
-            let _ = self.geyser_events_tx.send(GeyserEvent::UpdateSlotStatus {
-                slot: parent,
-                parent: parent.checked_sub(1),
-                status,
-            });
-        }
+        );
+        self.emit_slot_status(slot, Some(parent), GeyserSlotStatus::CreatedBank, timestamp);
         Ok(())
     }
 }
@@ -645,7 +639,8 @@ mod tests {
             let updates = svm.subscribe_for_slots_updates();
             while geyser.try_recv().is_ok() {}
 
-            let published = svm.publish_historical_slot(parent, parent + 1);
+            let published =
+                svm.publish_historical_slot(parent, parent + 1, parent.saturating_sub(1));
 
             assert!(
                 published.is_err(),
@@ -656,6 +651,52 @@ mod tests {
             assert!(
                 geyser.try_recv().is_err(),
                 "a Geyser slot status was published"
+            );
+        }
+    }
+
+    #[test]
+    fn historical_statuses_use_stored_parents_and_announce_the_new_bank_last() {
+        use super::{GeyserSlotStatus, SlotUpdate};
+        use crate::surfnet::GeyserEvent;
+
+        let (mut svm, _events, geyser) = SurfnetSvm::new(SurfnetSvmConfig::default()).unwrap();
+        let updates = svm.subscribe_for_slots_updates();
+        while geyser.try_recv().is_ok() {}
+        for (closed, next, stored_parent) in [(100, 110, 70), (110, 111, 100)] {
+            svm.publish_historical_slot(closed, next, stored_parent)
+                .unwrap();
+            let statuses: Vec<_> = geyser
+                .try_iter()
+                .map(|event| match event {
+                    GeyserEvent::UpdateSlotStatus {
+                        slot,
+                        parent,
+                        status,
+                    } => (slot, parent, status),
+                    other => panic!(
+                        "unexpected historical event kind: {:?}",
+                        std::mem::discriminant(&other)
+                    ),
+                })
+                .collect();
+            assert_eq!(
+                statuses,
+                vec![
+                    (closed, None, GeyserSlotStatus::Confirmed),
+                    (closed, Some(stored_parent), GeyserSlotStatus::Rooted),
+                    (next, Some(closed), GeyserSlotStatus::CreatedBank),
+                ]
+            );
+            let updates: Vec<_> = updates.try_iter().collect();
+            assert_eq!(updates.len(), 4);
+            assert!(matches!(*updates[0], SlotUpdate::Frozen { slot, .. } if slot == closed));
+            assert!(
+                matches!(*updates[1], SlotUpdate::OptimisticConfirmation { slot, .. } if slot == closed)
+            );
+            assert!(matches!(*updates[2], SlotUpdate::Root { slot, .. } if slot == closed));
+            assert!(
+                matches!(*updates[3], SlotUpdate::CreatedBank { slot, parent, .. } if slot == next && parent == closed)
             );
         }
     }

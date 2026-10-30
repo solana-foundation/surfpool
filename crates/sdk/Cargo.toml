@@ -39,6 +39,8 @@ surfpool-core = { workspace = true }
 surfpool-types = { workspace = true }
 
 [dev-dependencies]
+base64 = { workspace = true }
+bincode = { workspace = true }
 solana-program-pack = { workspace = true }
 solana-system-interface = { workspace = true }
 solana-transaction = { workspace = true }

@@ -270,6 +270,13 @@ pub async fn start_local_surfnet_runloop(
         }
     }
 
+    // Plugins see the end of startup and the open slot before RPC binds, so no traffic can
+    // send data for a slot they don't track yet.
+    svm_locker.with_svm_writer(|svm| {
+        let _ = svm.geyser_events_tx.send(GeyserEvent::EndOfStartup);
+        svm.announce_open_slot()
+    })?;
+
     let (_rpc_handle, _ws_handle, shutdown_rpc_servers) = start_rpc_servers_runloop(
         &config,
         &simnet_commands_tx,
@@ -356,9 +363,6 @@ pub async fn start_local_surfnet_runloop(
     }
     simnet_events_tx_cc.core_started(initial_transaction_count);
     svm_locker.with_svm_reader(|svm_reader| svm_reader.mark_core_started());
-
-    // Notify geyser plugins that startup is complete
-    let _ = svm_locker.with_svm_reader(|svm| svm.geyser_events_tx.send(GeyserEvent::EndOfStartup));
 
     start_block_production_runloop(
         clock_event_rx,
@@ -974,6 +978,7 @@ fn start_geyser_runloop(
                     }
                     Ok(GeyserEvent::UpdateSlotStatus { slot, parent, status }) => {
                         let slot_status = match status {
+                            crate::surfnet::GeyserSlotStatus::CreatedBank => SlotStatus::CreatedBank,
                             crate::surfnet::GeyserSlotStatus::Processed => SlotStatus::Processed,
                             crate::surfnet::GeyserSlotStatus::Confirmed => SlotStatus::Confirmed,
                             crate::surfnet::GeyserSlotStatus::Rooted => SlotStatus::Rooted,
@@ -1336,6 +1341,7 @@ fn start_ws_rpc_server_runloop(
                 slot_subscription_map: Arc::new(RwLock::new(HashMap::new())),
                 slots_updates_subscription_map: Arc::new(RwLock::new(HashMap::new())),
                 logs_subscription_map: Arc::new(RwLock::new(HashMap::new())),
+                block_subscription_map: Arc::new(RwLock::new(HashMap::new())),
                 snapshot_subscription_map: Arc::new(RwLock::new(HashMap::new())),
                 tokio_handle: tokio_handle.clone(),
             }

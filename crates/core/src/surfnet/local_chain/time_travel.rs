@@ -1,10 +1,7 @@
 //! Normal-chain time travel; historical clocks remain owned by SVM Replay.
 
-use chrono::Utc;
 use solana_clock::{Clock, Slot};
-use solana_commitment_config::CommitmentConfig;
 use solana_epoch_info::EpochInfo;
-use solana_rpc_client_api::response::SlotUpdate;
 use solana_slot_hashes::SlotHashes;
 
 use crate::{error::SurfpoolResult, surfnet::svm::SurfnetSvm};
@@ -46,13 +43,7 @@ impl SurfnetSvm {
                 .map(|&(key, hash)| (if key == open { slot } else { key }, hash))
                 .collect();
             self.local_vm()?.set_sysvar(&SlotHashes::new(&slot_hashes));
-            let root = self.slot_for_commitment(&CommitmentConfig::finalized());
-            self.notify_slot_subscribers(slot, parent, root);
-            self.notify_slots_updates_subscribers(SlotUpdate::CreatedBank {
-                slot,
-                parent,
-                timestamp: Utc::now().timestamp_millis().max(0) as u64,
-            });
+            self.announce_open_slot()?;
         }
         Ok(())
     }

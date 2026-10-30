@@ -7876,6 +7876,19 @@ async fn finalization_follows_the_alpenglow_feature(test_type: TestType, alpengl
         .subscribe_for_logs_updates(&CommitmentLevel::Confirmed, &RpcTransactionLogsFilter::All);
     let finalized_logs = locker
         .subscribe_for_logs_updates(&CommitmentLevel::Finalized, &RpcTransactionLogsFilter::All);
+    let confirmed_blocks =
+        locker.subscribe_for_block_updates(CommitmentLevel::Confirmed, None, Default::default());
+    let payer_blocks = locker.subscribe_for_block_updates(
+        CommitmentLevel::Confirmed,
+        Some(payer.pubkey()),
+        Default::default(),
+    );
+    // Unsubscribed before any block mentions its account.
+    drop(locker.subscribe_for_block_updates(
+        CommitmentLevel::Confirmed,
+        Some(Pubkey::new_unique()),
+        Default::default(),
+    ));
     let (status_tx, status_rx) = unbounded();
     locker
         .process_transaction(&None, transaction.into(), status_tx, false, true)
@@ -8011,6 +8024,27 @@ async fn finalization_follows_the_alpenglow_feature(test_type: TestType, alpengl
         });
         assert_eq!(root_update, now_finalized);
     }
+    // blockSubscribe: every confirmed block once, and only the payer's for a filter on it.
+    let confirmed_blocks: Vec<_> = confirmed_blocks.try_iter().map(|u| u.slot).collect();
+    assert_eq!(
+        confirmed_blocks,
+        (transaction_slot..transaction_slot + depth).collect::<Vec<_>>()
+    );
+    let payer_blocks: Vec<_> = payer_blocks
+        .try_iter()
+        .map(|u| {
+            (
+                u.slot,
+                u.block.and_then(|b| b.transactions).map(|t| t.len()),
+            )
+        })
+        .collect();
+    assert_eq!(payer_blocks, [(transaction_slot, Some(1))]);
+    assert_eq!(
+        locker.with_svm_reader(|svm| svm.block_subscriptions.len()),
+        2,
+        "a cancelled subscription is dropped at the next block"
+    );
     assert!(matches!(
         locker
             .get_local_signature_status_or_subscribe(

@@ -84,7 +84,16 @@ pub async fn handle_start_local_surfnet_command(
     let runloop_terminator = Arc::new(AtomicBool::new(false));
     let signal_terminator = runloop_terminator.clone();
     let signal_commands_tx = simnet_commands_tx.clone();
-    // Own process signals before starting HTTP; both frontends share this handler.
+    let simnet_events_tx = instance.simnet_events_tx();
+    // Finish interactive planning before the loading TUI owns the terminal. Execution
+    // and sealing still wait for the historical core to start.
+    let historical_plan = if historical.is_some() && !cmd.project.no_deploy {
+        Some(startup::plan_startup(&cmd, &simnet_events_tx).await)
+    } else {
+        None
+    };
+    // Prompts above have no running services and retain normal signal termination.
+    // Own shutdown signals before starting HTTP or the historical backend.
     ctrlc::set_handler(move || {
         signal_terminator.store(true, Ordering::Release);
         if let Err(error) = signal_commands_tx.send(SimnetCommand::Terminate(None)) {
@@ -93,7 +102,6 @@ pub async fn handle_start_local_surfnet_command(
     })
     .map_err(|error| format!("Failed to install shutdown signal handler: {error}"))?;
     let (subgraph_events_tx, subgraph_events_rx) = crossbeam::channel::unbounded();
-    let simnet_events_tx = instance.simnet_events_tx();
     // Subscribe before the instance moves into the simnet thread; the receiver
     // stays valid, and subscribing this early means no transition is missed.
     let startup_status_rx = instance.subscribe_startup_status();
@@ -239,6 +247,7 @@ pub async fn handle_start_local_surfnet_command(
                     &cmd,
                     &events_tx,
                     &commands_tx,
+                    historical_plan,
                 ));
                 match planned {
                     Ok(Some(rx)) => {
@@ -280,7 +289,7 @@ pub async fn handle_start_local_surfnet_command(
 
         if !runloop_terminator.load(Ordering::Acquire) {
             if let Some(rx) =
-                plan_startup_or_seal(&cmd, &simnet_events_tx, &simnet_commands_tx).await?
+                plan_startup_or_seal(&cmd, &simnet_events_tx, &simnet_commands_tx, None).await?
             {
                 runbook_progress_rx.push(rx);
             }
@@ -606,6 +615,7 @@ async fn plan_startup_or_seal(
     cmd: &StartSimnet,
     simnet_events_tx: &SimnetEventsTx,
     simnet_commands_tx: &Sender<SimnetCommand>,
+    prepared: Option<Result<startup::StartupPlan, String>>,
 ) -> Result<Option<Receiver<BlockEvent>>, String> {
     if cmd.project.no_deploy {
         // There are no startup tasks to execute, so seal the empty plan
@@ -615,7 +625,7 @@ async fn plan_startup_or_seal(
         seal_startup_plan(simnet_commands_tx, vec![]).map_err(|failure| failure.to_string())?;
         return Ok(None);
     }
-    match plan_and_dispatch_startup(cmd, simnet_events_tx, simnet_commands_tx).await {
+    match plan_and_dispatch_startup(cmd, simnet_events_tx, simnet_commands_tx, prepared).await {
         Ok(rx) => Ok(Some(rx)),
         // Planning failed before the plan was sealed. Drive the startup
         // state machine to Failed (from Planning-unsealed this always

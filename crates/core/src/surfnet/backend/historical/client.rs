@@ -843,6 +843,23 @@ impl HistoricalVm {
         }
     }
 
+    /// Checks lifetime without signatures before executing on a disposable bundle branch.
+    pub fn send_simulated(&self, tx: &VersionedTransaction) -> SurfpoolResult<TransactionResult> {
+        let reply = self.command(
+            "rpcSimulate",
+            Some(json!({"transactionBase64": wire(tx)?, "sigVerify": false,
+                "replaceRecentBlockhash": false})),
+        )?;
+        let output = field(&reply, "output")?;
+        if let Some(err) = transaction_error(output)? {
+            return Ok(Err(FailedTransactionMetadata {
+                err,
+                meta: metadata(output, tx)?,
+            }));
+        }
+        self.send_unverified(tx)
+    }
+
     /// Simulates on this branch; `accounts` get their post-execution images.
     pub fn simulate(
         &self,
