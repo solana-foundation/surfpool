@@ -37,6 +37,7 @@ mod tests {
             surfnet_port_pair(0),
             Some((DEFAULT_RPC_PORT, DEFAULT_RPC_PORT - 9))
         );
+        assert_eq!(surfnet_port_pair(5), Some((58_899, 58_890)));
         assert!(surfnet_port_pair(u16::MAX).is_none());
         assert!(surfnet_port_pair(6).is_none());
     }
