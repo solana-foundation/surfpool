@@ -1791,7 +1791,7 @@ fn test_enable_and_disable_cheatcodes(test_type: TestType) {
     );
 
     assert_eq!(
-        runloop_context.cheatcode_config.lock().unwrap().filter,
+        runloop_context.cheatcode_config.lock().unwrap().filter(),
         CheatcodeConfig::filter_all_list(false, available_methods.clone()),
         "The disabled cheatcodes list doesn't match the expected one"
     );
@@ -1889,7 +1889,7 @@ fn test_enable_and_disable_cheatcodes(test_type: TestType) {
     );
 
     assert_eq!(
-        runloop_context.cheatcode_config.lock().unwrap().filter,
+        runloop_context.cheatcode_config.lock().unwrap().filter(),
         CheatcodeFilter::List(vec![]),
         "Expected all the cheatcodes to be enabled"
     );
@@ -1908,7 +1908,7 @@ fn test_enable_and_disable_cheatcodes(test_type: TestType) {
     );
 
     assert_eq!(
-        runloop_context.cheatcode_config.lock().unwrap().filter,
+        runloop_context.cheatcode_config.lock().unwrap().filter(),
         CheatcodeConfig::filter_all_list(true, vec![]),
         "Expected all the features to be disabled"
     );

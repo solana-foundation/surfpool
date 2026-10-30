@@ -1818,11 +1818,26 @@ fn default_prometheus_addr() -> String {
 #[serde(rename_all = "camelCase")]
 pub struct CheatcodeConfig {
     pub lockout: bool, // if true, allows disabling even the `surfnet_enableCheatcodes`/`surfnetdisableCheatcodes` methods
-    pub filter: CheatcodeFilter,
-    /// Methods disabled with lockout. They stay disabled for the life of the
-    /// surfnet: nothing re-enables them, so locking is one-way.
-    #[serde(default)]
-    pub locked: Vec<String>,
+    pub disabled: DisabledCheatcodes,
+}
+
+/// The methods a [`CheatcodeConfig`] refuses.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DisabledCheatcodes {
+    /// Every gated method, for good: see [`CheatcodeConfig::lock_all`].
+    All,
+    /// These methods.
+    Methods(Vec<DisabledCheatcode>),
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DisabledCheatcode {
+    pub method: String,
+    /// Disabled with lockout: it stays disabled for the life of the surfnet,
+    /// nothing re-enables it, so locking is one-way.
+    pub locked: bool,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -1943,8 +1958,7 @@ impl CheatcodeConfig {
     pub fn new() -> Arc<Mutex<Self>> {
         Arc::new(Mutex::new(CheatcodeConfig {
             lockout: false,
-            filter: CheatcodeFilter::List(vec![]),
-            locked: vec![],
+            disabled: DisabledCheatcodes::Methods(vec![]),
         }))
     }
 
@@ -1963,43 +1977,57 @@ impl CheatcodeConfig {
         config
     }
 
+    /// The disabled methods, in the shape of the RPC parameter.
+    pub fn filter(&self) -> CheatcodeFilter {
+        match &self.disabled {
+            DisabledCheatcodes::All => CheatcodeFilter::all(),
+            DisabledCheatcodes::Methods(methods) => {
+                CheatcodeFilter::list(methods.iter().map(|m| m.method.clone()))
+            }
+        }
+    }
+
     /// Disable every gated method, permanently: all `surfnet_*` methods and
     /// the methods in [`GATED_RPC_METHODS`] (`requestAirdrop`, `exit`, plugin
     /// loading).
     pub fn lock_all(&mut self) {
         self.lockout = true;
-        self.filter = CheatcodeFilter::All("all".to_string());
+        self.disabled = DisabledCheatcodes::All;
     }
 
-    /// Disable `methods`, permanently. Methods already locked are skipped.
+    /// Disable `methods`, permanently. Methods already disabled are locked.
     pub fn lock_methods(&mut self, methods: &[String]) {
         self.lockout = true;
+        let DisabledCheatcodes::Methods(disabled) = &mut self.disabled else {
+            return;
+        };
         for method in methods {
-            if let CheatcodeFilter::List(list) = &mut self.filter
-                && !list.contains(method)
-            {
-                list.push(method.clone());
-            }
-            if !self.locked.contains(method) {
-                self.locked.push(method.clone());
+            match disabled.iter_mut().find(|d| &d.method == method) {
+                Some(entry) => entry.locked = true,
+                None => disabled.push(DisabledCheatcode {
+                    method: method.clone(),
+                    locked: true,
+                }),
             }
         }
     }
 
     /// Whether `cheatcode` can never be re-enabled.
     pub fn is_locked(&self, cheatcode: &str) -> bool {
-        match &self.filter {
-            CheatcodeFilter::All(_) if self.lockout => true,
-            _ => self.locked.iter().any(|c| c == cheatcode),
+        match &self.disabled {
+            DisabledCheatcodes::All => true,
+            DisabledCheatcodes::Methods(disabled) => {
+                disabled.iter().any(|d| d.locked && d.method == cheatcode)
+            }
         }
     }
 
     /// Re-enable every cheatcode that isn't locked.
     pub fn enable_all(&mut self) -> Result<(), String> {
-        if self.lockout && matches!(self.filter, CheatcodeFilter::All(_)) {
+        let DisabledCheatcodes::Methods(disabled) = &mut self.disabled else {
             return Err("All cheatcodes are locked".to_string());
-        }
-        self.filter = CheatcodeFilter::List(self.locked.clone());
+        };
+        disabled.retain(|d| d.locked);
         Ok(())
     }
 
@@ -2012,15 +2040,27 @@ impl CheatcodeConfig {
             self.lock_all();
             return;
         }
-        let mut filter = Self::filter_all_list(false, available_cheatcodes);
-        if let CheatcodeFilter::List(list) = &mut filter {
-            for method in &self.locked {
-                if !list.contains(method) {
-                    list.push(method.clone());
-                }
+        let DisabledCheatcodes::Methods(disabled) = &mut self.disabled else {
+            return;
+        };
+        let CheatcodeFilter::List(methods) = Self::filter_all_list(false, available_cheatcodes)
+        else {
+            return;
+        };
+        let mut all: Vec<DisabledCheatcode> = methods
+            .into_iter()
+            .map(|method| DisabledCheatcode {
+                locked: disabled.iter().any(|d| d.locked && d.method == method),
+                method,
+            })
+            .collect();
+        // Locks survive, including on methods outside `available_cheatcodes`.
+        for locked in disabled.drain(..).filter(|d| d.locked) {
+            if !all.iter().any(|d| d.method == locked.method) {
+                all.push(locked);
             }
         }
-        self.filter = filter;
+        *disabled = all;
     }
 
     pub fn disable_cheatcode(&mut self, cheatcode: &String) -> Result<(), String> {
@@ -2030,39 +2070,41 @@ impl CheatcodeConfig {
             return Err("Cannot disable surfnet_disableCheatcode or surfnet_enableCheatcode while lockout is false".to_string());
         }
 
-        if let CheatcodeFilter::List(list) = &mut self.filter {
-            if !list.contains(cheatcode) {
-                list.push(cheatcode.to_string());
-                Ok(())
-            } else {
-                Err("Cheatcode already disabled".to_string())
-            }
-        } else {
-            Err("All cheatcodes disabled".to_string())
+        let DisabledCheatcodes::Methods(disabled) = &mut self.disabled else {
+            return Err("All cheatcodes disabled".to_string());
+        };
+        if disabled.iter().any(|d| &d.method == cheatcode) {
+            return Err("Cheatcode already disabled".to_string());
         }
+        disabled.push(DisabledCheatcode {
+            method: cheatcode.clone(),
+            locked: false,
+        });
+        Ok(())
     }
+
     pub fn enable_cheatcode(&mut self, cheatcode: &str) -> Result<(), String> {
         if self.is_locked(cheatcode) {
             return Err(format!(
                 "Cheatcode {cheatcode} is locked and cannot be re-enabled"
             ));
         }
-        if let CheatcodeFilter::List(list) = &mut self.filter {
-            if let Some(pos) = list.iter().position(|c| c == cheatcode) {
-                list.remove(pos);
-                Ok(())
-            } else {
-                Err("Cheatcode isn't disabled".to_string())
-            }
-        } else {
-            Err("All cheatcodes are disabled".to_string())
-        }
+        let DisabledCheatcodes::Methods(disabled) = &mut self.disabled else {
+            return Err("All cheatcodes are disabled".to_string());
+        };
+        let Some(pos) = disabled.iter().position(|d| d.method == cheatcode) else {
+            return Err("Cheatcode isn't disabled".to_string());
+        };
+        disabled.remove(pos);
+        Ok(())
     }
 
     pub fn is_cheatcode_disabled(&self, cheatcode: &String) -> bool {
-        match &self.filter {
-            CheatcodeFilter::List(list) => list.contains(cheatcode),
-            CheatcodeFilter::All(_) => true,
+        match &self.disabled {
+            DisabledCheatcodes::All => true,
+            DisabledCheatcodes::Methods(disabled) => {
+                disabled.iter().any(|d| &d.method == cheatcode)
+            }
         }
     }
 
