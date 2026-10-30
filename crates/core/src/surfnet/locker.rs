@@ -3494,13 +3494,13 @@ impl SurfnetSvmLocker {
         match tag_map {
             None => Ok(None),
             Some(uuids_or_sigs) => {
+                // Profiles are kept up to `max_profiles`, oldest dropped
+                // first: a tag lists the ones still kept.
                 let mut profiles = Vec::new();
                 for id in uuids_or_sigs {
-                    let profile = self.get_profile_result(id, config)?;
-                    if profile.is_none() {
-                        return Err(SurfpoolError::tag_not_found(&tag));
+                    if let Some(profile) = self.get_profile_result(id, config)? {
+                        profiles.push(profile);
                     }
-                    profiles.push(profile.unwrap());
                 }
                 Ok(Some(profiles))
             }

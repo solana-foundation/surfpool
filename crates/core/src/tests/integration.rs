@@ -2911,6 +2911,49 @@ async fn test_profile_transaction_multi_instruction_basic(test_type: TestType) {
     }
 }
 
+/// With `max_profiles` reached, the oldest simulated profile is dropped, and
+/// a tag lists the profiles still kept instead of failing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tag_skips_profiles_dropped_by_max_profiles() {
+    let (svm_instance, _simnet_events_rx, _geyser_events_rx) =
+        SurfnetSvm::new(crate::surfnet::svm::SurfnetSvmConfig {
+            max_profiles: 1,
+            ..Default::default()
+        })
+        .unwrap();
+    let svm_locker = SurfnetSvmLocker::new(svm_instance);
+    let payer = Keypair::new();
+    svm_locker
+        .with_svm_writer(|svm| svm.airdrop(&payer.pubkey(), 10_000_000))
+        .unwrap()
+        .unwrap();
+    let latest_blockhash = svm_locker.with_svm_reader(|svm| svm.latest_blockhash());
+    let tag = "evicted".to_string();
+
+    let mut uuids = vec![];
+    for _ in 0..2 {
+        let instruction = transfer(&payer.pubkey(), &Pubkey::new_unique(), 1_000_000);
+        let message =
+            Message::new_with_blockhash(&[instruction], Some(&payer.pubkey()), &latest_blockhash);
+        let transaction =
+            VersionedTransaction::try_new(VersionedMessage::Legacy(message), &[&payer]).unwrap();
+        uuids.push(
+            svm_locker
+                .profile_transaction(&None, transaction, Some(tag.clone()))
+                .await
+                .unwrap()
+                .inner,
+        );
+    }
+
+    let tagged = svm_locker
+        .get_profile_results_by_tag(tag, &RpcProfileResultConfig::default())
+        .unwrap()
+        .expect("the tag still exists");
+    assert_eq!(tagged.len(), 1);
+    assert_eq!(tagged[0].key, UuidOrSignature::Uuid(uuids[1]));
+}
+
 #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
 #[test_case(TestType::in_memory(); "with in-memory sqlite db")]
 #[test_case(TestType::no_db(); "with no db")]
