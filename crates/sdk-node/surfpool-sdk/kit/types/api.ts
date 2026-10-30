@@ -10,6 +10,7 @@ import type {
     GetConfidentialBalanceResponse,
     GetStreamedAccountsResponse,
     GetSurfnetInfoResponse,
+    MintUpdate,
     OfflineAccountConfig,
     ResetAccountConfig,
     RpcProfileResultConfig,
@@ -111,6 +112,9 @@ export type SurfnetDisableCheatcodeApi = {
 // Accounts
 export type SurfnetSetAccountApi = {
     setAccount(pubkey: Address, update: AccountUpdate): null;
+};
+export type SurfnetSetMintApi = {
+    setMint(mint: Address, update: MintUpdate, tokenProgram?: Address): null;
 };
 export type SurfnetSetTokenAccountApi = {
     setTokenAccount(owner: Address, mint: Address, update: TokenAccountUpdate, tokenProgram?: Address): null;
@@ -218,6 +222,7 @@ export type SurfnetCheatcodesApi = SurfnetCloneProgramAccountApi &
     SurfnetResetNetworkApi &
     SurfnetResumeClockApi &
     SurfnetSetAccountApi &
+    SurfnetSetMintApi &
     SurfnetSetProgramAuthorityApi &
     SurfnetSetSupplyApi &
     SurfnetSetTokenAccountApi &
