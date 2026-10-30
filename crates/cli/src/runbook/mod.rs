@@ -229,9 +229,7 @@ pub async fn execute_runbook(
             cloud_svc_context,
         )
         .await;
-    if let Err(diags) = res {
-        log_diagnostic_lines(diags, &simnet_events_tx);
-    }
+    handle_context_build_result(res, &simnet_events_tx)?;
 
     runbook.enable_full_execution_mode();
 
@@ -652,6 +650,19 @@ fn log_diagnostic_lines(diags: Vec<Diagnostic>, simnet_events_tx: &SimnetEventsT
     }
 }
 
+fn handle_context_build_result(
+    result: Result<(), Vec<Diagnostic>>,
+    simnet_events_tx: &SimnetEventsTx,
+) -> Result<(), String> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(diags) => {
+            log_diagnostic_lines(diags, simnet_events_tx);
+            Err("Failed to build runbook execution contexts".to_string())
+        }
+    }
+}
+
 fn log_actions_to_execute(
     actions_to_execute: &IndexMap<String, Vec<(String, Option<String>)>>,
     is_first_time: bool,
@@ -892,5 +903,33 @@ pub fn handle_log_event(
                 );
             }
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::handle_context_build_result;
+    use surfpool_types::SimnetEventsTx;
+
+    #[test]
+    fn context_build_failure_is_returned_to_caller() {
+        let (simnet_events_tx, _simnet_events_rx) = SimnetEventsTx::unbounded();
+
+        let result = handle_context_build_result(Err(Vec::new()), &simnet_events_tx);
+
+        assert_eq!(
+            result,
+            Err("Failed to build runbook execution contexts".to_string())
+        );
+    }
+
+    #[test]
+    fn successful_context_build_continues() {
+        let (simnet_events_tx, _simnet_events_rx) = SimnetEventsTx::unbounded();
+
+        assert_eq!(
+            handle_context_build_result(Ok(()), &simnet_events_tx),
+            Ok(())
+        );
     }
 }
