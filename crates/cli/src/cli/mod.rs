@@ -16,6 +16,7 @@ use hiro_system_kit::{self, Logger};
 // The only caller is the daemon fork, which exists on Linux alone.
 #[cfg(target_os = "linux")]
 use log::info;
+use solana_hash::Hash;
 use solana_keypair::Keypair;
 use solana_pubkey::Pubkey;
 use solana_signer::{EncodableKey, Signer};
@@ -284,6 +285,13 @@ pub struct StartNetworkOptions {
         long_help = "Run without a remote RPC datasource. Use this to simulate an offline environment.\n\nExample: surfpool start --offline"
     )]
     pub offline: bool,
+    /// Report this hash from getGenesisHash.
+    #[arg(
+        long = "genesis-hash",
+        value_name = "HASH",
+        long_help = "Report this hash from getGenesisHash instead of the datasource's, so clients identify the surfnet as that cluster. Offline, the default is a hash that changes on every start.\n\nExample: surfpool start --offline --genesis-hash 5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d"
+    )]
+    pub genesis_hash: Option<Hash>,
 }
 
 #[derive(Args, PartialEq, Clone, Debug)]
@@ -689,6 +697,7 @@ impl StartSimnet {
             skip_blockhash_check: self.svm.skip_blockhash_check,
             surfnet_id: self.accounts.surfnet_id.clone(),
             snapshot,
+            genesis_hash: self.network.genesis_hash,
         }
     }
 
@@ -1066,8 +1075,25 @@ fn parse_stop_response(body: &str) -> Result<(), String> {
     Ok(())
 }
 
-async fn generate_completion_helpers(cmd: Completions) -> Result<(), String> {
+/// The command tree completion scripts are generated from. Subcommands name themselves as bare
+/// binaries for their help; a completion script needs each one's path from the root, or it
+/// offers none of their arguments.
+fn completion_command() -> clap::Command {
     let mut app = Opts::command();
+    let names: Vec<String> = app
+        .get_subcommands()
+        .map(|subcommand| subcommand.get_name().to_string())
+        .collect();
+    for name in names {
+        app = app.mut_subcommand(&name, |subcommand| {
+            subcommand.bin_name(format!("surfpool {name}"))
+        });
+    }
+    app
+}
+
+async fn generate_completion_helpers(cmd: Completions) -> Result<(), String> {
+    let mut app = completion_command();
     let file_name = cmd.shell.file_name("surfpool");
     let mut file = File::create(file_name.clone())
         .map_err(|e| format!("unable to create file {}: {}", file_name, e))?;
@@ -1209,6 +1235,42 @@ pub fn setup_logger(
 mod tests {
     use super::*;
 
+    #[test]
+    fn bash_completion_offers_the_start_arguments() {
+        let mut script = Vec::new();
+        clap_complete::generate(
+            Shell::Bash,
+            &mut completion_command(),
+            "surfpool",
+            &mut script,
+        );
+        let script = String::from_utf8(script).unwrap();
+        // The case `surfpool start` enters, then the options that case offers.
+        let lines: Vec<&str> = script.lines().map(str::trim).collect();
+        let entered = lines
+            .iter()
+            .position(|line| *line == "surfpool,start)")
+            .expect("a start transition");
+        let name = lines[entered + 1]
+            .strip_prefix("cmd=\"")
+            .and_then(|rest| rest.strip_suffix('"'))
+            .expect("the start case name");
+        let section = lines
+            .iter()
+            .position(|line| *line == format!("{name})"))
+            .expect("a start section");
+        let opts = lines[section..]
+            .iter()
+            .find(|line| line.starts_with("opts="))
+            .expect("start options");
+        for flag in ["--rpc-url", "--port", "--no-tui"] {
+            assert!(
+                opts.split(['"', ' ']).any(|word| word == flag),
+                "{flag} missing from {opts}"
+            );
+        }
+    }
+
     fn start_long_help() -> String {
         let mut command = Opts::command();
         let start = command
@@ -1313,6 +1375,23 @@ mod tests {
         .expect_err("rpc-url and network should conflict");
 
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn start_parser_passes_genesis_hash_to_the_simnet() {
+        let mainnet = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d";
+        let cmd = parse_start(&["surfpool", "start", "--offline", "--genesis-hash", mainnet]);
+
+        assert_eq!(
+            cmd.simnet_config(vec![], BTreeMap::new()).genesis_hash,
+            Some(mainnet.parse().unwrap())
+        );
+        assert_eq!(
+            parse_start(&["surfpool", "start"])
+                .simnet_config(vec![], BTreeMap::new())
+                .genesis_hash,
+            None
+        );
     }
 
     #[test]

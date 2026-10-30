@@ -2,16 +2,14 @@ use jsonrpc_core::Result;
 use jsonrpc_derive::rpc;
 use solana_client::{
     rpc_config::{RpcBlockProductionConfig, RpcContextConfig},
-    rpc_response::{
-        RpcBlockProduction, RpcInflationGovernor, RpcInflationRate, RpcResponseContext,
-    },
+    rpc_response::{RpcBlockProduction, RpcInflationGovernor, RpcInflationRate},
 };
 use solana_clock::Slot;
 use solana_commitment_config::CommitmentConfig;
 use solana_epoch_schedule::EpochSchedule;
 use solana_rpc_client_api::response::Response as RpcResponse;
 
-use super::{RunloopContext, State, utils::context_slot};
+use super::{RunloopContext, State};
 use crate::SURFPOOL_IDENTITY_PUBKEY;
 
 #[rpc]
@@ -466,7 +464,7 @@ impl BankData for SurfpoolBankDataRpc {
         let svm_locker = meta.get_svm_locker()?;
         let config = config.unwrap_or_default();
 
-        context_slot(&svm_locker, config.commitment, config.min_context_slot)?;
+        svm_locker.read_slot(config.commitment, config.min_context_slot)?;
 
         Ok(SURFPOOL_IDENTITY_PUBKEY.to_string())
     }
@@ -512,8 +510,9 @@ impl BankData for SurfpoolBankDataRpc {
         config: Option<RpcBlockProductionConfig>,
     ) -> Result<RpcResponse<RpcBlockProduction>> {
         meta.with_svm_reader(|svm_reader| {
-            let current_slot = svm_reader.get_latest_absolute_slot();
-            let epoch_info = &svm_reader.latest_epoch_info;
+            let read = svm_reader.read_slot(config.as_ref().and_then(|c| c.commitment), None)?;
+            let current_slot = read.slot();
+            let epoch_info = read.epoch_info(svm_reader);
 
             let (first_slot, last_slot) = if let Some(ref config) = config {
                 if let Some(ref range) = config.range {
@@ -527,19 +526,15 @@ impl BankData for SurfpoolBankDataRpc {
                 (epoch_start_slot, current_slot)
             };
 
-            RpcResponse {
-                context: RpcResponseContext::new(current_slot),
-                value: RpcBlockProduction {
-                    // Empty HashMap - no validator block production data in simulation
-                    by_identity: std::collections::HashMap::new(),
-                    range: solana_client::rpc_response::RpcBlockProductionRange {
-                        first_slot,
-                        last_slot,
-                    },
+            Ok(read.respond(RpcBlockProduction {
+                // Empty HashMap - no validator block production data in simulation
+                by_identity: std::collections::HashMap::new(),
+                range: solana_client::rpc_response::RpcBlockProductionRange {
+                    first_slot,
+                    last_slot,
                 },
-            }
-        })
-        .map_err(Into::into)
+            }))
+        })?
     }
 }
 

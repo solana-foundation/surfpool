@@ -141,3 +141,6 @@ ignore_tests_ci = []
 integration-tests = []
 register-tracing = ["litesvm/register-tracing"]
 prometheus = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-prometheus", "dep:prometheus", "dep:axum"]
+
+[lints.clippy]
+disallowed_methods = "deny"

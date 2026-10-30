@@ -32,7 +32,7 @@ use solana_transaction_status::RewardsAndNumPartitions;
 use surfpool_types::{
     BlockProductionMode, ClockCommand, ClockEvent, DEFAULT_MAINNET_RPC_URL, DataIndexingCommand,
     SimnetCommand, SimnetConfig, SimnetEvent, SimnetEventsTx, StartupPlanner, SurfnetStartupTask,
-    SurfpoolConfig,
+    SurfpoolConfig, TransactionConfirmationStatus, TransactionStatusEvent,
 };
 type PluginConstructor = unsafe fn() -> *mut dyn GeyserPlugin;
 use txtx_addon_kit::helpers::fs::FileLocation;
@@ -211,6 +211,13 @@ pub async fn start_local_surfnet_runloop(
     };
 
     svm_locker.initialize(&remote_rpc_client).await?;
+    // Before the RPC servers start: `sendTransaction`'s preflight reads the skip flag.
+    svm_locker.with_svm_writer(|svm_writer| {
+        svm_writer.skip_signature_verification = simnet.skip_signature_verification;
+        if let Some(genesis_hash) = simnet.genesis_hash {
+            svm_writer.cached_genesis_hash = Some(genesis_hash);
+        }
+    });
 
     if let Some(remote_client) = &remote_rpc_client {
         svm_locker
@@ -249,6 +256,13 @@ pub async fn start_local_surfnet_runloop(
             }
         }
     }
+
+    // Plugins see the end of startup and the open slot before RPC binds, so no traffic can
+    // send data for a slot they don't track yet.
+    svm_locker.with_svm_writer(|svm| {
+        let _ = svm.geyser_events_tx.send(GeyserEvent::EndOfStartup);
+        svm.announce_open_slot();
+    });
 
     let (_rpc_handle, _ws_handle, shutdown_rpc_servers) = start_rpc_servers_runloop(
         &config,
@@ -332,9 +346,6 @@ pub async fn start_local_surfnet_runloop(
     }
     simnet_events_tx_cc.core_started(initial_transaction_count);
 
-    // Notify geyser plugins that startup is complete
-    let _ = svm_locker.with_svm_reader(|svm| svm.geyser_events_tx.send(GeyserEvent::EndOfStartup));
-
     start_block_production_runloop(
         clock_event_rx,
         clock_command_tx,
@@ -377,12 +388,16 @@ pub async fn start_block_production_runloop(
     // block. Keeping it in the select lets commands submitted in the meantime
     // join that block instead of waiting for a whole finalization window.
     let (scheduled_block_tx, scheduled_block_rx) = bounded::<()>(1);
+    // Whether the clock is paused as this loop sees it: a tick the clock thread queued before
+    // it read a Pause is no slot, and a pause is acknowledged only after no tick can follow.
+    let mut clock_paused = false;
     loop {
         let mut do_produce_block = false;
 
         select! {
             recv(clock_event_rx) -> msg => if let Ok(event) = msg {
                 match event {
+                    ClockEvent::Tick if clock_paused => continue,
                     ClockEvent::Tick => {
                         if block_production_mode.eq(&BlockProductionMode::Clock) {
                             do_produce_block = true;
@@ -418,6 +433,14 @@ pub async fn start_block_production_runloop(
                             svm_locker.with_svm_writer(|svm_writer| {
                                 svm_writer.slot_time = updated_slot_time;
                             });
+                        }
+                        match &update {
+                            ClockCommand::Pause | ClockCommand::PauseWithConfirmation(_) => {
+                                clock_paused = true
+                            }
+                            ClockCommand::Resume => clock_paused = false,
+                            ClockCommand::Toggle => clock_paused = !clock_paused,
+                            ClockCommand::UpdateSlotInterval(_) => {}
                         }
 
                         // Handle PauseWithConfirmation specially
@@ -470,12 +493,9 @@ pub async fn start_block_production_runloop(
                             ));
                         }
 
-                        svm_locker.with_svm_writer(|svm_writer| {
-                            svm_writer.inner.set_sysvar(&clock);
-                            svm_writer.updated_at = clock.unix_timestamp as u64 * 1_000;
-                            svm_writer.set_latest_absolute_slot(clock.slot);
-                            svm_writer.simnet_events_tx.system_clock_updated(clock);
-                        });
+                        if let Err(e) = svm_locker.with_svm_writer(|svm_writer| svm_writer.apply_time_travel(clock)) {
+                            svm_locker.simnet_events_tx().error(format!("Failed to time travel: {e}"));
+                        }
                     }
                     SimnetCommand::UpdateInternalClockWithConfirmation(_, clock, response_tx) => {
                         // Confirm the current block to materialize any scheduled overrides for this slot
@@ -485,13 +505,9 @@ pub async fn start_block_production_runloop(
                             ));
                         }
 
-                        let epoch_info = svm_locker.with_svm_writer(|svm_writer| {
-                            svm_writer.inner.set_sysvar(&clock);
-                            svm_writer.updated_at = clock.unix_timestamp as u64 * 1_000;
-                            svm_writer.set_latest_absolute_slot(clock.slot);
-                            svm_writer.simnet_events_tx.system_clock_updated(clock);
-                            svm_writer.latest_epoch_info.clone()
-                        });
+                        let epoch_info = svm_locker
+                            .with_svm_writer(|svm_writer| svm_writer.apply_time_travel(clock))
+                            .map_err(|e| e.to_string());
 
                         // Send confirmation back
                         let _ = response_tx.send(epoch_info);
@@ -509,6 +525,13 @@ pub async fn start_block_production_runloop(
                        let skip_sig_verify = skip_sig_verify_override.unwrap_or(global_skip_sig_verify);
                        let sigverify = !skip_sig_verify;
                        let signature = transaction.signatures[0];
+                       // A duplicate of a send that was still queued or executing when this one
+                       // passed the RPC: the bank drops it, and Agave's RPC returns the signature.
+                       if svm_locker.with_svm_reader(|svm_reader| svm_reader.processed_slot(&transaction).is_some()) {
+                           svm_locker.mark_transaction_complete(&signature);
+                           let _ = status_tx.try_send(TransactionStatusEvent::Success(TransactionConfirmationStatus::Processed));
+                           continue
+                       }
                        let result = svm_locker.process_transaction(&remote_client_with_commitment, transaction, status_tx, skip_preflight, sigverify).await;
                        svm_locker.mark_transaction_complete(&signature);
                        if let Err(e) = result {
@@ -865,6 +888,7 @@ fn start_geyser_runloop(
                     }
                     Ok(GeyserEvent::UpdateSlotStatus { slot, parent, status }) => {
                         let slot_status = match status {
+                            crate::surfnet::GeyserSlotStatus::CreatedBank => SlotStatus::CreatedBank,
                             crate::surfnet::GeyserSlotStatus::Processed => SlotStatus::Processed,
                             crate::surfnet::GeyserSlotStatus::Confirmed => SlotStatus::Confirmed,
                             crate::surfnet::GeyserSlotStatus::Rooted => SlotStatus::Rooted,
@@ -1227,6 +1251,7 @@ fn start_ws_rpc_server_runloop(
                 slot_subscription_map: Arc::new(RwLock::new(HashMap::new())),
                 slots_updates_subscription_map: Arc::new(RwLock::new(HashMap::new())),
                 logs_subscription_map: Arc::new(RwLock::new(HashMap::new())),
+                block_subscription_map: Arc::new(RwLock::new(HashMap::new())),
                 snapshot_subscription_map: Arc::new(RwLock::new(HashMap::new())),
                 tokio_handle: tokio_handle.clone(),
             }

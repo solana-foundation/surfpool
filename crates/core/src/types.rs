@@ -458,7 +458,8 @@ impl TransactionWithStatusMeta {
         accounts_after: &[Option<Account>],
         pre_token_accounts_with_indexes: &[(usize, TokenAccount)],
         post_token_accounts_with_indexes: &[(usize, TokenAccount)],
-        token_mints: Vec<MintAccount>,
+        pre_token_mints: Vec<Option<MintAccount>>,
+        post_token_mints: Vec<MintAccount>,
         pre_token_program_ids: &[Pubkey],
         post_token_program_ids: &[Pubkey],
         loaded_addresses: LoadedAddresses,
@@ -484,24 +485,26 @@ impl TransactionWithStatusMeta {
                 pre_token_balances: Some(
                     pre_token_accounts_with_indexes
                         .iter()
-                        .zip(token_mints.clone())
+                        .zip(pre_token_mints)
                         .zip(pre_token_program_ids)
-                        .map(|(((i, a), mint), token_program)| TransactionTokenBalance {
-                            account_index: *i as u8,
-                            mint: a.mint().to_string(),
-                            ui_token_amount: token_amount_to_ui_amount_v3(
-                                a.amount(),
-                                &SplTokenAdditionalDataV2::with_decimals(mint.decimals()),
-                            ),
-                            owner: a.owner().to_string(),
-                            program_id: token_program.to_string(),
+                        .filter_map(|(((i, a), mint), token_program)| {
+                            Some(TransactionTokenBalance {
+                                account_index: *i as u8,
+                                mint: a.mint().to_string(),
+                                ui_token_amount: token_amount_to_ui_amount_v3(
+                                    a.amount(),
+                                    &SplTokenAdditionalDataV2::with_decimals(mint?.decimals()),
+                                ),
+                                owner: a.owner().to_string(),
+                                program_id: token_program.to_string(),
+                            })
                         })
                         .collect(),
                 ),
                 post_token_balances: Some(
                     post_token_accounts_with_indexes
                         .iter()
-                        .zip(token_mints)
+                        .zip(post_token_mints)
                         .zip(post_token_program_ids)
                         .map(|(((i, a), mint), token_program)| TransactionTokenBalance {
                             account_index: *i as u8,
@@ -532,7 +535,7 @@ impl TransactionWithStatusMeta {
         accounts_before: &[Option<Account>],
         accounts_after: &[Option<Account>],
         pre_token_accounts_with_indexes: &[(usize, TokenAccount)],
-        token_mints: Vec<MintAccount>,
+        token_mints: Vec<Option<MintAccount>>,
         token_program_ids: &[Pubkey],
         loaded_addresses: LoadedAddresses,
     ) -> Self {
@@ -552,15 +555,17 @@ impl TransactionWithStatusMeta {
             .iter()
             .zip(token_mints)
             .zip(token_program_ids)
-            .map(|(((i, a), mint), token_program)| TransactionTokenBalance {
-                account_index: *i as u8,
-                mint: a.mint().to_string(),
-                ui_token_amount: token_amount_to_ui_amount_v3(
-                    a.amount(),
-                    &SplTokenAdditionalDataV2::with_decimals(mint.decimals()),
-                ),
-                owner: a.owner().to_string(),
-                program_id: token_program.to_string(),
+            .filter_map(|(((i, a), mint), token_program)| {
+                Some(TransactionTokenBalance {
+                    account_index: *i as u8,
+                    mint: a.mint().to_string(),
+                    ui_token_amount: token_amount_to_ui_amount_v3(
+                        a.amount(),
+                        &SplTokenAdditionalDataV2::with_decimals(mint?.decimals()),
+                    ),
+                    owner: a.owner().to_string(),
+                    program_id: token_program.to_string(),
+                })
             })
             .collect();
 
@@ -813,6 +818,55 @@ impl TokenAccount {
         }
     }
 
+    /// Initialize the extensions that a Token-2022 associated account requires.
+    pub fn pack_associated_account(&self, mint_data: Option<&[u8]>) -> SurfpoolResult<Vec<u8>> {
+        let Self::SplToken2022(base) = self else {
+            return Ok(self.pack_into_vec());
+        };
+        use spl_token_2022_interface::extension::{
+            account_len::try_for_each_required_init_account_extension,
+            default_account_state::DefaultAccountState,
+        };
+        let invalid_account = |_| SurfpoolError::unpack_token_account();
+        let mut base = *base;
+        let mut extensions = vec![ExtensionType::ImmutableOwner];
+        // Cheatcodes also support synthetic mints with no account data.
+        if let Some(mint_data) = mint_data.filter(|data| !data.is_empty()) {
+            let mint =
+                StateWithExtensions::<spl_token_2022_interface::state::Mint>::unpack(mint_data)
+                    .map_err(invalid_account)?;
+            try_for_each_required_init_account_extension(mint.get_tlv_data(), |extension| {
+                if !extensions.contains(&extension) {
+                    extensions.push(extension);
+                }
+                Ok(())
+            })
+            .map_err(invalid_account)?;
+            if let Ok(default_state) = mint.get_extension::<DefaultAccountState>() {
+                base.state = default_state
+                    .state
+                    .try_into()
+                    .map_err(|_| SurfpoolError::unpack_token_account())?;
+            }
+        }
+        let len = ExtensionType::try_calculate_account_len::<
+            spl_token_2022_interface::state::Account,
+        >(&extensions)
+        .map_err(invalid_account)?;
+        let mut data = vec![0; len];
+        let mut state = StateWithExtensionsMut::<spl_token_2022_interface::state::Account>::unpack_uninitialized(&mut data)
+            .map_err(invalid_account)?;
+        for extension in extensions {
+            state
+                .init_account_extension_from_type(extension)
+                .map_err(invalid_account)?;
+        }
+        state.base = base;
+        state.pack_base();
+        state.init_account_type().map_err(invalid_account)?;
+        Ok(data)
+    }
+
     pub fn pack_into_preserving_extensions(&self, original: &[u8]) -> SurfpoolResult<Vec<u8>> {
         let base_len = spl_token_interface::state::Account::LEN;
         if original.len() < base_len {
@@ -921,6 +975,36 @@ impl TokenAccount {
 #[cfg(test)]
 mod token_account_packing_tests {
     use super::*;
+
+    #[test]
+    fn associated_account_respects_frozen_mint_default() {
+        use spl_token_2022_interface::{
+            extension::default_account_state::DefaultAccountState,
+            state::{Account as Token2022Account, AccountState, Mint},
+        };
+        let mint_len =
+            ExtensionType::try_calculate_account_len::<Mint>(&[ExtensionType::DefaultAccountState])
+                .unwrap();
+        let mut mint_data = vec![0; mint_len];
+        let mut mint =
+            StateWithExtensionsMut::<Mint>::unpack_uninitialized(&mut mint_data).unwrap();
+        mint.init_extension::<DefaultAccountState>(true)
+            .unwrap()
+            .state = AccountState::Frozen as u8;
+        mint.base.is_initialized = true;
+        mint.pack_base();
+        mint.init_account_type().unwrap();
+        let account = TokenAccount::new(
+            &spl_token_2022_interface::id(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            None,
+        );
+        let data = account.pack_associated_account(Some(&mint_data)).unwrap();
+        let account = StateWithExtensions::<Token2022Account>::unpack(&data).unwrap();
+        assert_eq!(account.base.state, AccountState::Frozen);
+        assert!(account.get_extension::<spl_token_2022_interface::extension::immutable_owner::ImmutableOwner>().is_ok());
+    }
 
     #[test]
     fn packing_preserves_token_2022_extension_bytes() {
@@ -1448,6 +1532,12 @@ impl GeyserAccountUpdate {
 pub enum TimeTravelConfig {
     AbsoluteEpoch(Epoch),
     AbsoluteSlot(Slot),
+    /// A slot reached at a given UNIX timestamp in milliseconds, rather than one
+    /// extrapolated from the slot time.
+    AbsoluteSlotAt {
+        slot: Slot,
+        timestamp: u64,
+    },
     AbsoluteTimestamp(u64),
 }
 

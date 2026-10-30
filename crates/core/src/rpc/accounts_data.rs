@@ -4,10 +4,7 @@ use solana_account_decoder::{
     UiAccount,
     parse_token::{UiTokenAmount, token_amount_to_ui_amount_v3},
 };
-use solana_client::{
-    rpc_config::RpcAccountInfoConfig,
-    rpc_response::{RpcBlockCommitment, RpcResponseContext},
-};
+use solana_client::{rpc_config::RpcAccountInfoConfig, rpc_response::RpcBlockCommitment};
 use solana_clock::{Clock, Slot};
 use solana_commitment_config::CommitmentConfig;
 use solana_rpc_client_api::response::Response as RpcResponse;
@@ -17,10 +14,7 @@ use spl_token_2022_interface::extension::StateWithExtensions;
 use super::{RunloopContext, SurfnetRpcContext};
 use crate::{
     error::{SurfpoolError, SurfpoolResult},
-    rpc::{
-        State,
-        utils::{context_slot, verify_pubkey},
-    },
+    rpc::{State, utils::verify_pubkey},
     surfnet::{
         locker::{SvmAccessContext, is_supported_token_program},
         svm::spl_token_additional_data,
@@ -111,9 +105,9 @@ pub trait AccountsData {
     /// - `block`: The target slot (block) to query.
     ///
     /// ## Returns
-    /// A [`RpcBlockCommitment`] containing a [`BlockCommitmentArray`], which is an array of 32
-    /// integers representing the number of votes at each lockout level for that block. Each index
-    /// corresponds to a lockout level (i.e., confidence in finality).
+    /// A [`RpcBlockCommitment`] whose `commitment` would be a [`BlockCommitmentArray`] of the
+    /// stake voted at each lockout level. The surfnet has no votes, so, like an Agave validator
+    /// running Alpenglow, it returns `null` commitment and zero total stake for every slot.
     ///
     /// ## Example Request (JSON-RPC)
     /// ```json
@@ -130,16 +124,12 @@ pub trait AccountsData {
     /// {
     ///   "jsonrpc": "2.0",
     ///   "result": {
-    ///     "commitment": [0, 4, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-    ///     "totalStake": 100000000
+    ///     "commitment": null,
+    ///     "totalStake": 0
     ///   },
     ///   "id": 1
     /// }
     /// ```
-    ///
-    /// ## Errors
-    /// - If the slot is not found in the current bank or has been purged, this call may return an error.
-    /// - May fail if the RPC node is lagging behind or doesn't have voting history for the slot.
     ///
     /// ## See also
     /// - [`BlockCommitmentArray`]: An array representing votes by lockout level
@@ -379,7 +369,8 @@ impl AccountsData for SurfpoolAccountsDataRpc {
         };
 
         Box::pin(async move {
-            let slot = context_slot(&svm_locker, config.commitment, config.min_context_slot)?;
+            // The locker reads the value under its own guard after any fetch, so take the slot first.
+            let read = svm_locker.read_slot(config.commitment, config.min_context_slot)?;
             let SvmAccessContext {
                 inner: account_update,
                 ..
@@ -406,10 +397,7 @@ impl AccountsData for SurfpoolAccountsDataRpc {
                 None
             };
 
-            Ok(RpcResponse {
-                context: RpcResponseContext::new(slot),
-                value: ui_account,
-            })
+            Ok(read.respond(ui_account))
         })
     }
 
@@ -441,7 +429,8 @@ impl AccountsData for SurfpoolAccountsDataRpc {
         let rpc_start = std::time::Instant::now();
 
         Box::pin(async move {
-            let slot = context_slot(&svm_locker, config.commitment, config.min_context_slot)?;
+            // The locker reads the value under its own guard after any fetch, so take the slot first.
+            let read = svm_locker.read_slot(config.commitment, config.min_context_slot)?;
             let SvmAccessContext {
                 inner: account_updates,
                 ..
@@ -478,10 +467,7 @@ impl AccountsData for SurfpoolAccountsDataRpc {
                 }
             }
 
-            Ok(RpcResponse {
-                context: RpcResponseContext::new(slot),
-                value: ui_accounts,
-            })
+            Ok(read.respond(ui_accounts))
         })
     }
 
@@ -490,29 +476,15 @@ impl AccountsData for SurfpoolAccountsDataRpc {
         meta: Self::Metadata,
         block: Slot,
     ) -> Result<RpcBlockCommitment<BlockCommitmentArray>> {
-        // get the info we need and free up lock before validation
-        let (current_slot, block_exists) = meta
-            .with_svm_reader(|svm_reader| {
-                svm_reader
-                    .blocks
-                    .contains_key(&block)
-                    .map_err(SurfpoolError::from)
-                    .map(|exists| (svm_reader.get_latest_absolute_slot(), exists))
-            })
-            .map_err(Into::<jsonrpc_core::Error>::into)??;
-
-        // block is valid if it exists in our block history or it's not too far in the future
-        if !block_exists && block > current_slot {
-            return Err(jsonrpc_core::Error::invalid_params(format!(
-                "Block {} not found",
-                block
-            )));
+        // Agave answers null rather than an error, so only warn about a likely mistake.
+        if let Ok(svm_locker) = meta.get_svm_locker() {
+            let tip = svm_locker.get_latest_absolute_slot();
+            if block > tip {
+                log::warn!("getBlockCommitment: slot {block} is ahead of the chain tip ({tip})");
+            }
         }
-
-        let commitment_array = [0u64; 32];
-
         Ok(RpcBlockCommitment {
-            commitment: Some(commitment_array),
+            commitment: None,
             total_stake: 0,
         })
     }
@@ -541,6 +513,8 @@ impl AccountsData for SurfpoolAccountsDataRpc {
         };
 
         Box::pin(async move {
+            // The locker reads the value under its own guard after any fetch, so take the slot first.
+            let read = svm_locker.read_slot(commitment, None)?;
             let token_account_result = svm_locker
                 .get_account(&remote_ctx, &pubkey, None)
                 .await?
@@ -564,7 +538,6 @@ impl AccountsData for SurfpoolAccountsDataRpc {
             };
 
             let SvmAccessContext {
-                slot,
                 inner: mint_account_result,
                 ..
             } = svm_locker
@@ -590,10 +563,7 @@ impl AccountsData for SurfpoolAccountsDataRpc {
                 })
                 .ok_or_else(SurfpoolError::unpack_mint_account)?;
 
-            Ok(RpcResponse {
-                context: RpcResponseContext::new(slot),
-                value: Some(token_amount_to_ui_amount_v3(amount, &mint_data)),
-            })
+            Ok(read.respond(Some(token_amount_to_ui_amount_v3(amount, &mint_data))))
         })
     }
 
@@ -617,8 +587,9 @@ impl AccountsData for SurfpoolAccountsDataRpc {
         };
 
         Box::pin(async move {
+            // The locker reads the value under its own guard after any fetch, so take the slot first.
+            let read = svm_locker.read_slot(commitment, None)?;
             let SvmAccessContext {
-                slot,
                 inner: mint_account_result,
                 ..
             } = svm_locker
@@ -651,10 +622,7 @@ impl AccountsData for SurfpoolAccountsDataRpc {
                 })
                 .ok_or_else(SurfpoolError::unpack_mint_account)?;
 
-            Ok(RpcResponse {
-                context: RpcResponseContext::new(slot),
-                value: token_amount_to_ui_amount_v3(supply, &mint_data),
-            })
+            Ok(read.respond(token_amount_to_ui_amount_v3(supply, &mint_data)))
         })
     }
 }
@@ -687,11 +655,9 @@ mod tests {
     use crate::{
         rpc::minimal::{Minimal, SurfpoolMinimalRpc},
         surfnet::{
-            AccountSource, FINALIZATION_SLOT_THRESHOLD, GetAccountResult,
-            remote::SurfnetRemoteClient, svm::AccountUpdatePolicy,
+            AccountSource, GetAccountResult, remote::SurfnetRemoteClient, svm::AccountUpdatePolicy,
         },
         tests::helpers::TestSetup,
-        types::SyntheticBlockhash,
     };
 
     #[ignore = "connection-required"]
@@ -792,86 +758,22 @@ mod tests {
     }
 
     #[test]
-    fn test_get_block_commitment_past_slot() {
+    fn test_get_block_commitment_is_null_for_any_slot() {
         let setup = TestSetup::new(SurfpoolAccountsDataRpc);
         let current_slot = setup.context.svm_locker.get_latest_absolute_slot();
-        let past_slot = if current_slot > 10 {
-            current_slot - 10
-        } else {
-            0
-        };
 
-        let result = setup
-            .rpc
-            .get_block_commitment(Some(setup.context), past_slot)
-            .unwrap();
-
-        // Should return commitment data for past slot
-        assert!(result.commitment.is_some());
-        assert_eq!(result.total_stake, 0);
-    }
-
-    #[test]
-    fn test_get_block_commitment_with_actual_block() {
-        let setup = TestSetup::new(SurfpoolAccountsDataRpc);
-
-        // create a block in the SVM's block history
-        let test_slot = 12345;
-        setup.context.svm_locker.with_svm_writer(|svm_writer| {
-            use crate::surfnet::BlockHeader;
-
-            svm_writer
-                .blocks
-                .store(
-                    test_slot,
-                    BlockHeader {
-                        hash: SyntheticBlockhash::new(test_slot).to_string(),
-                        previous_blockhash: SyntheticBlockhash::new(test_slot - 1).to_string(),
-                        parent_slot: test_slot - 1,
-                        block_time: chrono::Utc::now().timestamp_millis(),
-                        block_height: test_slot,
-                        signatures: vec![],
-                    },
-                )
-                .unwrap();
-        });
-
-        let result = setup
-            .rpc
-            .get_block_commitment(Some(setup.context), test_slot)
-            .unwrap();
-
-        // should return commitment data for the existing block
-        assert!(result.commitment.is_some());
-        assert_eq!(result.total_stake, 0);
-    }
-
-    #[test]
-    fn test_get_block_commitment_no_metadata() {
-        let setup = TestSetup::new(SurfpoolAccountsDataRpc);
-
-        let result = setup.rpc.get_block_commitment(None, 123);
-
-        assert!(result.is_err());
-        // This should fail because meta is None, triggering the SurfpoolError::missing_context() path
-    }
-
-    #[test]
-    fn test_get_block_commitment_future_slot_error() {
-        let setup = TestSetup::new(SurfpoolAccountsDataRpc);
-        let current_slot = setup.context.svm_locker.get_latest_absolute_slot();
-        let future_slot = current_slot + 1000;
-
-        let result = setup
-            .rpc
-            .get_block_commitment(Some(setup.context), future_slot);
-
-        // Should return an error for future slots
-        assert!(result.is_err());
-
-        let error = result.unwrap_err();
-        assert_eq!(error.code, jsonrpc_core::ErrorCode::InvalidParams);
-        assert!(error.message.contains("Block") && error.message.contains("not found"));
+        // Like an Agave validator running Alpenglow, for past, current and future slots.
+        for slot in [0, current_slot, current_slot + 1000] {
+            assert_eq!(
+                setup
+                    .rpc
+                    .get_block_commitment(Some(setup.context.clone()), slot),
+                Ok(RpcBlockCommitment {
+                    commitment: None,
+                    total_stake: 0,
+                })
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1843,21 +1745,27 @@ mod tests {
         println!("✅ Account order preserved with remote: [1M lamports, None, 3M lamports]");
     }
 
-    /// On a validator `getAccountInfo`, `getMultipleAccounts` and `getBalance` report the slot of
-    /// the bank their commitment selects, the same bank `getSlot` reports.
+    /// On a validator, account and token reads report the slot of the bank their commitment
+    /// selects, the same bank `getSlot` reports.
     #[tokio::test(flavor = "multi_thread")]
     async fn account_reads_answer_for_the_slot_their_commitment_names() {
+        use solana_client::rpc_config::{RpcLargestAccountsConfig, RpcSupplyConfig};
+
+        use crate::rpc::accounts_scan::{AccountsScan, SurfpoolAccountsScanRpc};
+
         let setup = TestSetup::new(SurfpoolAccountsDataRpc);
+        let (mint, holder, _) = set_scaled_mint(&setup, 6);
         let latest = setup.context.svm_locker.get_latest_absolute_slot();
+        let depth = setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm| svm.finalization_slot_threshold());
         let pubkey = Pubkey::new_unique().to_string();
 
         for (commitment, expected_slot) in [
             (CommitmentConfig::processed(), latest),
             (CommitmentConfig::confirmed(), latest - 1),
-            (
-                CommitmentConfig::finalized(),
-                latest - FINALIZATION_SLOT_THRESHOLD,
-            ),
+            (CommitmentConfig::finalized(), latest - depth),
         ] {
             let context_config = RpcContextConfig {
                 commitment: Some(commitment),
@@ -1904,9 +1812,65 @@ mod tests {
                     .unwrap()
                     .context
                     .slot,
+                setup
+                    .rpc
+                    .get_token_account_balance(
+                        Some(setup.context.clone()),
+                        holder.to_string(),
+                        Some(commitment),
+                    )
+                    .await
+                    .unwrap()
+                    .context
+                    .slot,
+                setup
+                    .rpc
+                    .get_token_supply(
+                        Some(setup.context.clone()),
+                        mint.to_string(),
+                        Some(commitment),
+                    )
+                    .await
+                    .unwrap()
+                    .context
+                    .slot,
+                SurfpoolAccountsScanRpc
+                    .get_token_largest_accounts(
+                        Some(setup.context.clone()),
+                        mint.to_string(),
+                        Some(commitment),
+                    )
+                    .await
+                    .unwrap()
+                    .context
+                    .slot,
+                SurfpoolAccountsScanRpc
+                    .get_largest_accounts(
+                        Some(setup.context.clone()),
+                        Some(RpcLargestAccountsConfig {
+                            commitment: Some(commitment),
+                            ..Default::default()
+                        }),
+                    )
+                    .await
+                    .unwrap()
+                    .context
+                    .slot,
+                SurfpoolAccountsScanRpc
+                    .get_supply(
+                        Some(setup.context.clone()),
+                        Some(RpcSupplyConfig {
+                            commitment: Some(commitment),
+                            ..Default::default()
+                        }),
+                    )
+                    .await
+                    .unwrap()
+                    .context
+                    .slot,
             ];
 
-            assert_eq!(slots, [expected_slot; 4], "{commitment:?}");
+            assert_eq!(slots, [expected_slot; 9], "{commitment:?}");
         }
     }
 }

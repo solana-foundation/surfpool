@@ -75,10 +75,10 @@ use spl_token_2022_interface::{
 };
 use surfpool_types::{
     AccountSnapshot, CheatcodeConfig, CheatcodeControlConfig, CheatcodeFilter,
-    DEFAULT_SLOT_TIME_MS, Idl, RpcProfileDepth, RpcProfileResultConfig, SimnetCommand, SimnetEvent,
-    StartupPlanner, SurfnetStartupPhase, SurfnetStartupStatus, SurfnetStartupTask,
-    SurfnetStartupTaskState, SurfpoolConfig, UiAccountChange, UiAccountProfileState,
-    UiKeyedProfileResult,
+    DEFAULT_SLOT_TIME_MS, Idl, RpcProfileDepth, RpcProfileResultConfig, SerialVmMutationResult,
+    SerialVmMutationTask, SimnetCommand, SimnetEvent, StartupPlanner, SurfnetStartupPhase,
+    SurfnetStartupStatus, SurfnetStartupTask, SurfnetStartupTaskState, SurfpoolConfig,
+    SvmFeatureConfig, UiAccountChange, UiAccountProfileState, UiKeyedProfileResult,
     types::{
         BlockProductionMode, RpcConfig, SimnetConfig, SubgraphConfig, TransactionStatusEvent,
         UuidOrSignature,
@@ -101,8 +101,9 @@ use crate::{
     runloops::start_local_surfnet_runloop,
     storage::tests::TestType,
     surfnet::{
-        FINALIZATION_SLOT_THRESHOLD, GeyserEvent, LocalSignatureStatusOrSubscription,
-        PluginCommand, SignatureSubscriptionType, locker::SurfnetSvmLocker, svm::SurfnetSvm,
+        GeyserEvent, INITIAL_SLOT, LEGACY_FINALIZATION_SLOT_THRESHOLD,
+        LocalSignatureStatusOrSubscription, PluginCommand, SignatureSubscriptionType,
+        locker::SurfnetSvmLocker, svm::SurfnetSvm,
     },
     tests::helpers::get_free_port,
     types::{TimeTravelConfig, TransactionLoadedAddresses},
@@ -4580,6 +4581,20 @@ fn boot_simnet(
     slot_time: Option<u64>,
     test_type: TestType,
 ) -> Result<BootedSimnet, RunloopError> {
+    boot_simnet_with_features(
+        block_production_mode,
+        slot_time,
+        test_type,
+        SvmFeatureConfig::default(),
+    )
+}
+
+fn boot_simnet_with_features(
+    block_production_mode: BlockProductionMode,
+    slot_time: Option<u64>,
+    test_type: TestType,
+    feature_config: SvmFeatureConfig,
+) -> Result<BootedSimnet, RunloopError> {
     let bind_host = "127.0.0.1";
     let bind_port = get_free_port().map_err(RunloopError::NoFreePort)?;
     let ws_port = get_free_port().map_err(RunloopError::NoFreePort)?;
@@ -4604,7 +4619,8 @@ fn boot_simnet(
         ..SurfpoolConfig::default()
     };
 
-    let (mut surfnet_svm, simnet_events_rx, geyser_events_rx) = test_type.initialize_svm();
+    let (mut surfnet_svm, simnet_events_rx, geyser_events_rx) =
+        test_type.initialize_svm_with_features(feature_config);
     // The runloop and the SVM must agree on slot time, as they do when the CLI builds both.
     surfnet_svm.slot_time = slot_time;
     let (simnet_commands_tx, simnet_commands_rx) = unbounded();
@@ -4633,8 +4649,13 @@ fn boot_simnet(
 // before the first transaction completes its full finalization window.
 #[tokio::test(flavor = "multi_thread")]
 async fn transaction_mode_processes_queued_transactions_before_finalization() {
-    let simnet = boot_simnet(BlockProductionMode::Transaction, Some(1), TestType::no_db())
-        .expect("the simnet should boot");
+    let simnet = boot_simnet_with_features(
+        BlockProductionMode::Transaction,
+        Some(1),
+        TestType::no_db(),
+        SvmFeatureConfig::new().disable(agave_feature_set::alpenglow::id()),
+    )
+    .expect("the simnet should boot");
     let payer = Keypair::new();
     simnet.locker.with_svm_writer(|svm| {
         svm.set_account(
@@ -4716,7 +4737,8 @@ async fn transaction_mode_processes_queued_transactions_before_finalization() {
                 })
             });
             if let [Some(first_slot), Some(second_slot)] = slots
-                && locker.get_latest_absolute_slot() >= second_slot + FINALIZATION_SLOT_THRESHOLD
+                && locker.get_latest_absolute_slot()
+                    >= second_slot + LEGACY_FINALIZATION_SLOT_THRESHOLD
             {
                 break (first_slot, second_slot);
             }
@@ -4727,7 +4749,7 @@ async fn transaction_mode_processes_queued_transactions_before_finalization() {
     .expect("both transactions should finalize");
 
     assert!(
-        slots.1 < slots.0 + FINALIZATION_SLOT_THRESHOLD,
+        slots.1 < slots.0 + LEGACY_FINALIZATION_SLOT_THRESHOLD,
         "the second transaction should not wait for a separate finalization window"
     );
 }
@@ -4762,6 +4784,39 @@ fn a_surfnet_stops_when_it_is_told_to(test_type: TestType) {
         .runloop
         .stop()
         .expect("the runloop should stop when told to");
+}
+
+#[test]
+fn test_pause_clock_acknowledges_the_final_slot() {
+    let rpc_server = SurfnetCheatcodesRpc::empty();
+    let simnet = boot_simnet(BlockProductionMode::Clock, Some(5), TestType::no_db())
+        .expect("the simnet should boot");
+    let (plugin_commands_tx, _plugin_commands_rx) = crossbeam_channel::unbounded::<PluginCommand>();
+    let runloop_context = RunloopContext {
+        id: None,
+        svm_locker: simnet.locker.clone(),
+        simnet_commands_tx: simnet.commands.clone(),
+        remote_rpc_client: None,
+        rpc_config: RpcConfig::default(),
+        cheatcode_config: CheatcodeConfig::new(),
+        plugin_commands_tx,
+    };
+    // A tick the clock queued before reading the pause must not move the slot after the ack.
+    for _ in 0..5 {
+        std::thread::sleep(Duration::from_millis(100));
+        let paused = rpc_server
+            .pause_clock(Some(runloop_context.clone()))
+            .expect("pause clock");
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            simnet.locker.get_latest_absolute_slot(),
+            paused.absolute_slot,
+            "the acknowledged slot is the paused slot"
+        );
+        rpc_server
+            .resume_clock(Some(runloop_context.clone()))
+            .expect("resume clock");
+    }
 }
 
 #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
@@ -4934,6 +4989,106 @@ fn test_time_travel_absolute_timestamp(test_type: TestType) {
     );
 
     println!("Time travel to absolute timestamp test passed successfully!");
+}
+
+/// A time travel to a slot at a given time lands there at that time, not at the time the slot
+/// time extrapolates, and leaves the time of every block before the jump as it was.
+#[test]
+fn time_travel_to_a_slot_at_a_time() {
+    use crate::rpc::full::{Full, SurfpoolFullRpc};
+
+    let slot_time = 1_000;
+    let simnet = boot_simnet(
+        BlockProductionMode::Manual,
+        Some(slot_time),
+        TestType::no_db(),
+    )
+    .expect("the simnet should boot");
+    let svm_locker = simnet.locker.clone();
+    let (plugin_commands_tx, _plugin_commands_rx) = crossbeam_channel::unbounded::<PluginCommand>();
+    let runloop_context = RunloopContext {
+        id: None,
+        svm_locker: svm_locker.clone(),
+        simnet_commands_tx: simnet.commands.clone(),
+        remote_rpc_client: None,
+        rpc_config: RpcConfig::default(),
+        cheatcode_config: CheatcodeConfig::new(),
+        plugin_commands_tx,
+    };
+    let confirm_block = || svm_locker.with_svm_writer(|svm| svm.confirm_current_block().unwrap());
+    let block_time = |slot| {
+        hiro_system_kit::nestable_block_on(
+            SurfpoolFullRpc.get_block_time(Some(runloop_context.clone()), slot),
+        )
+        .unwrap()
+    };
+
+    let airdrop = svm_locker
+        .airdrop(&Pubkey::new_unique(), LAMPORTS_PER_SOL)
+        .unwrap()
+        .unwrap()
+        .signature;
+    confirm_block();
+    confirm_block();
+    let before_jump = svm_locker.get_latest_absolute_slot() - 2;
+    let time_before_jump = block_time(before_jump);
+
+    let landing = 458_887_083;
+    let a_day_ago = (chrono::Utc::now().timestamp() - 24 * 60 * 60) as u64;
+    let travel = |slot| {
+        SurfnetCheatcodesRpc::empty().time_travel(
+            Some(runloop_context.clone()),
+            Some(TimeTravelConfig::AbsoluteSlotAt {
+                slot,
+                timestamp: a_day_ago * 1_000,
+            }),
+        )
+    };
+    assert!(travel(1).is_err(), "a slot in the past is rejected");
+    travel(landing).expect("time travel should succeed");
+    // A gap adds no depth: the transaction before it is finalized as `getSlot` says it is.
+    let finalized = svm_locker.get_slot_for_commitment(&CommitmentConfig::finalized());
+    let status = hiro_system_kit::nestable_block_on(SurfpoolFullRpc.get_signature_statuses(
+        Some(runloop_context.clone()),
+        vec![airdrop.to_string()],
+        None,
+    ))
+    .unwrap()
+    .value[0]
+        .clone()
+        .unwrap();
+    assert_eq!(
+        status.confirmation_status
+            == Some(solana_transaction_status::TransactionConfirmationStatus::Finalized),
+        status.slot <= finalized
+    );
+    // Skipped slots are no confirmations: the two blocks after it, then the landing.
+    assert_eq!(status.confirmations, Some(3));
+
+    let clock = svm_locker.with_svm_reader(|svm| svm.inner.get_sysvar::<Clock>());
+    assert_eq!(
+        (clock.slot, clock.unix_timestamp),
+        (landing, a_day_ago as i64)
+    );
+    confirm_block();
+    confirm_block();
+    // Under TowerBFT, a block's time is the Clock its transactions read.
+    assert_eq!(block_time(landing), Some(a_day_ago as i64));
+    assert_eq!(block_time(landing + 1), Some(a_day_ago as i64 + 1));
+    assert_eq!(block_time(before_jump), time_before_jump);
+
+    // The slot open when the travel is asked for is closed by the time it lands: it lands on
+    // the slot open then, so no slot is produced twice.
+    let open = svm_locker.get_latest_absolute_slot();
+    let landed = travel(open)
+        .expect("time travel should succeed")
+        .absolute_slot;
+    let clock = svm_locker.with_svm_reader(|svm| svm.inner.get_sysvar::<Clock>());
+    assert_eq!((landed, clock.slot), (open + 1, open + 1));
+    assert!(
+        travel(u64::MAX).is_err(),
+        "no block could follow the largest slot"
+    );
 }
 
 /// After each kind of time travel the Clock sysvar holds the absolute slot, as it does after
@@ -6006,8 +6161,8 @@ fn test_reset_network_keeps_latest_blockhash_valid(test_type: TestType) {
             svm_reader.latest_epoch_info.absolute_slot,
         )
     });
-    assert_eq!(genesis_slot, FINALIZATION_SLOT_THRESHOLD);
-    assert_eq!(latest_slot, FINALIZATION_SLOT_THRESHOLD);
+    assert_eq!(genesis_slot, INITIAL_SLOT);
+    assert_eq!(latest_slot, INITIAL_SLOT);
     assert_eq!(epoch_schedule, EpochSchedule::without_warmup());
 
     let latest_blockhash = svm_locker.with_svm_reader(|svm_reader| svm_reader.latest_blockhash());
@@ -6252,6 +6407,74 @@ fn start_surfnet(
     ))
 }
 
+/// Clients read `getGenesisHash` as the cluster's identity. A fork reports its
+/// datasource's hash and an offline surfnet its own genesis config's, unless
+/// `genesis_hash` names the cluster, which wins in both modes.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_genesis_hash_reports_the_configured_cluster() {
+    async fn genesis_hash_of(remote_rpc_url: Option<String>, genesis_hash: Option<Hash>) -> Hash {
+        let bind_port = get_free_port().unwrap();
+        let offline_mode = remote_rpc_url.is_none();
+        let config = SurfpoolConfig {
+            simnets: vec![SimnetConfig {
+                block_production_mode: BlockProductionMode::Manual,
+                offline_mode,
+                remote_rpc_url,
+                genesis_hash,
+                ..SimnetConfig::default()
+            }],
+            rpc: RpcConfig {
+                bind_host: "127.0.0.1".to_string(),
+                bind_port,
+                ws_port: get_free_port().unwrap(),
+                ..Default::default()
+            },
+            ..SurfpoolConfig::default()
+        };
+        let (svm, simnet_events_rx, geyser_events_rx) = TestType::no_db().initialize_svm();
+        let _runloop = spawn_runloop(
+            SurfnetSvmLocker::new(svm),
+            config,
+            unbounded(),
+            geyser_events_rx,
+        )
+        .expect("the surfnet should start");
+        let ready = if offline_mode {
+            wait_for_ready(&simnet_events_rx)
+        } else {
+            wait_for_ready_and_connected(&simnet_events_rx)
+        };
+        ready.expect("the surfnet should be ready");
+
+        RpcClient::new(format!("http://127.0.0.1:{bind_port}"))
+            .get_genesis_hash()
+            .await
+            .expect("getGenesisHash should answer")
+    }
+
+    let mainnet = Hash::from_str("5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d").unwrap();
+    let (datasource_url, datasource, _datasource_runloop) =
+        start_surfnet(vec![], None, TestType::no_db()).expect("the datasource should start");
+    let datasource_hash = datasource.with_svm_reader(|svm| svm.genesis_config.hash());
+
+    assert_eq!(
+        RpcClient::new(datasource_url.clone())
+            .get_genesis_hash()
+            .await
+            .expect("getGenesisHash should answer"),
+        datasource_hash
+    );
+    assert_eq!(genesis_hash_of(None, Some(mainnet)).await, mainnet);
+    assert_eq!(
+        genesis_hash_of(Some(datasource_url.clone()), None).await,
+        datasource_hash
+    );
+    assert_eq!(
+        genesis_hash_of(Some(datasource_url), Some(mainnet)).await,
+        mainnet
+    );
+}
+
 #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
 #[test_case(TestType::in_memory(); "with in-memory sqlite db")]
 #[test_case(TestType::no_db(); "with no db")]
@@ -6480,6 +6703,12 @@ async fn test_get_signatures_for_address_local_then_remote(test_type: TestType) 
         "local airdrops must produce distinct signatures"
     );
     // local_sigs[0] is the newer local signature; local_sigs[1] is the older one.
+    // The default `finalized` commitment lists only finalized signatures. The datasource
+    // signatures are older, so they are finalized by then too.
+    local_rpc
+        .poll_for_signature_with_commitment(&local_sigs[0], CommitmentConfig::finalized())
+        .await
+        .expect("local airdrop should finalize");
 
     // Scenario A: `before` is a local-only signature.
     // Pre-fix surfpool forwarded `before=local_sigs[0]` to the datasource, which had never seen
@@ -7140,6 +7369,270 @@ async fn test_remote_get_multiple_accounts_ordering(test_type: TestType) {
     );
 }
 
+// Regression #875: commitment queries, subscriptions, and roots must agree on
+// finality, including when Alpenglow is disabled to reproduce TowerBFT behavior.
+#[test_case(TestType::no_db(), true; "alpenglow without db")]
+#[test_case(TestType::in_memory(), true; "alpenglow with sqlite")]
+#[test_case(TestType::no_db(), false; "legacy without db")]
+#[test_case(TestType::in_memory(), false; "legacy with sqlite")]
+#[tokio::test(flavor = "multi_thread")]
+async fn finalization_follows_the_alpenglow_feature(test_type: TestType, alpenglow: bool) {
+    use solana_client::rpc_config::{
+        RpcSignaturesForAddressConfig, RpcTransactionConfig, RpcTransactionLogsFilter,
+    };
+    use solana_transaction_status::TransactionConfirmationStatus;
+
+    use crate::{
+        rpc::full::{RpcGetTransactionsForAddressConfig, RpcTransactionForAddressEntry},
+        surfnet::GeyserSlotStatus,
+    };
+
+    let features = if alpenglow {
+        SvmFeatureConfig::new().enable(agave_feature_set::alpenglow::id())
+    } else {
+        SvmFeatureConfig::new().disable(agave_feature_set::alpenglow::id())
+    };
+    let (mut svm, _events, geyser_events) = test_type.initialize_svm_with_features(features);
+    let depth = if alpenglow { 1 } else { 31 };
+    assert_eq!(svm.genesis_slot, INITIAL_SLOT);
+    assert_eq!(svm.finalization_slot_threshold(), depth);
+    assert_eq!(
+        svm.feature_set
+            .is_active(&agave_feature_set::alpenglow::id()),
+        alpenglow,
+    );
+    let finalized_slot = svm.slot_for_commitment(&CommitmentConfig::finalized());
+    assert!(
+        svm.inner
+            .get_sysvar::<solana_slot_hashes::SlotHashes>()
+            .get(&finalized_slot)
+            .is_some()
+    );
+
+    let payer = Keypair::new();
+    svm.set_account(
+        &payer.pubkey(),
+        Account {
+            lamports: LAMPORTS_PER_SOL,
+            owner: system_program::id(),
+            ..Account::default()
+        },
+    )
+    .unwrap();
+    let transaction = Transaction::new_signed_with_payer(
+        &[transfer(&payer.pubkey(), &Pubkey::new_unique(), 1_000_000)],
+        Some(&payer.pubkey()),
+        &[&payer],
+        svm.latest_blockhash(),
+    );
+    let signature = transaction.signatures[0];
+    let transaction_slot = svm.get_latest_absolute_slot();
+    let locker = SurfnetSvmLocker::new(svm);
+    let slots = locker.subscribe_for_slot_updates();
+    let slot_updates = locker.subscribe_for_slots_updates();
+    let confirmed =
+        locker.subscribe_for_signature_updates(&signature, SignatureSubscriptionType::confirmed());
+    let finalized =
+        locker.subscribe_for_signature_updates(&signature, SignatureSubscriptionType::finalized());
+    let confirmed_logs = locker
+        .subscribe_for_logs_updates(&CommitmentLevel::Confirmed, &RpcTransactionLogsFilter::All);
+    let finalized_logs = locker
+        .subscribe_for_logs_updates(&CommitmentLevel::Finalized, &RpcTransactionLogsFilter::All);
+    let confirmed_blocks =
+        locker.subscribe_for_block_updates(CommitmentLevel::Confirmed, None, Default::default());
+    let payer_blocks = locker.subscribe_for_block_updates(
+        CommitmentLevel::Confirmed,
+        Some(payer.pubkey()),
+        Default::default(),
+    );
+    // Unsubscribed before any block mentions its account.
+    drop(locker.subscribe_for_block_updates(
+        CommitmentLevel::Confirmed,
+        Some(Pubkey::new_unique()),
+        Default::default(),
+    ));
+    let (status_tx, status_rx) = unbounded();
+    locker
+        .process_transaction(&None, transaction.into(), status_tx, false, true)
+        .await
+        .unwrap();
+
+    let assert_status = |expected, confirmations| {
+        let expected = Some(expected);
+        let status = locker
+            .get_transaction_local(&signature, &RpcTransactionConfig::default())
+            .unwrap()
+            .map_found_transaction()
+            .unwrap();
+        assert_eq!(status.slot, transaction_slot);
+        assert_eq!(status.confirmation_status, expected);
+        assert_eq!(status.confirmations, confirmations);
+        // At the default `finalized` commitment, the signature is listed once finalized.
+        let signatures = locker
+            .get_signatures_for_address_local(&payer.pubkey(), None)
+            .unwrap();
+        assert_eq!(
+            signatures
+                .inner()
+                .first()
+                .and_then(|s| s.confirmation_status.clone()),
+            expected
+                .clone()
+                .filter(|s| *s == TransactionConfirmationStatus::Finalized)
+        );
+        // Until then, Agave cannot find it as a boundary at that commitment.
+        let until = RpcSignaturesForAddressConfig {
+            until: Some(signature.to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            locker
+                .get_signatures_for_address_local(&payer.pubkey(), Some(&until))
+                .map(|_| ())
+                .map_err(|e| {
+                    let e = jsonrpc_core::Error::from(e);
+                    (e.code, e.message)
+                }),
+            if expected == Some(TransactionConfirmationStatus::Finalized) {
+                Ok(())
+            } else {
+                Err((
+                    jsonrpc_core::ErrorCode::ServerError(-32020),
+                    format!("Transaction {signature} not found"),
+                ))
+            }
+        );
+        let transactions = locker
+            .get_transactions_for_address_local(
+                &payer.pubkey(),
+                &RpcGetTransactionsForAddressConfig::default(),
+            )
+            .unwrap();
+        let RpcTransactionForAddressEntry::Signature(entry) = &transactions.inner().data[0] else {
+            panic!("expected signature metadata");
+        };
+        assert_eq!(entry.confirmation_status, expected);
+    };
+    assert_status(TransactionConfirmationStatus::Processed, Some(0));
+    assert!(confirmed.try_recv().is_err());
+    assert!(finalized.try_recv().is_err());
+    let LocalSignatureStatusOrSubscription::Subscription(atomic_finalized) = locker
+        .get_local_signature_status_or_subscribe(&signature, SignatureSubscriptionType::finalized())
+        .unwrap()
+    else {
+        panic!("a processed transaction must wait for finalization");
+    };
+    assert!(atomic_finalized.try_recv().is_err());
+    geyser_events.try_iter().for_each(drop);
+
+    for advancement in 1..=depth {
+        locker.confirm_current_block(&None).await.unwrap();
+        let now_finalized = advancement == depth;
+        let expected = if now_finalized {
+            TransactionConfirmationStatus::Finalized
+        } else {
+            TransactionConfirmationStatus::Confirmed
+        };
+        assert_status(
+            expected,
+            if now_finalized {
+                None
+            } else {
+                Some(advancement as usize)
+            },
+        );
+        assert_eq!(
+            locker.get_slot_for_commitment(&CommitmentConfig::confirmed()),
+            transaction_slot + advancement - 1
+        );
+        assert_eq!(
+            locker.get_slot_for_commitment(&CommitmentConfig::finalized()),
+            transaction_slot + advancement - depth
+        );
+        assert_eq!(
+            slots.try_recv().unwrap().root,
+            transaction_slot + advancement - depth
+        );
+        if alpenglow {
+            locker.with_svm_reader(|svm| {
+                assert_eq!(
+                    svm.blockhash_for_commitment(&CommitmentConfig::confirmed()),
+                    svm.blockhash_for_commitment(&CommitmentConfig::finalized()),
+                );
+            });
+        }
+        if advancement == 1 {
+            assert!(confirmed.try_recv().unwrap().1.is_none());
+            assert!(confirmed_logs.try_recv().is_ok());
+        }
+        assert_eq!(finalized.try_recv().is_ok(), now_finalized);
+        assert_eq!(atomic_finalized.try_recv().is_ok(), now_finalized);
+        assert_eq!(finalized_logs.try_recv().is_ok(), now_finalized);
+        assert_eq!(
+            locker.has_transactions_pending_finalization(),
+            !now_finalized
+        );
+        let rooted = geyser_events.try_iter().any(|event| {
+            matches!(event,
+                GeyserEvent::UpdateSlotStatus { slot, status: GeyserSlotStatus::Rooted, .. }
+                    if slot == transaction_slot
+            )
+        });
+        assert_eq!(rooted, now_finalized);
+        let root_update = slot_updates.try_iter().any(|event| {
+            matches!(event.as_ref(),
+                SlotUpdate::Root { slot, .. } if *slot == transaction_slot
+            )
+        });
+        assert_eq!(root_update, now_finalized);
+    }
+    // blockSubscribe: every confirmed block once, and only the payer's for a filter on it.
+    let confirmed_blocks: Vec<_> = confirmed_blocks.try_iter().map(|u| u.slot).collect();
+    assert_eq!(
+        confirmed_blocks,
+        (transaction_slot..transaction_slot + depth).collect::<Vec<_>>()
+    );
+    let payer_blocks: Vec<_> = payer_blocks
+        .try_iter()
+        .map(|u| {
+            (
+                u.slot,
+                u.block.and_then(|b| b.transactions).map(|t| t.len()),
+            )
+        })
+        .collect();
+    assert_eq!(payer_blocks, [(transaction_slot, Some(1))]);
+    assert_eq!(
+        locker.with_svm_reader(|svm| svm.block_subscriptions.len()),
+        2,
+        "a cancelled subscription is dropped at the next block"
+    );
+    assert!(matches!(
+        locker
+            .get_local_signature_status_or_subscribe(
+                &signature,
+                SignatureSubscriptionType::finalized(),
+            )
+            .unwrap(),
+        LocalSignatureStatusOrSubscription::Status(_)
+    ));
+    let promotions: Vec<_> = status_rx
+        .try_iter()
+        .filter_map(|event| match event {
+            TransactionStatusEvent::Success(status) => Some(status),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        promotions,
+        vec![
+            surfpool_types::TransactionConfirmationStatus::Processed,
+            surfpool_types::TransactionConfirmationStatus::Confirmed,
+            surfpool_types::TransactionConfirmationStatus::Finalized,
+        ]
+    );
+}
+
 // websocket rpc methods tests
 
 #[test_case(SignatureSubscriptionType::processed() ; "processed commitment")]
@@ -7150,7 +7643,15 @@ async fn test_ws_signature_subscribe(subscription_type: SignatureSubscriptionTyp
     use crossbeam_channel::unbounded;
     use solana_system_interface::instruction as system_instruction;
 
-    let (svm_instance, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+    let (mut svm_instance, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+    // Leave epoch 0, where the epoch slot index equals the absolute slot (#896).
+    svm_instance
+        .travel_to(svm_instance.latest_epoch_info.slots_in_epoch + 100)
+        .unwrap();
+    assert_ne!(
+        svm_instance.latest_epoch_info.slot_index,
+        svm_instance.latest_epoch_info.absolute_slot
+    );
 
     let svm_locker = SurfnetSvmLocker::new(svm_instance);
 
@@ -7172,6 +7673,7 @@ async fn test_ws_signature_subscribe(subscription_type: SignatureSubscriptionTyp
         recent_blockhash,
     );
     let signature = tx.signatures[0];
+    let transaction_slot = svm_locker.get_latest_absolute_slot();
 
     // subscribe with processed commitment
     let notification_rx =
@@ -7208,9 +7710,9 @@ async fn test_ws_signature_subscribe(subscription_type: SignatureSubscriptionTyp
         error_opt.is_none(),
         "Transaction should succeed without error"
     );
-    println!(
-        "✓ Received {} signature notification at slot {}",
-        subscription_type, slot
+    assert_eq!(
+        slot, transaction_slot,
+        "{subscription_type} notification must carry the absolute slot"
     );
 }
 
@@ -7831,7 +8333,7 @@ async fn test_ws_account_subscribe_balance_change(test_type: TestType) {
     let account_update = account_rx.recv_timeout(Duration::from_secs(5));
     assert!(account_update.is_ok(), "Should receive account update");
 
-    let updated_account = account_update.unwrap();
+    let (_, updated_account) = account_update.unwrap();
     assert_eq!(
         updated_account.lamports,
         LAMPORTS_PER_SOL - 1_000_000 - 5000, // original - transfer amount - fees
@@ -8033,7 +8535,7 @@ async fn test_ws_account_subscribe_new_account_creation(test_type: TestType) {
         "Should receive notification when account is created"
     );
 
-    let created_account = account_update.unwrap();
+    let (_, created_account) = account_update.unwrap();
     assert_eq!(
         created_account.lamports, 1_000_000,
         "New account should have correct balance"
@@ -8290,11 +8792,8 @@ async fn test_ws_slots_updates_subscribe_manual_advancement(test_type: TestType)
     svm_locker.confirm_current_block(&None).await.unwrap();
 
     // Drain all events emitted for this single block confirmation and assert we
-    // observe the per-block lifecycle variants. `Root` is intentionally NOT
-    // asserted here: the rooted slot only catches up to `genesis_slot` after
-    // ~FINALIZATION_SLOT_THRESHOLD advancements, so a single confirmation is
-    // not expected to produce a `Root` event. See the
-    // `_root_emission` test below for that coverage.
+    // observe the per-block lifecycle variants. Root timing is covered separately
+    // by the feature-dependent finalization test.
     let mut saw_created_bank = false;
     let mut saw_frozen = false;
     let mut saw_optimistic_confirmation = false;
@@ -8335,8 +8834,6 @@ async fn test_ws_slots_updates_subscribe_manual_advancement(test_type: TestType)
 #[cfg_attr(feature = "postgres", test_case(TestType::postgres(); "with postgres db"))]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_ws_slots_updates_subscribe_root_emission(test_type: TestType) {
-    use crate::surfnet::FINALIZATION_SLOT_THRESHOLD;
-
     let (svm_instance, _simnet_events_rx, _geyser_events_rx) = test_type.initialize_svm();
     let svm_locker = SurfnetSvmLocker::new(svm_instance);
 
@@ -8345,7 +8842,7 @@ async fn test_ws_slots_updates_subscribe_root_emission(test_type: TestType) {
 
     // Advance enough slots for the rooted slot to catch up to `genesis_slot`,
     // which is what gates emission of `SlotUpdate::Root`.
-    let advancements = (FINALIZATION_SLOT_THRESHOLD as usize) + 2;
+    let advancements = svm_locker.with_svm_reader(|svm| svm.finalization_slot_threshold()) + 2;
     for _ in 0..advancements {
         svm_locker.confirm_current_block(&None).await.unwrap();
     }
@@ -8668,8 +9165,6 @@ async fn test_ws_logs_subscribe_finalized_commitment(test_type: TestType) {
     use solana_commitment_config::CommitmentLevel;
     use solana_system_interface::instruction as system_instruction;
 
-    use crate::surfnet::FINALIZATION_SLOT_THRESHOLD;
-
     let (svm_instance, _simnet_events_rx, _geyser_events_rx) = test_type.initialize_svm();
     let svm_locker = SurfnetSvmLocker::new(svm_instance);
 
@@ -8706,11 +9201,8 @@ async fn test_ws_logs_subscribe_finalized_commitment(test_type: TestType) {
         .await
         .unwrap();
 
-    // confirm and finalize the block
-    svm_locker.confirm_current_block(&None).await.unwrap();
-
-    // advance enough slots to trigger finalization
-    for _ in 0..FINALIZATION_SLOT_THRESHOLD {
+    let depth = svm_locker.with_svm_reader(|svm| svm.finalization_slot_threshold());
+    for _ in 0..depth {
         svm_locker.confirm_current_block(&None).await.unwrap();
     }
 
@@ -10600,7 +11092,7 @@ async fn test_ws_program_subscribe_basic(test_type: TestType) {
     let update = program_rx.recv_timeout(Duration::from_secs(5));
     assert!(update.is_ok(), "Should receive program account update");
 
-    let keyed_account = update.unwrap();
+    let (_, keyed_account) = update.unwrap();
     assert_eq!(
         keyed_account.pubkey,
         account_pubkey.to_string(),
@@ -10676,7 +11168,7 @@ async fn test_ws_program_subscribe_data_size_filter(test_type: TestType) {
         "Should receive notification for account matching dataSize filter"
     );
 
-    let keyed_account = update.unwrap();
+    let (_, keyed_account) = update.unwrap();
     assert_eq!(
         keyed_account.pubkey,
         matching_account_pubkey.to_string(),
@@ -10750,7 +11242,7 @@ async fn test_ws_program_subscribe_memcmp_filter(test_type: TestType) {
         "Should receive notification for account matching memcmp filter"
     );
 
-    let keyed_account = update.unwrap();
+    let (_, keyed_account) = update.unwrap();
     assert_eq!(
         keyed_account.pubkey,
         matching_pubkey.to_string(),
@@ -11572,7 +12064,8 @@ async fn test_create_lookup_table_with_finalized_slot(test_type: TestType) {
 
     assert_eq!(
         finalized_slot,
-        processed_slot.saturating_sub(FINALIZATION_SLOT_THRESHOLD),
+        processed_slot
+            .saturating_sub(svm_locker.with_svm_reader(|svm| svm.finalization_slot_threshold())),
         "test setup should mirror Surfpool's finalized slot lag"
     );
 
@@ -11589,53 +12082,57 @@ async fn test_create_lookup_table_with_finalized_slot(test_type: TestType) {
         "SlotHashes should contain finalized_slot={finalized_slot}; entries={slot_hash_slots:?}"
     );
 
-    let (create_lookup_table_ix, lookup_table_address) =
-        address_lookup_table_instruction::create_lookup_table(
-            payer.pubkey(),
-            payer.pubkey(),
-            finalized_slot,
+    // Clients pass `getSlot` at their commitment: Anchor's default is processed.
+    for recent_slot in [finalized_slot, processed_slot] {
+        let (create_lookup_table_ix, lookup_table_address) =
+            address_lookup_table_instruction::create_lookup_table(
+                payer.pubkey(),
+                payer.pubkey(),
+                recent_slot,
+            );
+        let recent_blockhash = svm_locker.with_svm_reader(|svm| svm.latest_blockhash());
+        let message = Message::new_with_blockhash(
+            &[create_lookup_table_ix],
+            Some(&payer.pubkey()),
+            &recent_blockhash,
         );
-    let recent_blockhash = svm_locker.with_svm_reader(|svm| svm.latest_blockhash());
-    let message = Message::new_with_blockhash(
-        &[create_lookup_table_ix],
-        Some(&payer.pubkey()),
-        &recent_blockhash,
-    );
-    let tx = VersionedTransaction::try_new(VersionedMessage::Legacy(message), &[&payer]).unwrap();
+        let tx =
+            VersionedTransaction::try_new(VersionedMessage::Legacy(message), &[&payer]).unwrap();
 
-    let (status_tx, status_rx) = crossbeam_unbounded();
-    let result = svm_locker
-        .process_transaction(&None, tx, status_tx, false, true)
-        .await;
-    assert!(
-        result.is_ok(),
-        "CreateLookupTable should accept getSlot(finalized) as recent_slot; \
+        let (status_tx, status_rx) = crossbeam_unbounded();
+        let result = svm_locker
+            .process_transaction(&None, tx, status_tx, false, true)
+            .await;
+        assert!(
+            result.is_ok(),
+            "CreateLookupTable should accept recent_slot={recent_slot}; \
          processed_slot={processed_slot}, finalized_slot={finalized_slot}, \
          SlotHashes entries={slot_hash_slots:?}, result={result:?}"
-    );
+        );
 
-    match status_rx.recv_timeout(Duration::from_secs(5)) {
-        Ok(TransactionStatusEvent::Success(_)) => {}
-        other => panic!(
-            "CreateLookupTable should succeed, got: {other:?}; \
+        match status_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(TransactionStatusEvent::Success(_)) => {}
+            other => panic!(
+                "CreateLookupTable should succeed, got: {other:?}; \
              processed_slot={processed_slot}, finalized_slot={finalized_slot}, \
              SlotHashes entries={slot_hash_slots:?}"
-        ),
-    }
+            ),
+        }
 
-    let lookup_table_account = svm_locker
-        .with_svm_reader(|svm| svm.get_account(&lookup_table_address))
-        .unwrap();
-    assert!(
-        matches!(
-            lookup_table_account,
-            Some(Account {
-                owner,
-                ..
-            }) if owner == solana_address_lookup_table_interface::program::id()
-        ),
-        "lookup table account {lookup_table_address} should be created"
-    );
+        let lookup_table_account = svm_locker
+            .with_svm_reader(|svm| svm.get_account(&lookup_table_address))
+            .unwrap();
+        assert!(
+            matches!(
+                lookup_table_account,
+                Some(Account {
+                    owner,
+                    ..
+                }) if owner == solana_address_lookup_table_interface::program::id()
+            ),
+            "lookup table account {lookup_table_address} should be created"
+        );
+    }
 }
 
 #[cfg_attr(feature = "ignore_tests_ci", ignore = "flaky CI tests")]
@@ -11797,6 +12294,245 @@ async fn test_send_transaction_skip_sig_verify_processes_and_updates_state(test_
         final_payer_balance.value > airdrop_amount - transfer_amount - LAMPORTS_PER_SOL / 10,
         "Payer balance ({}) should not have decreased by more than transfer + reasonable fees",
         final_payer_balance.value,
+    );
+}
+
+// Agave's RPC forwards a skip-preflight send without consulting the status cache and the bank
+// drops the duplicate, so the client gets the signature back; with preflight, the simulation
+// rejects it as AlreadyProcessed.
+#[test_case(TestType::sqlite(); "with on-disk sqlite db")]
+#[test_case(TestType::in_memory(); "with in-memory sqlite db")]
+#[test_case(TestType::no_db(); "with no db")]
+#[cfg_attr(feature = "postgres", test_case(TestType::postgres(); "with postgres db"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_send_transaction_resend_of_processed_transaction(test_type: TestType) {
+    let payer = Keypair::new();
+    let recipient = Pubkey::new_unique();
+    let bind_host = "127.0.0.1";
+    let bind_port = get_free_port().unwrap();
+    let ws_port = get_free_port().unwrap();
+    let config = SurfpoolConfig {
+        simnets: vec![SimnetConfig {
+            airdrop_addresses: vec![payer.pubkey()],
+            airdrop_token_amount: LAMPORTS_PER_SOL,
+            block_production_mode: BlockProductionMode::Manual,
+            offline_mode: true,
+            ..SimnetConfig::default()
+        }],
+        rpc: RpcConfig {
+            bind_host: bind_host.to_string(),
+            bind_port,
+            ws_port,
+            ..RpcConfig::default()
+        },
+        ..SurfpoolConfig::default()
+    };
+
+    let (surfnet_svm, simnet_events_rx, geyser_events_rx) = test_type.initialize_svm();
+    let (simnet_commands_tx, simnet_commands_rx) = unbounded();
+    let svm_locker = SurfnetSvmLocker::new(surfnet_svm);
+    let _runloop = spawn_runloop(
+        svm_locker.clone(),
+        config,
+        (simnet_commands_tx.clone(), simnet_commands_rx),
+        geyser_events_rx,
+    )
+    .expect("the runloop should start");
+    wait_for_ready(&simnet_events_rx).expect("the surfnet should start");
+
+    let url = format!("http://{bind_host}:{bind_port}");
+    let full_client = http::connect::<FullClient>(&url)
+        .await
+        .expect("Failed to connect to Surfpool");
+    let minimal_client = http::connect::<MinimalClient>(&url)
+        .await
+        .expect("Failed to connect to Surfpool");
+
+    let transfer = |lamports| {
+        Transaction::new_signed_with_payer(
+            &[system_instruction::transfer(
+                &payer.pubkey(),
+                &recipient,
+                lamports,
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            svm_locker.latest_absolute_blockhash(),
+        )
+    };
+    let encode = |tx: &Transaction| {
+        bs58::encode(bincode::serialize(&VersionedTransaction::from(tx.clone())).unwrap())
+            .into_string()
+    };
+    let send_config = |skip_preflight, preflight_commitment, skip_sig_verify| {
+        Some(SurfpoolRpcSendTransactionConfig {
+            base: RpcSendTransactionConfig {
+                skip_preflight,
+                preflight_commitment,
+                ..Default::default()
+            },
+            skip_sig_verify,
+        })
+    };
+    let skip_preflight = send_config(true, None, None);
+    let processed_preflight = send_config(false, Some(CommitmentLevel::Processed), None);
+    let tx = transfer(LAMPORTS_PER_SOL / 10);
+    let signature = tx.signatures[0].to_string();
+    let data = encode(&tx);
+
+    full_client
+        .send_transaction(data.clone(), None)
+        .await
+        .expect("the first send should succeed");
+    let observed_state = async || {
+        let payer = minimal_client.get_balance(payer.pubkey().to_string(), None);
+        let recipient = minimal_client.get_balance(recipient.to_string(), None);
+        let transaction_count = minimal_client.get_transaction_count(None);
+        (
+            payer.await.unwrap().value,
+            recipient.await.unwrap().value,
+            transaction_count.await.unwrap(),
+        )
+    };
+    let state_after_first_send = observed_state().await;
+
+    let resent = full_client
+        .send_transaction(data.clone(), skip_preflight.clone())
+        .await
+        .expect("a skip-preflight resend should return the signature");
+    assert_eq!(resent, signature);
+
+    // The finalized preflight bank has not processed it yet, so the simulation passes.
+    let resent = full_client
+        .send_transaction(data.clone(), None)
+        .await
+        .expect("a finalized-preflight resend should return the signature");
+    assert_eq!(resent, signature);
+
+    let simulation_error = async |data, config| {
+        let Err(jsonrpc_core_client::RpcError::JsonRpcError(err)) =
+            full_client.send_transaction(data, config).await
+        else {
+            panic!("the preflight resend should fail the simulation");
+        };
+        assert_eq!(err.code, jsonrpc_core::ErrorCode::ServerError(-32002));
+        let simulation = err
+            .data
+            .expect("the error should carry the simulation result");
+        assert_eq!(simulation["loadedAccountsDataSize"], 0);
+        (err.message, simulation["err"].clone())
+    };
+    assert_eq!(
+        simulation_error(data, processed_preflight.clone()).await,
+        (
+            "Transaction simulation failed: This transaction has already been processed"
+                .to_string(),
+            "AlreadyProcessed".into()
+        )
+    );
+
+    assert_eq!(
+        observed_state().await,
+        state_after_first_send,
+        "the resends should neither execute nor move lamports"
+    );
+
+    // Another message under the processed signature is a new transaction to the status cache.
+    let mut reusing_signature = transfer(LAMPORTS_PER_SOL / 20);
+    reusing_signature.signatures = tx.signatures.clone();
+    let reusing_data = encode(&reusing_signature);
+    full_client
+        .send_transaction(reusing_data.clone(), send_config(true, None, Some(true)))
+        .await
+        .expect("a send without signature verification should succeed");
+    assert_eq!(
+        observed_state().await.1,
+        state_after_first_send.1 + LAMPORTS_PER_SOL / 20,
+        "a different message reusing the signature should execute"
+    );
+
+    // Agave verifies the signatures before the preflight simulation checks the status cache.
+    assert_eq!(
+        simulation_error(reusing_data, processed_preflight.clone()).await,
+        (
+            "Transaction simulation failed: Transaction did not pass signature verification"
+                .to_string(),
+            "SignatureFailure".into()
+        )
+    );
+
+    // Hold the runloop so both sends queue before either executes.
+    let in_flight = transfer(LAMPORTS_PER_SOL / 40);
+    let in_flight_data = encode(&in_flight);
+    let balance_before_in_flight = observed_state().await.1;
+    let (release_tx, release_rx) = crossbeam_channel::bounded::<()>(1);
+    simnet_commands_tx
+        .send(SimnetCommand::ProcessSerialVmMutation(
+            SerialVmMutationTask::new(move || {
+                Box::pin(async move {
+                    let _ = release_rx.recv_timeout(Duration::from_secs(5));
+                    SerialVmMutationResult::NoBlock
+                })
+            }),
+        ))
+        .unwrap();
+    let wait_for_queue = async |done: fn(usize) -> bool| {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !done(simnet_commands_tx.len()) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+    };
+    wait_for_queue(|len| len == 0)
+        .await
+        .expect("the runloop should take the hold");
+    // Release on every path, so a send that fails before queuing reports instead of hanging.
+    let release = async {
+        let queued = wait_for_queue(|len| len >= 2).await;
+        let _ = release_tx.send(());
+        queued
+    };
+    let (first, second, queued) = tokio::join!(
+        full_client.send_transaction(in_flight_data.clone(), skip_preflight.clone()),
+        full_client.send_transaction(in_flight_data.clone(), skip_preflight),
+        release,
+    );
+    let in_flight_signature = in_flight.signatures[0].to_string();
+    queued.expect("both sends should queue while the runloop is held");
+    assert_eq!(
+        (
+            first.unwrap(),
+            second.expect("an in-flight duplicate should return the signature")
+        ),
+        (in_flight_signature.clone(), in_flight_signature)
+    );
+    assert_eq!(
+        observed_state().await.1,
+        balance_before_in_flight + LAMPORTS_PER_SOL / 40,
+        "the in-flight duplicate should not execute"
+    );
+
+    // Agave checks the transaction's age before the status cache.
+    let blockhash = in_flight.message.recent_blockhash;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while svm_locker
+            .with_svm_reader(|svm_reader| svm_reader.check_blockhash_is_recent(&blockhash))
+        {
+            simnet_commands_tx
+                .send(SimnetCommand::SlotForward(None))
+                .unwrap();
+            wait_for_queue(|len| len == 0).await.unwrap();
+        }
+    })
+    .await
+    .expect("the blockhash should expire");
+    assert_eq!(
+        simulation_error(in_flight_data, processed_preflight).await,
+        (
+            "Transaction simulation failed: Blockhash not found".to_string(),
+            "BlockhashNotFound".into()
+        )
     );
 }
 

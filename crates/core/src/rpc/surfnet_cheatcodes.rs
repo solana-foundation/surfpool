@@ -35,7 +35,8 @@ use crate::{
         utils::{decode_and_deserialize, verify_pubkey, verify_pubkeys},
     },
     surfnet::{
-        AccountSource, GetAccountResult, locker::SvmAccessContext, svm::AccountUpdatePolicy,
+        AccountSource, GetAccountResult, locker::SvmAccessContext,
+        surfnet_lite_svm::reject_managed_sysvar, svm::AccountUpdatePolicy,
     },
     types::{
         TimeTravelConfig, TokenAccount, build_confidential_token_account_data,
@@ -751,6 +752,9 @@ pub trait SurfnetCheatcodes {
     ///     **milliseconds** (like JavaScript `Date.now()`). Note that the `Clock` sysvar
     ///     programs read is in seconds, so a value taken from it must be multiplied by 1000.
     ///   - `absoluteSlot(u64)`: Moves to the specified absolute slot.
+    ///   - `absoluteSlotAt { slot, timestamp }`: Moves to the specified absolute slot at the
+    ///     specified UNIX timestamp in **milliseconds**, instead of the time the slot time
+    ///     extrapolates (e.g. to stand in for mainnet at its current slot and time).
     ///   - `absoluteEpoch(u64)`: Advances time to the specified epoch (each epoch = 432,000 slots).
     ///
     /// ## Returns
@@ -1518,6 +1522,14 @@ pub trait SurfnetCheatcodes {
     ) -> BoxFuture<Result<RpcResponse<()>>>;
 }
 
+#[allow(clippy::disallowed_methods)] // cheatcodes accept no minContextSlot; each picks its own slot
+fn cheatcode_response<T>(slot: Slot, value: T) -> RpcResponse<T> {
+    RpcResponse {
+        context: RpcResponseContext::new(slot),
+        value,
+    }
+}
+
 #[derive(Clone)]
 pub struct SurfnetCheatcodesRpc {
     pub registered_methods: Arc<RwLock<Vec<String>>>,
@@ -1549,6 +1561,10 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
             Ok(res) => res,
             Err(e) => return e.into(),
         };
+        // apply_account_update only reports insertion failures as events, so reject here.
+        if let Err(e) = reject_managed_sysvar(&pubkey) {
+            return e.into();
+        }
         let account_update_opt = match update.to_account_ext() {
             Err(e) => return Box::pin(future::err(e)),
             Ok(res) => res,
@@ -1598,10 +1614,7 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
 
             svm_locker.apply_account_update(account_to_set, AccountUpdatePolicy::Authoritative)?;
 
-            Ok(RpcResponse {
-                context: RpcResponseContext::new(latest_absolute_slot),
-                value: (),
-            })
+            Ok(cheatcode_response(latest_absolute_slot, ()))
         })
     }
 
@@ -1671,10 +1684,10 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
             }
         }
 
-        Ok(RpcResponse {
-            value: (),
-            context: RpcResponseContext::new(svm_locker.get_latest_absolute_slot()),
-        })
+        Ok(cheatcode_response(
+            svm_locker.get_latest_absolute_slot(),
+            (),
+        ))
     }
 
     fn enable_cheatcode(
@@ -1720,10 +1733,10 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
             }
         }
 
-        Ok(RpcResponse {
-            value: (),
-            context: RpcResponseContext::new(svm_locker.get_latest_absolute_slot()),
-        })
+        Ok(cheatcode_response(
+            svm_locker.get_latest_absolute_slot(),
+            (),
+        ))
     }
 
     fn set_token_account(
@@ -1785,45 +1798,47 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
             let mint_has_transfer_fee = confidential.is_some()
                 && !get_mint_result.is_none()
                 && mint_has_transfer_fee_config(get_mint_result.expected_data());
-            let minimum_rent = svm_locker.with_svm_reader(|svm_reader| {
-                svm_reader.inner.minimum_balance_for_rent_exemption(
-                    TokenAccount::get_packed_len_for_token_program_id(&token_program_id),
-                )
-            });
-
-            let (rent_exempt_reserve, initial_lamports) = if is_native_mint {
-                // For native mint, we need to allocate enough lamports to cover the wrapped SOL amount
-                (Some(minimum_rent), minimum_rent + token_amount) // 1 SOL wrapped
-            } else {
-                (None, minimum_rent)
-            };
-
             let SvmAccessContext {
                 slot,
                 inner: mut token_account,
                 ..
             } = svm_locker
-                .get_account(
-                    &remote_ctx,
-                    &associated_token_account,
-                    Some(Box::new(move |_| {
-                        let default =
-                            TokenAccount::new(&token_program_id, owner, mint, rent_exempt_reserve);
-                        let data = default.pack_into_vec();
-                        GetAccountResult::FoundAccount(
-                            associated_token_account,
-                            Account {
-                                lamports: initial_lamports,
-                                owner: token_program_id,
-                                executable: false,
-                                rent_epoch: 0,
-                                data,
-                            },
-                            AccountSource::Generated,
-                        )
-                    })),
-                )
+                .get_account(&remote_ctx, &associated_token_account, None)
                 .await?;
+
+            if token_account.is_none() {
+                let mut default = TokenAccount::new(&token_program_id, owner, mint, None);
+                let mint_data = (!get_mint_result.is_none())
+                    .then(|| get_mint_result.expected_data().as_slice());
+                let mut data = default.pack_associated_account(mint_data).map_err(|e| {
+                    Error::invalid_params(format!("Failed to initialize token account: {e}"))
+                })?;
+                let minimum_rent = svm_locker.with_svm_reader(|svm_reader| {
+                    svm_reader
+                        .inner
+                        .minimum_balance_for_rent_exemption(data.len())
+                });
+                let lamports = if is_native_mint {
+                    default = TokenAccount::new(&token_program_id, owner, mint, Some(minimum_rent));
+                    data = default.pack_into_preserving_extensions(&data)?;
+                    minimum_rent.checked_add(token_amount).ok_or_else(|| {
+                        Error::invalid_params("Native token balance overflows lamports")
+                    })?
+                } else {
+                    minimum_rent
+                };
+                token_account = GetAccountResult::FoundAccount(
+                    associated_token_account,
+                    Account {
+                        lamports,
+                        owner: token_program_id,
+                        executable: false,
+                        rent_epoch: 0,
+                        data,
+                    },
+                    AccountSource::Generated,
+                );
+            }
 
             let mut token_account_data = TokenAccount::unpack(token_account.expected_data())
                 .map_err(|e| {
@@ -1882,10 +1897,7 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
             })?;
             svm_locker.apply_account_update(token_account, AccountUpdatePolicy::Authoritative)?;
 
-            Ok(RpcResponse {
-                context: RpcResponseContext::new(slot),
-                value: (),
-            })
+            Ok(cheatcode_response(slot, ()))
         })
     }
 
@@ -1927,10 +1939,7 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
                 .clone_program_account(&remote_ctx, &source_program_id, &destination_program_id)
                 .await?;
 
-            Ok(RpcResponse {
-                context: RpcResponseContext::new(slot),
-                value: (),
-            })
+            Ok(cheatcode_response(slot, ()))
         })
     }
 
@@ -1965,10 +1974,7 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
                 .get_profile_result(key, &config)?
                 .ok_or(SurfpoolError::expected_profile_not_found(&key))?;
 
-            Ok(RpcResponse {
-                context: RpcResponseContext::new(slot),
-                value: ui_result,
-            })
+            Ok(cheatcode_response(slot, ui_result))
         })
     }
 
@@ -1982,10 +1988,7 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
         let svm_locker = meta.get_svm_locker()?;
         let profiles = svm_locker.get_profile_results_by_tag(tag, &config)?;
         let slot = svm_locker.get_latest_absolute_slot();
-        Ok(RpcResponse {
-            context: RpcResponseContext::new(slot),
-            value: profiles,
-        })
+        Ok(cheatcode_response(slot, profiles))
     }
 
     fn set_supply(
@@ -2027,10 +2030,7 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
                 svm_writer.get_latest_absolute_slot()
             });
 
-            Ok(RpcResponse {
-                context: RpcResponseContext::new(latest_absolute_slot),
-                value: (),
-            })
+            Ok(cheatcode_response(latest_absolute_slot, ()))
         })
     }
 
@@ -2065,10 +2065,7 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
                 .set_program_authority(&remote_ctx, program_id, new_authority)
                 .await?;
 
-            Ok(RpcResponse {
-                context: RpcResponseContext::new(slot),
-                value: (),
-            })
+            Ok(cheatcode_response(slot, ()))
         })
     }
 
@@ -2085,10 +2082,7 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
             .as_ref()
             .map(|pr| pr.slot)
             .unwrap_or_else(|| svm_locker.get_latest_absolute_slot());
-        Ok(RpcResponse {
-            context: RpcResponseContext::new(context_slot),
-            value: profile_result,
-        })
+        Ok(cheatcode_response(context_slot, profile_result))
     }
 
     fn register_idl(
@@ -2102,10 +2096,10 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
             Err(e) => return Err(e.into()),
         };
         svm_locker.register_idl(idl, slot)?;
-        Ok(RpcResponse {
-            context: RpcResponseContext::new(svm_locker.get_latest_absolute_slot()),
-            value: (),
-        })
+        Ok(cheatcode_response(
+            svm_locker.get_latest_absolute_slot(),
+            (),
+        ))
     }
 
     fn get_idl(
@@ -2124,10 +2118,7 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
         };
         let idl = svm_locker.get_idl(&program_id, slot);
         let slot = slot.unwrap_or_else(|| svm_locker.get_latest_absolute_slot());
-        Ok(RpcResponse {
-            context: RpcResponseContext::new(slot),
-            value: idl,
-        })
+        Ok(cheatcode_response(slot, idl))
     }
 
     fn get_local_signatures(
@@ -2143,12 +2134,7 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
         let limit = limit.unwrap_or(50);
         let latest = svm_locker.get_latest_absolute_slot();
         if limit == 0 {
-            return Box::pin(async move {
-                Ok(RpcResponse {
-                    context: RpcResponseContext::new(latest),
-                    value: Vec::new(),
-                })
-            });
+            return Box::pin(async move { Ok(cheatcode_response(latest, Vec::new())) });
         }
 
         let mut items: Vec<(
@@ -2191,12 +2177,7 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
             })
             .collect();
 
-        Box::pin(async move {
-            Ok(RpcResponse {
-                context: RpcResponseContext::new(latest),
-                value,
-            })
-        })
+        Box::pin(async move { Ok(cheatcode_response(latest, value)) })
     }
 
     fn pause_clock(&self, meta: Self::Metadata) -> Result<EpochInfo> {
@@ -2258,10 +2239,10 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
         let config = config.unwrap_or_default();
         let include_owned_accounts = config.include_owned_accounts.unwrap_or_default();
         svm_locker.reset_account(pubkey, include_owned_accounts)?;
-        Ok(RpcResponse {
-            context: RpcResponseContext::new(svm_locker.get_latest_absolute_slot()),
-            value: (),
-        })
+        Ok(cheatcode_response(
+            svm_locker.get_latest_absolute_slot(),
+            (),
+        ))
     }
 
     fn reset_network(&self, meta: Self::Metadata) -> BoxFuture<Result<RpcResponse<()>>> {
@@ -2278,10 +2259,10 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
 
         Box::pin(async move {
             svm_locker.reset_network(&remote_client).await?;
-            Ok(RpcResponse {
-                context: RpcResponseContext::new(svm_locker.get_latest_absolute_slot()),
-                value: (),
-            })
+            Ok(cheatcode_response(
+                svm_locker.get_latest_absolute_slot(),
+                (),
+            ))
         })
     }
 
@@ -2307,10 +2288,10 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
             svm_locker
                 .insert_offline_account(pubkey, include_owned_accounts)
                 .await?;
-            Ok(RpcResponse {
-                context: RpcResponseContext::new(svm_locker.get_latest_absolute_slot()),
-                value: (),
-            })
+            Ok(cheatcode_response(
+                svm_locker.get_latest_absolute_slot(),
+                (),
+            ))
         })
     }
 
@@ -2325,10 +2306,10 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
         let config = config.unwrap_or_default();
         let include_owned_accounts = config.include_owned_accounts.unwrap_or_default();
         svm_locker.stream_account(pubkey, include_owned_accounts)?;
-        Ok(RpcResponse {
-            context: RpcResponseContext::new(svm_locker.get_latest_absolute_slot()),
-            value: (),
-        })
+        Ok(cheatcode_response(
+            svm_locker.get_latest_absolute_slot(),
+            (),
+        ))
     }
 
     fn stream_accounts(
@@ -2342,10 +2323,10 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
             let include_owned_accounts = entry.include_owned_accounts.unwrap_or_default();
             svm_locker.stream_account(pubkey, include_owned_accounts)?;
         }
-        Ok(RpcResponse {
-            context: RpcResponseContext::new(svm_locker.get_latest_absolute_slot()),
-            value: (),
-        })
+        Ok(cheatcode_response(
+            svm_locker.get_latest_absolute_slot(),
+            (),
+        ))
     }
 
     fn get_streamed_accounts(
@@ -2363,10 +2344,10 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
             GetStreamedAccountsResponse::from_iter(accounts)
         });
 
-        Ok(RpcResponse {
-            context: RpcResponseContext::new(svm_locker.get_latest_absolute_slot()),
+        Ok(cheatcode_response(
+            svm_locker.get_latest_absolute_slot(),
             value,
-        })
+        ))
     }
 
     fn get_surfnet_info(
@@ -2388,10 +2369,10 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
         let value =
             GetSurfnetInfoResponse::with_startup(runbook_executions, startup_status, started_at);
 
-        Ok(RpcResponse {
-            context: RpcResponseContext::new(svm_locker.get_latest_absolute_slot()),
+        Ok(cheatcode_response(
+            svm_locker.get_latest_absolute_slot(),
             value,
-        })
+        ))
     }
 
     fn get_confidential_balance(
@@ -2439,10 +2420,7 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
             let balance = decrypt_confidential_balances(&account.data, &keys)
                 .map_err(Error::invalid_params)?;
 
-            Ok(RpcResponse {
-                context: RpcResponseContext::new(slot),
-                value: balance,
-            })
+            Ok(cheatcode_response(slot, balance))
         })
     }
 
@@ -2453,10 +2431,10 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
     ) -> Result<RpcResponse<DeriveConfidentialKeysResponse>> {
         let svm_locker = meta.get_svm_locker()?;
         let keys = derive_confidential_keys(&signature).map_err(Error::invalid_params)?;
-        Ok(RpcResponse {
-            context: RpcResponseContext::new(svm_locker.get_latest_absolute_slot()),
-            value: keys,
-        })
+        Ok(cheatcode_response(
+            svm_locker.get_latest_absolute_slot(),
+            keys,
+        ))
     }
 
     fn write_program(
@@ -2515,10 +2493,7 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
                 .write_program(program_id, authority, offset, &data, &remote_ctx)
                 .await?;
 
-            Ok(RpcResponse {
-                context: RpcResponseContext::new(slot),
-                value: (),
-            })
+            Ok(cheatcode_response(slot, ()))
         })
     }
 
@@ -2530,10 +2505,10 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
         let config = config.unwrap_or_default();
         let svm_locker = meta.get_svm_locker()?;
         let snapshot = svm_locker.export_snapshot(config)?;
-        Ok(RpcResponse {
-            context: RpcResponseContext::new(svm_locker.get_latest_absolute_slot()),
-            value: snapshot,
-        })
+        Ok(cheatcode_response(
+            svm_locker.get_latest_absolute_slot(),
+            snapshot,
+        ))
     }
 
     fn register_scenario(
@@ -2574,10 +2549,10 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
                     data: None,
                 })?;
 
-            Ok(RpcResponse {
-                context: RpcResponseContext::new(svm_locker.get_latest_absolute_slot()),
-                value: (),
-            })
+            Ok(cheatcode_response(
+                svm_locker.get_latest_absolute_slot(),
+                (),
+            ))
         })
     }
 }
@@ -2644,6 +2619,13 @@ mod tests {
             (
                 TimeTravelConfig::AbsoluteSlot(6),
                 serde_json::json!({ "absoluteSlot": 6 }),
+            ),
+            (
+                TimeTravelConfig::AbsoluteSlotAt {
+                    slot: 8,
+                    timestamp: 9,
+                },
+                serde_json::json!({ "absoluteSlotAt": { "slot": 8, "timestamp": 9 } }),
             ),
             (
                 TimeTravelConfig::AbsoluteTimestamp(7),
@@ -5258,6 +5240,46 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_set_account_rejects_clock_sysvar() {
+        let client = TestSetup::new(SurfnetCheatcodesRpc::empty());
+        let clock = || {
+            client
+                .context
+                .svm_locker
+                .with_svm_reader(|svm| svm.inner.get_sysvar::<solana_clock::Clock>())
+        };
+        let before = clock();
+        let forged = solana_clock::Clock {
+            slot: before.slot + 1_000,
+            ..before.clone()
+        };
+
+        let err = client
+            .rpc
+            .set_account(
+                Some(client.context.clone()),
+                solana_sdk_ids::sysvar::clock::ID.to_string(),
+                AccountUpdate {
+                    data: Some(hex::encode(bincode::serialize(&forged).unwrap()).into_bytes()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("setting the Clock must be rejected");
+
+        assert_eq!(err.code, jsonrpc_core::ErrorCode::InvalidParams);
+        assert_eq!(err.message, "Invalid params");
+        assert_eq!(
+            err.data,
+            Some(serde_json::json!(format!(
+                "Failed to set account {}: the Clock sysvar is maintained by surfpool; use surfnet_timeTravel instead",
+                solana_sdk_ids::sysvar::clock::ID
+            )))
+        );
+        assert_eq!(clock(), before);
+    }
+
     #[test]
     fn test_stream_accounts_invalid_pubkey() {
         let client = TestSetup::new(SurfnetCheatcodesRpc::empty());
@@ -5477,6 +5499,239 @@ mod tests {
         assert_eq!(state.base.amount, 42);
         assert_eq!(state.base.is_native, COption::Some(extended_rent));
         assert!(state.get_extension::<ImmutableOwner>().is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_set_token_2022_fee_mint_supports_real_transfer() {
+        use spl_token_2022_interface::{
+            extension::{
+                BaseStateWithExtensionsMut, ExtensionType, StateWithExtensionsMut,
+                transfer_fee::TransferFeeConfig,
+            },
+            state::Mint as Token2022Mint,
+        };
+
+        let client = TestSetup::new(SurfnetCheatcodesRpc::empty());
+        let source_owner = Keypair::new();
+        let destination_owner = Keypair::new();
+        let mint = Pubkey::new_unique();
+        let token_program = spl_token_2022_interface::id();
+        let mint_len = ExtensionType::try_calculate_account_len::<Token2022Mint>(&[
+            ExtensionType::TransferFeeConfig,
+        ])
+        .unwrap();
+        let mut mint_data = vec![0; mint_len];
+        {
+            let mut state =
+                StateWithExtensionsMut::<Token2022Mint>::unpack_uninitialized(&mut mint_data)
+                    .unwrap();
+            let config = state.init_extension::<TransferFeeConfig>(true).unwrap();
+            for fee in [
+                &mut config.older_transfer_fee,
+                &mut config.newer_transfer_fee,
+            ] {
+                fee.transfer_fee_basis_points = 100.into();
+                fee.maximum_fee = 100.into();
+            }
+            state.base = Token2022Mint {
+                supply: 500,
+                decimals: 0,
+                is_initialized: true,
+                ..Default::default()
+            };
+            state.pack_base();
+            state.init_account_type().unwrap();
+        }
+        let mint_rent = client.context.svm_locker.with_svm_reader(|svm| {
+            svm.inner
+                .minimum_balance_for_rent_exemption(mint_data.len())
+        });
+        set_account(
+            &client,
+            &mint,
+            &Account {
+                lamports: mint_rent,
+                data: mint_data,
+                owner: token_program,
+                executable: false,
+                rent_epoch: 0,
+            },
+        );
+        client
+            .context
+            .svm_locker
+            .airdrop(&source_owner.pubkey(), 1_000_000_000)
+            .unwrap()
+            .unwrap();
+
+        for (owner, amount) in [(&source_owner, 500), (&destination_owner, 0)] {
+            client
+                .rpc
+                .set_token_account(
+                    Some(client.context.clone()),
+                    owner.pubkey().to_string(),
+                    mint.to_string(),
+                    TokenAccountUpdate {
+                        amount: Some(amount),
+                        ..Default::default()
+                    },
+                    Some(token_program.to_string()),
+                )
+                .await
+                .unwrap();
+        }
+
+        let source_ata = get_associated_token_address_with_program_id(
+            &source_owner.pubkey(),
+            &mint,
+            &token_program,
+        );
+        let destination_ata = get_associated_token_address_with_program_id(
+            &destination_owner.pubkey(),
+            &mint,
+            &token_program,
+        );
+        let instruction = transfer_checked(
+            &token_program,
+            &source_ata,
+            &mint,
+            &destination_ata,
+            &source_owner.pubkey(),
+            &[&source_owner.pubkey()],
+            100,
+            0,
+        )
+        .unwrap();
+        let blockhash = client
+            .context
+            .svm_locker
+            .with_svm_reader(|svm| svm.latest_blockhash());
+        let transaction = Transaction::new_signed_with_payer(
+            &[instruction],
+            Some(&source_owner.pubkey()),
+            &[&source_owner],
+            blockhash,
+        );
+        let transfer_result = client
+            .context
+            .svm_locker
+            .with_svm_writer(|svm| svm.send_transaction(transaction.into(), false, false));
+        assert!(
+            transfer_result.is_ok(),
+            "a funded Token-2022 transfer-fee ATA should support a real transfer: {transfer_result:?}"
+        );
+        client.context.svm_locker.with_svm_reader(|svm| {
+            use spl_token_2022_interface::{
+                extension::{
+                    BaseStateWithExtensions, StateWithExtensions, immutable_owner::ImmutableOwner,
+                    transfer_fee::TransferFeeAmount,
+                },
+                state::Account as Token2022Account,
+            };
+            for (address, expected_amount) in [(source_ata, 400), (destination_ata, 99)] {
+                let account = svm.get_account(&address).unwrap().unwrap();
+                let state = StateWithExtensions::<Token2022Account>::unpack(&account.data).unwrap();
+                assert_eq!(state.base.amount, expected_amount);
+                assert!(state.get_extension::<ImmutableOwner>().is_ok());
+                assert!(
+                    account.lamports
+                        >= svm
+                            .inner
+                            .minimum_balance_for_rent_exemption(account.data.len())
+                );
+                let fee = state.get_extension::<TransferFeeAmount>().unwrap();
+                assert_eq!(
+                    u64::from(fee.withheld_amount),
+                    if address == destination_ata { 1 } else { 0 }
+                );
+            }
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_set_token_2022_ata_preserves_immutable_owner_rule() {
+        use spl_token_2022_interface::instruction::{AuthorityType, set_authority};
+
+        let client = TestSetup::new(SurfnetCheatcodesRpc::empty());
+        let owner = Keypair::new();
+        let new_owner = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let token_program = spl_token_2022_interface::id();
+        let mut mint_data = [0u8; spl_token_2022_interface::state::Mint::LEN];
+        spl_token_2022_interface::state::Mint {
+            decimals: 0,
+            is_initialized: true,
+            ..Default::default()
+        }
+        .pack_into_slice(&mut mint_data);
+        set_account(
+            &client,
+            &mint,
+            &Account {
+                lamports: 1_461_600,
+                data: mint_data.to_vec(),
+                owner: token_program,
+                executable: false,
+                rent_epoch: 0,
+            },
+        );
+        client
+            .context
+            .svm_locker
+            .airdrop(&owner.pubkey(), 1_000_000_000)
+            .unwrap()
+            .unwrap();
+        client
+            .rpc
+            .set_token_account(
+                Some(client.context.clone()),
+                owner.pubkey().to_string(),
+                mint.to_string(),
+                TokenAccountUpdate {
+                    amount: Some(100),
+                    ..Default::default()
+                },
+                Some(token_program.to_string()),
+            )
+            .await
+            .unwrap();
+
+        let ata =
+            get_associated_token_address_with_program_id(&owner.pubkey(), &mint, &token_program);
+        let instruction = set_authority(
+            &token_program,
+            &ata,
+            Some(&new_owner),
+            AuthorityType::AccountOwner,
+            &owner.pubkey(),
+            &[],
+        )
+        .unwrap();
+        let blockhash = client
+            .context
+            .svm_locker
+            .with_svm_reader(|svm| svm.latest_blockhash());
+        let transaction = Transaction::new_signed_with_payer(
+            &[instruction],
+            Some(&owner.pubkey()),
+            &[&owner],
+            blockhash,
+        );
+        let change_owner_result = client
+            .context
+            .svm_locker
+            .with_svm_writer(|svm| svm.send_transaction(transaction.into(), false, false));
+        assert_eq!(
+            change_owner_result
+                .expect_err("a Token-2022 ATA must reject owner changes")
+                .err,
+            solana_transaction_error::TransactionError::InstructionError(
+                0,
+                solana_instruction::error::InstructionError::Custom(
+                    spl_token_2022_interface::error::TokenError::ImmutableOwner as u32,
+                ),
+            )
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

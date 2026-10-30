@@ -1,219 +1,1002 @@
 use core::mem::size_of;
-use std::collections::HashMap;
+use std::{collections::HashMap, str::FromStr, sync::OnceLock};
 
+use anchor_lang_idl::types::{
+    IdlDefinedFields, IdlInstruction, IdlInstructionAccountItem, IdlType, IdlTypeDef, IdlTypeDefTy,
+};
+use log::warn;
 use phoenix_rise_accounts::{
-    PhoenixAccount, PhoenixAccountDecodeError,
-    perp_asset_map::{PerpAssetMap, PerpAssetMetadata, PriceComponent},
-    trader::TraderHeader,
+    global_config::GlobalConfig,
+    perp_asset_map::{FundingAccumulator, PerpAssetMetadata, PriceComponent},
+    spline_collection::{
+        GTC_LIFESPAN, SPLINE_REGION_CAPACITY, Spline, SplineCollection, TickRegion,
+    },
 };
 use solana_account::Account;
 use solana_clock::Clock;
 use solana_commitment_config::CommitmentConfig;
+use solana_compute_budget_interface::ComputeBudgetInstruction;
+use solana_instruction::{AccountMeta, Instruction};
+use solana_keypair::Keypair;
 use solana_pubkey::Pubkey;
-use surfpool_types::{AccountAddress, OverrideInstance, Scenario};
+use solana_signer::Signer;
+use solana_transaction::Transaction;
+use surfpool_types::Idl;
+use txtx_addon_network_svm::codec::idl::borsh_encode_value_to_idl_type;
 
-use super::collateral::{
-    current_quote_lot_collateral, ensure_collateral_floor, index_trader_state_range,
-    index_trader_state_ranges, parse_quote_lot_collateral, trader_header,
-    validate_hot_trader_fields,
+use super::{
+    market::{
+        Market, MarketContext, invalid_perp_asset_map, map_entries, move_market, phoenix_markets,
+        uncross_market,
+    },
+    trader::{cancel_order_writes, collateral_writes},
 };
 use crate::{
     error::{SurfpoolError, SurfpoolResult},
+    scenarios::registry::PHOENIX_ETERNAL_IDL_CONTENT,
     surfnet::{
         remote::SurfnetRemoteClient,
-        svm::{AccountUpdatePolicy, SurfnetSvm},
+        svm::{AccountUpdatePolicy, SurfnetSvm, json_to_txtx_value_for_idl_type},
     },
 };
 
-pub const PHOENIX_ETERNAL_PROGRAM_ID: Pubkey =
+pub const PHOENIX_PROGRAM_ID: Pubkey =
     Pubkey::from_str_const("EtrnLzgbS7nMMy5fbD42kXiUzGg8XQzJ972Xtk1cjWih");
-// Singletons that GlobalConfig points at; the mainnet tests check them against GlobalConfig.
+pub const PHOENIX_GLOBAL_CONFIG: Pubkey =
+    Pubkey::from_str_const("2zskx2iyCvb6Stg7RBZkt1f6MrF4dpYtMG3yMvKwqtUZ");
+/// GlobalConfig names this map too; the mainnet tests check the two agree.
 pub const PHOENIX_PERP_ASSET_MAP: Pubkey =
     Pubkey::from_str_const("2nHGAaEw3D5dd4hVueaUNoygkQFmoeKqRQWnSPqSMFUC");
-pub const PHOENIX_GLOBAL_TRADER_INDEX: Pubkey =
-    Pubkey::from_str_const("HCrPXLByGqRh2szQi3gj7oRdRVBNi1gccAyn4CQCT3HK");
 
-fn phoenix_account_kind(data: &[u8]) -> Option<PhoenixAccount> {
-    PhoenixAccount::from_discriminant(data.get(..8)?.try_into().unwrap())
+pub fn log_authority() -> Pubkey {
+    Pubkey::find_program_address(&[b"log"], &PHOENIX_PROGRAM_ID).0
 }
 
-const COLLATERAL_TEMPLATE_ID: &str = "phoenix-trader-collateral-stress";
-const COLLATERAL_FIELD: &str = "traderState.quoteLotCollateral";
-const MARKET_SYMBOL_FIELD: &str = "symbol";
-const DIRECT_MARK_TICKS_FIELD: &str = "target_ticks";
-const MAINTENANCE_FACTOR_FIELD: &str = "maintenance_risk_factor_bps";
-const MAX_RISK_FACTOR_BPS: u16 = 10_000;
-const PREPARATION_SLOT: u64 = 0;
+/// The exchange-wide accounts, as GlobalConfig names them.
+pub struct Exchange {
+    pub config: GlobalConfig,
+    pub perp_asset_map: Pubkey,
+    pub global_trader_index: Pubkey,
+    pub active_trader_buffer: Pubkey,
+}
+
+impl Exchange {
+    /// Reads GlobalConfig from the local VM, after putting it and the program there, and on the
+    /// first load the index, the buffer and every book ([`Exchange::hydrate_index_with_books`]).
+    pub async fn load(
+        svm: &mut SurfnetSvm,
+        remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
+    ) -> SurfpoolResult<Self> {
+        hydrate(
+            svm,
+            remote_ctx,
+            &[PHOENIX_PROGRAM_ID, PHOENIX_GLOBAL_CONFIG],
+        )
+        .await?;
+        let exchange = Self::from_config(&local_account(svm, &PHOENIX_GLOBAL_CONFIG)?)?;
+        exchange.hydrate_index_with_books(svm, remote_ctx).await?;
+        Ok(exchange)
+    }
+
+    /// Resting orders and the buffer's positions name traders by their node in the index, so a
+    /// book fetched after the index can name a node the index has since freed. While the index is
+    /// missing locally, it comes with the buffer and every book in one read. Past 100 accounts
+    /// the client splits that read, and the parts can come from different slots.
+    async fn hydrate_index_with_books(
+        &self,
+        svm: &mut SurfnetSvm,
+        remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
+    ) -> SurfpoolResult<()> {
+        if svm.inner.get_account(&self.global_trader_index)?.is_some() {
+            return Ok(());
+        }
+        hydrate(svm, remote_ctx, &[self.perp_asset_map]).await?;
+        let map = local_account(svm, &self.perp_asset_map)?;
+        let mut group = vec![self.global_trader_index, self.active_trader_buffer];
+        for entry in map_entries(&self.perp_asset_map, &map.data)? {
+            let params = entry.metadata.static_market_params();
+            group.push(Pubkey::new_from_array(params.market_account));
+        }
+        hydrate(svm, remote_ctx, &group).await
+    }
+
+    /// The exchange the GlobalConfig `account` describes.
+    pub fn from_config(account: &Account) -> SurfpoolResult<Self> {
+        let config = GlobalConfig::try_from_account_bytes(&account.data).map_err(|e| {
+            SurfpoolError::invalid_account_data(
+                PHOENIX_GLOBAL_CONFIG,
+                "Expected the Phoenix Eternal GlobalConfig",
+                Some(e),
+            )
+        })?;
+        Ok(Self {
+            perp_asset_map: Pubkey::new_from_array(config.perp_asset_map_key()),
+            global_trader_index: Pubkey::new_from_array(config.global_trader_index_header_key()),
+            active_trader_buffer: Pubkey::new_from_array(config.active_trader_buffer_header_key()),
+            config,
+        })
+    }
+}
+
+pub fn phoenix_idl() -> &'static Idl {
+    static IDL: OnceLock<Idl> = OnceLock::new();
+    IDL.get_or_init(|| {
+        serde_json::from_str(PHOENIX_ETERNAL_IDL_CONTENT).expect("the bundled Phoenix IDL parses")
+    })
+}
+
+/// An Eternal instruction encoded from its IDL definition. Accounts are named as in the IDL, and
+/// `args` holds one JSON value per IDL argument, shaped like its type.
+pub fn phoenix_instruction(
+    name: &str,
+    accounts: &[(&str, Pubkey)],
+    args: &serde_json::Value,
+) -> SurfpoolResult<Instruction> {
+    encode_instruction(name, accounts, args, true)
+}
+
+/// Like [`phoenix_instruction`], picking the accounts the instruction takes out of `known` and
+/// ignoring the rest.
+pub fn phoenix_instruction_from(
+    name: &str,
+    known: &[(&str, Pubkey)],
+    args: &serde_json::Value,
+) -> SurfpoolResult<Instruction> {
+    encode_instruction(name, known, args, false)
+}
+
+fn instruction_definition(name: &str) -> SurfpoolResult<&'static IdlInstruction> {
+    phoenix_idl()
+        .instructions
+        .iter()
+        .find(|instruction| instruction.name == name)
+        .ok_or_else(|| SurfpoolError::internal(format!("the Phoenix IDL has no {name}")))
+}
+
+fn encode_instruction(
+    name: &str,
+    accounts: &[(&str, Pubkey)],
+    args: &serde_json::Value,
+    strict: bool,
+) -> SurfpoolResult<Instruction> {
+    let idl = phoenix_idl();
+    let program_id = Pubkey::from_str(&idl.address)
+        .map_err(|e| SurfpoolError::internal(format!("invalid Phoenix IDL address: {e}")))?;
+    let definition = instruction_definition(name)?;
+
+    let mut data = definition.discriminator.clone();
+    for arg in &definition.args {
+        let value = args.get(&arg.name).ok_or_else(|| {
+            SurfpoolError::internal(format!("{name} needs the argument {}", arg.name))
+        })?;
+        let value = json_to_txtx_value_for_idl_type(value, &arg.ty, &idl.types)?;
+        let encoded = borsh_encode_value_to_idl_type(&value, &arg.ty, &idl.types, None)
+            .map_err(|e| SurfpoolError::internal(format!("{name} {}: {e}", arg.name)))?;
+        data.extend(encoded);
+    }
+
+    let mut metas = Vec::with_capacity(definition.accounts.len());
+    for item in &definition.accounts {
+        let IdlInstructionAccountItem::Single(account) = item else {
+            return Err(SurfpoolError::internal(format!(
+                "{name} groups its accounts, which the Phoenix IDL does not do"
+            )));
+        };
+        let Some((_, pubkey)) = accounts.iter().find(|(given, _)| *given == account.name) else {
+            return Err(SurfpoolError::internal(format!(
+                "{name} needs the account {}",
+                account.name
+            )));
+        };
+        metas.push(AccountMeta {
+            pubkey: *pubkey,
+            is_signer: account.signer,
+            is_writable: account.writable,
+        });
+    }
+    if let Some((unknown, _)) = accounts.iter().filter(|_| strict).find(|(given, _)| {
+        !definition
+            .accounts
+            .iter()
+            .any(|item| matches!(item, IdlInstructionAccountItem::Single(a) if a.name == *given))
+    }) {
+        return Err(SurfpoolError::internal(format!(
+            "{name} takes no account named {unknown}"
+        )));
+    }
+
+    Ok(Instruction {
+        program_id,
+        accounts: metas,
+        data,
+    })
+}
+
+/// A market symbol as Phoenix stores it: its bytes, zero-padded to 16.
+pub fn symbol_bytes(symbol: &str) -> [u8; 16] {
+    let mut bytes = [0_u8; 16];
+    let len = symbol.len().min(bytes.len());
+    bytes[..len].copy_from_slice(&symbol.as_bytes()[..len]);
+    bytes
+}
+
+/// The type `ty` names, when it names one in `types`.
+fn defined<'t>(ty: &IdlType, types: &'t [IdlTypeDef]) -> Option<&'t IdlTypeDefTy> {
+    let IdlType::Defined { name, .. } = ty else {
+        return None;
+    };
+    types.iter().find(|t| &t.name == name).map(|t| &t.ty)
+}
+
+/// The arguments of `name` built from a template's flat values: every IDL field takes the value
+/// named after it, a market symbol fills `perpAssetSymbol`, and an optional field left out is kept.
+pub fn instruction_args(
+    name: &str,
+    values: &HashMap<String, serde_json::Value>,
+    symbol: Option<&str>,
+) -> SurfpoolResult<serde_json::Value> {
+    let idl = phoenix_idl();
+    let mut args = serde_json::Map::new();
+    for arg in &instruction_definition(name)?.args {
+        let Some(IdlTypeDefTy::Struct {
+            fields: Some(IdlDefinedFields::Named(fields)),
+        }) = defined(&arg.ty, &idl.types)
+        else {
+            return Err(SurfpoolError::internal(format!(
+                "{name} {} is not a struct of named fields",
+                arg.name
+            )));
+        };
+        let mut object = serde_json::Map::new();
+        for field in fields {
+            let value = if field.name == "perpAssetSymbol" {
+                let symbol = symbol.ok_or_else(|| {
+                    SurfpoolError::internal(format!("{name} needs a market symbol"))
+                })?;
+                serde_json::json!({ "symbolBytes": symbol_bytes(symbol) })
+            } else if let Some(value) = given(values, &field.name) {
+                shape(value, &field.ty, &idl.types)?
+            } else if matches!(field.ty, IdlType::Option(_)) {
+                serde_json::Value::Null
+            } else {
+                return Err(SurfpoolError::internal(format!(
+                    "{name} needs {}",
+                    field.name
+                )));
+            };
+            object.insert(field.name.clone(), value);
+        }
+        args.insert(arg.name.clone(), object.into());
+    }
+    Ok(args.into())
+}
+
+/// A template value in the JSON shape the IDL encoder expects for `ty`: decimal strings become
+/// numbers, a bare value fills a one-field wrapper such as `BaseLots`, and a name picks a variant.
+fn shape(
+    value: &serde_json::Value,
+    ty: &IdlType,
+    types: &[IdlTypeDef],
+) -> SurfpoolResult<serde_json::Value> {
+    use serde_json::Value;
+    let invalid = || SurfpoolError::internal(format!("{value} does not fit {ty:?}"));
+    Ok(match (ty, value) {
+        (IdlType::Option(_), Value::Null) => Value::Null,
+        (IdlType::Option(inner), _) => shape(value, inner, types)?,
+        (IdlType::Bool, Value::String(text)) => Value::Bool(text.parse().map_err(|_| invalid())?),
+        (IdlType::U8 | IdlType::U16 | IdlType::U32 | IdlType::U64, Value::String(text)) => {
+            Value::from(text.trim().parse::<u64>().map_err(|_| invalid())?)
+        }
+        (IdlType::I8 | IdlType::I16 | IdlType::I32 | IdlType::I64, Value::String(text)) => {
+            Value::from(text.trim().parse::<i64>().map_err(|_| invalid())?)
+        }
+        (IdlType::Defined { .. }, _) => match (defined(ty, types), value) {
+            (
+                Some(IdlTypeDefTy::Struct {
+                    fields: Some(IdlDefinedFields::Named(fields)),
+                }),
+                _,
+            ) => match fields.as_slice() {
+                [field] => serde_json::json!({ &field.name: shape(value, &field.ty, types)? }),
+                _ => return Err(invalid()),
+            },
+            (Some(IdlTypeDefTy::Enum { .. }), Value::String(variant)) => {
+                serde_json::json!({ variant: null })
+            }
+            _ => value.clone(),
+        },
+        _ => value.clone(),
+    })
+}
+
+const FEE_PAYER_LAMPORTS: u64 = 1_000_000_000;
+const COMPUTE_UNIT_LIMIT: u32 = 1_400_000;
+
+/// Puts every listed account into the local VM, reading only the missing ones from the
+/// upstream datasource, the way any account read does.
+pub async fn hydrate(
+    svm: &mut SurfnetSvm,
+    remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
+    addresses: &[Pubkey],
+) -> SurfpoolResult<()> {
+    let mut missing = Vec::new();
+    for address in addresses {
+        if svm.inner.get_account(address)?.is_none() && !missing.contains(address) {
+            missing.push(*address);
+        }
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let phoenix_offline = svm
+        .offline_accounts
+        .get(&PHOENIX_PROGRAM_ID.to_string())?
+        .is_some_and(|config| config.include_owned_accounts);
+    for address in &missing {
+        if phoenix_offline || svm.offline_accounts.contains_key(&address.to_string())? {
+            return Err(SurfpoolError::internal(format!(
+                "{address} is offline and missing locally"
+            )));
+        }
+    }
+    let (client, commitment) = remote_ctx.as_ref().ok_or_else(|| {
+        SurfpoolError::internal(format!(
+            "{} accounts are missing locally and there is no datasource",
+            missing.len()
+        ))
+    })?;
+    for fetched in client.get_multiple_accounts(&missing, *commitment).await? {
+        svm.apply_account_update(fetched, AccountUpdatePolicy::HydrateIfAbsent)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn local_account(svm: &SurfnetSvm, address: &Pubkey) -> SurfpoolResult<Account> {
+    svm.inner
+        .get_account(address)?
+        .ok_or_else(|| SurfpoolError::internal(format!("{address} is missing locally")))
+}
+
+/// A copy of the local VM without signature checks, so instructions run as the signers they name.
+/// Nothing reaches the local VM until the caller writes back what [`Sandbox::writes`] returns.
+pub struct Sandbox<'a> {
+    live: &'a SurfnetSvm,
+    svm: SurfnetSvm,
+    written: Vec<Pubkey>,
+}
+
+impl<'a> Sandbox<'a> {
+    pub fn new(live: &'a SurfnetSvm) -> Self {
+        let mut svm = live.clone_for_profiling();
+        svm.inner.set_sigverify(false);
+        Self {
+            live,
+            svm,
+            written: Vec::new(),
+        }
+    }
+
+    /// Runs the instructions in order; the first failing one fails the run.
+    pub fn run(&mut self, instructions: &[Instruction]) -> SurfpoolResult<()> {
+        for (index, instruction) in instructions.iter().enumerate() {
+            self.send(instruction)
+                .map_err(|e| SurfpoolError::internal(format!("instruction {index} failed: {e}")))?;
+            for meta in &instruction.accounts {
+                if meta.is_writable && !self.written.contains(&meta.pubkey) {
+                    self.written.push(meta.pubkey);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The return data of a read-only instruction, such as a Hawkeye view.
+    pub fn view(&mut self, instruction: &Instruction) -> SurfpoolResult<Vec<u8>> {
+        self.send(instruction).map_err(SurfpoolError::internal)
+    }
+
+    /// An account as the instructions run so far left it.
+    pub fn account(&self, address: &Pubkey) -> SurfpoolResult<Account> {
+        local_account(&self.svm, address)
+    }
+
+    /// Moves the copy's Clock one slot on. Phoenix fixes the mark it uses for risk for the rest of
+    /// a slot once a risk action, such as a cancel, has read it.
+    pub fn next_slot(&mut self) {
+        let mut clock = self.svm.inner.get_sysvar::<Clock>();
+        clock.slot += 1;
+        self.svm.inner.set_sysvar(&clock);
+    }
+
+    /// Every account the instructions run so far changed, as it now is.
+    pub fn writes(self) -> SurfpoolResult<Vec<(Pubkey, Account)>> {
+        let mut changed = Vec::new();
+        for pubkey in self.written {
+            let Some(after) = self.svm.inner.get_account(&pubkey)? else {
+                continue;
+            };
+            if self.live.inner.get_account(&pubkey)?.as_ref() != Some(&after) {
+                changed.push((pubkey, after));
+            }
+        }
+        Ok(changed)
+    }
+
+    fn send(&mut self, instruction: &Instruction) -> Result<Vec<u8>, String> {
+        // A fresh payer gives every transaction its own signature.
+        let payer = Keypair::new();
+        self.svm
+            .inner
+            .airdrop(&payer.pubkey(), FEE_PAYER_LAMPORTS)
+            .map_err(|failed| format!("funding the fee payer failed: {:?}", failed.err))?;
+        let mut transaction = Transaction::new_with_payer(
+            &[
+                ComputeBudgetInstruction::set_compute_unit_limit(COMPUTE_UNIT_LIMIT),
+                instruction.clone(),
+            ],
+            Some(&payer.pubkey()),
+        );
+        transaction.partial_sign(&[&payer], self.svm.inner.svm.latest_blockhash());
+        self.svm
+            .inner
+            .send_transaction(transaction)
+            .map(|meta| meta.return_data.data)
+            .map_err(|failed| format!("{:?}; logs: {:?}", failed.err, failed.meta.logs))
+    }
+}
+
+/// Writes every account of one Phoenix override, or puts back the ones already written when a
+/// write fails: Phoenix needs its accounts to agree with each other. Returns the addresses written.
+pub(crate) fn write_all_or_none(
+    svm: &mut SurfnetSvm,
+    writes: Vec<(Pubkey, Account)>,
+    slot: u64,
+) -> SurfpoolResult<Vec<Pubkey>> {
+    // Read before any write: a write can change the local VM and then fail on its indexes.
+    let befores = writes
+        .iter()
+        .map(|(pubkey, _)| svm.inner.get_account(pubkey))
+        .collect::<SurfpoolResult<Vec<_>>>()?;
+    let mut written: Vec<(Pubkey, Option<Account>)> = Vec::with_capacity(writes.len());
+    for ((pubkey, account), before) in writes.into_iter().zip(befores) {
+        written.push((pubkey, before));
+        if let Err(error) = svm.set_scenario_override_account(&pubkey, account, slot) {
+            let mut unrestored = Vec::new();
+            for (pubkey, before) in written.into_iter().rev() {
+                if matches!(svm.inner.get_account(&pubkey), Ok(now) if now == before) {
+                    continue;
+                }
+                let created = before.is_none();
+                // An empty account deletes one the write created.
+                if let Err(e) =
+                    svm.set_scenario_override_account(&pubkey, before.unwrap_or_default(), slot)
+                {
+                    unrestored.push(format!("{pubkey}: {e}"));
+                }
+                // A delete also marks the account offline, but before the write it could still be
+                // fetched upstream.
+                if created && let Err(e) = svm.offline_accounts.take(&pubkey.to_string()) {
+                    unrestored.push(format!("{pubkey} stays offline: {e}"));
+                }
+            }
+            if unrestored.is_empty() {
+                return Err(error);
+            }
+            return Err(SurfpoolError::internal(format!(
+                "{error}; putting the accounts back also failed for {}",
+                unrestored.join(", ")
+            )));
+        }
+    }
+    Ok(written.into_iter().map(|(pubkey, _)| pubkey).collect())
+}
+
+/// Runs the instructions in a [`Sandbox`] and returns what they changed.
+pub fn run_instructions(
+    svm: &SurfnetSvm,
+    instructions: &[Instruction],
+) -> SurfpoolResult<Vec<(Pubkey, Account)>> {
+    let mut sandbox = Sandbox::new(svm);
+    sandbox.run(instructions)?;
+    sandbox.writes()
+}
+
 /// Phoenix refuses a market once its readings are older than its stale threshold times its `u8`
 /// `oracle_hard_stale_multiplier`, or than the threshold alone when that is 0. `u32::MAX` puts the
 /// limit beyond any session and keeps within a `u64`.
 const RAISED_STALE_THRESHOLD_SLOTS: u64 = u32::MAX as u64;
 
-/// What a caller can name a market by, and the current values a relative change starts from.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PhoenixMarket {
-    pub symbol: String,
-    pub orderbook: Pubkey,
-    pub mark_ticks: u64,
-    pub tick_size: u64,
-    pub base_lot_decimals: i8,
-    pub maintenance_risk_factor_bps: u16,
-    pub backstop_risk_factor_bps: u16,
+const TRADER_CAPABILITIES_TEMPLATE_ID: &str = "phoenix-trader-capabilities";
+const MARKET_SYMBOL_FIELD: &str = "symbol";
+const TRADER_FIELD: &str = "trader";
+const TARGET_TICKS_FIELD: &str = "target_ticks";
+const CHANGE_PERCENT_FIELD: &str = "change_percent";
+const EFFECTIVE_COLLATERAL_FIELD: &str = "effective_collateral_usdc";
+
+/// The GlobalConfig role that signs a configuration instruction on mainnet.
+#[derive(Clone, Copy, Debug)]
+enum Role {
+    Root,
+    Risk,
+    Market,
 }
 
-pub fn phoenix_markets(
-    perp_asset_map: Pubkey,
-    account: &Account,
-) -> SurfpoolResult<Vec<PhoenixMarket>> {
-    if account.owner != PHOENIX_ETERNAL_PROGRAM_ID {
-        return Err(SurfpoolError::invalid_account_owner(
-            perp_asset_map,
-            None::<PhoenixAccountDecodeError>,
-        ));
+/// Templates that run one of Phoenix's own configuration instructions, as the role that signs it
+/// on mainnet. Each template's fields are named after the instruction's IDL fields.
+const CONFIG_TEMPLATES: [(&str, &str, Role); 12] = [
+    (
+        "phoenix-market-risk-factors",
+        "UpdatePerpRiskFactors",
+        Role::Risk,
+    ),
+    (
+        "phoenix-market-cancel-risk-factor",
+        "UpdatePerpCancelRiskFactor",
+        Role::Risk,
+    ),
+    (
+        "phoenix-market-max-liquidation-size",
+        "UpdatePerpMaxLiquidationSize",
+        Role::Risk,
+    ),
+    (
+        "phoenix-market-open-interest-cap",
+        "UpdatePerpOpenInterestCap",
+        Role::Risk,
+    ),
+    (
+        "phoenix-market-funding",
+        "UpdateFundingParameters",
+        Role::Market,
+    ),
+    ("phoenix-market-fees", "UpdateMarketFees", Role::Market),
+    ("phoenix-market-status", "ChangeMarketStatus", Role::Market),
+    (
+        "phoenix-exchange-status",
+        "ChangeExchangeStatus",
+        Role::Root,
+    ),
+    (
+        "phoenix-withdraw-limits",
+        "UpdateWithdrawRateLimits",
+        Role::Root,
+    ),
+    (
+        "phoenix-withdraw-parameters",
+        "UpdateWithdrawParameters",
+        Role::Risk,
+    ),
+    ("phoenix-trader-fees", "UpdateTraderFees", Role::Market),
+    (
+        TRADER_CAPABILITIES_TEMPLATE_ID,
+        "SetTraderCapability",
+        Role::Risk,
+    ),
+];
+
+/// The writes of a configuration template's instruction, signed by its GlobalConfig role, which
+/// passes its own key as the permission account, as mainnet's configuration transactions do.
+async fn run_config_template(
+    svm: &mut SurfnetSvm,
+    remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
+    template_id: &str,
+    instruction: &str,
+    role: Role,
+    target: &Pubkey,
+    values: &HashMap<String, serde_json::Value>,
+) -> SurfpoolResult<Vec<(Pubkey, Account)>> {
+    let exchange = Exchange::load(svm, remote_ctx).await?;
+    let authority = Pubkey::new_from_array(match role {
+        Role::Root => exchange.config.root_authority(),
+        Role::Risk => exchange.config.risk_authority(),
+        Role::Market => exchange.config.market_authority(),
+    });
+    let withdraw_queue = Pubkey::new_from_array(exchange.config.withdraw_queue_key());
+    hydrate(
+        svm,
+        remote_ctx,
+        &[
+            exchange.perp_asset_map,
+            exchange.global_trader_index,
+            exchange.active_trader_buffer,
+            withdraw_queue,
+            *target,
+        ],
+    )
+    .await?;
+    let mut known = vec![
+        ("phoenixProgram", PHOENIX_PROGRAM_ID),
+        ("phoenixLogAuthority", log_authority()),
+        ("globalConfiguration", PHOENIX_GLOBAL_CONFIG),
+        ("authority", authority),
+        ("maybePermissionAccount", authority),
+        ("perpAssetMap", exchange.perp_asset_map),
+        ("globalTraderIndex", exchange.global_trader_index),
+        ("activeTraderBuffer", exchange.active_trader_buffer),
+        ("withdrawQueueAccount", withdraw_queue),
+        ("traderAccount", *target),
+    ];
+    let symbol = values
+        .get(MARKET_SYMBOL_FIELD)
+        .and_then(serde_json::Value::as_str);
+    let mut values = values.clone();
+    if let Some(symbol) = symbol {
+        let map = local_account(svm, &exchange.perp_asset_map)?;
+        let market = Market::find(&exchange.perp_asset_map, &map.data, symbol)?;
+        hydrate(svm, remote_ctx, &[market.orderbook]).await?;
+        known.push(("orderbook", market.orderbook));
+        known.push(("orderbookAccount", market.orderbook));
+        // UpdatePerpRiskFactors takes all three factors; one left out keeps its current value.
+        if instruction == "UpdatePerpRiskFactors" {
+            let fields = [
+                "maintenanceRiskFactor",
+                "backstopRiskFactor",
+                "highRiskRiskFactor",
+            ];
+            for (field, current) in fields.into_iter().zip(market.risk_factors) {
+                if given(&values, field).is_none() {
+                    values.insert(field.to_string(), current.to_string().into());
+                }
+            }
+        }
     }
-    let invalid = |error: PhoenixAccountDecodeError| {
-        SurfpoolError::invalid_account_data(
-            perp_asset_map,
-            "Expected a valid Phoenix Eternal PerpAssetMap account",
-            Some(error),
-        )
+    let args = if template_id == TRADER_CAPABILITIES_TEMPLATE_ID {
+        capability_toggles(&values)?
+    } else {
+        instruction_args(instruction, &values, symbol)?
     };
-    let map = PerpAssetMap::try_from_account_bytes(&account.data).map_err(invalid)?;
-    let mut markets = map
-        .iter()
-        .map(|entry| {
-            entry.map(|entry| PhoenixMarket {
-                symbol: entry.symbol.as_str().to_string(),
-                orderbook: Pubkey::new_from_array(
-                    entry.metadata.static_market_params().market_account,
-                ),
-                mark_ticks: entry
-                    .metadata
-                    .oracle_price()
-                    .mark_price
-                    .price
-                    .ticks
-                    .as_inner(),
-                tick_size: entry.metadata.static_market_params().tick_size.as_inner(),
-                base_lot_decimals: entry.metadata.static_market_params().base_lot_decimals,
-                maintenance_risk_factor_bps: entry.metadata.risk_params().risk_factors[0],
-                backstop_risk_factor_bps: entry.metadata.risk_params().risk_factors[1],
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(invalid)?;
-    markets.sort_unstable_by(|left, right| left.symbol.cmp(&right.symbol));
-
-    Ok(markets)
-}
-
-fn price_patch_error(account_pubkey: &Pubkey, message: impl core::fmt::Display) -> SurfpoolError {
-    SurfpoolError::invalid_account_data(
-        account_pubkey,
-        "Expected a valid Phoenix Eternal PerpAssetMap account",
-        Some(message),
+    run_instructions(
+        svm,
+        &[phoenix_instruction_from(instruction, &known, &args)?],
     )
 }
 
-fn checked_ticks(ticks: u64) -> SurfpoolResult<u64> {
-    // Margin is the mark times the tick size, so a zero mark would zero the margin of every
-    // position in the market instead of shocking it.
-    if ticks == 0 || ticks > u64::from(u32::MAX) {
+/// A template input, unless it was left out, left empty or null.
+fn given<'v>(
+    values: &'v HashMap<String, serde_json::Value>,
+    field: &str,
+) -> Option<&'v serde_json::Value> {
+    values
+        .get(field)
+        .filter(|value| !value.is_null() && value.as_str() != Some(""))
+}
+
+/// `SetTraderCapability` takes a list of toggles; its template takes one boolean per Phoenix
+/// capability, named after it, and toggles only those given.
+fn capability_toggles(
+    values: &HashMap<String, serde_json::Value>,
+) -> SurfpoolResult<serde_json::Value> {
+    const TARGETS: [&str; 6] = [
+        "PlaceLimitOrder",
+        "PlaceMarketOrder",
+        "RiskIncreasingTrade",
+        "RiskReducingTrade",
+        "DepositCollateral",
+        "WithdrawCollateral",
+    ];
+    let mut toggles = Vec::new();
+    for target in TARGETS {
+        let enable = match given(values, target) {
+            None => continue,
+            Some(serde_json::Value::Bool(enable)) => *enable,
+            Some(serde_json::Value::String(text)) => text
+                .parse()
+                .map_err(|_| SurfpoolError::internal(format!("{target} must be true or false")))?,
+            Some(other) => {
+                return Err(SurfpoolError::internal(format!(
+                    "{target} must be true or false, not {other}"
+                )));
+            }
+        };
+        toggles.push(serde_json::json!({ "target": { target: null }, "enable": enable }));
+    }
+    if toggles.is_empty() {
         return Err(SurfpoolError::internal(format!(
-            "price ticks {ticks} are outside the Phoenix mark range 1..={}",
-            u32::MAX
+            "set at least one of {}",
+            TARGETS.join(", ")
         )));
     }
-    Ok(ticks)
+    Ok(serde_json::json!({ "params": { "toggles": toggles } }))
 }
 
-fn patch_direct_mark(
+/// The writes a Phoenix override needs, or `None` when the account takes the generic IDL path.
+/// Each first keeps the markets usable ([`keep_markets_usable`]); `target_slot` is the slot played.
+pub async fn prepare_phoenix_override(
+    svm: &mut SurfnetSvm,
+    template_id: &str,
     account_pubkey: &Pubkey,
-    data: &[u8],
-    symbol: &str,
-    target_ticks: u64,
-    mark_slot: u64,
-) -> SurfpoolResult<Vec<u8>> {
-    let target_ticks = checked_ticks(target_ticks)?;
-    patch_market_metadata(account_pubkey, data, symbol, |_, bytes| {
-        let price_len = size_of::<PriceComponent>();
-        let mut price = bytemuck::pod_read_unaligned::<PriceComponent>(&bytes[..price_len]);
-        price.mark_price.price.slot = mark_slot;
-        price.mark_price.price.ticks = bytemuck::cast(target_ticks);
-        // Phoenix rebuilds the mark from its oracle inputs on every trade, so they carry the
-        // shock too; the book input is clamped around them and needs no write.
-        let mark = &mut price.mark_price;
-        for sample in mark
-            .spot_price_component
-            .last_exchange_spot_price
-            .iter_mut()
-            .chain(
-                mark.perp_price_component
-                    .last_exchange_perp_price
-                    .iter_mut(),
-            )
-        {
-            sample.ticks = mark.price.ticks;
-            sample.slot = mark_slot;
-        }
-        mark.spot_price_component.slot = mark_slot;
-        bytes[..price_len].copy_from_slice(bytemuck::bytes_of(&price));
-        Ok(())
-    })
-}
-
-fn patch_maintenance_factor(
-    account_pubkey: &Pubkey,
-    data: &[u8],
-    symbol: &str,
-    factor: u16,
-) -> SurfpoolResult<Vec<u8>> {
-    patch_market_metadata(account_pubkey, data, symbol, |metadata, bytes| {
-        // risk_factors is [maintenance, backstop, high_risk], and the risk tier is checked from
-        // the backstop up, so a maintenance factor at or below the backstop one leaves no
-        // Liquidatable tier.
-        let backstop = metadata.risk_params().risk_factors[1];
-        if factor <= backstop || factor > MAX_RISK_FACTOR_BPS {
-            return Err(SurfpoolError::internal(format!(
-                "{MAINTENANCE_FACTOR_FIELD} {factor} must be above {symbol}'s backstop factor \
-                 {backstop} and at most {MAX_RISK_FACTOR_BPS}"
-            )));
-        }
-        // The metadata layout type is private to the crate, so the field offset comes from the view.
-        let offset = metadata.risk_params().risk_factors.as_ptr() as usize
-            - metadata.as_bytes().as_ptr() as usize;
-        bytes[offset..offset + 2].copy_from_slice(&factor.to_le_bytes());
-        Ok(())
-    })
-}
-
-/// The map with every market's spot and perp oracle stale threshold raised to
-/// [`RAISED_STALE_THRESHOLD_SLOTS`], or `None` when they already are. A higher threshold is kept.
-fn raise_stale_thresholds(account_pubkey: &Pubkey, data: &[u8]) -> SurfpoolResult<Option<Vec<u8>>> {
-    let decode_error = |error: PhoenixAccountDecodeError| {
-        price_patch_error(
+    account: &Account,
+    values: &HashMap<String, serde_json::Value>,
+    remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
+    target_slot: u64,
+) -> SurfpoolResult<Option<Vec<(Pubkey, Account)>>> {
+    if !template_id.starts_with("phoenix-") && account.owner != PHOENIX_PROGRAM_ID {
+        return Ok(None);
+    }
+    keep_markets_usable(svm, remote_ctx, target_slot).await;
+    if let Some((_, instruction, role)) = CONFIG_TEMPLATES
+        .iter()
+        .find(|(config_template, ..)| *config_template == template_id)
+    {
+        return run_config_template(
+            svm,
+            remote_ctx,
+            template_id,
+            instruction,
+            *role,
             account_pubkey,
-            format!("invalid Phoenix PerpAssetMap account: {error}"),
+            values,
         )
+        .await
+        .map(Some);
+    }
+    match template_id {
+        "phoenix-market-move" => {
+            let symbol = text_input(values, MARKET_SYMBOL_FIELD)?;
+            let target_ticks = whole_number_input(values, TARGET_TICKS_FIELD)?;
+            move_market(svm, remote_ctx, symbol, target_ticks)
+                .await
+                .map(Some)
+        }
+        "phoenix-market-uncross" => {
+            let symbol = text_input(values, MARKET_SYMBOL_FIELD)?;
+            uncross_market(svm, remote_ctx, symbol).await.map(Some)
+        }
+        "phoenix-oracle-price" => {
+            let symbol = text_input(values, MARKET_SYMBOL_FIELD)?;
+            let mut context = MarketContext::load(svm, remote_ctx, symbol).await?;
+            let target_ticks = oracle_target(values, context.market.mark_ticks)?;
+            run_instructions(svm, &context.oracle_reports(target_ticks)?).map(Some)
+        }
+        "phoenix-trader-cancel-orders" => {
+            let text = text_input(values, TRADER_FIELD)?;
+            let trader = Pubkey::from_str(text).map_err(|e| {
+                SurfpoolError::internal(format!("{TRADER_FIELD} '{text}' is not an address: {e}"))
+            })?;
+            let symbols = match values.get(MARKET_SYMBOL_FIELD) {
+                None | Some(serde_json::Value::Null) => "",
+                Some(serde_json::Value::String(text)) => text.as_str(),
+                Some(_) => {
+                    return Err(SurfpoolError::internal(format!(
+                        "{MARKET_SYMBOL_FIELD} must be a string such as SOL, BTC, or empty for \
+                         every market"
+                    )));
+                }
+            };
+            let markets: Vec<&str> = symbols
+                .split(',')
+                .map(str::trim)
+                .filter(|symbol| !symbol.is_empty())
+                .collect();
+            cancel_order_writes(svm, remote_ctx, trader, &markets)
+                .await
+                .map(Some)
+        }
+        "phoenix-trader-collateral" => {
+            let wanted = usdc_input(values, EFFECTIVE_COLLATERAL_FIELD)?;
+            collateral_writes(svm, remote_ctx, *account_pubkey, account, wanted)
+                .await
+                .map(Some)
+        }
+        // Phoenix's other accounts take the generic IDL path.
+        _ => Ok(None),
+    }
+}
+
+fn text_input<'a>(
+    values: &'a HashMap<String, serde_json::Value>,
+    field: &str,
+) -> SurfpoolResult<&'a str> {
+    values
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| SurfpoolError::internal(format!("{field} must be a non-empty string")))
+}
+
+fn whole_number_input<T: FromStr>(
+    values: &HashMap<String, serde_json::Value>,
+    field: &str,
+) -> SurfpoolResult<T> {
+    let parsed = match values.get(field) {
+        Some(serde_json::Value::String(text)) => text.trim().parse().ok(),
+        Some(serde_json::Value::Number(number)) => number.to_string().parse().ok(),
+        _ => None,
     };
-    let map = PerpAssetMap::try_from_account_bytes(data).map_err(decode_error)?;
-    let price_len = size_of::<PriceComponent>();
-    let mut patched: Option<Vec<u8>> = None;
+    parsed.ok_or_else(|| {
+        SurfpoolError::internal(format!(
+            "{field} must be a whole number, as a decimal string or a JSON number"
+        ))
+    })
+}
+
+/// A USDC amount such as "-12.5" in Phoenix's quote lots, a millionth of a USDC each, rounded to
+/// the nearest lot.
+fn usdc_input(values: &HashMap<String, serde_json::Value>, field: &str) -> SurfpoolResult<i64> {
+    values
+        .get(field)
+        .and_then(decimal)
+        .map(|usdc| (usdc * 1_000_000.0).round())
+        .filter(|lots| lots.abs() < i64::MAX as f64)
+        .map(|lots| lots as i64)
+        .ok_or_else(|| {
+            SurfpoolError::internal(format!(
+                "{field} must be a USDC amount such as -12.5, as a decimal string or a JSON number"
+            ))
+        })
+}
+
+/// `target_ticks` as given, or `change_percent` applied to the market's mark.
+fn oracle_target(
+    values: &HashMap<String, serde_json::Value>,
+    mark_ticks: u64,
+) -> SurfpoolResult<u64> {
+    match (
+        given(values, TARGET_TICKS_FIELD),
+        given(values, CHANGE_PERCENT_FIELD),
+    ) {
+        (Some(_), None) => whole_number_input(values, TARGET_TICKS_FIELD),
+        (None, Some(percent)) => percent_of(mark_ticks, percent),
+        _ => Err(SurfpoolError::internal(format!(
+            "set exactly one of {TARGET_TICKS_FIELD} and {CHANGE_PERCENT_FIELD}"
+        ))),
+    }
+}
+
+/// `mark_ticks` moved by a percentage such as "-5" or "2.5", rounded to the nearest tick.
+fn percent_of(mark_ticks: u64, percent: &serde_json::Value) -> SurfpoolResult<u64> {
+    let change = decimal(percent).ok_or_else(|| {
+        SurfpoolError::internal(format!(
+            "{CHANGE_PERCENT_FIELD} must be a number such as -5 or 2.5, not {percent}"
+        ))
+    })?;
+    let moved = (mark_ticks as f64 * (1.0 + change / 100.0)).round();
+    if moved < 1.0 {
+        return Err(SurfpoolError::internal(format!(
+            "{CHANGE_PERCENT_FIELD} {change} leaves no positive price from {mark_ticks} ticks"
+        )));
+    }
+    Ok(moved as u64)
+}
+
+/// A decimal string or a JSON number, while it is finite.
+fn decimal(value: &serde_json::Value) -> Option<f64> {
+    match value {
+        serde_json::Value::String(text) => text.trim().parse::<f64>().ok(),
+        serde_json::Value::Number(number) => number.as_f64(),
+        _ => None,
+    }
+    .filter(|value| value.is_finite())
+}
+
+/// Nothing refreshes oracle readings or makers' quotes locally, so this raises the map's stale
+/// thresholds, restamps old readings, rewinds funding ahead of the Clock and keeps every spline
+/// region quoting ([`keep_quoting`]). A failure only warns and keeps the map.
+pub(crate) async fn keep_markets_usable(
+    svm: &mut SurfnetSvm,
+    remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
+    target_slot: u64,
+) {
+    let kept = async {
+        hydrate(svm, remote_ctx, &[PHOENIX_PERP_ASSET_MAP]).await?;
+        let map = local_account(svm, &PHOENIX_PERP_ASSET_MAP)?;
+        let clock = svm.inner.get_sysvar::<Clock>();
+        let raised = raise_stale_thresholds(&PHOENIX_PERP_ASSET_MAP, &map.data)?;
+        let now = u64::try_from(clock.unix_timestamp).unwrap_or(0);
+        let rewound = rewind_funding_timestamps(
+            &PHOENIX_PERP_ASSET_MAP,
+            raised.as_deref().unwrap_or(&map.data),
+            now,
+        )?;
+        let patched = rewound.or(raised);
+        let restamped = restamp_readings(
+            &PHOENIX_PERP_ASSET_MAP,
+            patched.as_deref().unwrap_or(&map.data),
+            clock.slot,
+        )?;
+        if let Some(data) = restamped.or(patched) {
+            svm.set_scenario_override_account(
+                &PHOENIX_PERP_ASSET_MAP,
+                Account {
+                    data,
+                    ..map.clone()
+                },
+                target_slot,
+            )?;
+        }
+        let splines: Vec<Pubkey> = phoenix_markets(PHOENIX_PERP_ASSET_MAP, &map)?
+            .iter()
+            .map(|market| market.splines)
+            .collect();
+        if let Err(e) = hydrate(svm, remote_ctx, &splines).await {
+            warn!("Could not load every Phoenix spline collection, keeping the local ones quoting: {e}");
+        }
+        // One collection that cannot be kept quoting must not stop the others.
+        for address in splines {
+            let kept = match svm.inner.get_account(&address) {
+                Ok(Some(account)) => match keep_quoting(&address, &account.data) {
+                    Ok(Some(data)) => svm.set_scenario_override_account(
+                        &address,
+                        Account { data, ..account },
+                        target_slot,
+                    ),
+                    other => other.map(|_| ()),
+                },
+                Ok(None) => Ok(()),
+                Err(e) => Err(e),
+            };
+            if let Err(e) = kept {
+                warn!("Could not keep {address} quoting: {e}");
+            }
+        }
+        Ok::<_, SurfpoolError>(())
+    }
+    .await;
+    if let Err(e) = kept {
+        warn!("Could not keep the Phoenix markets usable in the local VM: {e}");
+    }
+}
+
+/// The collection with every region's lifespan set to [`GTC_LIFESPAN`], or `None` when nothing
+/// changes: nobody re-quotes on a fork, so mainnet's lifespans of a few slots would empty the book.
+fn keep_quoting(address: &Pubkey, data: &[u8]) -> SurfpoolResult<Option<Vec<u8>>> {
+    // The layout of phoenix-rise-accounts' SplineCollection: a 112-byte header, then each spline's
+    // bid and ask regions back to back from byte 120 of it, with the lifespan last in each region.
+    const HEADER_LEN: usize = 112;
+    const REGIONS_START: usize = 120;
+    const LIFESPAN_START: usize = 40;
+    let collection = SplineCollection::try_from_account_bytes(data).map_err(|e| {
+        SurfpoolError::invalid_account_data(
+            address,
+            "Expected a Phoenix spline collection",
+            Some(e),
+        )
+    })?;
+    let mut patched = data.to_vec();
+    for spline in 0..collection.num_splines() as usize {
+        for region in 0..2 * SPLINE_REGION_CAPACITY {
+            let start = HEADER_LEN
+                + spline * size_of::<Spline>()
+                + REGIONS_START
+                + region * size_of::<TickRegion>()
+                + LIFESPAN_START;
+            patched[start..start + 8].copy_from_slice(&GTC_LIFESPAN.to_le_bytes());
+        }
+    }
+    Ok((patched != data).then_some(patched))
+}
+
+/// Every market's metadata in the map, with the offset it starts at in `data`.
+fn markets_in_map(
+    account_pubkey: &Pubkey,
+    data: &[u8],
+) -> SurfpoolResult<Vec<(usize, PerpAssetMetadata)>> {
+    let mut markets = Vec::new();
     // The decoder walks the entries in storage order, and each market's metadata holds its own
     // market account, so it occurs once in the map
     let mut cursor = 0;
-    for entry in map.iter() {
-        let metadata = entry.map_err(decode_error)?.metadata;
+    for entry in map_entries(account_pubkey, data)? {
+        let metadata = entry.metadata;
         let metadata_bytes = metadata.as_bytes();
         let offset = data[cursor..]
             .windows(metadata_bytes.len())
             .position(|window| window == metadata_bytes)
             .map(|position| cursor + position)
             .ok_or_else(|| {
-                price_patch_error(account_pubkey, "Phoenix market metadata was not found")
+                invalid_perp_asset_map(account_pubkey, "Phoenix market metadata was not found")
             })?;
         cursor = offset + metadata_bytes.len();
+        markets.push((offset, metadata));
+    }
+    Ok(markets)
+}
 
+/// The map with every market's spot and perp oracle stale threshold raised to
+/// [`RAISED_STALE_THRESHOLD_SLOTS`], or `None` when they already are. A higher threshold is kept.
+fn raise_stale_thresholds(account_pubkey: &Pubkey, data: &[u8]) -> SurfpoolResult<Option<Vec<u8>>> {
+    let price_len = size_of::<PriceComponent>();
+    let mut patched: Option<Vec<u8>> = None;
+    for (offset, metadata) in markets_in_map(account_pubkey, data)? {
         // The PriceComponent is the metadata's first field.
         let mut price = *metadata.oracle_price();
         let mark = &mut price.mark_price;
@@ -235,836 +1018,199 @@ fn raise_stale_thresholds(account_pubkey: &Pubkey, data: &[u8]) -> SurfpoolResul
     Ok(patched)
 }
 
-fn patch_market_metadata(
+/// The map with reading slots before `slot` moved up to it, or `None`; prices stay. On an old map a
+/// report's EMA leaves a deep search move no positive price, and Phoenix refuses the margin.
+fn restamp_readings(
     account_pubkey: &Pubkey,
     data: &[u8],
-    symbol: &str,
-    update: impl FnOnce(&PerpAssetMetadata, &mut [u8]) -> SurfpoolResult<()>,
-) -> SurfpoolResult<Vec<u8>> {
-    let decode_error = |error: PhoenixAccountDecodeError| {
-        price_patch_error(
-            account_pubkey,
-            format!("invalid Phoenix PerpAssetMap account: {error}"),
-        )
-    };
-    let map = PerpAssetMap::try_from_account_bytes(data).map_err(decode_error)?;
-    let entry = map
-        .find_by_symbol(symbol)
-        .map_err(decode_error)?
-        .ok_or_else(|| SurfpoolError::internal(format!("Phoenix market {symbol} was not found")))?;
-    let metadata_bytes = entry.metadata.as_bytes();
-    let metadata_offset = unique_subslice_offset(data, metadata_bytes).ok_or_else(|| {
-        price_patch_error(
-            account_pubkey,
-            "selected Phoenix market metadata does not occur exactly once",
-        )
-    })?;
-    let mut patched = data.to_vec();
-    update(
-        &entry.metadata,
-        &mut patched[metadata_offset..metadata_offset + metadata_bytes.len()],
-    )?;
+    slot: u64,
+) -> SurfpoolResult<Option<Vec<u8>>> {
+    let price_len = size_of::<PriceComponent>();
+    let mut patched: Option<Vec<u8>> = None;
+    for (offset, metadata) in markets_in_map(account_pubkey, data)? {
+        // The PriceComponent is the metadata's first field.
+        let mut price = *metadata.oracle_price();
+        let mark = &mut price.mark_price;
+        let samples = mark
+            .spot_price_component
+            .last_exchange_spot_price
+            .iter_mut()
+            .chain(
+                mark.perp_price_component
+                    .last_exchange_perp_price
+                    .iter_mut(),
+            )
+            .map(|sample| &mut sample.slot);
+        let mut stamped = false;
+        for reading in [&mut mark.price.slot, &mut mark.spot_price_component.slot]
+            .into_iter()
+            .chain(samples)
+        {
+            // An unused oracle sample stays empty rather than becoming a fresh zero price.
+            if *reading != 0 && *reading < slot {
+                *reading = slot;
+                stamped = true;
+            }
+        }
+        if stamped {
+            patched.get_or_insert_with(|| data.to_vec())[offset..offset + price_len]
+                .copy_from_slice(bytemuck::bytes_of(&price));
+        }
+    }
     Ok(patched)
 }
 
-fn unique_subslice_offset(data: &[u8], needle: &[u8]) -> Option<usize> {
-    let mut matches = data
-        .windows(needle.len())
-        .enumerate()
-        .filter(|(_, window)| *window == needle)
-        .map(|(offset, _)| offset);
-    let offset = matches.next()?;
-    matches.next().is_none().then_some(offset)
-}
-
-fn forge_phoenix_override(
+/// The map with funding timestamps after `now` (Unix seconds) moved back to it, or `None`. Phoenix
+/// fails to update funding, and every price, while the Clock is before the last update.
+fn rewind_funding_timestamps(
     account_pubkey: &Pubkey,
-    account: &Account,
-    account_values: &HashMap<String, serde_json::Value>,
-    mark_slot: u64,
-) -> SurfpoolResult<Vec<u8>> {
-    // Only the codec's inputs are read: other keys, such as PerpAssetMap fields a client copied
-    // from the decoded account, cannot be written through this codec.
-    let symbol = || {
-        account_values
-            .get(MARKET_SYMBOL_FIELD)
-            .and_then(serde_json::Value::as_str)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| SurfpoolError::internal("symbol must be a non-empty string"))
-    };
-    match (
-        account_values.get(DIRECT_MARK_TICKS_FIELD),
-        account_values.get(MAINTENANCE_FACTOR_FIELD),
-    ) {
-        (Some(ticks), None) => patch_direct_mark(
-            account_pubkey,
-            &account.data,
-            symbol()?,
-            parse_decimal(ticks, DIRECT_MARK_TICKS_FIELD, "an unsigned 64-bit integer")?,
-            mark_slot,
-        ),
-        (None, Some(factor)) => patch_maintenance_factor(
-            account_pubkey,
-            &account.data,
-            symbol()?,
-            parse_decimal(factor, MAINTENANCE_FACTOR_FIELD, "basis points")?,
-        ),
-        _ => Err(SurfpoolError::internal(
-            "Phoenix map overrides take symbol plus exactly one of target_ticks or \
-             maintenance_risk_factor_bps",
-        )),
-    }
-}
-
-/// The writes a Phoenix override needs, or `None` when the account takes the generic IDL path.
-/// Every Phoenix override also leaves the local PerpAssetMap's markets usable for the rest of the
-/// session; see `keep_oracle_readings_usable`. `target_slot` is the slot being materialized, which
-/// the override's writes are published at.
-pub async fn prepare_phoenix_override(
-    svm: &mut SurfnetSvm,
-    account_pubkey: &Pubkey,
-    account: &Account,
-    values: &HashMap<String, serde_json::Value>,
-    remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
-    fetch_before_use: bool,
-    target_slot: u64,
-) -> SurfpoolResult<Option<Vec<(Pubkey, Account)>>> {
-    if account.owner != PHOENIX_ETERNAL_PROGRAM_ID {
-        return Ok(None);
-    }
-    match phoenix_account_kind(&account.data) {
-        Some(PhoenixAccount::PerpAssetMap) => {
-            let mark_slot = svm.inner.get_sysvar::<Clock>().slot;
-            let data = forge_phoenix_override(account_pubkey, account, values, mark_slot)?;
-            // This override writes the map Phoenix reads, so the thresholds go in the same write.
-            let data = match raise_stale_thresholds(account_pubkey, &data) {
-                Ok(raised) => raised.unwrap_or(data),
-                Err(e) => {
-                    warn!(
-                        "Could not raise the Phoenix PerpAssetMap's oracle stale thresholds: {e}"
-                    );
-                    data
-                }
-            };
-            Ok(Some(vec![(
-                *account_pubkey,
-                Account {
-                    data,
-                    ..account.clone()
-                },
-            )]))
-        }
-        kind => {
-            keep_oracle_readings_usable(svm, remote_ctx, target_slot).await;
-            match kind {
-                Some(PhoenixAccount::Trader) => prepare_trader_override(
-                    svm,
-                    account_pubkey,
-                    account,
-                    values,
-                    remote_ctx,
-                    fetch_before_use,
-                )
-                .await
-                .map(Some),
-                _ => Ok(None),
+    data: &[u8],
+    now: u64,
+) -> SurfpoolResult<Option<Vec<u8>>> {
+    let mut patched: Option<Vec<u8>> = None;
+    for (offset, metadata) in markets_in_map(account_pubkey, data)? {
+        let mut funding = *metadata.funding_accumulator();
+        let mut rewound = false;
+        for timestamp in [
+            &mut funding.start_interval_timestamp,
+            &mut funding.last_funding_update_timestamp,
+        ] {
+            if bytemuck::cast::<_, u64>(*timestamp) > now {
+                *timestamp = bytemuck::cast(now);
+                rewound = true;
             }
         }
-    }
-}
-
-/// Oracle updates keep every market's readings fresh, and Phoenix refuses a market whose readings
-/// are too old (see [`RAISED_STALE_THRESHOLD_SLOTS`]). Nothing refreshes them locally, so
-/// this raises the thresholds of the local PerpAssetMap, fetching it first when it is not local
-/// yet. Prices and reading slots stay as they were, and the markets stay usable however far the
-/// local Clock moves. A failure leaves the map as it was and never fails the override. It runs on
-/// every Phoenix override, before that override's own checks, since the map is needed whether or
-/// not the override applies; each run reads the whole map.
-async fn keep_oracle_readings_usable(
-    svm: &mut SurfnetSvm,
-    remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
-    target_slot: u64,
-) {
-    let kept = async {
-        let map = phoenix_dependency(svm, &PHOENIX_PERP_ASSET_MAP, remote_ctx).await?;
-        let Some(data) = raise_stale_thresholds(&PHOENIX_PERP_ASSET_MAP, &map.data)? else {
-            return Ok(());
-        };
-        svm.set_scenario_override_account(
-            &PHOENIX_PERP_ASSET_MAP,
-            Account { data, ..map },
-            target_slot,
-        )
-    }
-    .await;
-    if let Err(e) = kept {
-        warn!("Could not raise the Phoenix PerpAssetMap's oracle stale thresholds: {e}");
-    }
-}
-
-async fn prepare_trader_override(
-    svm: &mut SurfnetSvm,
-    trader: &Pubkey,
-    account: &Account,
-    values: &HashMap<String, serde_json::Value>,
-    remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
-    fetch_before_use: bool,
-) -> SurfpoolResult<Vec<(Pubkey, Account)>> {
-    let header = trader_header(trader, account)?;
-    let hot = header.trader_state.is_hot();
-    // Ahead of every check, so a refused override still leaves the fresh record behind.
-    if fetch_before_use {
-        refresh_index_record(svm, &header, remote_ctx).await?;
-    }
-    let listed = !hot
-        && svm
-            .inner
-            .get_account(&PHOENIX_GLOBAL_TRADER_INDEX)?
-            .is_some_and(|index| index_trader_state_range(&index, &header.key).is_ok());
-    if hot || listed {
-        validate_hot_trader_fields(values)?;
-    }
-    let target = values
-        .get(COLLATERAL_FIELD)
-        .map(parse_quote_lot_collateral)
-        .transpose()?;
-    // A hot Trader's collateral is read from its GlobalTraderIndex record, so the record is what
-    // the target is checked against and patched in.
-    let index = match target {
-        Some(_) if hot => {
-            Some(phoenix_dependency(svm, &PHOENIX_GLOBAL_TRADER_INDEX, remote_ctx).await?)
+        if rewound {
+            // The metadata layout is private to the crate, so the field's offset is taken from
+            // the decoded copy.
+            let start = offset
+                + metadata.funding_accumulator() as *const FundingAccumulator as usize
+                - metadata.as_bytes().as_ptr() as usize;
+            patched.get_or_insert_with(|| data.to_vec())
+                [start..start + size_of::<FundingAccumulator>()]
+                .copy_from_slice(bytemuck::bytes_of(&funding));
         }
-        // The local GlobalTraderIndex can predate the Trader leaving the hot set, and Phoenix
-        // keeps reading a Trader the index lists from its record.
-        Some(_) => svm
-            .inner
-            .get_account(&PHOENIX_GLOBAL_TRADER_INDEX)?
-            .filter(|index| index_trader_state_range(index, &header.key).is_ok()),
-        _ => None,
-    };
-    let mut values = values.clone();
-    if let Some(target) = target {
-        ensure_collateral_is_lowered(
-            current_quote_lot_collateral(&header, index.as_ref())?,
-            target,
-        )?;
-        values.insert(
-            COLLATERAL_FIELD.to_string(),
-            serde_json::Value::from(target),
-        );
     }
-    let idl_versions = svm
-        .registered_idls
-        .get(&PHOENIX_ETERNAL_PROGRAM_ID.to_string())?
-        .unwrap_or_default();
-    let idl = &idl_versions
-        .first()
-        .ok_or_else(|| SurfpoolError::internal("No IDL registered for Phoenix Eternal"))?
-        .1;
-    let data = svm.get_forged_account_data(trader, &account.data, idl, &values)?;
-    // A listed Trader is capped by its index record above, not by its account copy.
-    if !hot && !listed {
-        let forged = TraderHeader::try_read_from_account_bytes(&data).map_err(|error| {
-            SurfpoolError::invalid_account_data(
-                trader,
-                "Expected a valid Phoenix Eternal Trader account",
-                Some(error),
-            )
-        })?;
-        // Phoenix looks a hot-flagged Trader up in the GlobalTraderIndex, which does not list
-        // this one, so every later transaction for it would fail.
-        if forged.trader_state.is_hot() {
-            return Err(SurfpoolError::internal(
-                "Phoenix traderState.flags must keep the HOT bit clear on a Trader the \
-                 GlobalTraderIndex does not list",
-            ));
-        }
-        let collateral = forged.trader_state.quote_lot_collateral.as_inner();
-        ensure_collateral_floor(collateral)?;
-        ensure_collateral_is_lowered(
-            header.trader_state.quote_lot_collateral.as_inner(),
-            collateral,
-        )?;
-    }
-
-    let mut writes = Vec::new();
-    if let (Some(mut index), Some(collateral)) = (index, values.get(COLLATERAL_FIELD)) {
-        let range = index_trader_state_range(&index, &header.key)?;
-        let encoded = SurfnetSvm::get_forged_idl_type_data(
-            &index.data[range.clone()],
-            idl,
-            "TraderState",
-            &HashMap::from([("quoteLotCollateral".to_string(), collateral.clone())]),
-        )?;
-        if encoded.len() != range.len() {
-            return Err(SurfpoolError::internal(format!(
-                "the re-encoded TraderState is {} bytes, the GlobalTraderIndex record holds {}",
-                encoded.len(),
-                range.len()
-            )));
-        }
-        index.data[range].copy_from_slice(&encoded);
-        writes.push((PHOENIX_GLOBAL_TRADER_INDEX, index));
-    }
-    writes.push((
-        *trader,
-        Account {
-            data,
-            ..account.clone()
-        },
-    ));
-    Ok(writes)
-}
-
-/// Phoenix reads a Trader's collateral from its GlobalTraderIndex record whenever the local index
-/// lists it, so fetchBeforeUse refreshes the collateral there too: from the upstream record, or from
-/// the refetched Trader account when a cold Trader has left the upstream index. The rest of the
-/// record stays as the local VM has it, and so does the whole record if the fetch fails. The
-/// refreshed record is stored at once, as core stores the refetched Trader, so later overrides in
-/// the same slot are checked against it.
-async fn refresh_index_record(
-    svm: &mut SurfnetSvm,
-    header: &TraderHeader,
-    remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
-) -> SurfpoolResult<()> {
-    let Some((client, commitment)) = remote_ctx else {
-        return Ok(());
-    };
-    // An index not held locally yet is fetched whole, and so fresh, when the override needs it.
-    let Some(mut index) = svm.inner.get_account(&PHOENIX_GLOBAL_TRADER_INDEX)? else {
-        return Ok(());
-    };
-    let Ok(local) = index_trader_state_range(&index, &header.key) else {
-        return Ok(());
-    };
-    let Ok(Ok(remote)) = client
-        .get_account(&PHOENIX_GLOBAL_TRADER_INDEX, *commitment)
-        .await
-        .map(|fetched| fetched.map_account())
-    else {
-        return Ok(());
-    };
-    let Ok(upstream_records) = index_trader_state_ranges(&remote) else {
-        return Ok(());
-    };
-    let trader = Pubkey::new_from_array(header.key);
-    let account_collateral = header
-        .trader_state
-        .quote_lot_collateral
-        .as_inner()
-        .to_le_bytes();
-    let fresh = match upstream_records.into_iter().find(|(key, _)| *key == trader) {
-        Some((_, upstream)) if upstream.len() == local.len() => {
-            &remote.data[upstream.start..upstream.start + 8]
-        }
-        // A cold Trader that left the upstream index keeps its collateral in its own account, which
-        // core just refetched. A hot Trader's account copy is stale, so its record stays.
-        None if !header.trader_state.is_hot() => &account_collateral[..],
-        _ => return Ok(()),
-    };
-    index.data[local.start..local.start + 8].copy_from_slice(fresh);
-    svm.set_account(&PHOENIX_GLOBAL_TRADER_INDEX, index)?;
-    Ok(())
-}
-
-async fn phoenix_dependency(
-    svm: &mut SurfnetSvm,
-    address: &Pubkey,
-    remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
-) -> SurfpoolResult<Account> {
-    if let Some(account) = svm.inner.get_account(address)? {
-        return Ok(account);
-    }
-    if svm.offline_accounts.contains_key(&address.to_string())?
-        || svm
-            .offline_accounts
-            .get(&PHOENIX_ETERNAL_PROGRAM_ID.to_string())?
-            .is_some_and(|config| config.include_owned_accounts)
-    {
-        return Err(SurfpoolError::internal(format!(
-            "Phoenix dependency {address} is offline and missing locally"
-        )));
-    }
-    let (client, commitment) = remote_ctx.as_ref().ok_or_else(|| {
-        SurfpoolError::internal(format!("Phoenix dependency {address} is missing locally"))
-    })?;
-    let fetched = client.get_account(address, *commitment).await?;
-    let account = fetched.clone().map_account()?;
-    // Fetch the dependency once instead of per override, the way any read from the upstream
-    // datasource does: the account is also indexed by owner, so getProgramAccounts serves the
-    // local copy the override then patches.
-    svm.apply_account_update(fetched, AccountUpdatePolicy::HydrateIfAbsent)?;
-    Ok(account)
-}
-
-/// Raising collateral needs a real deposit into the global vault.
-fn ensure_collateral_is_lowered(
-    current_quote_lots: i64,
-    target_quote_lots: i64,
-) -> SurfpoolResult<()> {
-    if target_quote_lots > current_quote_lots {
-        return Err(SurfpoolError::internal(format!(
-            "Phoenix collateral stress can only lower collateral: {current_quote_lots} quote lots \
-             are backed by the global vault, {target_quote_lots} would not be. Deposit first to \
-             raise it."
-        )));
-    }
-    Ok(())
-}
-
-pub fn build_phoenix_collateral_scenario(
-    trader: Pubkey,
-    trader_account: &Account,
-    target_quote_lots: &str,
-) -> SurfpoolResult<Scenario> {
-    let target_quote_lots = parse_quote_lot_collateral(&serde_json::json!(target_quote_lots))?;
-    trader_header(&trader, trader_account)?;
-
-    let values = HashMap::from([(
-        COLLATERAL_FIELD.to_string(),
-        serde_json::json!(target_quote_lots.to_string()),
-    )]);
-    let mut collateral_override = OverrideInstance::new(
-        COLLATERAL_TEMPLATE_ID.to_string(),
-        PREPARATION_SLOT,
-        AccountAddress::Pubkey(trader.to_string()),
-    )
-    .with_values(values)
-    .with_label("Phoenix Trader collateral stress".to_string());
-    collateral_override.fetch_before_use = true;
-
-    let mut scenario = Scenario::new(
-        "Phoenix Trader Collateral Stress".to_string(),
-        "Set exact signed quote-lot collateral on a Phoenix Trader, and on its record in the local GlobalTraderIndex when the index lists it."
-            .to_string(),
-    );
-    scenario.tags = vec![
-        "phoenix-eternal".to_string(),
-        "collateral".to_string(),
-        "risk".to_string(),
-    ];
-    scenario.add_override(collateral_override);
-
-    Ok(scenario)
-}
-
-fn parse_decimal<T: core::str::FromStr>(
-    value: &serde_json::Value,
-    field: &str,
-    expected: &str,
-) -> SurfpoolResult<T> {
-    let parsed = match value {
-        serde_json::Value::String(text) => text.parse().ok(),
-        serde_json::Value::Number(number) if number.is_u64() => number.to_string().parse().ok(),
-        _ => None,
-    };
-    parsed.ok_or_else(|| {
-        SurfpoolError::internal(format!(
-            "{field} must be {expected}, as a decimal string or a whole number"
-        ))
-    })
+    Ok(patched)
 }
 
 #[cfg(test)]
-mod tests {
-    use base64::{Engine, prelude::BASE64_STANDARD};
-    use phoenix_rise_accounts::{PhoenixAccount, trader::TraderHeader};
-    use solana_account::Account;
+pub(crate) mod tests {
+    use std::collections::HashSet;
+
+    use phoenix_rise_accounts::{
+        PhoenixAccount,
+        perp_asset_map::{PerpAssetMap, PerpAssetMetadata},
+    };
+    use solana_system_interface::instruction as system_instruction;
+    use surfpool_types::AccountAddress;
 
     use super::*;
-    use crate::scenarios::TemplateRegistry;
-
-    const TRADER_HEADER_LEN: usize = size_of::<TraderHeader>();
-    const COLLATERAL_BYTE_RANGE: core::ops::Range<usize> = 88..96;
-    const POSITION_MAP_PREFIX_LEN: usize = 16;
-    const POSITION_ENTRY_LEN: usize = 40;
-    const PERP_ASSET_MAP_LEN: usize = 1_622_064;
-    const SOL_PERP_ASSET_MAP_PREFIX_B64: &str = "jjZz33zvbCYBAAAAAAAAAF+FshYAAAAALAAAAAAAAAAtAAAAAQAAAAAEAAAAAAAAU09MAAAAAAAAAAAAAAAAAJIjVQMAAAAAK+yGGQAAAAAr7IYZAAAAABccAAAAAAAAK+yGGQAAAAAXHAAAAAAAACXshhkAAAAAFxwAAAAAAAAk7IYZAAAAABccAAAAAAAAIuyGGQAAAAAWHAAAAAAAACnshhkAAAAAGBwAAAAAAABkAAAAAAAAABkAAAAAAAAAK+yGGQAAAAAAAAAAAAAAAHUAAAAAAAAAdwEAAAAAAAByAQAAAAAAACvshhkAAAAAERwAAAAAAAAl7IYZAAAAABEcAAAAAAAAJOyGGQAAAAASHAAAAAAAACLshhkAAAAAERwAAAAAAAAp7IYZAAAAABEcAAAAAAAAZAAAAAAAAAAZAAAAAAAAACvshhkAAAAAGRwAAAAAAABkAAAAAAAAAGQAAAAAAAAAcgEAAAAAAAAk7IYZAAAAABkcAAAAAAAAJOyGGQAAAAAaHAAAAAAAAPjrhhkAAAAAFBwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAICAQAAAAAAAgIBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgIBAAAAAAACAgEAAAAAAAAAAAAAAAAAAAAAAAAAAAACAgEAAAAAAAICAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAICAQAAAAAAAgIBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgIBAAAAAAACAgEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA2d/uHkzTMEI+nE0Ymaus9KEPf4oJXVEtWcWP29rQOywAAAAAAAAAAPBv/oFQVyUzn/BwmYuYTfvalmqearF4UMH8Xu10jPi1AAAAAAAAAAC9eIxYdxEuqtIqoFaGCUmDIS3Ki2887zwxOIzii37LZgAAAAAAAAAAp5Qc5gqxc5w9o5gk0/YHpMTClPTT8zaXjCVPspfSfxwAAAAAAAAAAIj2IrJxxvwcSeH0Zi3/xWcn5icVCYuh/OncuwHqSRBjAAAAAAAAAAD0AQEAAAAAACvshhkAAAAAnI6GGQAAAAAAAAAAAAAAAFRyhhkAAAAA5wAF8p4BAAAh9gTyngEAAFj1BPKeAQAAxu8E8p4BAAC6/ATyngEAAAAAAAAAAAAAAAAAAAAAAABZQzBUxbJLqOqoIX/f+QNvuZxLwZEZqXGqSDPsYEwjH2QAAAAAAAAAAAACAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAATMvqAQAAAAAPAAAAAAAAABAnAAAAAAAATcvqAQAAAAABAAAAAAAAABAnAAAAAAAATsvqAQAAAAABAAAAAAAAABAnAAAAAAAAT8vqAQAAAAABAAAAAAAAABAnAAAAAAAAECcAAAAAAABQwwAAAAAAAKCGAQAAAAAAZAAAAAAAAAAgoQcAAAAAAMgAAAAAAAAAQEIPAAAAAAAsAQAAAAAAAICWmAAAAAAAkAEAAAAAAACIE9AH6ANMHWQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAVFYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAKCQAAAAAAAJDaOWoAAAAAatw5agAAAAAQDgAAAAAAAIBRAQAAAAAAogYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAnuYhAAAAAABMy+oBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQlRDAAAAAAAAAAAAAAAAAA==";
-
-    fn trader_fixture(collateral: i64, len: u64, capacity: u64) -> Vec<u8> {
-        let capacity = usize::try_from(capacity).expect("fixture capacity");
-        let mut data =
-            vec![0_u8; TRADER_HEADER_LEN + POSITION_MAP_PREFIX_LEN + capacity * POSITION_ENTRY_LEN];
-        data[..8].copy_from_slice(&PhoenixAccount::Trader.discriminant());
-        data[COLLATERAL_BYTE_RANGE].copy_from_slice(&collateral.to_le_bytes());
-        data[112..116].copy_from_slice(&(capacity as u32).to_le_bytes());
-        data[TRADER_HEADER_LEN..TRADER_HEADER_LEN + 8].copy_from_slice(&len.to_le_bytes());
-        data[TRADER_HEADER_LEN + 8..TRADER_HEADER_LEN + 16]
-            .copy_from_slice(&(capacity as u64).to_le_bytes());
-        if len > 0 && capacity > 0 {
-            data[TRADER_HEADER_LEN + POSITION_MAP_PREFIX_LEN
-                ..TRADER_HEADER_LEN + POSITION_MAP_PREFIX_LEN + 8]
-                .copy_from_slice(&42_u64.to_le_bytes());
-        }
-        data
-    }
-
-    fn trader_account() -> Account {
-        Account {
-            lamports: 1,
-            data: trader_fixture(0, 1, 2),
-            owner: PHOENIX_ETERNAL_PROGRAM_ID,
-            executable: false,
-            rent_epoch: 0,
-        }
-    }
-
-    fn trader_account_for(trader: Pubkey, collateral: i64) -> Account {
-        let mut account = Account {
-            data: trader_fixture(collateral, 1, 2),
-            ..trader_account()
-        };
-        account.data[24..56].copy_from_slice(trader.as_ref());
-        account
-    }
-
-    fn perp_asset_map_fixture() -> Vec<u8> {
-        let prefix = BASE64_STANDARD
-            .decode(SOL_PERP_ASSET_MAP_PREFIX_B64)
-            .unwrap();
-        let mut data = vec![0_u8; PERP_ASSET_MAP_LEN];
-        data[..prefix.len()].copy_from_slice(&prefix);
-        data[24..26].copy_from_slice(&1_u16.to_le_bytes());
-        data[32..36].copy_from_slice(&1_u32.to_le_bytes());
-        data[36..40].copy_from_slice(&0_u32.to_le_bytes());
-        data
-    }
-
-    fn perp_asset_map_account() -> Account {
-        Account {
-            lamports: 1,
-            data: perp_asset_map_fixture(),
-            owner: PHOENIX_ETERNAL_PROGRAM_ID,
-            executable: false,
-            rent_epoch: 0,
-        }
-    }
+    use crate::scenarios::{
+        protocols::phoenix_eternal::v1::market::tests::perp_asset_map_account,
+        registry::template_registry,
+    };
 
     #[test]
-    fn builds_one_collateral_override() {
-        let trader = Pubkey::new_unique();
-        let funded = trader_account_for(trader, 500);
-        let registry = TemplateRegistry::new();
-
-        for target in ["500", "-9007199254740993"] {
-            let preparation = build_phoenix_collateral_scenario(trader, &funded, target).unwrap();
-            assert_eq!(preparation.overrides.len(), 1);
-            let collateral_override = &preparation.overrides[0];
-            assert!(
-                registry.contains(&collateral_override.template_id),
-                "the override must name a bundled template"
-            );
-            assert_eq!(
-                collateral_override.account,
-                AccountAddress::Pubkey(trader.to_string())
-            );
-            assert_eq!(
-                collateral_override.values[COLLATERAL_FIELD],
-                serde_json::json!(target)
-            );
-            assert_eq!(collateral_override.scenario_relative_slot, PREPARATION_SLOT);
-            assert!(collateral_override.fetch_before_use);
-        }
-    }
-
-    #[test]
-    fn direct_mark_patches_only_the_selected_mark_ticks_and_slot() {
-        let account = perp_asset_map_account();
-        let values = HashMap::from([
-            (MARKET_SYMBOL_FIELD.to_string(), serde_json::json!("SOL")),
-            (DIRECT_MARK_TICKS_FIELD.to_string(), serde_json::json!("1")),
-        ]);
-
-        let patched =
-            forge_phoenix_override(&Pubkey::new_unique(), &account, &values, 123).unwrap();
-        let after = PerpAssetMap::try_from_account_bytes(&patched)
-            .unwrap()
-            .find_by_symbol("SOL")
-            .unwrap()
-            .unwrap();
-        let mark = after.metadata.oracle_price().mark_price;
-        assert_eq!((mark.price.ticks.as_inner(), mark.price.slot), (1, 123));
-        for sample in mark
-            .spot_price_component
-            .last_exchange_spot_price
-            .iter()
-            .chain(mark.perp_price_component.last_exchange_perp_price.iter())
-        {
-            assert_eq!((sample.ticks.as_inner(), sample.slot), (1, 123));
-        }
-        assert_eq!(mark.spot_price_component.slot, 123);
-        assert_eq!(patched.len(), account.data.len());
-
-        for rejected in ["0", "4294967296"] {
-            let values = HashMap::from([
-                (MARKET_SYMBOL_FIELD.to_string(), serde_json::json!("SOL")),
-                (
-                    DIRECT_MARK_TICKS_FIELD.to_string(),
-                    serde_json::json!(rejected),
-                ),
-            ]);
-            assert!(
-                forge_phoenix_override(&Pubkey::new_unique(), &account, &values, 123).is_err(),
-                "{rejected}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn direct_mark_is_stamped_with_the_clock_slot() {
+    fn a_failed_write_puts_back_the_accounts_written_before_it() {
         let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
-        svm.inner
-            .set_account(PHOENIX_PERP_ASSET_MAP, perp_asset_map_account())
-            .unwrap();
-        let mut clock = svm.inner.get_sysvar::<Clock>();
-        clock.slot = 1_000;
-        svm.inner.set_sysvar(&clock);
-        let template = TemplateRegistry::new()
-            .get("phoenix-direct-mark-risk-shock")
-            .expect("template")
-            .clone();
-        let mut scenario = Scenario::new("mark".to_string(), "mark".to_string());
-        scenario.add_override(
-            OverrideInstance::new(template.id, 0, template.address).with_values(HashMap::from([
-                (MARKET_SYMBOL_FIELD.to_string(), serde_json::json!("SOL")),
-                (DIRECT_MARK_TICKS_FIELD.to_string(), serde_json::json!("1")),
-            ])),
-        );
-        // Registered for an earlier slot, which surfnet_registerScenario allows, and played at once.
-        svm.register_scenario(scenario, Some(900)).unwrap();
-
-        svm.materialize_overrides_for_slot(&None, 900)
-            .await
-            .unwrap();
-
-        let account = svm
-            .inner
-            .get_account(&PHOENIX_PERP_ASSET_MAP)
-            .unwrap()
-            .unwrap();
-        let price = PerpAssetMap::try_from_account_bytes(&account.data)
-            .unwrap()
-            .find_by_symbol("SOL")
-            .unwrap()
-            .unwrap()
-            .metadata
-            .oracle_price()
-            .mark_price
-            .price;
-        assert_eq!(
-            (price.ticks.as_inner(), price.slot),
-            (1, 1_000),
-            "the mark must be fresh at the slot the program reads it, not the scheduled one"
-        );
-    }
-
-    #[test]
-    fn maintenance_factor_patches_only_the_selected_market_factor() {
-        let account = perp_asset_map_account();
-        let factors = |data: &[u8]| {
-            PerpAssetMap::try_from_account_bytes(data)
-                .unwrap()
-                .find_by_symbol("SOL")
-                .unwrap()
-                .unwrap()
-                .metadata
-                .risk_params()
-                .risk_factors
+        let (first, unloadable) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let before = Account {
+            lamports: 1_000_000,
+            data: vec![1; 8],
+            owner: PHOENIX_PROGRAM_ID,
+            ..Account::default()
         };
-        let before = factors(&account.data);
-        let values = HashMap::from([
-            (MARKET_SYMBOL_FIELD.to_string(), serde_json::json!("SOL")),
+        svm.set_account(&first, before.clone()).unwrap();
+        // A program account whose bytes are no program is refused.
+        let broken_program = Account {
+            lamports: 1_000_000,
+            data: vec![0xff; 64],
+            owner: Pubkey::from_str_const("BPFLoader2111111111111111111111111111111111"),
+            executable: true,
+            rent_epoch: 0,
+        };
+        let writes = vec![
             (
-                MAINTENANCE_FACTOR_FIELD.to_string(),
-                serde_json::json!("10000"),
+                first,
+                Account {
+                    data: vec![2; 8],
+                    ..before.clone()
+                },
             ),
-        ]);
+            (unloadable, broken_program),
+        ];
 
-        let patched =
-            forge_phoenix_override(&Pubkey::new_unique(), &account, &values, 123).unwrap();
-        assert_eq!(factors(&patched), [10_000, before[1], before[2]]);
-        let changed = patched
-            .iter()
-            .zip(&account.data)
-            .filter(|(after, before)| after != before)
-            .count();
-        assert!(changed <= 2, "only the factor's two bytes may change");
-
-        let maintenance = |factor: &str| {
-            let values = HashMap::from([
-                (MARKET_SYMBOL_FIELD.to_string(), serde_json::json!("SOL")),
-                (
-                    MAINTENANCE_FACTOR_FIELD.to_string(),
-                    serde_json::json!(factor),
-                ),
-            ]);
-            forge_phoenix_override(&Pubkey::new_unique(), &account, &values, 123)
-        };
-        // Just above the backstop factor still leaves a Liquidatable tier.
-        let lowest = before[1] + 1;
-        assert_eq!(
-            factors(&maintenance(&lowest.to_string()).unwrap()),
-            [lowest, before[1], before[2]]
-        );
-        // At or below the backstop factor, above 100%, or not basis points.
-        for rejected in [&before[1].to_string(), "0", "10001", "65536", "1.5"] {
-            assert!(maintenance(rejected).is_err(), "{rejected}");
-        }
-    }
-
-    // These templates' fields are codec inputs, not IDL paths, so the registry's IDL check
-    // cannot cover them; this ties the YAML field names to what the codec accepts.
-    #[test]
-    fn market_list_reports_what_the_market_writers_wrote() {
-        let mut account = perp_asset_map_account();
-        for (field, value) in [
-            (DIRECT_MARK_TICKS_FIELD, "777"),
-            (MAINTENANCE_FACTOR_FIELD, "9000"),
-        ] {
-            let values = HashMap::from([
-                (MARKET_SYMBOL_FIELD.to_string(), serde_json::json!("SOL")),
-                (field.to_string(), serde_json::json!(value)),
-            ]);
-            account.data =
-                forge_phoenix_override(&Pubkey::new_unique(), &account, &values, 123).unwrap();
-        }
-
-        assert_eq!(
-            phoenix_markets(PHOENIX_PERP_ASSET_MAP, &account).unwrap(),
-            vec![PhoenixMarket {
-                symbol: "SOL".to_string(),
-                orderbook: Pubkey::from_str_const("71Si24E4uc3oCaPbPZTozC1ptSNNqygjjebxSmErSsC2"),
-                mark_ticks: 777,
-                tick_size: 100,
-                base_lot_decimals: 2,
-                maintenance_risk_factor_bps: 9_000,
-                backstop_risk_factor_bps: 2_000,
-            }]
-        );
-
-        let foreign = Account {
-            owner: Pubkey::new_unique(),
-            ..perp_asset_map_account()
-        };
-        assert!(phoenix_markets(PHOENIX_PERP_ASSET_MAP, &foreign).is_err());
+        assert!(write_all_or_none(&mut svm, writes, 1).is_err());
+        assert_eq!(svm.inner.get_account(&first).unwrap(), Some(before));
     }
 
     #[test]
-    fn the_codec_accepts_every_market_template_field_set() {
-        let registry = TemplateRegistry::new();
-        let market_templates: Vec<_> = registry
+    fn a_failed_write_deletes_the_accounts_written_before_it_created() {
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let (created, unloadable) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let broken_program = Account {
+            lamports: 1_000_000,
+            data: vec![0xff; 64],
+            owner: Pubkey::from_str_const("BPFLoader2111111111111111111111111111111111"),
+            executable: true,
+            rent_epoch: 0,
+        };
+        let writes = vec![
+            (
+                created,
+                Account {
+                    lamports: 1_000_000,
+                    data: vec![2; 8],
+                    owner: PHOENIX_PROGRAM_ID,
+                    ..Account::default()
+                },
+            ),
+            (unloadable, broken_program),
+        ];
+
+        assert!(write_all_or_none(&mut svm, writes, 1).is_err());
+        assert!(svm.get_account(&created).unwrap().is_none());
+        assert!(
+            !svm.offline_accounts
+                .contains_key(&created.to_string())
+                .unwrap()
+        );
+    }
+
+    /// Every Phoenix template that carries a fixed address: its id, account type and address.
+    pub(crate) fn template_addresses() -> Vec<(&'static str, &'static str, Pubkey)> {
+        template_registry()
             .by_protocol("Phoenix Eternal")
             .into_iter()
-            .filter(|template| template.account_type == "PerpAssetMap")
-            .collect();
-        assert_eq!(
-            market_templates.len(),
-            2,
-            "direct mark and maintenance margin"
-        );
-
-        for template in market_templates {
-            assert_eq!(
-                template.address,
-                AccountAddress::Pubkey(PHOENIX_PERP_ASSET_MAP.to_string()),
-                "{}",
-                template.id
-            );
-            let values = template
-                .properties
-                .iter()
-                .map(|property| {
-                    let value = match property.path.as_str() {
-                        MARKET_SYMBOL_FIELD => "SOL",
-                        MAINTENANCE_FACTOR_FIELD => "10000",
-                        _ => "1",
-                    };
-                    (property.path.clone(), serde_json::json!(value))
-                })
-                .collect();
-            forge_phoenix_override(&Pubkey::new_unique(), &perp_asset_map_account(), &values, 1)
-                .unwrap_or_else(|error| panic!("{}: {error}", template.id));
-        }
+            .filter_map(|template| match &template.address {
+                AccountAddress::Pubkey(address) if !address.is_empty() => Some((
+                    template.id.as_str(),
+                    template.account_type.as_str(),
+                    Pubkey::from_str(address).unwrap_or_else(|e| panic!("{}: {e}", template.id)),
+                )),
+                _ => None,
+            })
+            .collect()
     }
 
     #[test]
-    fn market_overrides_ignore_keys_outside_the_codec_inputs() {
-        // An editor that starts from the decoded map sends its top-level scalars and arrays too.
-        let account = perp_asset_map_account();
-        for (field, value) in [
-            (DIRECT_MARK_TICKS_FIELD, "1"),
-            (MAINTENANCE_FACTOR_FIELD, "10000"),
-        ] {
-            let clean = HashMap::from([
-                (MARKET_SYMBOL_FIELD.to_string(), serde_json::json!("SOL")),
-                (field.to_string(), serde_json::json!(value)),
-            ]);
-            let mut editor = clean.clone();
-            editor.insert("numAssets".to_string(), serde_json::json!(1));
-            editor.insert(
-                "padding0".to_string(),
-                serde_json::json!([0, 0, 0, 0, 0, 0]),
-            );
-            assert_eq!(
-                forge_phoenix_override(&Pubkey::new_unique(), &account, &editor, 123).unwrap(),
-                forge_phoenix_override(&Pubkey::new_unique(), &account, &clean, 123).unwrap(),
-            );
-        }
-    }
-
-    #[test]
-    fn market_overrides_need_a_symbol_and_exactly_one_codec_input() {
-        let account = perp_asset_map_account();
-        let symbol = (MARKET_SYMBOL_FIELD.to_string(), serde_json::json!("SOL"));
-        let ticks = (DIRECT_MARK_TICKS_FIELD.to_string(), serde_json::json!("1"));
-        let factor = (
-            MAINTENANCE_FACTOR_FIELD.to_string(),
-            serde_json::json!("10000"),
-        );
-        for values in [
-            vec![symbol.clone()],
-            vec![symbol.clone(), ticks.clone(), factor.clone()],
-            vec![ticks.clone()],
-            vec![factor.clone()],
-            vec![
-                (MARKET_SYMBOL_FIELD.to_string(), serde_json::json!(1)),
-                ticks.clone(),
-            ],
-        ] {
-            let values = HashMap::from_iter(values);
-            assert!(
-                forge_phoenix_override(&Pubkey::new_unique(), &account, &values, 123).is_err(),
-                "{values:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn market_inputs_take_whole_json_numbers_as_well_as_strings() {
-        let account = perp_asset_map_account();
-        let forge = |field: &str, value: serde_json::Value| {
-            let values = HashMap::from([
-                (MARKET_SYMBOL_FIELD.to_string(), serde_json::json!("SOL")),
-                (field.to_string(), value),
-            ]);
-            forge_phoenix_override(&Pubkey::new_unique(), &account, &values, 123)
-        };
-        for (field, text, number) in [
-            (DIRECT_MARK_TICKS_FIELD, "1", 1),
-            (MAINTENANCE_FACTOR_FIELD, "10000", 10_000),
-        ] {
-            assert_eq!(
-                forge(field, serde_json::json!(number)).unwrap(),
-                forge(field, serde_json::json!(text)).unwrap(),
-                "{field}"
-            );
-            for rejected in [serde_json::json!(-1), serde_json::json!(1.5)] {
-                assert!(
-                    forge(field, rejected.clone()).is_err(),
-                    "{field}: {rejected}"
-                );
+    fn templates_carry_the_addresses_the_writers_use() {
+        let addresses = template_addresses();
+        assert!(!addresses.is_empty());
+        let mut withdraw_queues = HashSet::new();
+        for (id, account_type, address) in addresses {
+            match account_type {
+                "PerpAssetMap" => assert_eq!(address, PHOENIX_PERP_ASSET_MAP, "{id}"),
+                "GlobalConfiguration" => assert_eq!(address, PHOENIX_GLOBAL_CONFIG, "{id}"),
+                // The writers read this one from GlobalConfig; the mainnet tests check it there.
+                "WithdrawQueueHeader" => {
+                    withdraw_queues.insert(address);
+                }
+                other => panic!("{id} carries an address for {other}, which nothing checks"),
             }
         }
+        assert_eq!(withdraw_queues.len(), 1, "{withdraw_queues:?}");
     }
 
     /// Where the fixture markets' PriceComponents start: after the 48-byte map header, each
@@ -1166,40 +1312,153 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rewinding_funding_timestamps_moves_only_those_ahead_of_the_clock() {
+        let account = two_market_map_account();
+        let funding = |data: &[u8], symbol: &str| *market(data, symbol).funding_accumulator();
+        let seconds = |timestamp| bytemuck::cast::<_, u64>(timestamp);
+        let now = seconds(funding(&account.data, "SOL").last_funding_update_timestamp) - 60;
+
+        let rewound = rewind_funding_timestamps(&PHOENIX_PERP_ASSET_MAP, &account.data, now)
+            .unwrap()
+            .expect("the fixture's last funding update is ahead of the clock");
+
+        for symbol in ["SOL", "BTC"] {
+            let before = market(&account.data, symbol);
+            let mut expected = *before.funding_accumulator();
+            expected.last_funding_update_timestamp = bytemuck::cast(now);
+            if seconds(expected.start_interval_timestamp) > now {
+                expected.start_interval_timestamp = bytemuck::cast(now);
+            }
+            let after = market(&rewound, symbol);
+            assert_eq!(*after.funding_accumulator(), expected, "{symbol}");
+            assert_eq!(after.oracle_price(), before.oracle_price(), "{symbol}");
+            assert_eq!(after.risk_params(), before.risk_params(), "{symbol}");
+        }
+        assert_eq!(
+            rewind_funding_timestamps(&PHOENIX_PERP_ASSET_MAP, &rewound, now).unwrap(),
+            None,
+            "a rewound map is written once"
+        );
+        assert_eq!(
+            rewind_funding_timestamps(&PHOENIX_PERP_ASSET_MAP, &account.data, u64::MAX).unwrap(),
+            None,
+            "timestamps before the clock stay"
+        );
+    }
+
+    #[test]
+    fn restamping_moves_old_reading_slots_to_the_clock_and_keeps_prices() {
+        let account = two_market_map_account();
+        let readings = |data: &[u8], symbol: &str| {
+            let mark = market(data, symbol).oracle_price().mark_price;
+            let samples: Vec<_> = mark
+                .spot_price_component
+                .last_exchange_spot_price
+                .into_iter()
+                .chain(mark.perp_price_component.last_exchange_perp_price)
+                .collect();
+            (mark, samples)
+        };
+        let (sol, _) = readings(&account.data, "SOL");
+        let slot = sol.price.slot + 300;
+
+        let restamped = restamp_readings(&PHOENIX_PERP_ASSET_MAP, &account.data, slot)
+            .unwrap()
+            .expect("the fixture's readings are before the slot");
+
+        for symbol in ["SOL", "BTC"] {
+            let (before, before_samples) = readings(&account.data, symbol);
+            let (after, after_samples) = readings(&restamped, symbol);
+            assert_eq!(after.price.ticks, before.price.ticks, "{symbol}");
+            assert_eq!(after.price.slot, slot, "{symbol}");
+            assert_eq!(after.spot_price_component.slot, slot, "{symbol}");
+            for (after, before) in after_samples.iter().zip(&before_samples) {
+                assert_eq!(after.ticks, before.ticks, "{symbol}");
+                assert_eq!(
+                    after.slot,
+                    if before.slot == 0 { 0 } else { slot },
+                    "{symbol}"
+                );
+            }
+            assert_eq!(
+                after.book_price_component, before.book_price_component,
+                "{symbol}"
+            );
+            assert_eq!(
+                market(&restamped, symbol).risk_params(),
+                market(&account.data, symbol).risk_params(),
+                "{symbol}"
+            );
+        }
+        assert_eq!(
+            restamp_readings(&PHOENIX_PERP_ASSET_MAP, &restamped, slot).unwrap(),
+            None,
+            "a restamped map is written once"
+        );
+        assert_eq!(
+            restamp_readings(&PHOENIX_PERP_ASSET_MAP, &account.data, 1).unwrap(),
+            None,
+            "readings ahead of the clock stay"
+        );
+    }
+
+    #[test]
+    fn keeps_every_spline_region_quoting_and_writes_nothing_else() {
+        // A header naming two splines, mainnet's short lifespans, and a spare slot after them.
+        let spare = 112 + 2 * size_of::<Spline>();
+        let mut data = vec![6_u8; spare + size_of::<Spline>()];
+        data[..112].fill(0);
+        data[..8].copy_from_slice(&PhoenixAccount::SplineCollection.discriminant());
+        data[40..43].copy_from_slice(b"SOL");
+        data[72..76].copy_from_slice(&2_u32.to_le_bytes());
+        let address = Pubkey::new_unique();
+
+        let patched = keep_quoting(&address, &data).unwrap().unwrap();
+
+        for spline in SplineCollection::try_from_account_bytes(&patched)
+            .unwrap()
+            .splines()
+        {
+            let spline = spline.unwrap();
+            for region in spline.bid_regions().iter().chain(spline.ask_regions()) {
+                assert_eq!(region.lifespan(), GTC_LIFESPAN);
+            }
+        }
+        let changed = (0..data.len()).filter(|i| patched[*i] != data[*i]).count();
+        assert_eq!(
+            changed,
+            2 * 2 * SPLINE_REGION_CAPACITY * 8,
+            "only the lifespans change"
+        );
+        assert_eq!(
+            keep_quoting(&address, &patched).unwrap(),
+            None,
+            "written once"
+        );
+    }
+
     #[tokio::test]
-    async fn a_map_override_leaves_every_market_usable() {
+    async fn keeps_every_local_market_usable_and_never_fails_an_override() {
         let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        // Nothing to raise and nowhere to fetch the map from: the override goes on.
+        keep_markets_usable(&mut svm, &None, 0).await;
+        assert!(
+            svm.inner
+                .get_account(&PHOENIX_PERP_ASSET_MAP)
+                .unwrap()
+                .is_none()
+        );
+
         svm.inner
             .set_account(PHOENIX_PERP_ASSET_MAP, two_market_map_account())
             .unwrap();
-        let template = TemplateRegistry::new()
-            .get("phoenix-maintenance-margin-stress")
-            .expect("template")
-            .clone();
-        let mut scenario = Scenario::new("maintenance".to_string(), "maintenance".to_string());
-        scenario.add_override(
-            OverrideInstance::new(template.id, 0, template.address).with_values(HashMap::from([
-                (MARKET_SYMBOL_FIELD.to_string(), serde_json::json!("SOL")),
-                (
-                    MAINTENANCE_FACTOR_FIELD.to_string(),
-                    serde_json::json!("9000"),
-                ),
-            ])),
-        );
-        svm.register_scenario(scenario, Some(100)).unwrap();
-
-        svm.materialize_overrides_for_slot(&None, 100)
-            .await
+        keep_markets_usable(&mut svm, &None, 0).await;
+        let map = svm
+            .inner
+            .get_account(&PHOENIX_PERP_ASSET_MAP)
+            .unwrap()
             .unwrap();
-
-        let map = svm.get_account(&PHOENIX_PERP_ASSET_MAP).unwrap().unwrap();
-        let metadata = PerpAssetMap::try_from_account_bytes(&map.data)
-            .unwrap()
-            .find_by_symbol("SOL")
-            .unwrap()
-            .unwrap()
-            .metadata;
-        assert_eq!(metadata.risk_params().risk_factors[0], 9_000);
         for symbol in ["SOL", "BTC"] {
             assert_eq!(
                 oracle_thresholds(&map.data, symbol),
@@ -1209,135 +1468,256 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn a_map_override_still_applies_when_the_thresholds_cannot_be_raised() {
-        // A second entry with a non-ASCII symbol: finding SOL stops before it, raising every
-        // market's threshold does not.
-        let mut map = perp_asset_map_account();
-        map.data[32..36].copy_from_slice(&2_u32.to_le_bytes());
-        map.data[1_632] = 0xFF;
-        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
-        svm.inner.set_account(PHOENIX_PERP_ASSET_MAP, map).unwrap();
-        let template = TemplateRegistry::new()
-            .get("phoenix-maintenance-margin-stress")
-            .expect("template")
-            .clone();
-        let mut scenario = Scenario::new("maintenance".to_string(), "maintenance".to_string());
-        scenario.add_override(
-            OverrideInstance::new(template.id, 0, template.address).with_values(HashMap::from([
-                (MARKET_SYMBOL_FIELD.to_string(), serde_json::json!("SOL")),
-                (
-                    MAINTENANCE_FACTOR_FIELD.to_string(),
-                    serde_json::json!("9000"),
-                ),
-            ])),
-        );
-        svm.register_scenario(scenario, Some(100)).unwrap();
+    #[test]
+    fn reads_template_inputs_as_strings_or_numbers() {
+        let values = HashMap::from([
+            ("symbol".to_string(), serde_json::json!("SOL")),
+            ("target_ticks".to_string(), serde_json::json!("10750")),
+            ("as_number".to_string(), serde_json::json!(10750)),
+        ]);
+        assert_eq!(text_input(&values, "symbol").unwrap(), "SOL");
+        let ticks = |field| whole_number_input::<u64>(&values, field).unwrap();
+        assert_eq!((ticks("target_ticks"), ticks("as_number")), (10750, 10750));
 
-        svm.materialize_overrides_for_slot(&None, 100)
-            .await
-            .unwrap();
-
-        let map = svm.get_account(&PHOENIX_PERP_ASSET_MAP).unwrap().unwrap();
-        let metadata = PerpAssetMap::try_from_account_bytes(&map.data)
-            .unwrap()
-            .find_by_symbol("SOL")
-            .unwrap()
-            .unwrap()
-            .metadata;
-        assert_eq!(metadata.risk_params().risk_factors[0], 9_000);
+        let bad = HashMap::from([
+            ("symbol".to_string(), serde_json::json!("")),
+            ("target_ticks".to_string(), serde_json::json!("-1")),
+            ("as_number".to_string(), serde_json::json!(1.5)),
+        ]);
+        assert!(text_input(&bad, "symbol").is_err());
+        assert!(text_input(&bad, "missing").is_err());
+        assert!(whole_number_input::<u64>(&bad, "target_ticks").is_err());
+        assert!(whole_number_input::<u64>(&bad, "as_number").is_err());
     }
 
-    #[tokio::test]
-    async fn any_phoenix_override_leaves_the_local_map_usable() {
-        use crate::surfnet::GeyserEvent;
+    #[test]
+    fn takes_the_oracle_target_in_ticks_or_as_a_percentage_of_the_mark() {
+        let target = |pairs: &[(&str, serde_json::Value)]| {
+            let values = pairs
+                .iter()
+                .map(|(field, value)| (field.to_string(), value.clone()))
+                .collect();
+            oracle_target(&values, 10_801)
+        };
+        let ticks = serde_json::json!("10261");
+        let percent = |value| (CHANGE_PERCENT_FIELD, value);
+        assert_eq!(
+            target(&[(TARGET_TICKS_FIELD, ticks.clone())]).unwrap(),
+            10_261
+        );
+        assert_eq!(target(&[percent(serde_json::json!("-5"))]).unwrap(), 10_261);
+        assert_eq!(
+            target(&[percent(serde_json::json!("+2.5"))]).unwrap(),
+            11_071
+        );
+        assert_eq!(
+            target(&[percent(serde_json::json!(-0.25))]).unwrap(),
+            10_774
+        );
+        assert_eq!(
+            target(&[
+                (TARGET_TICKS_FIELD, serde_json::json!("")),
+                percent(serde_json::json!("10"))
+            ])
+            .unwrap(),
+            11_881
+        );
 
-        let trader = Pubkey::new_unique();
-        let funded = trader_account_for(trader, 500);
-        let (mut svm, _events_rx, geyser_rx) = SurfnetSvm::default();
-        svm.set_account(&PHOENIX_PERP_ASSET_MAP, perp_asset_map_account())
-            .unwrap();
-        svm.set_account(&trader, funded.clone()).unwrap();
-        let scenario = build_phoenix_collateral_scenario(trader, &funded, "100").unwrap();
-        svm.register_scenario(scenario, Some(100)).unwrap();
-
-        svm.materialize_overrides_for_slot(&None, 100)
-            .await
-            .unwrap();
-
-        let stressed = svm.get_account(&trader).unwrap().unwrap();
-        assert_eq!(stressed.data[COLLATERAL_BYTE_RANGE], 100_i64.to_le_bytes());
-        let map = svm.get_account(&PHOENIX_PERP_ASSET_MAP).unwrap().unwrap();
-        assert_eq!(oracle_thresholds(&map.data, "SOL"), RAISED_THRESHOLDS);
+        for bad in ["5%", "abc", "inf", "-100", "-150"] {
+            assert!(
+                target(&[percent(serde_json::json!(bad))]).is_err(),
+                "{bad:?} is refused"
+            );
+        }
+        assert!(target(&[]).is_err(), "one of the two is needed");
         assert!(
-            geyser_rx.try_iter().any(|event| matches!(
-                event,
-                GeyserEvent::UpdateAccount(update)
-                    if update.pubkey == PHOENIX_PERP_ASSET_MAP
-                        && update.account == map
-                        && update.slot == 100
-            )),
-            "Geyser plugins receive the raised map at the materialized slot"
+            target(&[
+                (TARGET_TICKS_FIELD, ticks),
+                percent(serde_json::json!("-5"))
+            ])
+            .is_err(),
+            "not both"
         );
     }
 
-    #[tokio::test]
-    async fn override_on_any_other_phoenix_account_leaves_the_local_map_usable() {
-        const EXPIRES_AT_BYTE_RANGE: core::ops::Range<usize> = 88..96;
-        let permission = Pubkey::new_unique();
-        let mut data = vec![0_u8; 168];
-        data[..8].copy_from_slice(&PhoenixAccount::PermissionAccount.discriminant());
-        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
-        svm.set_account(&PHOENIX_PERP_ASSET_MAP, perp_asset_map_account())
-            .unwrap();
-        svm.set_account(
-            &permission,
-            Account {
-                data,
-                ..trader_account()
-            },
+    #[test]
+    fn reads_collateral_as_a_signed_string_or_number() {
+        let collateral = |value| {
+            let values = HashMap::from([(EFFECTIVE_COLLATERAL_FIELD.to_string(), value)]);
+            usdc_input(&values, EFFECTIVE_COLLATERAL_FIELD)
+        };
+        assert_eq!(
+            collateral(serde_json::json!(" -5030.91685 ")).unwrap(),
+            -5_030_916_850
+        );
+        assert_eq!(collateral(serde_json::json!(8.191788)).unwrap(), 8_191_788);
+        assert_eq!(
+            collateral(serde_json::json!("750.60748")).unwrap(),
+            750_607_480
+        );
+        assert_eq!(collateral(serde_json::json!(12)).unwrap(), 12_000_000);
+        for bad in ["", "12 USDC", "NaN", "inf", "1e13"] {
+            assert!(collateral(serde_json::json!(bad)).is_err(), "{bad}");
+        }
+        assert!(collateral(serde_json::json!(true)).is_err());
+    }
+
+    const LIQUIDATOR: Pubkey =
+        Pubkey::from_str_const("BP7sV1VFnbPMPyJX1tZNbXHbZkyLNFEaBWJhyMvkbxKz");
+    const QUOTE_MINT: &str = "PhUsd11YkbjSaWjFncfAAmatntsjx3MgDR9B6g1ks3A";
+
+    fn liquidation_accounts() -> Vec<(&'static str, Pubkey)> {
+        let trader = Pubkey::new_unique();
+        vec![
+            (
+                "phoenixProgram",
+                Pubkey::from_str(&phoenix_idl().address).unwrap(),
+            ),
+            ("phoenixLogAuthority", Pubkey::new_unique()),
+            ("globalConfiguration", Pubkey::new_unique()),
+            ("liquidatorWallet", LIQUIDATOR),
+            ("liquidatedTrader", trader),
+            ("traderAccount", trader),
+            ("perpAssetMap", Pubkey::new_unique()),
+            ("globalTraderIndex", Pubkey::new_unique()),
+            ("activeTraderBuffer", Pubkey::new_unique()),
+            ("orderbook", Pubkey::new_unique()),
+            ("splines", Pubkey::new_unique()),
+        ]
+    }
+
+    #[test]
+    fn encodes_a_mainnet_liquidation_byte_for_byte() {
+        // liquidate_via_market_order data of a mainnet transaction at slot 429053028.
+        let mainnet = "fbf1b86c46467fc605d08ca0437ee7562b6648e76d5094af350b57c3820b6716fc96e777d449a9dd\
+                       951c0000000000004d4000000000000000";
+        let instruction = phoenix_instruction(
+            "LiquidateViaMarketOrder",
+            &liquidation_accounts(),
+            &serde_json::json!({
+                "params": {
+                    "assetMint": QUOTE_MINT,
+                    "liquidationSize": { "inner": 7317 },
+                    "liquidationPrice": { "inner": 16461 },
+                    "fillOrKill": false,
+                }
+            }),
         )
         .unwrap();
-        let mut scenario = Scenario::new("permission".to_string(), "permission".to_string());
-        scenario.add_override(
-            OverrideInstance::new(
-                "phoenix-permission-limits".to_string(),
-                0,
-                AccountAddress::Pubkey(permission.to_string()),
-            )
-            .with_values(HashMap::from([(
-                "expiresAtTimestamp".to_string(),
-                serde_json::json!(1),
-            )])),
+        let expected: Vec<u8> = (0..mainnet.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&mainnet[i..i + 2], 16).unwrap())
+            .collect();
+        assert_eq!(instruction.data, expected);
+        assert_eq!(instruction.accounts.len(), 11);
+        let liquidator = &instruction.accounts[3];
+        assert_eq!(
+            (
+                liquidator.pubkey,
+                liquidator.is_signer,
+                liquidator.is_writable
+            ),
+            (LIQUIDATOR, true, false)
         );
-        svm.register_scenario(scenario, Some(100)).unwrap();
-
-        svm.materialize_overrides_for_slot(&None, 100)
-            .await
-            .unwrap();
-
-        let expired = svm.get_account(&permission).unwrap().unwrap();
-        assert_eq!(expired.data[EXPIRES_AT_BYTE_RANGE], 1_i64.to_le_bytes());
-        let map = svm.get_account(&PHOENIX_PERP_ASSET_MAP).unwrap().unwrap();
-        assert_eq!(oracle_thresholds(&map.data, "SOL"), RAISED_THRESHOLDS);
+        assert!(instruction.accounts[4].is_writable);
     }
 
-    #[tokio::test]
-    async fn an_override_still_applies_when_the_map_cannot_be_kept() {
-        let trader = Pubkey::new_unique();
-        let funded = trader_account_for(trader, 500);
-        // No local map and no upstream datasource to fetch one from.
+    #[test]
+    fn capability_toggles_keep_a_capability_left_empty() {
+        let values = HashMap::from([
+            ("PlaceLimitOrder".to_string(), serde_json::json!("")),
+            ("WithdrawCollateral".to_string(), serde_json::json!("false")),
+            ("DepositCollateral".to_string(), serde_json::json!(true)),
+        ]);
+        assert_eq!(
+            capability_toggles(&values).unwrap(),
+            serde_json::json!({ "params": { "toggles": [
+                { "target": { "DepositCollateral": null }, "enable": true },
+                { "target": { "WithdrawCollateral": null }, "enable": false },
+            ] } })
+        );
+        let empty = HashMap::from([("PlaceLimitOrder".to_string(), serde_json::json!(""))]);
+        let error = capability_toggles(&empty).unwrap_err().to_string();
+        assert!(error.contains("set at least one"), "{error}");
+        let bad = HashMap::from([("PlaceLimitOrder".to_string(), serde_json::json!("yes"))]);
+        assert!(capability_toggles(&bad).is_err());
+    }
+
+    #[test]
+    fn refuses_missing_and_unknown_accounts_and_arguments() {
+        let args = serde_json::json!({
+            "params": {
+                "assetMint": QUOTE_MINT,
+                "liquidationSize": { "inner": 1 },
+                "liquidationPrice": { "inner": 1 },
+                "fillOrKill": false,
+            }
+        });
+        let mut missing = liquidation_accounts();
+        missing.retain(|(name, _)| *name != "orderbook");
+        assert!(phoenix_instruction("LiquidateViaMarketOrder", &missing, &args).is_err());
+
+        let mut unknown = liquidation_accounts();
+        unknown.push(("orderBook", Pubkey::new_unique()));
+        assert!(phoenix_instruction("LiquidateViaMarketOrder", &unknown, &args).is_err());
+
+        assert!(
+            phoenix_instruction(
+                "LiquidateViaMarketOrder",
+                &liquidation_accounts(),
+                &serde_json::json!({})
+            )
+            .is_err()
+        );
+        assert!(phoenix_instruction("NoSuchInstruction", &[], &args).is_err());
+    }
+
+    fn funded_svm(owner: &Pubkey) -> SurfnetSvm {
         let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
-        svm.set_account(&trader, funded.clone()).unwrap();
-        let scenario = build_phoenix_collateral_scenario(trader, &funded, "100").unwrap();
-        svm.register_scenario(scenario, Some(100)).unwrap();
+        svm.inner.airdrop(owner, 5_000_000_000).unwrap();
+        svm
+    }
 
-        svm.materialize_overrides_for_slot(&None, 100)
-            .await
-            .unwrap();
+    #[test]
+    fn returns_what_the_instructions_wrote_and_leaves_the_local_vm_alone() {
+        // Neither key is ever available here, yet the transfer runs as its owner.
+        let owner = Pubkey::new_unique();
+        let recipient = Pubkey::new_unique();
+        let svm = funded_svm(&owner);
+        let before = svm.inner.get_account(&owner).unwrap().unwrap();
 
-        let stressed = svm.get_account(&trader).unwrap().unwrap();
-        assert_eq!(stressed.data[COLLATERAL_BYTE_RANGE], 100_i64.to_le_bytes());
-        assert_eq!(svm.get_account(&PHOENIX_PERP_ASSET_MAP).unwrap(), None);
+        let written = run_instructions(
+            &svm,
+            &[system_instruction::transfer(&owner, &recipient, 1_000_000)],
+        )
+        .unwrap();
+
+        let lamports: Vec<(Pubkey, u64)> = written
+            .iter()
+            .map(|(pubkey, account)| (*pubkey, account.lamports))
+            .collect();
+        assert_eq!(
+            lamports,
+            vec![(owner, before.lamports - 1_000_000), (recipient, 1_000_000)]
+        );
+        assert_eq!(svm.inner.get_account(&owner).unwrap().unwrap(), before);
+        assert!(svm.inner.get_account(&recipient).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_failing_instruction_fails_the_run_with_its_logs() {
+        let owner = Pubkey::new_unique();
+        let svm = funded_svm(&owner);
+        let error = run_instructions(
+            &svm,
+            &[
+                system_instruction::transfer(&owner, &Pubkey::new_unique(), 1_000_000),
+                system_instruction::transfer(&owner, &Pubkey::new_unique(), u64::MAX),
+            ],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("instruction 1 failed"), "{error}");
+        assert!(error.contains("logs"), "{error}");
     }
 }

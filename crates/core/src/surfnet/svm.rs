@@ -1,6 +1,10 @@
 use std::{
     cmp::max,
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    ops::{
+        Bound::{Excluded, Unbounded},
+        RangeInclusive,
+    },
     str::FromStr,
     sync::Arc,
     time::SystemTime,
@@ -26,8 +30,12 @@ use solana_account_decoder::{
 use solana_client::{
     rpc_client::SerializableTransaction,
     rpc_config::{RpcAccountInfoConfig, RpcBlockConfig, RpcTransactionLogsFilter},
+    rpc_custom_error::RpcCustomError,
     rpc_filter::RpcFilterType,
-    rpc_response::{RpcKeyedAccount, RpcLogsResponse, RpcPerfSample},
+    rpc_response::{
+        Response as RpcResponse, RpcBlockUpdate, RpcBlockUpdateError, RpcKeyedAccount,
+        RpcLogsResponse, RpcPerfSample, RpcResponseContext,
+    },
 };
 use solana_clock::{Clock, Slot};
 use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
@@ -48,7 +56,7 @@ use solana_rpc_client_api::response::{SlotInfo, SlotTransactionStats, SlotUpdate
 use solana_runtime_transaction::transaction_meta::TransactionConfiguration;
 use solana_sdk_ids::{bpf_loader, system_program};
 use solana_signature::Signature;
-use solana_slot_hashes::MAX_ENTRIES as MAX_SLOT_HASHES_ENTRIES;
+use solana_slot_hashes::{MAX_ENTRIES as MAX_SLOT_HASHES_ENTRIES, SlotHashes};
 use solana_system_interface::instruction as system_instruction;
 use solana_transaction::versioned::VersionedTransaction;
 use solana_transaction_error::TransactionError;
@@ -85,21 +93,26 @@ use uuid::Uuid;
 
 use super::{
     AccountSource, AccountSubscriptionData, BlockHeader, BlockIdentifier, CoupledAccount,
-    FINALIZATION_SLOT_THRESHOLD, GetAccountResult, GeyserBlockMetadata, GeyserEntryInfo,
-    GeyserEvent, GeyserSlotStatus, GeyserTransactionEvent, LocalSignatureStatus,
+    GetAccountResult, GeyserBlockMetadata, GeyserEntryInfo, GeyserEvent, GeyserSlotStatus,
+    GeyserTransactionEvent, INITIAL_SLOT, LEGACY_FINALIZATION_SLOT_THRESHOLD, LocalSignatureStatus,
     LocalSignatureStatusOrSubscription, ProgramSubscriptionData, SignatureSubscriptionData,
     SignatureSubscriptionType, SlotsUpdatesSubscriptionData, remote::SurfnetRemoteClient,
 };
 use crate::{
     error::{AirdropError, SurfpoolError, SurfpoolResult},
+    helpers::time_travel::clock_for_slot,
     rpc::utils::convert_transaction_metadata_from_canonical,
     scenarios::{
         TemplateRegistry, account_data_values,
-        protocols::phoenix_eternal::v1::state_builder::prepare_phoenix_override, template_registry,
+        protocols::phoenix_eternal::v1::state_builder::{
+            prepare_phoenix_override, write_all_or_none,
+        },
+        template_registry,
     },
     storage::{OverlayStorage, Storage, StorageBackend},
     surfnet::{
-        LogsSubscriptionData, locker::is_supported_token_program, surfnet_lite_svm::SurfnetLiteSvm,
+        BlockSubscriptionData, LogsSubscriptionData, locker::is_supported_token_program,
+        surfnet_lite_svm::SurfnetLiteSvm,
     },
     types::{
         GeyserAccountUpdate, MintAccount, OfflineAccountConfig, SerializableAccountAdditionalData,
@@ -301,7 +314,7 @@ fn json_integer_digits(json: &serde_json::Value, target: &str) -> SurfpoolResult
 }
 
 /// Converts JSON into a txtx [`Value`] using the expected IDL type
-fn json_to_txtx_value_for_idl_type(
+pub(crate) fn json_to_txtx_value_for_idl_type(
     json: &serde_json::Value,
     idl_type: &IdlType,
     idl_types: &[IdlTypeDef],
@@ -401,6 +414,42 @@ fn json_to_txtx_value(json: &serde_json::Value) -> SurfpoolResult<Value> {
 
 pub type AccountOwner = Pubkey;
 
+/// The slot a read at some commitment answers for, with its `minContextSlot` already judged.
+/// Only [`SurfnetSvm::read_slot`] makes one.
+#[derive(Clone, Copy, Debug)]
+pub struct ReadSlot(Slot);
+
+impl ReadSlot {
+    pub fn slot(self) -> Slot {
+        self.0
+    }
+
+    /// Like Agave's `new_response(&bank, value)`: the response context is the slot read at.
+    #[allow(clippy::disallowed_methods)] // the one sanctioned context for request/response handlers
+    pub fn respond<T>(self, value: T) -> RpcResponse<T> {
+        RpcResponse {
+            context: RpcResponseContext::new(self.0),
+            value,
+        }
+    }
+
+    /// Like Agave's `bank.get_epoch_info()` on the bank at this slot.
+    pub fn epoch_info(self, svm: &SurfnetSvm) -> EpochInfo {
+        let tip = &svm.latest_epoch_info;
+        let schedule = svm.inner.get_sysvar::<EpochSchedule>();
+        let (epoch, slot_index) = schedule.get_epoch_and_slot_index(self.0);
+        EpochInfo {
+            epoch,
+            slot_index,
+            slots_in_epoch: schedule.get_slots_in_epoch(epoch),
+            absolute_slot: self.0,
+            // Skipped slots hold no block: step back by the blocks after this slot.
+            block_height: tip.block_height.saturating_sub(svm.blocks_after(self.0)),
+            transaction_count: tip.transaction_count,
+        }
+    }
+}
+
 #[allow(deprecated)]
 use solana_sysvar::recent_blockhashes::MAX_ENTRIES;
 
@@ -490,6 +539,7 @@ pub struct SurfnetSvm {
     pub simulated_transaction_profiles: Box<dyn Storage<String, KeyedProfileResult>>,
     pub executed_transaction_profiles: Box<dyn Storage<String, KeyedProfileResult>>,
     pub logs_subscriptions: Vec<LogsSubscriptionData>,
+    pub block_subscriptions: Vec<BlockSubscriptionData>,
     pub snapshot_subscriptions: Vec<super::SnapshotSubscriptionData>,
     pub updated_at: u64,
     pub slot_time: u64,
@@ -522,6 +572,8 @@ pub struct SurfnetSvm {
     pub instruction_profiling_enabled: bool,
     pub max_profiles: usize,
     pub skip_blockhash_check: bool,
+    /// The simnet's `skip_signature_verification`, which a send's `skip_sig_verify` overrides.
+    pub skip_signature_verification: bool,
     pub runbook_executions: Vec<RunbookExecutionStatusReport>,
     /// The startup state machine. Kept private so that every mutation goes
     /// through [`Self::seal_startup_plan`] and its sibling wrappers, which
@@ -551,6 +603,17 @@ pub struct SurfnetSvm {
     pub slot_checkpoint: Box<dyn Storage<String, u64>>,
     /// Tracks the slot at which we last persisted the checkpoint.
     pub last_checkpoint_slot: u64,
+    /// The slot each time travel lands on, mapped to the slot of its parent block and
+    /// its time in milliseconds. The slots between the two are skipped: they hold no block.
+    /// A landing with no gap only sets the time, as a travel to the open slot does.
+    landings: BTreeMap<Slot, (Slot, u64)>,
+    /// `landings`, persisted.
+    landings_db: Box<dyn Storage<Slot, (Slot, u64)>>,
+    /// The slot each restart reopened, mapped to its time in milliseconds. Unlike a landing, a
+    /// restart is not a time travel: it skips no slot and keeps the epoch's start.
+    restarts: BTreeMap<Slot, u64>,
+    /// `restarts`, persisted.
+    restarts_db: Box<dyn Storage<Slot, u64>>,
     /// The storage backend every kv store above was opened on. Owns the
     /// surfnet's database connections; kept so shutdown has one place to
     /// flush and so the connections live exactly as long as the surfnet.
@@ -690,16 +753,6 @@ fn synthetic_chain_tip_at_index(index: u64) -> BlockIdentifier {
     }
 }
 
-fn synthetic_blockhash_for_slot(slot: Slot, genesis_slot: Slot) -> SyntheticBlockhash {
-    if slot >= genesis_slot {
-        return SyntheticBlockhash::new(slot - genesis_slot);
-    }
-
-    // Pre-genesis slot hashes only exist to cover the finalized warmup window.
-    // Keep them deterministic and distinct from local chain-index hashes.
-    SyntheticBlockhash::new(u64::MAX - (genesis_slot - slot - 1))
-}
-
 impl SurfnetSvm {
     pub(crate) fn mark_transaction_pending(&mut self, signature: Signature) {
         *self
@@ -749,7 +802,17 @@ impl SurfnetSvm {
 
     /// Explicitly shutdown the SVM, performing cleanup like WAL checkpoint for SQLite.
     /// This should be called before the application exits to ensure data is persisted.
-    pub fn shutdown(&self) {
+    pub fn shutdown(&mut self) {
+        // Checkpoint the last block, so a restart opens the slot after it.
+        let last_block = self.parent_slot(self.get_latest_absolute_slot());
+        if let Err(e) = self
+            .slot_checkpoint
+            .store("latest_slot".to_string(), last_block)
+        {
+            self.simnet_events_tx.error(format!(
+                "Failed to checkpoint slot {last_block} on shutdown: {e}"
+            ));
+        }
         self.storage_backend.shutdown();
     }
 
@@ -826,6 +889,7 @@ impl SurfnetSvm {
             slot_subscriptions: Vec::new(),
             slots_updates_subscriptions: Vec::new(),
             logs_subscriptions: Vec::new(),
+            block_subscriptions: Vec::new(),
             snapshot_subscriptions: Vec::new(),
 
             updated_at: self.updated_at,
@@ -845,6 +909,7 @@ impl SurfnetSvm {
             instruction_profiling_enabled: self.instruction_profiling_enabled,
             max_profiles: self.max_profiles,
             skip_blockhash_check: self.skip_blockhash_check,
+            skip_signature_verification: self.skip_signature_verification,
             runbook_executions: self.runbook_executions.clone(),
             startup_status: self.startup_status.clone(),
             // Same rule as the dummy event channels above: the sandbox gets a
@@ -858,6 +923,10 @@ impl SurfnetSvm {
             genesis_updated_at: self.genesis_updated_at,
             slot_checkpoint: OverlayStorage::wrap(self.slot_checkpoint.clone_box()),
             last_checkpoint_slot: self.last_checkpoint_slot,
+            landings: self.landings.clone(),
+            landings_db: OverlayStorage::wrap(self.landings_db.clone_box()),
+            restarts: self.restarts.clone(),
+            restarts_db: OverlayStorage::wrap(self.restarts_db.clone_box()),
             storage_backend: self.storage_backend.clone(),
         }
     }
@@ -867,14 +936,13 @@ impl SurfnetSvm {
     }
 
     pub(crate) fn default_epoch_info(epoch_schedule: &EpochSchedule) -> EpochInfo {
-        let (epoch, slot_index) =
-            epoch_schedule.get_epoch_and_slot_index(FINALIZATION_SLOT_THRESHOLD);
+        let (epoch, slot_index) = epoch_schedule.get_epoch_and_slot_index(INITIAL_SLOT);
         EpochInfo {
             epoch,
             slot_index,
             slots_in_epoch: epoch_schedule.get_slots_in_epoch(epoch),
-            absolute_slot: FINALIZATION_SLOT_THRESHOLD,
-            block_height: FINALIZATION_SLOT_THRESHOLD,
+            absolute_slot: INITIAL_SLOT,
+            block_height: INITIAL_SLOT,
             transaction_count: None,
         }
     }
@@ -1195,83 +1263,34 @@ impl SurfnetSvm {
             )?
         };
         let epoch_schedule = Self::default_epoch_schedule();
-        let mut epoch_info = Self::default_epoch_info(&epoch_schedule);
+        let epoch_info = Self::default_epoch_info(&epoch_schedule);
         let default_genesis_slot = epoch_info.absolute_slot;
         let slot_checkpoint_db: Box<dyn Storage<String, u64>> =
             storage_backend.open_store("slot_checkpoint")?;
+        let landings_db: Box<dyn Storage<Slot, (Slot, u64)>> =
+            storage_backend.open_store("landings")?;
+        let landings: BTreeMap<_, _> = landings_db.into_iter()?.collect();
+        let restarts_db: Box<dyn Storage<Slot, u64>> = storage_backend.open_store("restarts")?;
+        let restarts: BTreeMap<_, _> = restarts_db.into_iter()?.collect();
 
-        // Recover chain state: prefer slot checkpoint, fall back to max block in DB.
-        let checkpoint_slot = slot_checkpoint_db.get(&"latest_slot".to_string())?;
-        let max_block_slot = blocks_db
-            .into_iter()
-            .unwrap()
-            .max_by_key(|(slot, _): &(u64, BlockHeader)| *slot);
-        let has_persisted_chain_state = checkpoint_slot.is_some() || max_block_slot.is_some();
-
-        let (chain_tip, recovered_slot, recovered_block_height) =
-            match (checkpoint_slot, max_block_slot) {
-                // Prefer checkpoint if it's higher than the max stored block.
-                (Some(checkpoint), Some((block_slot, block))) => {
-                    if checkpoint > block_slot {
-                        (
-                            synthetic_chain_tip_at_index(checkpoint),
-                            checkpoint,
-                            checkpoint,
-                        )
-                    } else {
-                        (
-                            BlockIdentifier {
-                                index: block.block_height,
-                                hash: block.hash,
-                            },
-                            block_slot,
-                            block.block_height,
-                        )
-                    }
-                }
-                (Some(checkpoint), None) => (
-                    synthetic_chain_tip_at_index(checkpoint),
-                    checkpoint,
-                    checkpoint,
-                ),
-                (None, Some((block_slot, block))) => (
-                    BlockIdentifier {
-                        index: block.block_height,
-                        hash: block.hash,
-                    },
-                    block_slot,
-                    block.block_height,
-                ),
-                (None, None) => (
-                    BlockIdentifier::zero(),
-                    epoch_info.absolute_slot,
-                    epoch_info.block_height,
-                ),
-            };
-
-        if has_persisted_chain_state {
-            let (epoch, slot_index) = epoch_schedule.get_epoch_and_slot_index(recovered_slot);
-            epoch_info.epoch = epoch;
-            epoch_info.slot_index = slot_index;
-            epoch_info.absolute_slot = recovered_slot;
-            epoch_info.block_height = recovered_block_height;
-        }
+        // Recover chain state: the slot after the last block, checkpointed or stored, or the slot
+        // a time travel landed on since.
+        let last_block = slot_checkpoint_db
+            .get(&"latest_slot".to_string())?
+            .max(blocks_db.keys()?.into_iter().max());
+        let recovered_slot = last_block
+            .map(|slot| slot + 1)
+            .max(landings.last_key_value().map(|(&slot, _)| slot));
 
         // Initialize transactions_processed from database count for persistent storage
         let transactions_processed = transactions_db.count()?;
         let updated_at = Utc::now().timestamp_millis() as u64;
-        let last_checkpoint_slot = checkpoint_slot.unwrap_or_else(|| {
-            if has_persisted_chain_state {
-                recovered_slot
-            } else {
-                0
-            }
-        });
+        let last_checkpoint_slot = last_block.unwrap_or(0);
 
         let mut svm = Self {
             inner,
             remote_rpc_url: None,
-            chain_tip,
+            chain_tip: BlockIdentifier::zero(),
             blocks: blocks_db,
             transactions: transactions_db,
             pending_transaction_signatures: HashMap::new(),
@@ -1292,6 +1311,7 @@ impl SurfnetSvm {
             simulated_transaction_profiles: simulated_transaction_profiles_db,
             executed_transaction_profiles: executed_transaction_profiles_db,
             logs_subscriptions: Vec::new(),
+            block_subscriptions: Vec::new(),
             snapshot_subscriptions: Vec::new(),
             updated_at,
             slot_time: config.slot_time,
@@ -1317,6 +1337,7 @@ impl SurfnetSvm {
             instruction_profiling_enabled: config.instruction_profiling_enabled,
             max_profiles: config.max_profiles,
             skip_blockhash_check: config.skip_blockhash_check,
+            skip_signature_verification: false,
             runbook_executions: Vec::new(),
             startup_status: SurfnetStartupStatus::default(),
             startup_status_watch_tx: tokio::sync::watch::channel(SurfnetStartupStatus::default()).0,
@@ -1329,15 +1350,42 @@ impl SurfnetSvm {
             genesis_updated_at: updated_at,
             slot_checkpoint: slot_checkpoint_db,
             last_checkpoint_slot,
+            landings,
+            landings_db,
+            restarts,
+            restarts_db,
             storage_backend,
         };
 
         svm.inner.set_log_bytes_limit(config.log_bytes_limit);
-        if !has_persisted_chain_state {
-            svm.chain_tip = svm.new_blockhash();
+        svm.inner.set_sysvar(&epoch_schedule);
+        let anchor = |key: &str| svm.slot_checkpoint.get(&key.to_string());
+        let genesis = (anchor("genesis_slot")?, anchor("genesis_height")?);
+        let genesis_updated_at = anchor("genesis_updated_at")?;
+        match (recovered_slot, genesis, genesis_updated_at) {
+            // Reopen the chain where it stopped, at the time it is now.
+            (Some(slot), (Some(genesis_slot), Some(genesis_height)), Some(genesis_updated_at)) => {
+                svm.genesis_slot = genesis_slot;
+                svm.genesis_updated_at = genesis_updated_at;
+                svm.set_latest_absolute_slot(slot);
+                svm.restarts_db.store(slot, svm.updated_at)?;
+                svm.restarts.insert(slot, svm.updated_at);
+                let height = genesis_height + svm.blocks_in(svm.genesis_slot, slot - 1);
+                svm.chain_tip = synthetic_chain_tip_at_index(height);
+                svm.latest_epoch_info.block_height = height;
+            }
+            // No chain, or one stored before its genesis was: start a new one, after any slot the
+            // old one stored, so none is produced again.
+            (stale, ..) => {
+                if let Some(slot) = stale {
+                    svm.genesis_slot = slot;
+                    svm.set_latest_absolute_slot(slot);
+                }
+                svm.chain_tip = svm.new_blockhash();
+                svm.store_genesis_anchor()?;
+            }
         }
         svm.register_builtin_template_idls();
-        svm.inner.set_sysvar(&epoch_schedule);
         svm.reconstruct_sysvars();
 
         Ok((svm, simnet_events_rx, geyser_events_rx))
@@ -1355,20 +1403,43 @@ impl SurfnetSvm {
     ///
     /// # Arguments
     /// * `epoch_info` - The epoch information to initialize with.
-    pub fn initialize(&mut self, epoch_info: EpochInfo, epoch_schedule: EpochSchedule) {
-        self.chain_tip = self.new_blockhash();
-        self.latest_epoch_info = epoch_info.clone();
-        // Set genesis_slot to the current slot when initializing (syncing with remote)
-        // This marks the starting point for this surfnet instance
-        self.genesis_slot = epoch_info.absolute_slot;
-        self.updated_at = Utc::now().timestamp_millis() as u64;
-        // Update genesis_updated_at to match the new genesis_slot
-        self.genesis_updated_at = self.updated_at;
-
+    pub fn initialize(
+        &mut self,
+        epoch_info: EpochInfo,
+        epoch_schedule: EpochSchedule,
+    ) -> SurfpoolResult<()> {
         self.inner.set_sysvar(&epoch_schedule);
+        // A restart keeps the chain it recovered: the open slot is past genesis.
+        if self.get_latest_absolute_slot() == self.genesis_slot {
+            // The remote's block at its slot has its height: the local chain opens the slot after
+            // it, on top of it (at least 1, as offline: the block at height h has the synthetic
+            // hash of h - 1).
+            self.chain_tip = synthetic_chain_tip_at_index(epoch_info.block_height.max(1));
+            self.latest_epoch_info = epoch_info.clone();
+            self.genesis_slot = epoch_info.absolute_slot + 1;
+            self.set_latest_absolute_slot(self.genesis_slot);
+            self.updated_at = Utc::now().timestamp_millis() as u64;
+            // Update genesis_updated_at to match the new genesis_slot
+            self.genesis_updated_at = self.updated_at;
+            self.store_genesis_anchor()?;
+        }
 
         // Reconstruct all sysvars (RecentBlockhashes, SlotHashes, Clock)
         self.reconstruct_sysvars();
+        Ok(())
+    }
+
+    /// Persists what a restart cannot derive about genesis: its slot, the height of the chain
+    /// tip its first block is built on, and its time.
+    fn store_genesis_anchor(&mut self) -> SurfpoolResult<()> {
+        for (key, value) in [
+            ("genesis_slot", self.genesis_slot),
+            ("genesis_height", self.chain_tip.index),
+            ("genesis_updated_at", self.genesis_updated_at),
+        ] {
+            self.slot_checkpoint.store(key.to_string(), value)?;
+        }
+        Ok(())
     }
 
     pub fn set_profile_instructions(&mut self, do_profile_instructions: bool) {
@@ -1557,12 +1628,42 @@ impl SurfnetSvm {
         self.latest_epoch_info.clone()
     }
 
-    /// Calculates the block time for a given slot based on genesis timestamp.
-    /// Returns the time in milliseconds since genesis.
+    /// Calculates the block time for a given slot, in milliseconds, as the stream gave it: the
+    /// time its slot opened at, `slot_time` per slot from the time its run opened at (the last
+    /// time travel's landing or restart at or before it, or else genesis), plus `block_time_lag`.
     pub fn calculate_block_time_for_slot(&self, slot: Slot) -> u64 {
-        // Calculate time relative to genesis_slot (when this surfnet started)
-        let slots_since_genesis = slot.saturating_sub(self.genesis_slot);
-        self.genesis_updated_at + (slots_since_genesis * self.slot_time)
+        let landing = self
+            .landings
+            .range(..=slot)
+            .next_back()
+            .map(|(&s, &(_, t))| (s, t));
+        let restart = self
+            .restarts
+            .range(..=slot)
+            .next_back()
+            .map(|(&s, &t)| (s, t));
+        // A restart at a landing's slot came after it: `max_by_key` keeps the last of equals.
+        let (start, start_time) = [landing, restart]
+            .into_iter()
+            .flatten()
+            .max_by_key(|&(start, _)| start)
+            .filter(|&(start, _)| start >= self.genesis_slot)
+            .unwrap_or((self.genesis_slot, self.genesis_updated_at));
+        start_time + slot.saturating_sub(start) * self.slot_time + self.block_time_lag()
+    }
+
+    /// How much later a block's time is than the Clock its transactions read: under Alpenglow
+    /// the block footer stamps the block as it ends (`Bank::update_clock_from_footer`), under
+    /// TowerBFT the block's time is that Clock (`Bank::update_clock`).
+    fn block_time_lag(&self) -> u64 {
+        if self
+            .feature_set
+            .is_active(&agave_feature_set::alpenglow::id())
+        {
+            self.slot_time
+        } else {
+            0
+        }
     }
 
     /// Slots between garbage collections of the lite SVM cache at the current slot time.
@@ -1596,6 +1697,128 @@ impl SurfnetSvm {
         slot >= self.genesis_slot && slot <= latest_slot
     }
 
+    /// Moves the open slot to `slot` for a time travel, and records the time `updated_at` holds
+    /// there, even if `slot` is already open. Moving forward skips the slots in between, as a
+    /// leader's missed slots are: the block at `slot` is built on the last one, even if the open
+    /// slot was itself a landing.
+    pub(crate) fn travel_to(&mut self, slot: Slot) -> SurfpoolResult<()> {
+        let open = self.get_latest_absolute_slot();
+        // The block `slot` is built on: the last one before the open slot, or before `slot` if
+        // it travels back.
+        let parent = self.block_at_or_before(slot.min(open).saturating_sub(1));
+        // A landing or restart at the open slot is replaced; one past a backward travel never
+        // happened. Write the store before memory, so a failed write leaves the chain in memory
+        // as it was; the store may then have dropped stale landings and restarts already.
+        for &stale in self.landings.range(slot.min(open)..).map(|(s, _)| s) {
+            if stale != slot {
+                self.landings_db.take(&stale)?;
+            }
+        }
+        for &stale in self.restarts.range(slot.min(open)..).map(|(s, _)| s) {
+            self.restarts_db.take(&stale)?;
+        }
+        self.landings_db.store(slot, (parent, self.updated_at))?;
+        self.landings.split_off(&slot.min(open));
+        self.restarts.split_off(&slot.min(open));
+        self.landings.insert(slot, (parent, self.updated_at));
+        self.set_latest_absolute_slot(slot);
+        // Announce the slot it lands on, as its bank is created; a skipped slot gets none.
+        if slot > open {
+            // The open slot's SlotHashes entry moves with it: the skipped slot holds none.
+            let slot_hashes: Vec<_> = self
+                .inner
+                .get_sysvar::<SlotHashes>()
+                .iter()
+                .map(|&(key, hash)| (if key == open { slot } else { key }, hash))
+                .collect();
+            self.inner.set_sysvar(&SlotHashes::new(&slot_hashes));
+            self.announce_open_slot();
+        }
+        Ok(())
+    }
+
+    /// Applies a time travel's `clock`: records its landing, then moves the Clock, the time and
+    /// the open slot to it. A slot already closed, as the one open when the travel was asked for
+    /// is by now, lands on the open slot: only its time changes. If the landing can't be
+    /// recorded, nothing changes in memory.
+    pub(crate) fn apply_time_travel(&mut self, clock: Clock) -> SurfpoolResult<EpochInfo> {
+        let previous = std::mem::replace(&mut self.updated_at, clock.unix_timestamp as u64 * 1_000);
+        if let Err(e) = self.travel_to(clock.slot.max(self.get_latest_absolute_slot())) {
+            self.updated_at = previous;
+            return Err(e);
+        }
+        let clock = Clock {
+            slot: self.latest_epoch_info.absolute_slot,
+            epoch: self.latest_epoch_info.epoch,
+            ..clock
+        };
+        self.inner.set_sysvar(&clock);
+        self.simnet_events_tx.system_clock_updated(clock);
+        Ok(self.latest_epoch_info.clone())
+    }
+
+    /// The parent of the block at `slot`: the slot before it, unless a time travel landed there.
+    fn parent_slot(&self, slot: Slot) -> Slot {
+        self.landings
+            .get(&slot)
+            .map_or(slot.saturating_sub(1), |&(parent, _)| parent)
+    }
+
+    /// `slot`, or the last slot before it with a block if a time travel skipped it.
+    fn block_at_or_before(&self, slot: Slot) -> Slot {
+        match self.landings.range(slot + 1..).next() {
+            Some((_, &(parent, _))) if parent < slot => parent,
+            _ => slot,
+        }
+    }
+
+    /// The block `n` blocks before the last block at or before `slot`, along the chain: a time
+    /// travel's gap adds no depth. Costs one step per time travel, not per slot.
+    fn blocks_back(&self, slot: Slot, mut n: u64) -> Slot {
+        let mut slot = self.block_at_or_before(slot);
+        for (&landing, &(parent, _)) in self.landings.range(..=slot).rev() {
+            if n <= slot - landing {
+                break;
+            }
+            n -= slot - landing + 1;
+            slot = parent;
+        }
+        slot.saturating_sub(n)
+    }
+
+    /// The runs of consecutive slots holding a block within `from..=to`, in order: the slots a
+    /// time travel skipped hold none. Costs one step per time travel, not per slot.
+    pub(crate) fn block_runs(&self, from: Slot, to: Slot) -> Vec<RangeInclusive<Slot>> {
+        let mut runs = vec![];
+        let mut start = from;
+        for (&landing, &(parent, _)) in self.landings.range((Excluded(from), Unbounded)) {
+            if parent.min(to) >= start {
+                runs.push(start..=parent.min(to));
+            }
+            if landing > to {
+                return runs;
+            }
+            start = start.max(landing);
+        }
+        if to >= start {
+            runs.push(start..=to);
+        }
+        runs
+    }
+
+    /// The blocks in `from..=to`.
+    fn blocks_in(&self, from: Slot, to: Slot) -> u64 {
+        self.block_runs(from, to)
+            .iter()
+            .map(|run| run.end() - run.start() + 1)
+            .sum()
+    }
+
+    /// The blocks after `slot`, up to the one the open slot will hold.
+    pub(crate) fn blocks_after(&self, slot: Slot) -> u64 {
+        self.blocks_in(slot + 1, self.get_latest_absolute_slot())
+    }
+
     /// Gets a block from storage, or reconstructs an empty block if the slot is within
     /// the valid range (sparse block storage).
     ///
@@ -1605,28 +1828,29 @@ impl SurfnetSvm {
     /// # Returns
     /// * `Ok(Some(BlockHeader))` - If the block exists or can be reconstructed
     /// * `Ok(None)` - If the slot is outside the valid range
-    /// * `Err(_)` - If there was an error accessing storage
+    /// * `Err(_)` - If a time travel skipped the slot, or there was an error accessing storage
     pub fn get_block_or_reconstruct(&self, slot: Slot) -> SurfpoolResult<Option<BlockHeader>> {
         match self.blocks.get(&slot)? {
             Some(block) => Ok(Some(block)),
-            None => {
-                if self.is_slot_in_valid_range(slot) {
-                    Ok(Some(self.reconstruct_empty_block(slot)))
-                } else {
-                    Ok(None)
-                }
+            None if !self.is_slot_in_valid_range(slot) => Ok(None),
+            None if self.block_at_or_before(slot) != slot => {
+                let finalized = self.slot_for_commitment(&CommitmentConfig::finalized());
+                Err(SurfpoolError::slot_skipped(slot, slot <= finalized))
             }
+            None => Ok(Some(self.reconstruct_empty_block(slot))),
         }
     }
 
     /// Reconstructs an empty block header for a slot that wasn't stored.
     /// This is used for sparse block storage where empty blocks are not persisted.
+    /// Its hashes are the ones `new_blockhash` gave the block at its height.
     pub fn reconstruct_empty_block(&self, slot: Slot) -> BlockHeader {
-        let block_height = slot;
+        // The open slot's block will be one higher than the chain tip.
+        let block_height = (self.chain_tip.index + 1).saturating_sub(self.blocks_after(slot));
         BlockHeader {
-            hash: SyntheticBlockhash::new(block_height).to_string(),
-            previous_blockhash: SyntheticBlockhash::new(block_height.saturating_sub(1)).to_string(),
-            parent_slot: slot.saturating_sub(1),
+            hash: SyntheticBlockhash::new(block_height.saturating_sub(1)).to_string(),
+            previous_blockhash: SyntheticBlockhash::new(block_height.saturating_sub(2)).to_string(),
+            parent_slot: self.parent_slot(slot),
             block_time: (self.calculate_block_time_for_slot(slot) / 1_000) as i64,
             block_height,
             signatures: vec![],
@@ -1666,42 +1890,45 @@ impl SurfnetSvm {
         let recent_blockhashes = RecentBlockhashes::from_iter(recent_blockhashes_vec);
         self.inner.set_sysvar(&recent_blockhashes);
 
-        // 2. Reconstruct SlotHashes - maps absolute slots to blockhashes.
-        // The local ledger starts at genesis_slot, but finalized commitment is
-        // reported as current_slot - FINALIZATION_SLOT_THRESHOLD. During the
-        // initial warmup this points before genesis_slot, so seed those
-        // synthetic slots into SlotHashes while preserving the local hash
-        // mapping for genesis_slot and later.
-        let slot_hash_start_index =
-            current_index.saturating_sub(MAX_SLOT_HASHES_ENTRIES as u64 - 1);
-        let local_start_absolute_slot = slot_hash_start_index + self.genesis_slot;
-        let finalized_start_absolute_slot =
-            current_absolute_slot.saturating_sub(FINALIZATION_SLOT_THRESHOLD);
-        let earliest_retained_slot =
-            current_absolute_slot.saturating_sub(MAX_SLOT_HASHES_ENTRIES as u64 - 1);
-        let start_absolute_slot = local_start_absolute_slot
-            .min(finalized_start_absolute_slot)
-            .max(earliest_retained_slot);
-        let slot_hashes_vec: Vec<_> = (start_absolute_slot..=current_absolute_slot)
+        // 2. Reconstruct SlotHashes as `new_blockhash` keys it: the open slot and each block before
+        // it, newest first, up to 512, the open slot with the latest blockhash and each block one
+        // index lower. Skipped slots have no entry. The local ledger starts
+        // at genesis_slot, but finalized commitment can point before it during warmup, so seed
+        // those slots too; their indices count down past zero, wrapping, so their hashes stay
+        // distinct from local ones.
+        let finalized = self.slot_for_commitment(&CommitmentConfig::finalized());
+        let runs = self.block_runs(self.genesis_slot.min(finalized), current_absolute_slot);
+        let slot_hashes_vec: Vec<_> = runs
+            .into_iter()
             .rev()
-            .map(|slot| {
-                (
-                    slot,
-                    *synthetic_blockhash_for_slot(slot, self.genesis_slot).hash(),
-                )
+            .flat_map(|run| run.rev())
+            .take(MAX_SLOT_HASHES_ENTRIES)
+            .zip(1..)
+            .map(|(slot, depth)| {
+                let index = current_index.wrapping_sub(depth);
+                (slot, *SyntheticBlockhash::new(index).hash())
             })
             .collect();
         let slot_hashes = SlotHashes::new(&slot_hashes_vec);
         self.inner.set_sysvar(&slot_hashes);
 
-        // 3. Reconstruct Clock using absolute slot
-        let unix_timestamp = self.calculate_block_time_for_slot(current_absolute_slot) / 1_000;
+        // 3. Reconstruct Clock using absolute slot: the time the open slot opened at
+        let unix_timestamp = self
+            .calculate_block_time_for_slot(current_absolute_slot)
+            .saturating_sub(self.block_time_lag())
+            / 1_000;
+        // Nothing restores when this epoch started on this chain, so it starts now, as a warp
+        // starts it at the Clock's time (`Bank::warp_from_parent`). After a restart the rebuilt
+        // Clock can run ahead of `updated_at`, the time the next blocks write, so take the
+        // earlier of the two: the epoch never starts after a time a program reads.
         let clock = Clock {
-            slot: current_absolute_slot,
-            epoch: self.latest_epoch_info.epoch,
-            unix_timestamp: unix_timestamp as i64,
-            epoch_start_timestamp: 0,
-            leader_schedule_epoch: 0,
+            epoch_start_timestamp: (unix_timestamp as i64).min((self.updated_at / 1_000) as i64),
+            ..clock_for_slot(
+                current_absolute_slot,
+                unix_timestamp as i64,
+                None,
+                &self.inner.get_sysvar::<EpochSchedule>(),
+            )
         };
         self.inner.set_sysvar(&clock);
     }
@@ -1753,6 +1980,9 @@ impl SurfnetSvm {
         self.inner
             .set_sysvar(&RecentBlockhashes::from_iter(recent_blockhashes));
 
+        // Surfpool's processed slot is the open one, where transactions run, so it has an entry,
+        // as Agave's processed (frozen) slot has for the bank after it: the slot that opens next
+        // holds the blockhash its transactions use. A time travel re-keys it to where it lands.
         let mut slot_hashes = self.inner.get_sysvar::<SlotHashes>();
         slot_hashes.add(
             self.get_latest_absolute_slot() + 1,
@@ -1781,13 +2011,58 @@ impl SurfnetSvm {
             .any(|entry| entry.blockhash == *recent_blockhash)
     }
 
+    /// Returns the finalization depth: one slot with Alpenglow, otherwise 31 slots.
+    pub fn finalization_slot_threshold(&self) -> u64 {
+        if self
+            .feature_set
+            .is_active(&agave_feature_set::alpenglow::id())
+        {
+            1
+        } else {
+            LEGACY_FINALIZATION_SLOT_THRESHOLD
+        }
+    }
+
     /// Returns the slot visible at `commitment`.
     pub fn slot_for_commitment(&self, commitment: &CommitmentConfig) -> Slot {
         let slot = self.get_latest_absolute_slot();
         match commitment.commitment {
             CommitmentLevel::Processed => slot,
-            CommitmentLevel::Confirmed => slot.saturating_sub(1),
-            CommitmentLevel::Finalized => slot.saturating_sub(FINALIZATION_SLOT_THRESHOLD),
+            CommitmentLevel::Confirmed => self.block_at_or_before(slot.saturating_sub(1)),
+            // As a tower roots, one vote per block: `threshold - 1` blocks below the last.
+            CommitmentLevel::Finalized => self.blocks_back(
+                slot.saturating_sub(1),
+                self.finalization_slot_threshold() - 1,
+            ),
+        }
+    }
+
+    /// The status of a transaction in the block at `slot`, as Agave reports it: finalized once
+    /// that block is, confirmed once it is closed.
+    pub fn confirmation_status(&self, slot: Slot) -> RpcTransactionConfirmationStatus {
+        if slot <= self.slot_for_commitment(&CommitmentConfig::finalized()) {
+            RpcTransactionConfirmationStatus::Finalized
+        } else if slot < self.get_latest_absolute_slot() {
+            RpcTransactionConfirmationStatus::Confirmed
+        } else {
+            RpcTransactionConfirmationStatus::Processed
+        }
+    }
+
+    /// Resolves `commitment` to a slot and refuses a `min_context_slot` above it, as Agave's
+    /// `get_bank_with_config` does. The surfnet keeps one account state, so this read reflects
+    /// every transaction up to this slot.
+    pub fn read_slot(
+        &self,
+        commitment: Option<CommitmentConfig>,
+        min_context_slot: Option<Slot>,
+    ) -> jsonrpc_core::Result<ReadSlot> {
+        let slot = self.slot_for_commitment(&commitment.unwrap_or_default());
+        match min_context_slot {
+            Some(min_context_slot) if slot < min_context_slot => {
+                Err(RpcCustomError::MinContextSlotNotReached { context_slot: slot }.into())
+            }
+            _ => Ok(ReadSlot(slot)),
         }
     }
 
@@ -1808,9 +2083,9 @@ impl SurfnetSvm {
     }
 
     /// Blocks a blockhash must age before `commitment` can see it. The tip blockhash
-    /// belongs to the last closed slot, one behind the latest slot.
+    /// belongs to the last closed slot, one block behind the latest slot.
     fn min_blockhash_age(&self, commitment: &CommitmentConfig) -> usize {
-        let lag = self.get_latest_absolute_slot() - self.slot_for_commitment(commitment);
+        let lag = self.blocks_after(self.slot_for_commitment(commitment));
         lag.saturating_sub(1) as usize
     }
 
@@ -1820,6 +2095,19 @@ impl SurfnetSvm {
         self.blockhashes_from_tip()
             .get(self.min_blockhash_age(commitment))
             .copied()
+    }
+
+    /// The blockhash getLatestBlockhash reports at `commitment`, with its last valid block height.
+    pub fn latest_blockhash_at(&self, commitment: &CommitmentConfig) -> (Hash, u64) {
+        let blockhash = self
+            .blockhash_for_commitment(commitment)
+            .unwrap_or_else(|| self.latest_blockhash());
+        let age = self.blockhash_age(&blockhash).unwrap_or(0);
+        let minted_at_block_height = self.latest_epoch_info.block_height.saturating_sub(age);
+        (
+            blockhash,
+            minted_at_block_height + MAX_RECENT_BLOCKHASHES_STANDARD as u64,
+        )
     }
 
     /// Blocks minted since `blockhash`, or `None` if it is not a recent blockhash.
@@ -1950,8 +2238,6 @@ impl SurfnetSvm {
     /// requiring a mutable reference to the SVM, which we don't have/want in the simulation path.
     /// Additionally, having this function internally lets us do this check before we start fetching accounts from mainnet.
     pub fn sigverify(&self, tx: &VersionedTransaction) -> Result<(), FailedTransactionMetadata> {
-        let signature = tx.signatures[0];
-
         if tx.verify_with_results().iter().any(|valid| !*valid) {
             return Err(FailedTransactionMetadata {
                 err: TransactionError::SignatureFailure,
@@ -1959,16 +2245,26 @@ impl SurfnetSvm {
             });
         }
 
-        if matches!(
-            self.transactions.get(&signature.to_string()),
-            Ok(Some(SurfnetTransactionStatus::Processed(_)))
-        ) {
+        if self.processed_slot(tx).is_some() {
             return Err(FailedTransactionMetadata {
                 err: TransactionError::AlreadyProcessed,
                 meta: TransactionMetadata::default(),
             });
         }
         Ok(())
+    }
+
+    /// The slot that processed `tx`. Agave's status cache keys by message hash, so a stored
+    /// transaction under the same signature counts only if its message is the same.
+    pub(crate) fn processed_slot(&self, tx: &VersionedTransaction) -> Option<Slot> {
+        match self.transactions.get(&tx.signatures[0].to_string()) {
+            Ok(Some(SurfnetTransactionStatus::Processed(processed)))
+                if processed.0.transaction.message.hash() == tx.message.hash() =>
+            {
+                Some(processed.0.slot)
+            }
+            _ => None,
+        }
     }
 
     /// Sets an account in the local SVM state and notifies listeners.
@@ -2269,17 +2565,23 @@ impl SurfnetSvm {
         self.updated_at = current_time;
         self.genesis_updated_at = current_time;
         self.latest_epoch_info = epoch_info.clone();
-        // Set genesis_slot to the current slot when resetting (similar to initialize)
-        self.genesis_slot = epoch_info.absolute_slot;
-        let chain_tip_hash = SyntheticBlockhash::new(epoch_info.block_height).to_string();
-        self.chain_tip = BlockIdentifier::new(epoch_info.block_height, chain_tip_hash.as_str());
         self.inner.set_sysvar(&epoch_schedule);
+        // As in `initialize`: the local chain opens the slot after the remote's block.
+        self.genesis_slot = epoch_info.absolute_slot + 1;
+        self.set_latest_absolute_slot(self.genesis_slot);
+        self.chain_tip = synthetic_chain_tip_at_index(epoch_info.block_height.max(1));
+        self.landings.clear();
+        self.landings_db.clear()?;
+        self.restarts.clear();
+        self.restarts_db.clear()?;
         // Rebuild sysvars so getLatestBlockhash / sendTransaction stay aligned after reset.
         self.reconstruct_sysvars();
         // Reset checkpoint state to avoid recovering stale chain tips after a reset.
         self.slot_checkpoint.clear()?;
         self.last_checkpoint_slot = self.genesis_slot;
+        self.store_genesis_anchor()?;
         self.recent_blockhashes.clear();
+        self.announce_open_slot();
 
         Ok(())
     }
@@ -2542,7 +2844,6 @@ impl SurfnetSvm {
     fn confirm_transactions(&mut self) -> Result<(Vec<Signature>, u64), SurfpoolError> {
         let mut confirmed_transactions = vec![];
         let mut num_failed: u64 = 0;
-        let slot = self.latest_epoch_info.slot_index;
         let current_slot = self.latest_epoch_info.absolute_slot;
 
         while let Some((tx, status_tx, error)) =
@@ -2555,9 +2856,8 @@ impl SurfnetSvm {
                 TransactionConfirmationStatus::Confirmed,
             ));
             let signature = tx.signatures[0];
-            let finalized_at = self.latest_epoch_info.absolute_slot + FINALIZATION_SLOT_THRESHOLD;
             self.transactions_queued_for_finalization.push_back((
-                finalized_at,
+                current_slot,
                 tx,
                 status_tx,
                 error.clone(),
@@ -2566,7 +2866,7 @@ impl SurfnetSvm {
             self.notify_signature_subscribers(
                 SignatureSubscriptionType::confirmed(),
                 &signature,
-                slot,
+                current_slot,
                 error,
             );
 
@@ -2602,12 +2902,12 @@ impl SurfnetSvm {
     /// # Returns
     /// `Ok(())` on success, or `Err(SurfpoolError)` on error.
     fn finalize_transactions(&mut self) -> Result<(), SurfpoolError> {
-        let current_slot = self.latest_epoch_info.absolute_slot;
+        let finalized = self.slot_for_commitment(&CommitmentConfig::finalized());
         let mut requeue = VecDeque::new();
-        while let Some((finalized_at, tx, status_tx, error)) =
+        while let Some((slot, tx, status_tx, error)) =
             self.transactions_queued_for_finalization.pop_front()
         {
-            if current_slot >= finalized_at {
+            if slot <= finalized {
                 let _ = status_tx.try_send(TransactionStatusEvent::Success(
                     TransactionConfirmationStatus::Finalized,
                 ));
@@ -2631,7 +2931,7 @@ impl SurfnetSvm {
                     .unwrap_or(vec![]);
                 self.notify_logs_subscribers(signature, None, logs, CommitmentLevel::Finalized);
             } else {
-                requeue.push_back((finalized_at, tx, status_tx, error));
+                requeue.push_back((slot, tx, status_tx, error));
             }
         }
         // Requeue any transactions that are not yet finalized
@@ -2817,6 +3117,7 @@ impl SurfnetSvm {
         // sample. See https://solana.com/docs/rpc/websocket/slotsupdatessubscribe
         let slots_update_ts: u64 = Utc::now().timestamp_millis().max(0) as u64;
         let previous_chain_tip = self.chain_tip.clone();
+        let parent = self.parent_slot(slot);
         if slot.is_multiple_of(self.garbage_collection_interval_slots()) {
             debug!("Clearing liteSVM cache at slot {}", slot);
             self.inner.garbage_collect(self.feature_set.clone());
@@ -2827,19 +3128,20 @@ impl SurfnetSvm {
 
         let num_transactions = confirmed_signatures.len() as u64;
         let num_successful_transactions = num_transactions.saturating_sub(num_failed_transactions);
+        let block_time = (self.updated_at + self.block_time_lag()) as i64 / 1_000;
         self.updated_at += self.slot_time;
 
         // Only store blocks that have transactions (sparse block storage)
-        // Empty blocks can be reconstructed on-the-fly from their slot number
+        // Empty blocks can be reconstructed on-the-fly from their slot and the chain tip
         if !confirmed_signatures.is_empty() {
             self.blocks.store(
                 slot,
                 BlockHeader {
                     hash: self.chain_tip.hash.clone(),
                     previous_blockhash: previous_chain_tip.hash.clone(),
-                    block_time: self.updated_at as i64 / 1_000,
+                    block_time,
                     block_height: self.chain_tip.index,
-                    parent_slot: slot.saturating_sub(1),
+                    parent_slot: parent,
                     signatures: confirmed_signatures,
                 },
             )?;
@@ -2869,17 +3171,10 @@ impl SurfnetSvm {
         let total_transactions = self.latest_epoch_info.transaction_count.unwrap_or(0);
         self.latest_epoch_info.transaction_count = Some(total_transactions + num_transactions);
 
-        let parent_slot = self.latest_epoch_info.absolute_slot.saturating_sub(1);
-        let new_slot = self.latest_epoch_info.absolute_slot;
-        let root = new_slot.saturating_sub(FINALIZATION_SLOT_THRESHOLD);
-        self.notify_slot_subscribers(new_slot, parent_slot, root);
-
         // Emit `slotsUpdatesNotification` events for the lifecycle transition
         // we just completed:
         //   * `Frozen`     – the slot that was just closed (`slot`) is now
         //                    immutable; surface its execution stats.
-        //   * `CreatedBank`– the next slot (`new_slot`) has just been opened
-        //                    on top of `parent_slot` (= the freshly-frozen slot).
         // Surfpool's execution model has no gossip layer, so the
         // `FirstShredReceived` / `Completed` / `Dead` variants documented by
         // Solana are intentionally not produced here.
@@ -2898,45 +3193,9 @@ impl SurfnetSvm {
                 max_transactions_per_entry: num_transactions,
             },
         });
-        self.notify_slots_updates_subscribers(SlotUpdate::CreatedBank {
-            slot: new_slot,
-            parent: parent_slot,
-            timestamp: slots_update_ts,
-        });
 
-        let geyser_parent_slot = slot.saturating_sub(1);
-
-        // Emit confirmation for the same slot used by processed account/transaction updates.
-        self.geyser_events_tx
-            .send(GeyserEvent::UpdateSlotStatus {
-                slot,
-                parent: slot.checked_sub(1),
-                status: GeyserSlotStatus::Confirmed,
-            })
-            .ok();
-        // Mirror the Confirmed Geyser event as an `OptimisticConfirmation`
-        // notification for `slotsUpdatesSubscribe` clients.
-        self.notify_slots_updates_subscribers(SlotUpdate::OptimisticConfirmation {
-            slot,
-            timestamp: slots_update_ts,
-        });
-
-        // Notify geyser plugins of block metadata
-        let block_metadata = GeyserBlockMetadata {
-            slot,
-            blockhash: self.chain_tip.hash.clone(),
-            parent_slot: geyser_parent_slot,
-            parent_blockhash: previous_chain_tip.hash.clone(),
-            block_time: Some(self.updated_at as i64 / 1_000),
-            block_height: Some(self.chain_tip.index),
-            executed_transaction_count: num_transactions,
-            entry_count: 1, // Surfpool produces 1 entry per block
-        };
-        self.geyser_events_tx
-            .send(GeyserEvent::NotifyBlockMetadata(block_metadata))
-            .ok();
-
-        // Notify geyser plugins of entry (Surfpool emits 1 entry per block)
+        // The block's entry goes before its metadata: Yellowstone drops the metadata of an empty
+        // block whose entry arrives after it.
         let entry_hash = solana_hash::Hash::from_str(&self.chain_tip.hash)
             .map(|h| h.to_bytes().to_vec())
             .unwrap_or_else(|_| vec![0u8; 32]);
@@ -2952,36 +3211,72 @@ impl SurfnetSvm {
             .send(GeyserEvent::NotifyEntry(entry_info))
             .ok();
 
-        let clock: Clock = Clock {
-            slot: self.latest_epoch_info.absolute_slot,
-            epoch: self.latest_epoch_info.epoch,
-            unix_timestamp: self.updated_at as i64 / 1_000,
-            epoch_start_timestamp: 0, // todo
-            leader_schedule_epoch: 0, // todo
+        // Notify geyser plugins of block metadata
+        let block_metadata = GeyserBlockMetadata {
+            slot,
+            blockhash: self.chain_tip.hash.clone(),
+            parent_slot: parent,
+            parent_blockhash: previous_chain_tip.hash.clone(),
+            block_time: Some(block_time),
+            block_height: Some(self.chain_tip.index),
+            executed_transaction_count: num_transactions,
+            entry_count: 1, // Surfpool produces 1 entry per block
         };
+        self.geyser_events_tx
+            .send(GeyserEvent::NotifyBlockMetadata(block_metadata))
+            .ok();
+
+        // The block's statuses follow its data. Confirmed carries no parent, as in Agave.
+        self.emit_slot_status(
+            slot,
+            Some(parent),
+            GeyserSlotStatus::Processed,
+            slots_update_ts,
+        );
+        self.emit_slot_status(slot, None, GeyserSlotStatus::Confirmed, slots_update_ts);
+        self.notify_block_subscribers(slot, CommitmentLevel::Confirmed);
+
+        let epoch_schedule = self.inner.get_sysvar::<EpochSchedule>();
+        let mut closed = self.inner.get_sysvar::<Clock>();
+        // Under Alpenglow the footer of an epoch's first block starts the epoch at the time the
+        // block ended, the time the next slot opens at (`Bank::update_clock_from_footer`).
+        if self
+            .feature_set
+            .is_active(&agave_feature_set::alpenglow::id())
+            && epoch_schedule.get_epoch(slot.saturating_sub(1)) != closed.epoch
+        {
+            closed.epoch_start_timestamp = self.updated_at as i64 / 1_000;
+        }
+        let clock = clock_for_slot(
+            self.latest_epoch_info.absolute_slot,
+            self.updated_at as i64 / 1_000,
+            Some(&closed),
+            &epoch_schedule,
+        );
 
         let _ = self.simnet_events_tx.system_clock_updated(clock.clone());
         self.inner.set_sysvar(&clock);
 
         self.finalize_transactions()?;
 
-        // Notify geyser plugins of newly rooted (finalized) slot
-        // Only emit if root is a valid slot (greater than genesis)
-        if root >= self.genesis_slot {
-            self.geyser_events_tx
-                .send(GeyserEvent::UpdateSlotStatus {
-                    slot: root,
-                    parent: root.checked_sub(1),
-                    status: GeyserSlotStatus::Rooted,
-                })
-                .ok();
-            // Mirror the Rooted Geyser event as a `Root` notification for
-            // `slotsUpdatesSubscribe` clients.
-            self.notify_slots_updates_subscribers(SlotUpdate::Root {
-                slot: root,
-                timestamp: slots_update_ts,
-            });
+        // Notify geyser plugins of newly rooted (finalized) slots: the blocks after the parent
+        // block's root, in order.
+        let rooted_before = self.blocks_back(parent, self.finalization_slot_threshold() - 1);
+        let root = self.slot_for_commitment(&CommitmentConfig::finalized());
+        let roots = self.block_runs((rooted_before + 1).max(self.genesis_slot), root);
+        for root in roots.into_iter().flatten() {
+            let parent = self.parent_slot(root);
+            self.emit_slot_status(
+                root,
+                Some(parent),
+                GeyserSlotStatus::Rooted,
+                slots_update_ts,
+            );
+            self.notify_block_subscribers(root, CommitmentLevel::Finalized);
         }
+
+        // The next slot is announced last, so none of its data can precede it.
+        self.announce_open_slot();
 
         // Evict the accounts marked as streamed from cache to enforce them to be fetched again
         let accounts_to_reset: Vec<_> = self.streamed_accounts.into_iter()?.collect();
@@ -3265,28 +3560,22 @@ impl SurfnetSvm {
 
                 match prepare_phoenix_override(
                     self,
+                    &override_instance.template_id,
                     &account_pubkey,
                     &account,
                     &account_values,
                     remote_ctx,
-                    // Only an account core has just refetched counts as fresh.
-                    fetch_from_upstream && settled_this_slot.contains(&account_pubkey),
                     target_slot,
                 )
                 .await
                 {
                     Ok(Some(writes)) => {
-                        for (pubkey, written) in writes {
-                            if let Err(e) =
-                                self.set_scenario_override_account(&pubkey, written, target_slot)
-                            {
-                                warn!(
-                                    "Failed to set {} for override {}: {}",
-                                    pubkey, override_instance.id, e
-                                );
-                                break;
-                            }
-                            settled_this_slot.insert(pubkey);
+                        match write_all_or_none(self, writes, target_slot) {
+                            Ok(written) => settled_this_slot.extend(written),
+                            Err(e) => warn!(
+                                "Skipping override {} for {}: {}",
+                                override_instance.id, account_pubkey, e
+                            ),
                         }
                         continue;
                     }
@@ -3608,19 +3897,11 @@ impl SurfnetSvm {
         signature: &Signature,
         subscription_type: SignatureSubscriptionType,
     ) -> SurfpoolResult<LocalSignatureStatusOrSubscription> {
-        let current_slot = self.get_latest_absolute_slot();
         if let Some(SurfnetTransactionStatus::Processed(transaction)) =
             self.transactions.get(&signature.to_string())?
         {
             let (transaction, _) = transaction.as_ref();
-            let confirmation_status =
-                if current_slot >= transaction.slot + FINALIZATION_SLOT_THRESHOLD {
-                    RpcTransactionConfirmationStatus::Finalized
-                } else if current_slot > transaction.slot {
-                    RpcTransactionConfirmationStatus::Confirmed
-                } else {
-                    RpcTransactionConfirmationStatus::Processed
-                };
+            let confirmation_status = self.confirmation_status(transaction.slot);
 
             if subscription_type.is_satisfied_by(confirmation_status) {
                 return Ok(LocalSignatureStatusOrSubscription::Status(
@@ -3641,7 +3922,7 @@ impl SurfnetSvm {
         &mut self,
         account_pubkey: &Pubkey,
         encoding: Option<UiAccountEncoding>,
-    ) -> Receiver<UiAccount> {
+    ) -> Receiver<(Slot, UiAccount)> {
         let (tx, rx) = unbounded();
         self.account_subscriptions
             .entry(*account_pubkey)
@@ -3655,7 +3936,7 @@ impl SurfnetSvm {
         program_id: &Pubkey,
         encoding: Option<UiAccountEncoding>,
         filters: Option<Vec<RpcFilterType>>,
-    ) -> Receiver<RpcKeyedAccount> {
+    ) -> Receiver<(Slot, RpcKeyedAccount)> {
         let (tx, rx) = unbounded();
         self.program_subscriptions
             .entry(*program_id)
@@ -3701,6 +3982,7 @@ impl SurfnetSvm {
         account_updated_pubkey: &Pubkey,
         account: &Account,
     ) {
+        let slot = self.get_latest_absolute_slot();
         let mut remaining = vec![];
         if let Some(subscriptions) = self.account_subscriptions.remove(account_updated_pubkey) {
             for (encoding, tx) in subscriptions {
@@ -3711,7 +3993,7 @@ impl SurfnetSvm {
                 let account = self
                     .account_to_rpc_keyed_account(account_updated_pubkey, account, &config, None)
                     .account;
-                if tx.send(account).is_err() {
+                if tx.send((slot, account)).is_err() {
                     // The receiver has been dropped, so we can skip notifying
                     continue;
                 } else {
@@ -3727,6 +4009,7 @@ impl SurfnetSvm {
 
     pub fn notify_program_subscribers(&mut self, account_pubkey: &Pubkey, account: &Account) {
         let program_id = account.owner;
+        let slot = self.get_latest_absolute_slot();
         let mut remaining = vec![];
         if let Some(subscriptions) = self.program_subscriptions.remove(&program_id) {
             for (encoding, filters, tx) in subscriptions {
@@ -3745,7 +4028,7 @@ impl SurfnetSvm {
                 };
                 let keyed_account =
                     self.account_to_rpc_keyed_account(account_pubkey, account, &config, None);
-                if tx.send(keyed_account).is_err() {
+                if tx.send((slot, keyed_account)).is_err() {
                     // The receiver has been dropped, so we can skip notifying
                     continue;
                 } else {
@@ -3772,10 +4055,17 @@ impl SurfnetSvm {
         config: &RpcBlockConfig,
     ) -> SurfpoolResult<Option<UiConfirmedBlock>> {
         // Try to get stored block, or reconstruct empty block if within valid range
-        let Some(block) = self.get_block_or_reconstruct(slot)? else {
-            return Ok(None);
-        };
+        self.get_block_or_reconstruct(slot)?
+            .map(|block| self.encode_block(block, config))
+            .transpose()
+    }
 
+    /// Encodes `block` as getBlock answers it.
+    fn encode_block(
+        &self,
+        block: BlockHeader,
+        config: &RpcBlockConfig,
+    ) -> SurfpoolResult<UiConfirmedBlock> {
         let transaction_details = config.transaction_details.unwrap_or_default();
         // Signatures mode answers from the block header, so a missing tx record
         // cannot drop a signature and no transaction is loaded.
@@ -3813,7 +4103,7 @@ impl SurfnetSvm {
             },
         )?;
         block.signatures = signatures;
-        Ok(Some(block))
+        Ok(block)
     }
 
     /// Gets all accounts owned by a specific program ID from the account registry.
@@ -4071,6 +4361,51 @@ impl SurfnetSvm {
             .retain(|tx| tx.send(arc.clone()).is_ok());
     }
 
+    /// Sends a slot status to Geyser plugins and mirrors it to `slotsUpdatesSubscribe`, so the
+    /// two streams can't disagree.
+    fn emit_slot_status(
+        &mut self,
+        slot: Slot,
+        parent: Option<Slot>,
+        status: GeyserSlotStatus,
+        timestamp: u64,
+    ) {
+        let update = match status {
+            GeyserSlotStatus::CreatedBank => Some(SlotUpdate::CreatedBank {
+                slot,
+                parent: parent.unwrap_or_default(),
+                timestamp,
+            }),
+            GeyserSlotStatus::Processed => None,
+            GeyserSlotStatus::Confirmed => {
+                Some(SlotUpdate::OptimisticConfirmation { slot, timestamp })
+            }
+            GeyserSlotStatus::Rooted => Some(SlotUpdate::Root { slot, timestamp }),
+        };
+        self.geyser_events_tx
+            .send(GeyserEvent::UpdateSlotStatus {
+                slot,
+                parent,
+                status,
+            })
+            .ok();
+        if let Some(update) = update {
+            self.notify_slots_updates_subscribers(update);
+        }
+    }
+
+    /// Announces the open slot on its parent block, as Agave does when it creates the slot's
+    /// bank: at startup, after each block, after a time travel and a reset. A skipped slot gets
+    /// none.
+    pub fn announce_open_slot(&mut self) {
+        let slot = self.get_latest_absolute_slot();
+        let parent = self.parent_slot(slot);
+        let root = self.slot_for_commitment(&CommitmentConfig::finalized());
+        self.notify_slot_subscribers(slot, parent, root);
+        let timestamp = Utc::now().timestamp_millis().max(0) as u64;
+        self.emit_slot_status(slot, Some(parent), GeyserSlotStatus::CreatedBank, timestamp);
+    }
+
     pub fn write_simulated_profile_result(
         &mut self,
         uuid: Uuid,
@@ -4177,6 +4512,85 @@ impl SurfnetSvm {
                 let _ = tx.send((self.get_latest_absolute_slot(), message));
             }
         }
+    }
+
+    pub fn subscribe_for_block_updates(
+        &mut self,
+        commitment_level: CommitmentLevel,
+        mentions: Option<Pubkey>,
+        config: RpcBlockConfig,
+    ) -> Arc<Receiver<RpcBlockUpdate>> {
+        let (tx, rx) = unbounded();
+        let rx = Arc::new(rx);
+        self.block_subscriptions.push((
+            commitment_level,
+            mentions,
+            config,
+            tx,
+            Arc::downgrade(&rx),
+        ));
+        rx
+    }
+
+    /// Sends the block at `slot` to the `blockSubscribe` subscribers at `commitment_level`,
+    /// encoded as getBlock answers it. A subscriber to the blocks that mention an account gets
+    /// only the transactions that do, and no notification for a block where none do.
+    fn notify_block_subscribers(&mut self, slot: Slot, commitment_level: CommitmentLevel) {
+        if self.block_subscriptions.is_empty() {
+            return;
+        }
+        let Ok(Some(block)) = self.get_block_or_reconstruct(slot) else {
+            return;
+        };
+        let mentions = |signature: &Signature, account: &Pubkey| {
+            let Ok(Some(status)) = self.transactions.get(&signature.to_string()) else {
+                return false;
+            };
+            status.as_processed().is_some_and(|(tx, _)| {
+                let loaded = &tx.meta.loaded_addresses;
+                tx.transaction
+                    .message
+                    .static_account_keys()
+                    .iter()
+                    .chain(&loaded.writable)
+                    .chain(&loaded.readonly)
+                    .any(|key| key == account)
+            })
+        };
+        let subscriptions = std::mem::take(&mut self.block_subscriptions);
+        self.block_subscriptions = subscriptions
+            .into_iter()
+            .filter(|(level, account, config, tx, rx)| {
+                if rx.strong_count() == 0 {
+                    return false;
+                }
+                if *level != commitment_level {
+                    return true;
+                }
+                let mut block = block.clone();
+                if let Some(account) = account {
+                    block
+                        .signatures
+                        .retain(|signature| mentions(signature, account));
+                    if block.signatures.is_empty() {
+                        return true;
+                    }
+                }
+                let update = match self.encode_block(block, config) {
+                    Ok(block) => RpcBlockUpdate {
+                        slot,
+                        block: Some(block),
+                        err: None,
+                    },
+                    Err(_) => RpcBlockUpdate {
+                        slot,
+                        block: None,
+                        err: Some(RpcBlockUpdateError::BlockStoreError),
+                    },
+                };
+                tx.send(update).is_ok()
+            })
+            .collect();
     }
 
     /// Registers a snapshot subscription and returns a sender and receiver for notifications.
@@ -5984,45 +6398,116 @@ mod tests {
             surfnet_id,
             ..SurfnetSvmConfig::default()
         };
-        let checkpoint_slot = {
-            let (mut svm, _events_rx, _geyser_rx) =
+        let (open, height, tip) = {
+            // Nothing drains Geyser here, so its receiver is dropped: a full channel would block.
+            let (mut svm, _events_rx, _) =
                 SurfnetSvm::new_with_db(Some(database_url), config.clone()).unwrap();
-            let target_slot = svm
-                .checkpoint_interval_slots()
-                .max(FINALIZATION_SLOT_THRESHOLD);
+            let target_slot = svm.checkpoint_interval_slots().max(INITIAL_SLOT);
             while svm.get_latest_absolute_slot() <= target_slot {
                 svm.confirm_current_block().unwrap();
             }
-
-            let checkpoint_slot = svm
-                .slot_checkpoint
-                .get(&"latest_slot".to_string())
-                .unwrap()
-                .expect("checkpoint slot should be persisted");
             svm.shutdown();
-            checkpoint_slot
+            (
+                svm.get_latest_absolute_slot(),
+                svm.latest_epoch_info.block_height,
+                svm.chain_tip.clone(),
+            )
+        };
+
+        // The slot after the last block reopens, on top of it: the height is not the slot.
+        let (mut svm, _events_rx, _geyser_rx) =
+            SurfnetSvm::new_with_db(Some(database_url), config).unwrap();
+        assert_eq!(svm.get_latest_absolute_slot(), open);
+        assert_eq!(svm.latest_epoch_info.block_height, height);
+        assert_eq!(svm.chain_tip, tip);
+        assert_eq!(svm.inner.get_sysvar::<Clock>().slot, open);
+
+        svm.confirm_current_block().unwrap();
+        assert_eq!(
+            svm.chain_tip.hash,
+            SyntheticBlockhash::new(height).to_string()
+        );
+    }
+
+    /// A restart keeps the chain as it was: the slots a time travel skipped stay skipped, the
+    /// empty blocks read back with the height, hash and time they had, including a time set at
+    /// the open slot, no slot is produced twice, and the height goes on.
+    #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
+    #[cfg_attr(feature = "postgres", test_case(TestType::postgres(); "with postgres db"))]
+    fn test_new_with_db_restores_time_travel_skips(test_type: TestType) {
+        let (database_url, surfnet_id) = match &test_type {
+            TestType::OnDiskSqlite(db_path) => (db_path.as_str(), "time-travel-skips".to_string()),
+            #[cfg(feature = "postgres")]
+            TestType::Postgres { url, surfnet_id } => (url.as_str(), surfnet_id.clone()),
+            _ => unreachable!("test case must provide persistent database storage"),
+        };
+        let config = SurfnetSvmConfig {
+            surfnet_id,
+            ..SurfnetSvmConfig::default()
+        };
+        let read = |svm: &SurfnetSvm, slots: &[Slot]| -> Vec<(u64, String, i64, Slot)> {
+            slots
+                .iter()
+                .map(|&slot| {
+                    let block = svm.get_block_or_reconstruct(slot).unwrap().unwrap();
+                    (
+                        block.block_height,
+                        block.hash,
+                        block.block_time,
+                        block.parent_slot,
+                    )
+                })
+                .collect()
+        };
+        let (blocks, before, open, height) = {
+            let (mut svm, _events_rx, _geyser_rx) =
+                SurfnetSvm::new_with_db(Some(database_url), config.clone()).unwrap();
+            svm.confirm_current_block().unwrap();
+            let last_block = svm.get_latest_absolute_slot() - 1;
+            let landing = last_block + 10;
+            svm.travel_to(last_block + 5).unwrap();
+            svm.travel_to(landing).unwrap();
+            // `absoluteSlotAt` the open slot: a day earlier.
+            svm.updated_at -= 24 * 60 * 60 * 1_000;
+            let landing_time = ((svm.updated_at + svm.block_time_lag()) / 1_000) as i64;
+            svm.travel_to(landing).unwrap();
+            for _ in 0..3 {
+                svm.confirm_current_block().unwrap();
+            }
+            let blocks = vec![last_block, landing, landing + 1, landing + 2];
+            let before = read(&svm, &blocks);
+            assert_eq!((before[1].2, before[1].3), (landing_time, last_block));
+            svm.shutdown();
+            let height = svm.latest_epoch_info.block_height;
+            (blocks, before, svm.get_latest_absolute_slot(), height)
         };
 
         let (mut svm, _events_rx, _geyser_rx) =
             SurfnetSvm::new_with_db(Some(database_url), config).unwrap();
-        assert_eq!(svm.get_latest_absolute_slot(), checkpoint_slot);
-        assert_eq!(svm.latest_epoch_info.block_height, checkpoint_slot);
-        assert_eq!(svm.chain_tip.index, checkpoint_slot);
+        assert_eq!(svm.get_latest_absolute_slot(), open);
+        // The restart is no time travel: the last landing is still the travel's.
         assert_eq!(
-            svm.chain_tip.hash,
-            SyntheticBlockhash::new(checkpoint_slot - 1).to_string()
+            svm.landings.last_key_value().map(|(&slot, _)| slot),
+            Some(blocks[1])
         );
-
-        let clock = svm.inner.get_sysvar::<Clock>();
-        assert_eq!(clock.slot, checkpoint_slot);
-
-        let recovered_blockhash = svm.chain_tip.hash.clone();
+        assert_eq!(read(&svm, &blocks), before);
+        // SlotHashes holds the open slot and the blocks, each with the blockhash its
+        // transactions used (the block before's), and no skipped slot.
+        let slot_hashes = svm.inner.get_sysvar::<solana_slot_hashes::SlotHashes>();
+        let hashes: Vec<_> = blocks[1..]
+            .iter()
+            .chain([&open])
+            .map(|slot| slot_hashes.get(slot).copied())
+            .collect();
+        let streamed: Vec<_> = before
+            .iter()
+            .map(|block| Hash::from_str(&block.1).ok())
+            .collect();
+        assert_eq!(hashes, streamed);
+        assert!(slot_hashes.get(&(blocks[0] + 1)).is_none());
+        assert!(svm.get_block_or_reconstruct(blocks[0] + 1).is_err());
         svm.confirm_current_block().unwrap();
-        assert_eq!(
-            svm.chain_tip.hash,
-            SyntheticBlockhash::new(checkpoint_slot).to_string()
-        );
-        assert_ne!(svm.chain_tip.hash, recovered_blockhash);
+        assert_eq!(read(&svm, &[open])[0].0, height + 1);
     }
 
     #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
@@ -6047,7 +6532,7 @@ mod tests {
                 SurfnetSvm::new_with_db(Some(database_url), config.clone()).unwrap();
             let block_slot = svm
                 .checkpoint_interval_slots()
-                .max(FINALIZATION_SLOT_THRESHOLD)
+                .max(INITIAL_SLOT)
                 .saturating_add(7);
             svm.blocks
                 .store(
@@ -6068,14 +6553,18 @@ mod tests {
                     .unwrap()
                     .is_none()
             );
+            // A database from before the genesis anchor holds no chain to continue.
+            for key in ["genesis_slot", "genesis_height", "genesis_updated_at"] {
+                svm.slot_checkpoint.take(&key.to_string()).unwrap();
+            }
             svm.shutdown();
             block_slot
         };
 
         let (svm, _events_rx, _geyser_rx) =
             SurfnetSvm::new_with_db(Some(database_url), config).unwrap();
-        assert_eq!(svm.get_latest_absolute_slot(), block_slot);
-        assert_eq!(svm.latest_epoch_info.block_height, block_slot);
+        assert_eq!(svm.get_latest_absolute_slot(), block_slot + 1);
+        assert_eq!(svm.genesis_slot, block_slot + 1);
         assert_eq!(svm.last_checkpoint_slot, block_slot);
     }
 
@@ -6095,11 +6584,8 @@ mod tests {
         assert_eq!(svm.slot_time, 123);
         assert!(!svm.instruction_profiling_enabled);
         assert_eq!(svm.max_profiles, 17);
-        assert_eq!(
-            svm.latest_epoch_info.absolute_slot,
-            FINALIZATION_SLOT_THRESHOLD
-        );
-        assert_eq!(svm.genesis_slot, FINALIZATION_SLOT_THRESHOLD);
+        assert_eq!(svm.latest_epoch_info.absolute_slot, INITIAL_SLOT);
+        assert_eq!(svm.genesis_slot, INITIAL_SLOT);
         assert!(!svm.feature_set.is_active(&disable_fees_sysvar::id()));
 
         let epoch_schedule = svm.inner.get_sysvar::<EpochSchedule>();
@@ -6142,14 +6628,18 @@ mod tests {
             transaction_count: None,
         };
 
-        svm.initialize(epoch_info.clone(), EpochSchedule::without_warmup());
+        svm.initialize(epoch_info.clone(), EpochSchedule::without_warmup())
+            .unwrap();
 
         assert_eq!(svm.slot_time, 321);
         assert!(!svm.instruction_profiling_enabled);
         assert_eq!(svm.max_profiles, 23);
         assert!(!svm.feature_set.is_active(&disable_fees_sysvar::id()));
-        assert_eq!(svm.latest_epoch_info, epoch_info);
-        assert_eq!(svm.genesis_slot, 777);
+        // The local chain opens the slot after the remote's block, on top of it.
+        assert_eq!(svm.genesis_slot, 778);
+        svm.confirm_current_block().unwrap();
+        let block = svm.get_block_or_reconstruct(778).unwrap().unwrap();
+        assert_eq!((block.parent_slot, block.block_height), (777, 778));
     }
 
     #[test]
@@ -6163,7 +6653,9 @@ mod tests {
 
     #[test]
     fn test_blockhash_minted_during_finalized_warmup_stays_visible_at_finalized() {
-        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        let (mut svm, _events_rx, _geyser_rx) = TestType::no_db().initialize_svm_with_features(
+            SvmFeatureConfig::new().disable(agave_feature_set::alpenglow::id()),
+        );
         let finalized = CommitmentConfig::finalized();
         let confirm_blocks = |svm: &mut SurfnetSvm, count: u64| {
             for _ in 0..count {
@@ -6172,7 +6664,7 @@ mod tests {
         };
 
         // The chain is too short for finalized to have its own blockhash, so it hands out the tip.
-        confirm_blocks(&mut svm, FINALIZATION_SLOT_THRESHOLD - 2);
+        confirm_blocks(&mut svm, LEGACY_FINALIZATION_SLOT_THRESHOLD - 2);
         assert_eq!(svm.blockhash_for_commitment(&finalized), None);
         let warmup_blockhash = svm.latest_blockhash();
         assert!(svm.is_blockhash_visible_at(&warmup_blockhash, &finalized));
@@ -6184,7 +6676,7 @@ mod tests {
 
         let fresh_blockhash = svm.latest_blockhash();
         assert!(svm.is_blockhash_visible_at(&fresh_blockhash, &CommitmentConfig::confirmed()));
-        confirm_blocks(&mut svm, FINALIZATION_SLOT_THRESHOLD - 2);
+        confirm_blocks(&mut svm, LEGACY_FINALIZATION_SLOT_THRESHOLD - 2);
         assert!(!svm.is_blockhash_visible_at(&fresh_blockhash, &finalized));
         confirm_blocks(&mut svm, 1);
         assert!(svm.is_blockhash_visible_at(&fresh_blockhash, &finalized));
@@ -6397,12 +6889,12 @@ mod tests {
     #[test_case(TestType::no_db(); "with no db")]
     #[cfg_attr(feature = "postgres", test_case(TestType::postgres(); "with postgres db"))]
     fn test_feature_set_empty_config_uses_mainnet_baseline(test_type: TestType) {
-        // An empty `SvmFeatureConfig` should yield exactly the mainnet baseline:
-        // features active on mainnet are active; features not active on mainnet
-        // are inactive.
         let (svm, _events_rx, _geyser_rx) =
             test_type.initialize_svm_with_features(SvmFeatureConfig::new());
 
+        let baseline = LiteSVM::mainnet_feature_set();
+        assert_eq!(svm.feature_set.active(), baseline.active());
+        assert_eq!(svm.feature_set.inactive(), baseline.inactive());
         assert!(svm.feature_set.is_active(&disable_fees_sysvar::id()));
         assert!(!svm.feature_set.is_active(&enable_loader_v4::id()));
     }
@@ -6440,8 +6932,6 @@ mod tests {
     #[test_case(TestType::no_db(); "with no db")]
     #[cfg_attr(feature = "postgres", test_case(TestType::postgres(); "with postgres db"))]
     fn test_feature_set_mainnet_baseline(test_type: TestType) {
-        // Default config → exact mainnet baseline. Spot-check a representative
-        // sample of features on each side of the mainnet activation line.
         let (svm, _events_rx, _geyser_rx) =
             test_type.initialize_svm_with_features(SvmFeatureConfig::default());
 
@@ -6804,6 +7294,8 @@ mod tests {
         svm.latest_epoch_info.absolute_slot = 100;
         svm.genesis_updated_at = 1000000; // 1 second in ms
         svm.slot_time = 400; // 400ms per slot
+        // A block at every slot from 0 to 99: slot 99's is the 100th, at height 100.
+        svm.chain_tip = BlockIdentifier::new(100, "test_hash");
 
         // Request a slot that wasn't stored (no block stored at slot 50)
         let result = svm.get_block_or_reconstruct(50).unwrap();
@@ -6818,7 +7310,12 @@ mod tests {
             block.signatures.is_empty(),
             "reconstructed block should have no signatures"
         );
-        assert_eq!(block.block_height, 50);
+        assert_eq!(block.block_height, 51);
+        assert_eq!(block.hash, SyntheticBlockhash::new(50).to_string());
+        assert_eq!(
+            block.previous_blockhash,
+            SyntheticBlockhash::new(49).to_string()
+        );
         assert_eq!(block.parent_slot, 49);
 
         // Verify the block time is calculated correctly
@@ -6847,6 +7344,222 @@ mod tests {
         // Request slot after latest
         let result = svm.get_block_or_reconstruct(200).unwrap();
         assert!(result.is_none(), "should return None for slot after latest");
+    }
+
+    /// The blocks Geyser announced, and the slots it rooted, in the order it sent them.
+    fn streamed_blocks_and_roots(events: &[GeyserEvent]) -> (Vec<GeyserBlockMetadata>, Vec<Slot>) {
+        let (mut blocks, mut roots) = (vec![], vec![]);
+        for event in events {
+            match event {
+                GeyserEvent::NotifyBlockMetadata(block) => blocks.push(block.clone()),
+                GeyserEvent::UpdateSlotStatus {
+                    slot,
+                    status: GeyserSlotStatus::Rooted,
+                    ..
+                } => roots.push(*slot),
+                _ => {}
+            }
+        }
+        (blocks, roots)
+    }
+
+    /// `getBlock` answers each block as Geyser announced it, the empty blocks it reconstructs
+    /// included.
+    fn assert_blocks_read_as_streamed(svm: &SurfnetSvm, streamed: &[GeyserBlockMetadata]) {
+        for block in streamed {
+            let read = svm.get_block_or_reconstruct(block.slot).unwrap().unwrap();
+            assert_eq!(
+                (
+                    read.hash,
+                    read.previous_blockhash,
+                    Some(read.block_height),
+                    read.parent_slot,
+                    Some(read.block_time)
+                ),
+                (
+                    block.blockhash.clone(),
+                    block.parent_blockhash.clone(),
+                    block.block_height,
+                    block.parent_slot,
+                    block.block_time
+                ),
+                "slot {}",
+                block.slot
+            );
+        }
+    }
+
+    /// The local chain starts at a slot that is not its height, so an empty block's height and
+    /// hashes cannot be derived from its slot. A block's time is the Clock its transactions
+    /// read under TowerBFT, and the time it ended under Alpenglow.
+    #[test_case(false; "towerbft")]
+    #[test_case(true; "alpenglow")]
+    fn empty_blocks_read_back_as_streamed(alpenglow: bool) {
+        let features = match alpenglow {
+            true => SvmFeatureConfig::new().enable(agave_feature_set::alpenglow::id()),
+            false => SvmFeatureConfig::new().disable(agave_feature_set::alpenglow::id()),
+        };
+        let (mut svm, _events_rx, geyser_rx) =
+            TestType::no_db().initialize_svm_with_features(features);
+        let mut clock_times = vec![];
+        for _ in 0..5 {
+            let opened = svm.updated_at as i64;
+            assert_eq!(
+                svm.inner.get_sysvar::<Clock>().unix_timestamp,
+                opened / 1_000
+            );
+            clock_times.push(opened);
+            svm.confirm_current_block().unwrap();
+        }
+
+        let (blocks, _) = streamed_blocks_and_roots(&geyser_rx.try_iter().collect::<Vec<_>>());
+        let ended = if alpenglow { svm.slot_time as i64 } else { 0 };
+        let expected: Vec<_> = clock_times
+            .iter()
+            .map(|t| Some((t + ended) / 1_000))
+            .collect();
+        let streamed: Vec<_> = blocks.iter().map(|block| block.block_time).collect();
+        assert_eq!(streamed, expected);
+        assert_blocks_read_as_streamed(&svm, &blocks);
+    }
+
+    /// A forward time travel skips the slots it jumps, as a leader's missed slots are: the
+    /// block it lands on is built on the last block, the skipped slots hold none, heights stay
+    /// consecutive, and every block is rooted once and in order, the ones before the jump too.
+    /// Two travels with no block between skip as one.
+    #[test]
+    fn time_travel_skips_the_slots_it_jumps() {
+        let (mut svm, _events_rx, geyser_rx) = SurfnetSvm::default();
+        let finalized_blocks = svm.subscribe_for_block_updates(
+            CommitmentLevel::Finalized,
+            None,
+            RpcBlockConfig::default(),
+        );
+        for _ in 0..3 {
+            svm.confirm_current_block().unwrap();
+        }
+        let last_block = svm.get_latest_absolute_slot() - 1;
+        let landing = last_block + 100;
+        svm.travel_to(last_block + 50).unwrap();
+        svm.travel_to(landing).unwrap();
+        assert_eq!(
+            svm.slot_for_commitment(&CommitmentConfig::confirmed()),
+            last_block
+        );
+        // The open slot's SlotHashes entry moved to the landing: no skipped slot has one.
+        let slot_hashes = svm.inner.get_sysvar::<SlotHashes>();
+        assert_eq!(
+            slot_hashes[..2],
+            [(landing, svm.latest_blockhash()), slot_hashes[1]]
+        );
+        assert_eq!(slot_hashes[1].0, last_block);
+        for _ in 0..=svm.finalization_slot_threshold() {
+            svm.confirm_current_block().unwrap();
+        }
+
+        let events: Vec<_> = geyser_rx.try_iter().collect();
+        let (blocks, roots) = streamed_blocks_and_roots(&events);
+        for pair in blocks.windows(2) {
+            assert_eq!(
+                (pair[1].parent_slot, pair[1].block_height),
+                (pair[0].slot, pair[0].block_height.map(|height| height + 1))
+            );
+        }
+        assert!(blocks.iter().any(|block| block.slot == landing));
+        assert_blocks_read_as_streamed(&svm, &blocks);
+        // Rooted by now: Agave's `SlotSkipped`.
+        for slot in last_block + 1..landing {
+            let error = svm.get_block_or_reconstruct(slot).unwrap_err();
+            assert_eq!(jsonrpc_core::Error::from(error).code.code(), -32007);
+        }
+        let produced: Vec<Slot> = blocks.iter().map(|block| block.slot).collect();
+        assert_eq!(roots, produced[..roots.len()]);
+        assert!(roots.contains(&last_block) && roots.contains(&landing));
+        // Around the jump, Geyser hears each block's entry, then its metadata, Processed and
+        // Confirmed; the landing announced on the last block before content can reach it; each
+        // block rooted once, with its parent; and nothing for a skipped slot.
+        let lifecycle: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                GeyserEvent::UpdateSlotStatus {
+                    slot,
+                    parent,
+                    status,
+                } => Some((*slot, format!("{status:?}"), *parent)),
+                GeyserEvent::NotifyEntry(entry) => Some((entry.slot, "Entry".into(), None)),
+                GeyserEvent::NotifyBlockMetadata(block) => {
+                    Some((block.slot, "BlockMeta".into(), None))
+                }
+                _ => None,
+            })
+            .filter(|(slot, ..)| (last_block..=landing).contains(slot))
+            .collect();
+        let (last, before) = (last_block, last_block - 1);
+        let expected = [
+            (last, "CreatedBank", Some(before)),
+            (last, "Entry", None),
+            (last, "BlockMeta", None),
+            (last, "Processed", Some(before)),
+            (last, "Confirmed", None),
+            (last + 1, "CreatedBank", Some(last)),
+            (last + 50, "CreatedBank", Some(last)),
+            (landing, "CreatedBank", Some(last)),
+            (landing, "Entry", None),
+            (landing, "BlockMeta", None),
+            (landing, "Processed", Some(last)),
+            (landing, "Confirmed", None),
+            (last, "Rooted", Some(before)),
+            (landing, "Rooted", Some(last)),
+        ]
+        .map(|(slot, status, parent)| (slot, status.to_string(), parent));
+        assert_eq!(lifecycle, expected);
+        let finalized: Vec<Slot> = finalized_blocks
+            .try_iter()
+            .map(|update| update.slot)
+            .collect();
+        assert_eq!(finalized, roots);
+        // Travelling back into the gap abandons the landing past it: the open slot holds a block.
+        svm.travel_to(last_block + 10).unwrap();
+        assert!(
+            svm.get_block_or_reconstruct(last_block + 10)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// A time travel as far as mainnet's slot costs the block that lands it no more than any
+    /// other: rooting walks the runs of blocks, not the slots skipped between them. And its gap
+    /// adds no depth: as a tower roots, one vote per block, the blocks before it root once 30
+    /// blocks sit on top of them.
+    #[test]
+    fn a_jump_to_mainnet_slot_roots_the_blocks_before_it_by_block_depth() {
+        let (mut svm, _events_rx, geyser_rx) = TestType::no_db().initialize_svm_with_features(
+            SvmFeatureConfig::new().disable(agave_feature_set::alpenglow::id()),
+        );
+        for _ in 0..3 {
+            svm.confirm_current_block().unwrap();
+        }
+        let landing = 458_887_083;
+        svm.travel_to(landing).unwrap();
+        let started = std::time::Instant::now();
+        svm.confirm_current_block().unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+
+        let (blocks, roots) = streamed_blocks_and_roots(&geyser_rx.try_iter().collect::<Vec<_>>());
+        let before_jump: Vec<Slot> = blocks
+            .iter()
+            .map(|block| block.slot)
+            .filter(|slot| *slot < landing)
+            .collect();
+        assert_eq!(before_jump.len(), 3);
+        assert!(roots.is_empty());
+        for _ in 1..svm.finalization_slot_threshold() - 1 {
+            svm.confirm_current_block().unwrap();
+        }
+        assert_eq!(
+            streamed_blocks_and_roots(&geyser_rx.try_iter().collect::<Vec<_>>()).1,
+            before_jump
+        );
     }
 
     #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
@@ -6897,10 +7610,12 @@ mod tests {
     fn test_reconstruct_sysvars_slot_hashes(test_type: TestType) {
         use solana_slot_hashes::SlotHashes;
 
-        let (mut svm, _events_rx, _geyser_rx) = test_type.initialize_svm();
+        let (mut svm, _events_rx, _geyser_rx) = test_type.initialize_svm_with_features(
+            SvmFeatureConfig::new().disable(agave_feature_set::alpenglow::id()),
+        );
 
-        // Set up: chain_tip.index = 5, genesis_slot = 100 (absolute slot = 105)
-        svm.chain_tip = BlockIdentifier::new(5, "test_hash");
+        // Set up: genesis_slot = 100 at chain_tip.index 1, five blocks on (absolute slot = 105)
+        svm.chain_tip = synthetic_chain_tip_at_index(6);
         svm.genesis_slot = 100;
         svm.latest_epoch_info.absolute_slot = 105;
 
@@ -6916,16 +7631,8 @@ mod tests {
             slot_hashes.get(&74).is_some(),
             "SlotHashes should contain the finalized warmup floor"
         );
-
-        // Check that slot 105 maps to hash for index 5
-        let expected_hash_105 = SyntheticBlockhash::new(5);
-        let hash_for_105 = slot_hashes.get(&105);
-        assert!(hash_for_105.is_some(), "SlotHashes should contain slot 105");
-        assert_eq!(
-            hash_for_105.unwrap(),
-            expected_hash_105.hash(),
-            "Hash for slot 105 should match SyntheticBlockhash for index 5"
-        );
+        // The open slot holds the blockhash its transactions use.
+        assert_eq!(slot_hashes.get(&105), Some(&svm.latest_blockhash()));
 
         // Check that slot 100 maps to hash for index 0
         let expected_hash_100 = SyntheticBlockhash::new(0);
@@ -6936,6 +7643,15 @@ mod tests {
             expected_hash_100.hash(),
             "Hash for slot 100 should match SyntheticBlockhash for index 0"
         );
+
+        // Closing slot 105 keys the next blockhash by the slot that opens, above the rebuilt
+        // entries.
+        let open_hash = svm.latest_blockhash();
+        svm.confirm_current_block().unwrap();
+        assert_eq!(
+            svm.inner.get_sysvar::<SlotHashes>()[..2],
+            [(106, svm.latest_blockhash()), (105, open_hash)]
+        );
     }
 
     #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
@@ -6945,10 +7661,12 @@ mod tests {
     fn test_reconstruct_sysvars_slot_hashes_cover_finalized_warmup(test_type: TestType) {
         use solana_slot_hashes::SlotHashes;
 
-        let (mut svm, _events_rx, _geyser_rx) = test_type.initialize_svm();
+        let (mut svm, _events_rx, _geyser_rx) = test_type.initialize_svm_with_features(
+            SvmFeatureConfig::new().disable(agave_feature_set::alpenglow::id()),
+        );
 
         svm.chain_tip = BlockIdentifier::new(9, "test_hash");
-        svm.genesis_slot = FINALIZATION_SLOT_THRESHOLD;
+        svm.genesis_slot = INITIAL_SLOT;
         svm.latest_epoch_info.absolute_slot = 40;
 
         svm.reconstruct_sysvars();
@@ -6957,7 +7675,7 @@ mod tests {
 
         assert_eq!(
             slot_hashes.len(),
-            (FINALIZATION_SLOT_THRESHOLD + 1) as usize
+            (LEGACY_FINALIZATION_SLOT_THRESHOLD + 1) as usize
         );
         assert!(
             slot_hashes.get(&9).is_some(),
@@ -6976,27 +7694,34 @@ mod tests {
     fn test_reconstruct_sysvars_clock(test_type: TestType) {
         let (mut svm, _events_rx, _geyser_rx) = test_type.initialize_svm();
 
-        // Set up: chain_tip.index = 50, genesis_slot = 1000 (absolute slot = 1050)
+        // Set up: chain_tip.index = 50, genesis_slot = 2_161_000 (absolute slot 2_161_050, epoch 5)
         svm.chain_tip = BlockIdentifier::new(50, "test_hash");
-        svm.genesis_slot = 1000;
-        svm.latest_epoch_info.absolute_slot = 1050;
-        svm.latest_epoch_info.epoch = 5;
+        svm.genesis_slot = 2_161_000;
+        svm.latest_epoch_info.absolute_slot = 2_161_050;
         svm.genesis_updated_at = 2_000_000; // 2 seconds in ms
         svm.slot_time = 400; // 400ms per slot
+        // As after a restart, block production resumes earlier than the rebuilt Clock.
+        svm.updated_at = 2_010_000;
 
         svm.reconstruct_sysvars();
 
         // Verify Clock sysvar
         let clock = svm.inner.get_sysvar::<Clock>();
 
-        assert_eq!(clock.slot, 1050, "Clock slot should be absolute slot");
-        assert_eq!(clock.epoch, 5, "Clock epoch should match latest_epoch_info");
+        assert_eq!(clock.slot, 2_161_050, "Clock slot should be absolute slot");
+        assert_eq!(
+            clock.epoch, 5,
+            "Clock epoch should come from the epoch schedule"
+        );
 
         // Expected timestamp: genesis_updated_at + (50 slots * 400ms) = 2_000_000 + 20_000 = 2_020_000ms = 2020 seconds
         assert_eq!(
             clock.unix_timestamp, 2020,
             "Clock unix_timestamp should be calculated correctly"
         );
+        // The epoch starts no later than the time the next blocks write.
+        assert_eq!(clock.epoch_start_timestamp, 2010);
+        assert_eq!(clock.leader_schedule_epoch, 6);
     }
 
     #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
@@ -8312,6 +9037,54 @@ mod tests {
         }
     }
 
+    /// Block after block, the Clock carries the epoch's start time over and resets it at the first
+    /// block of the next epoch, with the leader schedule epoch the schedule gives the slot, as
+    /// Agave's `Bank::update_clock` writes it.
+    /// Under Alpenglow, the footer of the epoch's first block moves the epoch's start to the time
+    /// that block ended (`Bank::update_clock_from_footer`).
+    #[test_case(false; "towerbft")]
+    #[test_case(true; "alpenglow")]
+    fn clock_epoch_fields_follow_agave_across_an_epoch_boundary(alpenglow: bool) {
+        let features = match alpenglow {
+            true => SvmFeatureConfig::new().enable(agave_feature_set::alpenglow::id()),
+            false => SvmFeatureConfig::new().disable(agave_feature_set::alpenglow::id()),
+        };
+        let (mut svm, _events_rx, _geyser_rx) =
+            TestType::no_db().initialize_svm_with_features(features);
+        svm.slot_time = 1_000;
+        svm.updated_at = 1_000_000;
+        svm.latest_epoch_info.absolute_slot = 431_998;
+        svm.inner.set_sysvar(&Clock {
+            slot: 431_998,
+            epoch_start_timestamp: 7,
+            epoch: 0,
+            leader_schedule_epoch: 1,
+            unix_timestamp: 1_000,
+        });
+
+        let mut seen = vec![];
+        for _ in 0..3 {
+            svm.confirm_current_block().unwrap();
+            let clock = svm.inner.get_sysvar::<Clock>();
+            seen.push((
+                clock.slot,
+                clock.unix_timestamp,
+                clock.epoch,
+                clock.epoch_start_timestamp,
+                clock.leader_schedule_epoch,
+            ));
+        }
+
+        assert_eq!(
+            seen,
+            [
+                (431_999, 1_001, 0, 7, 1),
+                (432_000, 1_002, 1, 1_002, 2),
+                (432_001, 1_003, 1, if alpenglow { 1_003 } else { 1_002 }, 2),
+            ]
+        );
+    }
+
     /// Garbage collection rebuilds LiteSVM, and must keep the epoch schedule the surfnet was
     /// started with: the epoch info is derived from it.
     #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
@@ -8531,7 +9304,7 @@ mod tests {
             .unwrap();
 
         let account = svm.get_account(&account_pubkey).unwrap().unwrap();
-        let update = updates
+        let (_, update) = updates
             .try_recv()
             .expect("the override must notify the account's subscribers");
         assert_eq!(update.data.decode(), Some(account.data));

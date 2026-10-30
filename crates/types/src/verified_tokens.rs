@@ -92,7 +92,7 @@ pub static VERIFIED_TOKENS_BY_SYMBOL: Lazy<HashMap<String, TokenInfo>> = Lazy::n
 
 #[cfg(test)]
 mod tests {
-    use super::parse_csv_line;
+    use super::{VERIFIED_TOKENS, parse_csv_line};
 
     #[test]
     fn parse_csv_line_handles_quoted_fields() {
@@ -106,5 +106,12 @@ mod tests {
         let fields = parse_csv_line(r#"address,"""quoted""",QT,,6"#);
 
         assert_eq!(fields[1], r#""quoted""#);
+    }
+
+    #[test]
+    fn loads_every_row() {
+        let rows = include_str!("verified_tokens.csv").lines().skip(1).count();
+
+        assert_eq!(VERIFIED_TOKENS.len(), rows);
     }
 }

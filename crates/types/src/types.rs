@@ -789,7 +789,11 @@ pub enum SimnetCommand {
     SlotBackward(Option<Hash>),
     CommandClock(Option<(Hash, String)>, ClockCommand),
     UpdateInternalClock(Option<(Hash, String)>, Clock),
-    UpdateInternalClockWithConfirmation(Option<(Hash, String)>, Clock, Sender<EpochInfo>),
+    UpdateInternalClockWithConfirmation(
+        Option<(Hash, String)>,
+        Clock,
+        Sender<Result<EpochInfo, String>>,
+    ),
     UpdateBlockProductionMode(BlockProductionMode),
     /// Executes a transaction. `sendTransaction` enqueues this on the same
     /// channel as the startup commands below, so channel order decides which
@@ -921,6 +925,10 @@ pub struct SimnetConfig {
     /// Snapshot accounts to preload at startup.
     /// Keys are pubkey strings, values can be None to fetch from remote RPC.
     pub snapshot: BTreeMap<String, Option<AccountSnapshot>>,
+    /// Hash reported by `getGenesisHash`, overriding the datasource's (or, offline,
+    /// the local genesis config's), so clients can identify the surfnet as a cluster.
+    #[serde(default)]
+    pub genesis_hash: Option<solana_hash::Hash>,
 }
 
 impl Default for SimnetConfig {
@@ -940,6 +948,7 @@ impl Default for SimnetConfig {
             skip_blockhash_check: false,
             surfnet_id: "default".to_string(),
             snapshot: BTreeMap::new(),
+            genesis_hash: None,
         }
     }
 }

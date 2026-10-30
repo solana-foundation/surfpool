@@ -15,8 +15,7 @@ use solana_client::{
     rpc_custom_error::RpcCustomError,
     rpc_response::{
         RpcBlockhash, RpcConfirmedTransactionStatusWithSignature, RpcContactInfo,
-        RpcInflationReward, RpcPerfSample, RpcPrioritizationFee, RpcResponseContext,
-        RpcSimulateTransactionResult,
+        RpcInflationReward, RpcPerfSample, RpcPrioritizationFee, RpcSimulateTransactionResult,
     },
 };
 use solana_clock::{Slot, UnixTimestamp};
@@ -40,7 +39,7 @@ use surfpool_types::{
 use super::{
     RunloopContext, State, SurfnetRpcContext,
     utils::{
-        context_slot, decode_and_deserialize, decode_rpc_versioned_transaction,
+        decode_and_deserialize, decode_rpc_versioned_transaction,
         verify_and_parse_signatures_for_address_params, verify_pubkey,
     },
 };
@@ -48,9 +47,7 @@ use crate::{
     SURFPOOL_IDENTITY_PUBKEY,
     error::{SurfpoolError, SurfpoolResult},
     rpc::utils::{adjust_default_transaction_config, get_default_transaction_config},
-    surfnet::{
-        GetTransactionResult, locker::SvmAccessContext, svm::MAX_RECENT_BLOCKHASHES_STANDARD,
-    },
+    surfnet::GetTransactionResult,
     types::{SurfnetTransactionStatus, surfpool_tx_metadata_to_litesvm_tx_metadata},
 };
 
@@ -1078,7 +1075,7 @@ pub trait Full {
     ///   - `before`: Start search before this signature.
     ///   - `until`: Search until this signature (exclusive).
     ///   - `limit`: Maximum number of results to return (default: 1,000; max: 1,000).
-    ///   - `commitment`: The level of commitment desired (e.g., finalized).
+    ///   - `commitment`: `confirmed` or `finalized` (default); `processed` is rejected.
     ///   - `minContextSlot`: The minimum slot that the query should be evaluated at.
     ///
     /// ## Returns
@@ -1088,7 +1085,7 @@ pub trait Full {
     /// - `err`: If the transaction failed, an error object; otherwise `null`.
     /// - `memo`: Optional memo attached to the transaction.
     /// - `blockTime`: Approximate production time of the block containing the transaction (Unix timestamp).
-    /// - `confirmationStatus`: One of `processed`, `confirmed`, or `finalized`.
+    /// - `confirmationStatus`: `confirmed` or `finalized`.
     ///
     /// ## Example Request
     /// ```json
@@ -1544,8 +1541,7 @@ impl Full for SurfpoolFullRpc {
                 }
             };
 
-            context_slot(
-                &svm_locker,
+            svm_locker.read_slot(
                 config.as_ref().and_then(|config| config.commitment),
                 config.as_ref().and_then(|config| config.min_context_slot),
             )?;
@@ -1668,7 +1664,7 @@ impl Full for SurfpoolFullRpc {
         Box::pin(async move {
             // Capture the context slot once at the beginning to ensure consistency
             // across all signature lookups, even if the slot advances during the loop
-            let context_slot = svm_locker.get_latest_absolute_slot();
+            let read = svm_locker.read_slot(Some(CommitmentConfig::processed()), None)?;
 
             let mut responses = Vec::with_capacity(signatures.len());
             for signature in signatures.into_iter() {
@@ -1689,10 +1685,7 @@ impl Full for SurfpoolFullRpc {
                 }
                 responses.push(status);
             }
-            Ok(RpcResponse {
-                context: RpcResponseContext::new(context_slot),
-                value: responses,
-            })
+            Ok(read.respond(responses))
         })
     }
 
@@ -1781,21 +1774,42 @@ impl Full for SurfpoolFullRpc {
                     config.base.preflight_commitment.unwrap_or_default()
                 },
             };
-            context_slot(
-                &ctx.svm_locker,
-                Some(preflight_commitment),
-                config.base.min_context_slot,
-            )?;
+            ctx.svm_locker
+                .read_slot(Some(preflight_commitment), config.base.min_context_slot)?;
 
             if !config.base.skip_preflight {
-                let blockhash_visible = ctx.svm_locker.with_svm_reader(|svm_reader| {
-                    svm_reader.is_blockhash_visible_at(
+                // Agave verifies the signatures, then simulates at the preflight bank: lifetime
+                // (blockhash or durable nonce) first, then a status cache that holds only the
+                // slots up to the bank's own. A duplicate that bank cannot see yet passes, and the
+                // runloop drops it. A transaction's full lifetime check (its nonce account may
+                // still be on the datasource) runs in the runloop after its accounts load; here it
+                // only decides a duplicate, whose accounts are local since it ran.
+                let preflight_error = ctx.svm_locker.with_svm_reader(|svm_reader| {
+                    let sigverify = !config
+                        .skip_sig_verify
+                        .unwrap_or(svm_reader.skip_signature_verification);
+                    let duplicate =
+                        svm_reader
+                            .processed_slot(&unsanitized_tx)
+                            .is_some_and(|slot| {
+                                slot <= svm_reader.slot_for_commitment(&preflight_commitment)
+                            });
+                    if sigverify && unsanitized_tx.verify_with_results().contains(&false) {
+                        Some(TransactionError::SignatureFailure)
+                    } else if !svm_reader.is_blockhash_visible_at(
                         tx_message.recent_blockhash(),
                         &preflight_commitment,
-                    )
+                    ) || (duplicate
+                        && !svm_reader.validate_transaction_blockhash(&unsanitized_tx))
+                    {
+                        Some(TransactionError::BlockhashNotFound)
+                    } else if duplicate {
+                        Some(TransactionError::AlreadyProcessed)
+                    } else {
+                        None
+                    }
                 });
-                if !blockhash_visible {
-                    let error = TransactionError::BlockhashNotFound;
+                if let Some(error) = preflight_error {
                     return Err(Error {
                         data: Some(
                             serde_json::to_value(get_simulate_transaction_result(
@@ -1806,7 +1820,7 @@ impl Full for SurfpoolFullRpc {
                                 false,
                                 &tx_message,
                                 None,
-                                None,
+                                Some(0),
                             ))
                             .map_err(|e| {
                                 Error::invalid_params(format!(
@@ -1972,7 +1986,6 @@ impl Full for SurfpoolFullRpc {
         };
 
         Box::pin(async move {
-            context_slot(&svm_locker, config.commitment, config.min_context_slot)?;
             let loaded_addresses = svm_locker
                 .get_loaded_addresses(&remote_ctx, &unsanitized_tx.message)
                 .await?;
@@ -1981,36 +1994,38 @@ impl Full for SurfpoolFullRpc {
                 loaded_addresses.as_ref().map(|l| l.all_loaded_addresses()),
             );
 
-            let SvmAccessContext {
-                slot,
-                inner: _,
-                latest_blockhash,
-                latest_epoch_info,
-            } = svm_locker
+            svm_locker
                 .get_multiple_accounts(&remote_ctx, &transaction_pubkeys, None)
                 .await?;
 
             // Convert TransactionLoadedAddresses to LoadedAddresses before it gets consumed
             let loaded_addresses_data = loaded_addresses.as_ref().map(|la| la.loaded_addresses());
 
-            let replacement_blockhash = if config.replace_recent_blockhash {
-                unsanitized_tx
-                    .message
-                    .set_recent_blockhash(latest_blockhash);
-                Some(RpcBlockhash {
-                    blockhash: latest_blockhash.to_string(),
-                    // The latest blockhash was minted at the current block height.
-                    last_valid_block_height: latest_epoch_info.block_height
-                        + MAX_RECENT_BLOCKHASHES_STANDARD as u64,
-                })
-            } else {
-                None
-            };
-
-            // Clone the message before moving the transaction for later use in result formatting
-            let tx_message = unsanitized_tx.message.clone();
-
-            let simulation = svm_locker.simulate_transaction(unsanitized_tx, config.sig_verify);
+            // Like Agave's simulation bank: the context slot, the replacement blockhash and the
+            // simulated state come from one guard, taken once the accounts are loaded.
+            let (read, replacement_blockhash, tx_message, simulation) = svm_locker
+                .with_svm_reader(|svm_reader| {
+                    let read = svm_reader.read_slot(config.commitment, config.min_context_slot)?;
+                    let replacement_blockhash = config.replace_recent_blockhash.then(|| {
+                        let (blockhash, last_valid_block_height) =
+                            svm_reader.latest_blockhash_at(&config.commitment.unwrap_or_default());
+                        unsanitized_tx.message.set_recent_blockhash(blockhash);
+                        RpcBlockhash {
+                            blockhash: blockhash.to_string(),
+                            last_valid_block_height,
+                        }
+                    });
+                    // Clone the message before moving the transaction for result formatting
+                    let tx_message = unsanitized_tx.message.clone();
+                    let simulation =
+                        svm_reader.simulate_transaction(unsanitized_tx, config.sig_verify);
+                    Ok::<_, jsonrpc_core::Error>((
+                        read,
+                        replacement_blockhash,
+                        tx_message,
+                        simulation,
+                    ))
+                })?;
             let loaded_accounts_data_size = match &simulation {
                 Ok(info) => info.meta.loaded_accounts_data_size,
                 Err(info) => info.meta.loaded_accounts_data_size,
@@ -2063,10 +2078,7 @@ impl Full for SurfpoolFullRpc {
                 ),
             };
 
-            Ok(RpcResponse {
-                context: RpcResponseContext::new(slot),
-                value,
-            })
+            Ok(read.respond(value))
         })
     }
 
@@ -2128,21 +2140,8 @@ impl Full for SurfpoolFullRpc {
         };
 
         Box::pin(async move {
-            let block_time = svm_locker.with_svm_reader(|svm_reader| {
-                Ok::<_, jsonrpc_core::Error>(match svm_reader.blocks.get(&slot)? {
-                    Some(block) => Some(block.block_time),
-                    None => {
-                        // With sparse block storage, calculate time for missing blocks
-                        if svm_reader.is_slot_in_valid_range(slot) {
-                            let time_ms = svm_reader.calculate_block_time_for_slot(slot);
-                            Some((time_ms / 1_000) as i64)
-                        } else {
-                            None
-                        }
-                    }
-                })
-            })?;
-            Ok(block_time)
+            let block = svm_locker.with_svm_reader(|svm| svm.get_block_or_reconstruct(slot))?;
+            Ok(block.map(|block| block.block_time))
         })
     }
 
@@ -2186,28 +2185,12 @@ impl Full for SurfpoolFullRpc {
         };
 
         Box::pin(async move {
-            let committed_latest_slot =
-                context_slot(&svm_locker, Some(commitment), config.min_context_slot)?;
+            let committed_latest_slot = svm_locker
+                .read_slot(Some(commitment), config.min_context_slot)?
+                .slot();
             let effective_end_slot = end_slot
                 .map(|end| end.min(committed_latest_slot))
                 .unwrap_or(committed_latest_slot);
-
-            let genesis_slot = svm_locker.with_svm_reader(|svm| svm.genesis_slot);
-
-            let (local_min_slot, local_slots, effective_end_slot) = if effective_end_slot
-                < start_slot
-            {
-                (None, vec![], effective_end_slot)
-            } else {
-                // With sparse block storage, all slots from genesis_slot onwards are valid
-                // Return all slots in the requested range instead of filtering by stored blocks
-                let local_min_slot = Some(genesis_slot);
-                let local_slots: Vec<Slot> = (start_slot.max(genesis_slot)..=effective_end_slot)
-                    .filter(|slot| *slot <= committed_latest_slot)
-                    .collect();
-
-                (local_min_slot, local_slots, effective_end_slot)
-            };
 
             if effective_end_slot.saturating_sub(start_slot) > MAX_SLOT_RANGE {
                 return Err(Error::invalid_params(format!(
@@ -2216,6 +2199,24 @@ impl Full for SurfpoolFullRpc {
                     effective_end_slot.saturating_sub(start_slot)
                 )));
             }
+
+            let genesis_slot = svm_locker.with_svm_reader(|svm| svm.genesis_slot);
+
+            let (local_min_slot, local_slots, effective_end_slot) =
+                if effective_end_slot < start_slot {
+                    (None, vec![], effective_end_slot)
+                } else {
+                    // With sparse block storage, all slots from genesis_slot onwards are valid
+                    // Return all slots in the requested range instead of filtering by stored blocks
+                    let local_min_slot = Some(genesis_slot);
+                    // A slot a time travel skipped holds no block.
+                    let runs = svm_locker.with_svm_reader(|svm| {
+                        svm.block_runs(start_slot.max(genesis_slot), effective_end_slot)
+                    });
+                    let local_slots: Vec<Slot> = runs.into_iter().flatten().collect();
+
+                    (local_min_slot, local_slots, effective_end_slot)
+                };
 
             let remote_slots = if let (Some((remote_client, _)), Some(local_min)) =
                 (&remote_ctx, local_min_slot)
@@ -2298,15 +2299,19 @@ impl Full for SurfpoolFullRpc {
         };
 
         Box::pin(async move {
-            let committed_latest_slot =
-                context_slot(&svm_locker, Some(commitment), config.min_context_slot)?;
+            let committed_latest_slot = svm_locker
+                .read_slot(Some(commitment), config.min_context_slot)?
+                .slot();
             let genesis_slot = svm_locker.with_svm_reader(|svm| svm.genesis_slot);
 
             // With sparse block storage, all slots from genesis_slot onwards are valid
             // Return all slots in the requested range instead of filtering by stored blocks
             let local_min_slot = Some(genesis_slot);
-            let local_slots: Vec<Slot> =
-                (start_slot.max(genesis_slot)..=committed_latest_slot).collect();
+            // A slot a time travel skipped holds no block.
+            let runs = svm_locker.with_svm_reader(|svm| {
+                svm.block_runs(start_slot.max(genesis_slot), committed_latest_slot)
+            });
+            let local_slots: Vec<Slot> = runs.into_iter().flatten().take(limit).collect();
 
             // fetch remote blocks when needed, using the same logic as get_blocks
             let remote_slots = if let (Some((remote_client, _)), Some(local_min)) =
@@ -2408,9 +2413,14 @@ impl Full for SurfpoolFullRpc {
         };
 
         Box::pin(async move {
-            context_slot(
-                &svm_locker,
-                config.as_ref().and_then(|config| config.commitment),
+            let commitment = config.as_ref().and_then(|config| config.commitment);
+            if !commitment.unwrap_or_default().is_at_least_confirmed() {
+                return Err(Error::invalid_params(
+                    "Method does not support commitment below `confirmed`",
+                ));
+            }
+            svm_locker.read_slot(
+                commitment,
                 config.as_ref().and_then(|config| config.min_context_slot),
             )?;
             let signatures = svm_locker
@@ -2486,28 +2496,13 @@ impl Full for SurfpoolFullRpc {
         let config = config.unwrap_or_default();
         let commitment = config.commitment.unwrap_or_default();
 
-        let slot = context_slot(&svm_locker, Some(commitment), config.min_context_slot)?;
-
-        let (blockhash, last_valid_block_height) = svm_locker.with_svm_reader(|svm_reader| {
-            let blockhash = svm_reader
-                .blockhash_for_commitment(&commitment)
-                .unwrap_or_else(|| svm_reader.latest_blockhash());
-            let age = svm_reader.blockhash_age(&blockhash).unwrap_or(0);
-            let minted_at_block_height = svm_reader
-                .latest_epoch_info
-                .block_height
-                .saturating_sub(age);
-            (
-                blockhash,
-                minted_at_block_height + MAX_RECENT_BLOCKHASHES_STANDARD as u64,
-            )
-        });
-        Ok(RpcResponse {
-            context: RpcResponseContext::new(slot),
-            value: RpcBlockhash {
+        svm_locker.with_svm_reader(|svm_reader| {
+            let read = svm_reader.read_slot(Some(commitment), config.min_context_slot)?;
+            let (blockhash, last_valid_block_height) = svm_reader.latest_blockhash_at(&commitment);
+            Ok(read.respond(RpcBlockhash {
                 blockhash: blockhash.to_string(),
                 last_valid_block_height,
-            },
+            }))
         })
     }
 
@@ -2524,14 +2519,14 @@ impl Full for SurfpoolFullRpc {
 
         let svm_locker = meta.get_svm_locker()?;
 
-        let slot = context_slot(&svm_locker, config.commitment, config.min_context_slot)?;
-
-        let is_valid =
-            svm_locker.with_svm_reader(|svm_reader| svm_reader.check_blockhash_is_recent(&hash));
-
-        Ok(RpcResponse {
-            context: RpcResponseContext::new(slot),
-            value: is_valid,
+        svm_locker.with_svm_reader(|svm_reader| {
+            let read = svm_reader.read_slot(config.commitment, config.min_context_slot)?;
+            // Agave checks the blockhash queue of the bank at the commitment.
+            Ok(read.respond(
+                svm_reader.check_blockhash_is_recent(&hash)
+                    && svm_reader
+                        .is_blockhash_visible_at(&hash, &config.commitment.unwrap_or_default()),
+            ))
         })
     }
 
@@ -2546,14 +2541,9 @@ impl Full for SurfpoolFullRpc {
 
         let config = config.unwrap_or_default();
         let svm_locker = meta.get_svm_locker()?;
-        let slot = context_slot(&svm_locker, config.commitment, config.min_context_slot)?;
-
-        let fee = svm_locker
-            .with_svm_reader(|svm_reader| svm_reader.estimate_fee_for_message(&message))?;
-
-        Ok(RpcResponse {
-            context: RpcResponseContext::new(slot),
-            value: Some(fee),
+        svm_locker.with_svm_reader(|svm_reader| {
+            let read = svm_reader.read_slot(config.commitment, config.min_context_slot)?;
+            Ok(read.respond(Some(svm_reader.estimate_fee_for_message(&message)?)))
         })
     }
 
@@ -2567,15 +2557,10 @@ impl Full for SurfpoolFullRpc {
             commitment: CommitmentLevel::Processed,
         });
 
-        let slot = context_slot(
-            &meta.get_svm_locker()?,
-            Some(commitment_config),
-            config.min_context_slot,
-        )?;
-        Ok(RpcResponse {
-            context: RpcResponseContext::new(slot),
-            value: 0,
-        })
+        let read = meta
+            .get_svm_locker()?
+            .read_slot(Some(commitment_config), config.min_context_slot)?;
+        Ok(read.respond(0))
     }
 
     fn get_recent_prioritization_fees(
@@ -2806,7 +2791,10 @@ mod tests {
     use super::*;
     use crate::{
         runloops::start_block_production_runloop,
-        surfnet::{BlockHeader, FINALIZATION_SLOT_THRESHOLD, remote::SurfnetRemoteClient},
+        surfnet::{
+            BlockHeader, INITIAL_SLOT, LEGACY_FINALIZATION_SLOT_THRESHOLD,
+            remote::SurfnetRemoteClient, svm::MAX_RECENT_BLOCKHASHES_STANDARD,
+        },
         tests::helpers::TestSetup,
         types::{SyntheticBlockhash, TransactionWithStatusMeta},
     };
@@ -3657,7 +3645,11 @@ mod tests {
                 .blocking_read()
                 .latest_epoch_info
                 .absolute_slot,
-            transaction_start_slot + FINALIZATION_SLOT_THRESHOLD,
+            transaction_start_slot
+                + transaction_setup
+                    .context
+                    .svm_locker
+                    .with_svm_reader(|svm| svm.finalization_slot_threshold()),
             "a successful airdrop should produce blocks through finalization in transaction mode"
         );
 
@@ -4251,7 +4243,7 @@ mod tests {
 
         let res = setup
             .rpc
-            .get_block(Some(setup.context), FINALIZATION_SLOT_THRESHOLD, None)
+            .get_block(Some(setup.context), INITIAL_SLOT, None)
             .await
             .unwrap();
 
@@ -4280,7 +4272,7 @@ mod tests {
 
         let res = setup
             .rpc
-            .get_block_time(Some(setup.context), FINALIZATION_SLOT_THRESHOLD)
+            .get_block_time(Some(setup.context), INITIAL_SLOT)
             .await
             .unwrap();
 
@@ -4543,9 +4535,12 @@ mod tests {
 
     #[test]
     fn test_get_latest_blockhash() {
-        let setup = TestSetup::new(SurfpoolFullRpc);
+        let setup = TestSetup::new_with_features(
+            SurfpoolFullRpc,
+            surfpool_types::SvmFeatureConfig::new().enable(agave_feature_set::alpenglow::id()),
+        );
 
-        confirm_blocks(&setup, FINALIZATION_SLOT_THRESHOLD);
+        confirm_blocks(&setup, 1);
 
         // processed commitment
         {
@@ -4634,11 +4629,10 @@ mod tests {
                 .get_latest_blockhash(&commitment)
                 .unwrap();
 
-            // The finalized blockhash is 30 blocks old, so it expires 30 blocks sooner.
+            // Alpenglow exposes the same blockhash at confirmed and finalized.
             let current_block_height = setup.context.svm_locker.get_epoch_info().block_height;
-            let expected_last_valid_block_height = current_block_height
-                - (FINALIZATION_SLOT_THRESHOLD - 1)
-                + MAX_RECENT_BLOCKHASHES_STANDARD as u64;
+            let expected_last_valid_block_height =
+                current_block_height + MAX_RECENT_BLOCKHASHES_STANDARD as u64;
 
             assert_eq!(
                 res.value.blockhash,
@@ -4654,7 +4648,10 @@ mod tests {
 
     #[test]
     fn test_get_latest_blockhash_finalized_trails_the_tip_across_empty_slots() {
-        let setup = TestSetup::new(SurfpoolFullRpc);
+        let setup = TestSetup::new_with_features(
+            SurfpoolFullRpc,
+            surfpool_types::SvmFeatureConfig::new().disable(agave_feature_set::alpenglow::id()),
+        );
         let latest_blockhash = |commitment: CommitmentConfig| {
             setup
                 .rpc
@@ -4670,11 +4667,11 @@ mod tests {
                 .blockhash
         };
 
-        confirm_blocks(&setup, FINALIZATION_SLOT_THRESHOLD);
+        confirm_blocks(&setup, LEGACY_FINALIZATION_SLOT_THRESHOLD);
         let tip = latest_blockhash(CommitmentConfig::confirmed());
 
         // No transaction lands, so none of these slots is stored as a block.
-        confirm_blocks(&setup, FINALIZATION_SLOT_THRESHOLD - 2);
+        confirm_blocks(&setup, LEGACY_FINALIZATION_SLOT_THRESHOLD - 2);
         assert_ne!(latest_blockhash(CommitmentConfig::finalized()), tip);
         confirm_blocks(&setup, 1);
         assert_eq!(latest_blockhash(CommitmentConfig::finalized()), tip);
@@ -4685,8 +4682,12 @@ mod tests {
     async fn test_send_transaction_preflights_blockhash_at_preflight_commitment() {
         let payer = Keypair::new();
         let (mempool_tx, mempool_rx) = crossbeam_channel::unbounded();
-        let setup = TestSetup::new_with_mempool(SurfpoolFullRpc, mempool_tx);
-        confirm_blocks(&setup, FINALIZATION_SLOT_THRESHOLD);
+        let mut setup = TestSetup::new_with_features(
+            SurfpoolFullRpc,
+            surfpool_types::SvmFeatureConfig::new().disable(agave_feature_set::alpenglow::id()),
+        );
+        setup.context.simnet_commands_tx = mempool_tx;
+        confirm_blocks(&setup, LEGACY_FINALIZATION_SLOT_THRESHOLD);
 
         let confirmed_blockhash = setup
             .rpc
@@ -5175,7 +5176,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_get_blocks_with_limit_commitment_levels() {
-        let setup = TestSetup::new(SurfpoolFullRpc);
+        let setup = TestSetup::new_with_features(
+            SurfpoolFullRpc,
+            surfpool_types::SvmFeatureConfig::new().enable(agave_feature_set::alpenglow::id()),
+        );
 
         insert_test_blocks(&setup, 80..=120);
 
@@ -5215,7 +5219,7 @@ mod tests {
             .unwrap();
         assert_eq!(confirmed_result, vec![115, 116, 117, 118, 119]);
 
-        // Test finalized commitment (latest = 120 - 31 = 89)
+        // Alpenglow finalized commitment has the same latest slot as confirmed.
         let finalized_result = setup
             .rpc
             .get_blocks_with_limit(
@@ -5231,7 +5235,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(finalized_result, vec![85, 86, 87, 88, 89]);
+        assert_eq!(finalized_result, (85..95).collect::<Vec<_>>());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -5279,25 +5283,17 @@ mod tests {
     async fn test_get_blocks_with_limit_large_limit() {
         let setup = TestSetup::new(SurfpoolFullRpc);
 
-        insert_test_blocks(
-            &setup,
-            FINALIZATION_SLOT_THRESHOLD..1000 + FINALIZATION_SLOT_THRESHOLD,
-        );
+        insert_test_blocks(&setup, INITIAL_SLOT..1000 + INITIAL_SLOT);
 
         let result = setup
             .rpc
-            .get_blocks_with_limit(
-                Some(setup.context.clone()),
-                FINALIZATION_SLOT_THRESHOLD,
-                1000,
-                None,
-            )
+            .get_blocks_with_limit(Some(setup.context.clone()), INITIAL_SLOT, 1000, None)
             .await
             .unwrap();
 
         assert_eq!(result.len(), 1000);
-        assert_eq!(result[0], FINALIZATION_SLOT_THRESHOLD);
-        assert_eq!(result[999], 999 + FINALIZATION_SLOT_THRESHOLD);
+        assert_eq!(result[0], INITIAL_SLOT);
+        assert_eq!(result[999], 999 + INITIAL_SLOT);
 
         for i in 1..result.len() {
             assert!(
@@ -5361,7 +5357,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_get_blocks_commitment_levels() {
-        let setup = TestSetup::new(SurfpoolFullRpc);
+        let setup = TestSetup::new_with_features(
+            SurfpoolFullRpc,
+            surfpool_types::SvmFeatureConfig::new().enable(agave_feature_set::alpenglow::id()),
+        );
 
         insert_test_blocks(&setup, 50..=100);
 
@@ -5401,7 +5400,7 @@ mod tests {
             .unwrap();
         assert_eq!(confirmed_result, vec![95, 96, 97, 98, 99]);
 
-        // finalized commitment -> latest = 100 - 31(finalization threshold)
+        // Alpenglow finalized commitment -> latest = 99
         let finalized_result = setup
             .rpc
             .get_blocks(
@@ -5417,12 +5416,15 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(finalized_result, vec![65, 66, 67, 68, 69]);
+        assert_eq!(finalized_result, (65..=99).collect::<Vec<_>>());
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_get_blocks_config_in_place_of_end_slot() {
-        let setup = TestSetup::new(SurfpoolFullRpc);
+        let setup = TestSetup::new_with_features(
+            SurfpoolFullRpc,
+            surfpool_types::SvmFeatureConfig::new().enable(agave_feature_set::alpenglow::id()),
+        );
 
         insert_test_blocks(&setup, 50..=100);
 
@@ -5440,7 +5442,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(result, vec![65, 66, 67, 68, 69]);
+        assert_eq!(result, (65..=99).collect::<Vec<_>>());
 
         let result = setup
             .rpc
@@ -5459,11 +5461,14 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_get_blocks_min_context_slot() {
-        let setup = TestSetup::new(SurfpoolFullRpc);
+        let setup = TestSetup::new_with_features(
+            SurfpoolFullRpc,
+            surfpool_types::SvmFeatureConfig::new().enable(agave_feature_set::alpenglow::id()),
+        );
 
         insert_test_blocks(&setup, 100..=110);
 
-        // min_context_slot = 105 > 79, so should return MinContextSlotNotReached error
+        // Slot 110 is processed, but is newer than the finalized slot (109).
         let result = setup
             .rpc
             .get_blocks(
@@ -5472,7 +5477,7 @@ mod tests {
                 Some(RpcBlocksConfigWrapper::EndSlotOnly(Some(105))),
                 Some(RpcContextConfig {
                     commitment: Some(CommitmentConfig::finalized()),
-                    min_context_slot: Some(105),
+                    min_context_slot: Some(110),
                 }),
             )
             .await;
@@ -5522,6 +5527,48 @@ mod tests {
         assert_eq!(result, expected);
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_blocks_leaves_out_slots_a_time_travel_skipped() {
+        let setup = TestSetup::new(SurfpoolFullRpc);
+        let last_block = setup.context.svm_locker.with_svm_writer(|svm_writer| {
+            svm_writer.confirm_current_block().unwrap();
+            let last_block = svm_writer.get_latest_absolute_slot() - 1;
+            svm_writer.travel_to(last_block + 10).unwrap();
+            svm_writer.confirm_current_block().unwrap();
+            last_block
+        });
+        let landing = last_block + 10;
+
+        let blocks = setup
+            .rpc
+            .get_blocks(Some(setup.context.clone()), last_block, None, None)
+            .await
+            .unwrap();
+        assert_eq!(blocks, vec![last_block, landing, landing + 1]);
+
+        let skipped = last_block + 1;
+        let block_time = setup
+            .rpc
+            .get_block_time(Some(setup.context.clone()), skipped)
+            .await
+            .unwrap_err();
+        // Not rooted yet: Agave's `BlockNotAvailable`.
+        assert_eq!(block_time.code.code(), -32004);
+        let block = setup
+            .rpc
+            .get_block(
+                Some(setup.context.clone()),
+                skipped,
+                Some(RpcEncodingConfigWrapper::Current(Some(RpcBlockConfig {
+                    commitment: Some(CommitmentConfig::confirmed()),
+                    ..RpcBlockConfig::default()
+                }))),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(block.code.code(), -32004);
+    }
+
     // helper to insert blocks into the SVM at specific slots
     fn confirm_blocks(setup: &TestSetup<SurfpoolFullRpc>, count: u64) {
         setup.context.svm_locker.with_svm_writer(|svm_writer| {
@@ -5538,6 +5585,8 @@ mod tests {
         let slots: Vec<u64> = slots.into_iter().collect();
         setup.context.svm_locker.with_svm_writer(|svm_writer| {
             for slot in slots.iter() {
+                // A block at every slot from 0: the block at slot `s` is the `s + 1`th, and
+                // its hash is the synthetic one of the height before it.
                 svm_writer
                     .blocks
                     .store(
@@ -5547,7 +5596,7 @@ mod tests {
                             previous_blockhash: SyntheticBlockhash::new(slot.saturating_sub(1))
                                 .to_string(),
                             block_time: chrono::Utc::now().timestamp_millis(),
-                            block_height: *slot,
+                            block_height: slot + 1,
                             parent_slot: slot.saturating_sub(1),
                             signatures: vec![],
                         },
@@ -5590,7 +5639,7 @@ mod tests {
             .rpc
             .get_blocks(
                 Some(setup.context),
-                FINALIZATION_SLOT_THRESHOLD,
+                INITIAL_SLOT,
                 Some(RpcBlocksConfigWrapper::EndSlotOnly(Some(60))),
                 None,
             )
@@ -5599,7 +5648,7 @@ mod tests {
 
         // With sparse block storage, all slots in range are returned (empty blocks reconstructed)
         // local_min is now 0, so slots 10-60 are all within local range
-        let expected: Vec<Slot> = (FINALIZATION_SLOT_THRESHOLD..=60).collect();
+        let expected: Vec<Slot> = (INITIAL_SLOT..=60).collect();
         assert_eq!(
             result, expected,
             "Should return all local blocks in range including reconstructed empty blocks"
@@ -5624,7 +5673,7 @@ mod tests {
             "Stored blocks minimum should be slot 50"
         );
 
-        let start_slot = FINALIZATION_SLOT_THRESHOLD;
+        let start_slot = INITIAL_SLOT;
         // case 1: request blocks 31-40 (entirely "before" stored blocks, but within reconstructible range)
         // With sparse storage, local_min is 0, so slots 31-40 are all within local range
         let result = setup
@@ -5717,7 +5766,7 @@ mod tests {
         });
         assert_eq!(stored_min, Some(100), "Stored blocks minimum should be 100");
         assert_eq!(latest_slot, 200, "Latest slot should be 200");
-        let start_slot = FINALIZATION_SLOT_THRESHOLD;
+        let start_slot = INITIAL_SLOT;
         // Case 1: slots start_slot-50 - with sparse storage, all slots in range are returned
         let result = setup
             .rpc
@@ -5864,7 +5913,7 @@ mod tests {
         let expected_slot = setup.context.svm_locker.with_svm_reader(|svm_reader| {
             svm_reader
                 .get_latest_absolute_slot()
-                .saturating_sub(FINALIZATION_SLOT_THRESHOLD)
+                .saturating_sub(svm_reader.finalization_slot_threshold())
         });
 
         assert_eq!(result.context.slot, expected_slot);
@@ -5979,7 +6028,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_is_blockhash_valid_commitment_and_context_slot() {
-        let setup = TestSetup::new(SurfpoolFullRpc);
+        let setup = TestSetup::new_with_features(
+            SurfpoolFullRpc,
+            surfpool_types::SvmFeatureConfig::new().enable(agave_feature_set::alpenglow::id()),
+        );
 
         // Set up some block history to test commitment levels
         insert_test_blocks(&setup, 70..=100);
@@ -6025,7 +6077,7 @@ mod tests {
         assert_eq!(confirmed_result.value, true);
         assert_eq!(confirmed_result.context.slot, 99);
 
-        // Test finalized commitment (should use slot = 100 - 31 = 69)
+        // Alpenglow finalized commitment uses the confirmed slot (99).
         let finalized_result = setup
             .rpc
             .is_blockhash_valid(
@@ -6041,7 +6093,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(finalized_result.value, true);
-        assert_eq!(finalized_result.context.slot, 69);
+        assert_eq!(finalized_result.context.slot, 99);
 
         // Test min_context_slot validation - should succeed when slot is high enough
         let min_context_success = setup
@@ -6068,7 +6120,7 @@ mod tests {
                 commitment: Some(CommitmentConfig {
                     commitment: CommitmentLevel::Finalized,
                 }),
-                min_context_slot: Some(80),
+                min_context_slot: Some(100),
             }),
         );
 
@@ -6111,7 +6163,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_minimum_ledger_slot_finds_minimum() {
-        // With sparse block storage, minimum ledger slot is always FINALIZATION_SLOT_THRESHOLD for local surfnets
+        // With sparse block storage, minimum ledger slot is always INITIAL_SLOT for local surfnets
         let setup = TestSetup::new(SurfpoolFullRpc);
 
         insert_test_blocks(&setup, vec![500, 100, 1000, 50, 750]);
@@ -6125,8 +6177,8 @@ mod tests {
         // With sparse block storage, get_first_local_slot() returns 0 since all
         // blocks from slot 0 can be reconstructed on-the-fly
         assert_eq!(
-            result, FINALIZATION_SLOT_THRESHOLD,
-            "Should return FINALIZATION_SLOT_THRESHOLD since empty blocks can be reconstructed from that slot"
+            result, INITIAL_SLOT,
+            "Should return INITIAL_SLOT since empty blocks can be reconstructed from that slot"
         );
     }
 
@@ -6469,6 +6521,129 @@ mod tests {
 
             assert_eq!(simulation_res.value.err, None);
         }
+    }
+
+    /// A validator reads the blockhash and the context slot from one bank, so the context slot
+    /// and `lastValidBlockHeight` keep one offset while blocks are produced.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn latest_blockhash_and_its_context_slot_come_from_one_read() {
+        let setup = TestSetup::new(SurfpoolFullRpc);
+        let locker = setup.context.svm_locker.clone();
+        for _ in 0..3 {
+            locker.confirm_current_block(&None).await.unwrap();
+        }
+        let ctx = || Some(setup.context.clone());
+        let processed = Some(RpcContextConfig {
+            commitment: Some(CommitmentConfig::processed()),
+            min_context_slot: None,
+        });
+        let offset = |response: RpcResponse<RpcBlockhash>| {
+            response.value.last_valid_block_height as i64 - response.context.slot as i64
+        };
+        let expected = offset(setup.rpc.get_latest_blockhash(ctx(), processed).unwrap());
+
+        let producer = tokio::spawn(async move {
+            for _ in 0..300 {
+                locker.confirm_current_block(&None).await.unwrap();
+            }
+        });
+        let mut offsets = std::collections::BTreeSet::new();
+        loop {
+            offsets.insert(offset(
+                setup.rpc.get_latest_blockhash(ctx(), processed).unwrap(),
+            ));
+            if producer.is_finished() {
+                break;
+            }
+        }
+        producer.await.unwrap();
+        assert_eq!(offsets, [expected].into());
+    }
+
+    /// A validator answers these from the bank its commitment selects (`get_bank_with_config`),
+    /// so the value and the context slot are the finalized bank's, not the tip's.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reads_answer_from_the_slot_their_commitment_names() {
+        use crate::rpc::{
+            bank_data::{BankData, SurfpoolBankDataRpc},
+            minimal::{Minimal, SurfpoolMinimalRpc},
+        };
+
+        let setup = TestSetup::new(SurfpoolFullRpc);
+        let locker = &setup.context.svm_locker;
+        for _ in 0..40 {
+            locker.confirm_current_block(&None).await.unwrap();
+        }
+        let ctx = || Some(setup.context.clone());
+        let finalized = Some(RpcContextConfig {
+            commitment: Some(CommitmentConfig::finalized()),
+            min_context_slot: None,
+        });
+        let finalized_slot = SurfpoolMinimalRpc.get_slot(ctx(), finalized).unwrap();
+        let tip_blockhash = locker.with_svm_reader(|svm| svm.latest_blockhash());
+
+        let epoch_info = SurfpoolMinimalRpc.get_epoch_info(ctx(), finalized).unwrap();
+        assert_eq!(
+            (epoch_info.absolute_slot, epoch_info.block_height),
+            (
+                finalized_slot,
+                SurfpoolMinimalRpc
+                    .get_block_height(ctx(), finalized)
+                    .unwrap()
+            )
+        );
+
+        let valid = setup
+            .rpc
+            .is_blockhash_valid(ctx(), tip_blockhash.to_string(), finalized)
+            .unwrap();
+        assert!(
+            !valid.value,
+            "the tip blockhash is not in the finalized bank"
+        );
+
+        let payer = Keypair::new();
+        let tx = Transaction::new_signed_with_payer(
+            &[transfer(&payer.pubkey(), &Pubkey::new_unique(), 1)],
+            Some(&payer.pubkey()),
+            &[&payer],
+            tip_blockhash,
+        );
+        let simulated = setup
+            .rpc
+            .simulate_transaction(
+                ctx(),
+                BASE64_STANDARD.encode(bincode::serialize(&tx).unwrap()),
+                Some(RpcSimulateTransactionConfig {
+                    replace_recent_blockhash: true,
+                    encoding: Some(UiTransactionEncoding::Base64),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        let latest = setup.rpc.get_latest_blockhash(ctx(), finalized).unwrap();
+        assert_eq!(
+            (
+                simulated.context.slot,
+                simulated.value.replacement_blockhash
+            ),
+            (finalized_slot, Some(latest.value))
+        );
+
+        let production = SurfpoolBankDataRpc
+            .get_block_production(
+                ctx(),
+                Some(solana_client::rpc_config::RpcBlockProductionConfig {
+                    commitment: Some(CommitmentConfig::finalized()),
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            (production.context.slot, production.value.range.last_slot),
+            (finalized_slot, finalized_slot)
+        );
     }
 
     /// Every method taking `minContextSlot` judges it against the slot its commitment names, and
