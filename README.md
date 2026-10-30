@@ -130,6 +130,35 @@ surfpool start --help
 
 Is documenting all the options available.
 
+See where a transaction's compute units went, CPI by CPI:
+
+```console
+$ surfpool profile <SIGNATURE>
+3axDtsg6…EfGAZg
+✓ succeeded in slot 463,409,289 · 80,167 CU
+
+├─ Compute Budget            —
+├─ Compute Budget            —
+├─ Associated Token  17,913 CU   22.3%
+│  ├─ SPL Token         179 CU
+│  ├─ System                 —
+│  ├─ SPL Token          37 CU
+│  └─ SPL Token         229 CU
+├─ Jupiter v6        60,370 CU   75.3%
+│  ├─ Pump AMM       53,546 CU
+│  │  ├─ Token-2022   2,977 CU
+│  │  ├─ SPL Token      112 CU
+│  │  ├─ SPL Token      112 CU
+│  │  └─ Pump AMM     2,116 CU
+│  └─ Jupiter v6         91 CU
+├─ SPL Token            118 CU    0.1%
+└─ Token-2022         1,466 CU    1.8%
+
+300 CU went to builtin programs, which log no cost of their own.
+```
+
+It reads the transaction from the local surfnet by default, or from any RPC with `--rpc-url`. Programs with an IDL registered on the surfnet are shown by name. `--folded cu.txt` also writes a flame graph for [speedscope](https://www.speedscope.app), and `--json` prints the tree for scripts.
+
 ## Crypto Infrastructure as Code: A New Standard in Web3
 
 Infrastructure as code (IaC) transforms how teams deploy and operate Solana programs:
