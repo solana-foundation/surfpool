@@ -1936,13 +1936,15 @@ pub const SURFNET_CHEATCODE_METHODS: [&str; 28] = [
 ];
 
 /// Non-`surfnet_*` methods that a client handed a surfnet must not have:
-/// `requestAirdrop` mints SOL out of thin air, and the admin methods stop the
-/// surfnet or load code into it. They are refused only once every cheatcode
+/// `requestAirdrop` mints SOL out of thin air, `snapshotSubscribe` (WebSocket)
+/// overwrites accounts with a client-supplied snapshot, and the admin methods
+/// stop the surfnet or load native code into its process. They are refused only once every cheatcode
 /// is locked; a surfnet that isn't locked keeps them, so wallets and tests
 /// that airdrop, and `surfpool stop`, keep working after
 /// `surfnet_disableCheatcode`.
-pub const GATED_RPC_METHODS: [&str; 5] = [
+pub const GATED_RPC_METHODS: [&str; 6] = [
     "requestAirdrop",
+    "snapshotSubscribe",
     "exit",
     "loadPlugin",
     "reloadPlugin",
@@ -2257,6 +2259,7 @@ mod tests {
             "requestAirdrop",
             "exit",
             "loadPlugin",
+            "snapshotSubscribe",
         ] {
             assert!(
                 config.is_cheatcode_disabled(&method.to_string()),

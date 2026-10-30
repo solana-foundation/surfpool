@@ -178,8 +178,8 @@ impl SurfnetBuilder {
     /// unlock them.
     ///
     /// [`CheatcodeFilter::all`] locks the whole surfnet: every `surfnet_*`
-    /// method, `requestAirdrop`, and the admin methods that stop the surfnet
-    /// or load plugins, so it behaves like a plain validator RPC for every
+    /// method, `requestAirdrop`, the `snapshotSubscribe` WebSocket import,
+    /// and the admin methods that stop the surfnet or load plugins, so it behaves like a plain validator RPC for every
     /// client. [`CheatcodeFilter::list`] locks only those methods;
     /// [`Self::start`] fails with [`SurfnetError::Startup`] if one of them
     /// isn't a cheatcode.

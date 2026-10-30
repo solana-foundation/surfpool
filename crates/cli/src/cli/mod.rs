@@ -486,7 +486,7 @@ pub struct StartSvmOptions {
         default_missing_value = "all",
         value_delimiter = ',',
         value_parser = parse_lockable_method,
-        long_help = "Lock cheatcodes before the RPC server accepts its first request. Locked methods are refused for the life of the surfnet: nothing, including surfnet_enableCheatcode, turns them back on.\n\nWithout a value, locks the whole surfnet: every surfnet_* method, requestAirdrop, and the admin methods exit, loadPlugin, reloadPlugin and unloadPlugin. Stop it with Ctrl-C or a signal, since `surfpool stop` relies on exit. With a comma-separated list, locks only those surfnet_* methods.\n\nExample: surfpool start --lock-cheatcodes\nExample: surfpool start --lock-cheatcodes=surfnet_setAccount,surfnet_timeTravel"
+        long_help = "Lock cheatcodes before the RPC server accepts its first request. Locked methods are refused for the life of the surfnet: nothing, including surfnet_enableCheatcode, turns them back on.\n\nWithout a value, locks the whole surfnet: every surfnet_* method, requestAirdrop, the snapshotSubscribe WebSocket import, and the admin methods exit, loadPlugin, reloadPlugin and unloadPlugin. Stop it with Ctrl-C or a signal, since `surfpool stop` relies on exit. With a comma-separated list, locks only those surfnet_* methods.\n\nExample: surfpool start --lock-cheatcodes\nExample: surfpool start --lock-cheatcodes=surfnet_setAccount,surfnet_timeTravel"
     )]
     pub lock_cheatcodes: Option<Vec<String>>,
 }
