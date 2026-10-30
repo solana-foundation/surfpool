@@ -14,10 +14,9 @@ use solana_program_option::COption;
 use solana_pubkey::Pubkey;
 use solana_sdk_ids::sysvar;
 use solana_slot_hashes::SlotHashes;
-use solana_sysvar::last_restart_slot::LastRestartSlot;
 #[allow(deprecated)]
 use solana_sysvar::recent_blockhashes::RecentBlockhashes;
-use solana_sysvar::slot_history::SlotHistory;
+use solana_sysvar::{last_restart_slot::LastRestartSlot, slot_history::SlotHistory};
 use solana_transaction::versioned::VersionedTransaction;
 
 use crate::{
