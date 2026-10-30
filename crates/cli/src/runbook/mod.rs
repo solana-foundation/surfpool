@@ -264,14 +264,8 @@ pub async fn execute_runbook(
             };
         }
 
-        let consolidated_changes = match ctx.diff(old, new) {
-            Ok(changes) => changes,
-            Err(e) => {
-                let _ = simnet_events_tx.warn("Failed to process runbook snapshot");
-                simnet_events_tx.warn(e);
-                return Ok(());
-            }
-        };
+        let consolidated_changes =
+            handle_snapshot_diff_result(ctx.diff(old, new), &simnet_events_tx)?;
 
         let Some(consolidated_changes) = display_snapshot_diffing(consolidated_changes) else {
             return Ok(());
@@ -663,6 +657,20 @@ fn handle_context_build_result(
     }
 }
 
+fn handle_snapshot_diff_result<T, E: std::fmt::Display>(
+    result: Result<T, E>,
+    simnet_events_tx: &SimnetEventsTx,
+) -> Result<T, String> {
+    match result {
+        Ok(changes) => Ok(changes),
+        Err(error) => {
+            let _ = simnet_events_tx.warn("Failed to process runbook snapshot");
+            simnet_events_tx.warn(error.to_string());
+            Err("Failed to process runbook snapshot".to_string())
+        }
+    }
+}
+
 fn log_actions_to_execute(
     actions_to_execute: &IndexMap<String, Vec<(String, Option<String>)>>,
     is_first_time: bool,
@@ -908,7 +916,7 @@ pub fn handle_log_event(
 
 #[cfg(test)]
 mod tests {
-    use super::handle_context_build_result;
+    use super::{handle_context_build_result, handle_snapshot_diff_result};
     use surfpool_types::SimnetEventsTx;
 
     #[test]
@@ -930,6 +938,19 @@ mod tests {
         assert_eq!(
             handle_context_build_result(Ok(()), &simnet_events_tx),
             Ok(())
+        );
+    }
+
+    #[test]
+    fn snapshot_diff_failure_is_returned_to_caller() {
+        let (simnet_events_tx, _simnet_events_rx) = SimnetEventsTx::unbounded();
+
+        let result =
+            handle_snapshot_diff_result::<(), _>(Err("invalid prior snapshot"), &simnet_events_tx);
+
+        assert_eq!(
+            result,
+            Err("Failed to process runbook snapshot".to_string())
         );
     }
 }
