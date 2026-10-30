@@ -218,21 +218,21 @@ pub fn calculate_time_travel_clock(
             slot_time,
             epoch_schedule,
         ),
-        TimeTravelConfig::AbsoluteSlotAt { slot, timestamp } => calculate_absolute_slot_clock(
-            *slot,
-            epoch_info.absolute_slot,
-            current_updated_at,
-            slot_time,
-            epoch_schedule,
-        )
-        .map(|clock| {
-            let timestamp_seconds = (*timestamp / 1000) as i64;
-            Clock {
-                epoch_start_timestamp: timestamp_seconds,
-                unix_timestamp: timestamp_seconds,
-                ..clock
+        TimeTravelConfig::AbsoluteSlotAt { slot, timestamp } => {
+            if *slot < epoch_info.absolute_slot {
+                return Err(TimeTravelError::PastSlot {
+                    target: *slot,
+                    current: epoch_info.absolute_slot,
+                });
             }
-        }),
+            let timestamp_seconds = (*timestamp / 1000) as i64;
+            Ok(clock_for_slot(
+                *slot,
+                timestamp_seconds,
+                None,
+                epoch_schedule,
+            ))
+        }
         TimeTravelConfig::AbsoluteEpoch(new_epoch) => calculate_absolute_epoch_clock(
             *new_epoch,
             epoch_info.epoch,
@@ -291,13 +291,7 @@ mod tests {
     fn test_calculate_absolute_timestamp_clock_rejects_slot_overflow() {
         let epoch_info = create_test_epoch_info(1, 1000, 433_000);
 
-        let result = calculate_absolute_timestamp_clock(
-            u64::MAX,
-            1_000_000_000,
-            1,
-            &epoch_info,
-            &schedule(),
-        );
+        let result = calculate_absolute_timestamp_clock(u64::MAX, 0, 1, &epoch_info, &schedule());
 
         assert!(matches!(result, Err(TimeTravelError::ArithmeticOverflow)));
     }
