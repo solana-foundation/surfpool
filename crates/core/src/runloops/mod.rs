@@ -29,6 +29,7 @@ use jsonrpc_ws_server::{
 };
 use libloading::{Library, Symbol};
 use serde::Serialize;
+use solana_clock::{BankId, Slot};
 use solana_commitment_config::CommitmentConfig;
 use solana_message::SimpleAddressLoader;
 use solana_pubkey::Pubkey;
@@ -55,6 +56,15 @@ use crate::{
         remote::SurfnetRemoteClient,
     },
 };
+
+/// Returns the geyser bank ID for `slot`.
+///
+/// Surfpool runs a single fork with exactly one bank per slot, so the slot
+/// number identifies the bank instance that every bank-scoped notification
+/// (account, transaction, entry, block metadata and bank status) refers to.
+fn bank_id_for_slot(slot: Slot) -> BankId {
+    slot
+}
 
 /// The accounts a hydration batch could not produce: requested, not found
 /// remotely, and not deliberately kept offline. Offline accounts are absent by
@@ -892,7 +902,7 @@ fn start_geyser_runloop(
                         };
 
                         for plugin in managed_plugins.iter().map(|p| &*p.plugin) {
-                            if let Err(e) = plugin.notify_transaction(ReplicaTransactionInfoVersions::V0_0_3(&transaction_replica), event.transaction_with_status_meta.slot) {
+                            if let Err(e) = plugin.notify_transaction_for_bank(ReplicaTransactionInfoVersions::V0_0_3(&transaction_replica), event.transaction_with_status_meta.slot, bank_id_for_slot(event.transaction_with_status_meta.slot)) {
                                 log_error(format!("Failed to notify Geyser plugin of new transaction: {:?}", e))
                             };
                         }
@@ -918,7 +928,7 @@ fn start_geyser_runloop(
                         };
 
                         for plugin in managed_plugins.iter().map(|p| &*p.plugin) {
-                            if let Err(e) = plugin.update_account(ReplicaAccountInfoVersions::V0_0_3(&account_replica), slot, false) {
+                            if let Err(e) = plugin.update_account_for_bank(ReplicaAccountInfoVersions::V0_0_3(&account_replica), slot, bank_id_for_slot(slot)) {
                                 log_error(format!("Failed to update account in Geyser plugin: {:?}", e));
                             }
                         }
@@ -943,9 +953,8 @@ fn start_geyser_runloop(
                             txn: sanitized_transaction.as_ref(),
                         };
 
-                        // Send startup account updates with is_startup=true
                         for plugin in managed_plugins.iter().map(|p| &*p.plugin) {
-                            if let Err(e) = plugin.update_account(ReplicaAccountInfoVersions::V0_0_3(&account_replica), slot, true) {
+                            if let Err(e) = plugin.update_account_from_snapshot(ReplicaAccountInfoVersions::V0_0_3(&account_replica), slot) {
                                 log_error(format!("Failed to send startup account update to Geyser plugin: {:?}", e));
                             }
                         }
@@ -966,7 +975,7 @@ fn start_geyser_runloop(
                         };
 
                         for plugin in managed_plugins.iter().map(|p| &*p.plugin) {
-                            if let Err(e) = plugin.update_slot_status(slot, parent, &slot_status) {
+                            if let Err(e) = plugin.update_bank_status(slot, parent, &slot_status, bank_id_for_slot(slot)) {
                                 simnet_events_tx.error(format!("Failed to update slot status in Geyser plugin: {:?}", e));
                             }
                         }
@@ -990,7 +999,7 @@ fn start_geyser_runloop(
                         };
 
                         for plugin in managed_plugins.iter().map(|p| &*p.plugin) {
-                            if let Err(e) = plugin.notify_block_metadata(ReplicaBlockInfoVersions::V0_0_4(&block_info)) {
+                            if let Err(e) = plugin.notify_block_metadata_for_bank(ReplicaBlockInfoVersions::V0_0_4(&block_info), bank_id_for_slot(block_info.slot)) {
                                 simnet_events_tx.error(format!("Failed to notify block metadata to Geyser plugin: {:?}", e));
                             }
                         }
@@ -1006,7 +1015,7 @@ fn start_geyser_runloop(
                         };
 
                         for plugin in managed_plugins.iter().map(|p| &*p.plugin) {
-                            if let Err(e) = plugin.notify_entry(ReplicaEntryInfoVersions::V0_0_2(&entry_replica)) {
+                            if let Err(e) = plugin.notify_entry_for_bank(ReplicaEntryInfoVersions::V0_0_2(&entry_replica), bank_id_for_slot(entry_replica.slot)) {
                                 simnet_events_tx.error(format!("Failed to notify entry to Geyser plugin: {:?}", e));
                             }
                         }
