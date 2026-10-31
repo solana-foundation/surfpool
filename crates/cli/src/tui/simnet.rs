@@ -392,6 +392,7 @@ pub enum DisplayedUrl {
     Datasource(SanitizedConfig),
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn start_app(
     simnet_events_rx: Receiver<SimnetEvent>,
     simnet_commands_tx: Sender<SimnetCommand>,
@@ -400,6 +401,7 @@ pub fn start_app(
     displayed_url: DisplayedUrl,
     breaker: Option<Keypair>,
     initial_transactions: u64,
+    should_exit: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn Error>> {
     // setup terminal
     enable_raw_mode()?;
@@ -418,7 +420,7 @@ pub fn start_app(
         breaker,
         initial_transactions,
     );
-    let res = run_app(&mut terminal, app);
+    let res = run_app(&mut terminal, app, should_exit);
 
     // restore terminal
     disable_raw_mode()?;
@@ -432,7 +434,11 @@ pub fn start_app(
     Ok(())
 }
 
-fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<()> {
+fn run_app<B: Backend>(
+    terminal: &mut Terminal<B>,
+    mut app: App,
+    should_exit: Arc<AtomicBool>,
+) -> io::Result<()> {
     let (tx, rx) = unbounded();
     let rpc_api_url = match app.displayed_url {
         DisplayedUrl::Datasource(ref config) => config.rpc_url.clone(),
@@ -449,22 +455,9 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
         }
     });
 
-    let ctrlc_simnet_cmd_tx_clone = app.simnet_commands_tx.clone();
-
-    let should_exit = Arc::new(AtomicBool::new(false));
-    let should_exit_read = Arc::clone(&should_exit);
-    let should_exit_write = Arc::clone(&should_exit);
-
-    ctrlc::set_handler(move || {
-        // Send terminate command to allow graceful shutdown (Drop to run)
-        let _ = ctrlc_simnet_cmd_tx_clone.send(SimnetCommand::Terminate(None));
-        should_exit_write.store(true, std::sync::atomic::Ordering::Release);
-    })
-    .expect("Error setting Ctrl-C handler");
-
     let mut runbooks_completed = false;
     loop {
-        if should_exit_read.load(std::sync::atomic::Ordering::Acquire) {
+        if should_exit.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(());
         }
 

@@ -214,6 +214,21 @@ pub async fn start_local_surfnet_runloop(
         )?),
     };
 
+    let simnet_events_tx_cc = svm_locker.simnet_events_tx();
+    let (plugin_commands_tx, plugin_commands_rx) = unbounded::<PluginCommand>();
+    // Drain startup events before initialization or snapshots can fill the bounded queue.
+    match start_geyser_runloop(
+        config.plugin_config_path.clone(),
+        simnet_events_tx_cc.clone(),
+        geyser_events_rx,
+        plugin_commands_rx,
+    ) {
+        Ok(_) => {}
+        Err(e) => {
+            simnet_events_tx_cc.error(format!("Geyser plugin failed: {e}"));
+        }
+    };
+
     svm_locker.initialize(&remote_rpc_client).await?;
     // Before the RPC servers start: `sendTransaction`'s preflight reads the skip flag.
     svm_locker.with_svm_writer(|svm_writer| {
@@ -261,10 +276,6 @@ pub async fn start_local_surfnet_runloop(
         }
     }
 
-    let simnet_events_tx_cc = svm_locker.simnet_events_tx();
-
-    let (plugin_commands_tx, plugin_commands_rx) = unbounded::<PluginCommand>();
-
     // Plugins see the end of startup and the open slot before RPC binds, so no traffic can
     // send data for a slot they don't track yet.
     svm_locker.with_svm_writer(|svm| {
@@ -281,18 +292,6 @@ pub async fn start_local_surfnet_runloop(
     )?;
 
     let simnet_config = simnet.clone();
-
-    match start_geyser_runloop(
-        config.plugin_config_path.clone(),
-        simnet_events_tx_cc.clone(),
-        geyser_events_rx,
-        plugin_commands_rx,
-    ) {
-        Ok(_) => {}
-        Err(e) => {
-            let _ = simnet_events_tx_cc.error(format!("Geyser plugin failed: {e}"));
-        }
-    };
 
     let (coalesced_slots, clock_driven) =
         svm_locker.with_svm_reader(|svm| (svm.coalesced_slots.clone(), svm.clock_driven.clone()));
