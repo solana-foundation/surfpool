@@ -1609,13 +1609,14 @@ mod tests {
         let accounts = locker
             .get_token_accounts_by_owner(
                 &Some(remote),
+                RpcContextConfig::default(),
                 owner,
                 &TokenAccountsFilter::Mint(mint),
                 &config,
             )
             .await
             .expect("local token accounts survive a datasource that has never seen the mint")
-            .inner;
+            .value;
 
         assert_eq!(accounts.len(), 1);
         assert_eq!(accounts[0].pubkey, token_account_pubkey.to_string());
@@ -1793,14 +1794,117 @@ mod tests {
         };
 
         let accounts = locker
-            .get_token_largest_accounts(&Some((remote, CommitmentConfig::default())), &mint)
+            .get_token_largest_accounts(
+                &Some((remote, CommitmentConfig::default())),
+                RpcContextConfig::default(),
+                &mint,
+            )
             .await
             .expect("local holders survive a datasource that has never seen the mint")
-            .inner;
+            .value;
 
         assert_eq!(accounts.len(), 1);
         assert_eq!(accounts[0].address, holder.to_string());
         assert_eq!(accounts[0].amount.amount, "42");
+    }
+
+    /// Answers getTokenLargestAccounts with one holder of 1 token, at a 1.0 multiplier.
+    struct ReturnsOneHolder(Pubkey);
+
+    #[async_trait]
+    impl RpcSender for ReturnsOneHolder {
+        async fn send(
+            &self,
+            _request: RpcRequest,
+            _params: serde_json::Value,
+        ) -> ClientResult<serde_json::Value> {
+            Ok(serde_json::json!({
+                "context": { "slot": 0 },
+                "value": [{
+                    "address": self.0.to_string(),
+                    "amount": "1000000",
+                    "decimals": 6,
+                    "uiAmount": 1.0,
+                    "uiAmountString": "1",
+                }],
+            }))
+        }
+
+        fn get_transport_stats(&self) -> RpcTransportStats {
+            RpcTransportStats::default()
+        }
+
+        fn url(&self) -> String {
+            "http://returns-one-holder.example".to_string()
+        }
+    }
+
+    /// A holder only the datasource returns gets its amount from this surfnet's mint and Clock,
+    /// like the local holders it is ranked against.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_remote_largest_holder_uses_the_local_mint() {
+        use solana_account::Account;
+        use spl_token_2022_interface::{
+            extension::{
+                BaseStateWithExtensionsMut, ExtensionType, StateWithExtensionsMut,
+                scaled_ui_amount::ScaledUiAmountConfig,
+            },
+            state::Mint,
+        };
+
+        let (svm, _, _) = SurfnetSvm::default();
+        let locker = SurfnetSvmLocker::new(svm);
+        let (mint, holder) = (Pubkey::new_unique(), Pubkey::new_unique());
+        let mut data =
+            vec![
+                0;
+                ExtensionType::try_calculate_account_len::<Mint>(&[ExtensionType::ScaledUiAmount])
+                    .unwrap()
+            ];
+        let mut state = StateWithExtensionsMut::<Mint>::unpack_uninitialized(&mut data).unwrap();
+        let config = state.init_extension::<ScaledUiAmountConfig>(true).unwrap();
+        config.multiplier = 2.0.into();
+        config.new_multiplier = 2.0.into();
+        state.base = Mint {
+            supply: 1_000_000,
+            decimals: 6,
+            is_initialized: true,
+            ..Default::default()
+        };
+        state.pack_base();
+        state.init_account_type().unwrap();
+        locker.with_svm_writer(|svm| {
+            let lamports = svm.inner.minimum_balance_for_rent_exemption(data.len());
+            svm.set_account(
+                &mint,
+                Account {
+                    lamports,
+                    data,
+                    owner: spl_token_2022_interface::id(),
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+        });
+        let remote = SurfnetRemoteClient {
+            client: RpcClient::new_sender(ReturnsOneHolder(holder), RpcClientConfig::default())
+                .into(),
+        };
+
+        let accounts = locker
+            .get_token_largest_accounts(
+                &Some((remote, CommitmentConfig::default())),
+                RpcContextConfig::default(),
+                &mint,
+            )
+            .await
+            .unwrap()
+            .value;
+
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].address, holder.to_string());
+        assert_eq!(accounts[0].amount.ui_amount, Some(2.0));
     }
 
     #[tokio::test(flavor = "multi_thread")]

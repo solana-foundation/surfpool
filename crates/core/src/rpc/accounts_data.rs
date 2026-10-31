@@ -4,8 +4,11 @@ use solana_account_decoder::{
     UiAccount,
     parse_token::{UiTokenAmount, token_amount_to_ui_amount_v3},
 };
-use solana_client::{rpc_config::RpcAccountInfoConfig, rpc_response::RpcBlockCommitment};
-use solana_clock::{Clock, Slot};
+use solana_client::{
+    rpc_config::{RpcAccountInfoConfig, RpcContextConfig},
+    rpc_response::RpcBlockCommitment,
+};
+use solana_clock::Slot;
 use solana_commitment_config::CommitmentConfig;
 use solana_rpc_client_api::response::Response as RpcResponse;
 use solana_runtime::commitment::BlockCommitmentArray;
@@ -369,8 +372,8 @@ impl AccountsData for SurfpoolAccountsDataRpc {
         };
 
         Box::pin(async move {
-            // The locker reads the value under its own guard after any fetch, so take the slot first.
-            let read = svm_locker.read_slot(config.commitment, config.min_context_slot)?;
+            // Refuse before asking the datasource; the value's guard reads the slot again.
+            svm_locker.read_slot(config.commitment, config.min_context_slot)?;
             let SvmAccessContext {
                 inner: account_update,
                 ..
@@ -380,24 +383,15 @@ impl AccountsData for SurfpoolAccountsDataRpc {
             if let Some(m) = crate::telemetry::metrics() {
                 m.record_rpc_request("getAccountInfo", rpc_start.elapsed().as_millis() as u64);
             }
-            let ui_account = if let Some(((pubkey, account), token_data)) =
-                account_update.map_account_with_token_data()
-            {
-                Some(
-                    svm_locker
-                        .account_to_rpc_keyed_account(
-                            &pubkey,
-                            &account,
-                            &config,
-                            token_data.map(|(mint, _)| mint),
-                        )
-                        .account,
-                )
-            } else {
-                None
+            let at = RpcContextConfig {
+                commitment: config.commitment,
+                min_context_slot: config.min_context_slot,
             };
-
-            Ok(read.respond(ui_account))
+            let mut response = svm_locker.encode_accounts_at(at, vec![account_update], &config)?;
+            Ok(RpcResponse {
+                context: response.context,
+                value: response.value.pop().flatten(),
+            })
         })
     }
 
@@ -429,8 +423,8 @@ impl AccountsData for SurfpoolAccountsDataRpc {
         let rpc_start = std::time::Instant::now();
 
         Box::pin(async move {
-            // The locker reads the value under its own guard after any fetch, so take the slot first.
-            let read = svm_locker.read_slot(config.commitment, config.min_context_slot)?;
+            // Refuse before asking the datasource; the value's guard reads the slot again.
+            svm_locker.read_slot(config.commitment, config.min_context_slot)?;
             let SvmAccessContext {
                 inner: account_updates,
                 ..
@@ -446,28 +440,12 @@ impl AccountsData for SurfpoolAccountsDataRpc {
                 );
             }
 
-            // Convert account updates to UI accounts, order is already preserved by get_multiple_accounts
-            let mut ui_accounts = vec![];
-            for account_update in account_updates.into_iter() {
-                if let Some(((pubkey, account), token_data)) =
-                    account_update.map_account_with_token_data()
-                {
-                    ui_accounts.push(Some(
-                        svm_locker
-                            .account_to_rpc_keyed_account(
-                                &pubkey,
-                                &account,
-                                &config,
-                                token_data.map(|(mint, _)| mint),
-                            )
-                            .account,
-                    ));
-                } else {
-                    ui_accounts.push(None);
-                }
-            }
-
-            Ok(read.respond(ui_accounts))
+            // Order is already preserved by get_multiple_accounts.
+            let at = RpcContextConfig {
+                commitment: config.commitment,
+                min_context_slot: config.min_context_slot,
+            };
+            Ok(svm_locker.encode_accounts_at(at, account_updates, &config)?)
         })
     }
 
@@ -513,57 +491,66 @@ impl AccountsData for SurfpoolAccountsDataRpc {
         };
 
         Box::pin(async move {
-            // The locker reads the value under its own guard after any fetch, so take the slot first.
-            let read = svm_locker.read_slot(commitment, None)?;
             let token_account_result = svm_locker
                 .get_account(&remote_ctx, &pubkey, None)
                 .await?
                 .inner;
-
-            let token_account = token_account_result.map_account()?;
-
-            let (mint_pubkey, amount) = if is_supported_token_program(&token_account.owner) {
-                let unpacked_token_account = TokenAccount::unpack(&token_account.data)?;
-                (
-                    unpacked_token_account.mint(),
-                    unpacked_token_account.amount(),
-                )
-            } else {
-                return Err(SurfpoolError::invalid_account_data(
-                    pubkey,
-                    "Account is not owned by Token or Token-2022 program",
-                    None::<String>,
-                )
-                .into());
-            };
-
-            let SvmAccessContext {
-                inner: mint_account_result,
-                ..
-            } = svm_locker
-                .get_account(&remote_ctx, &mint_pubkey, None)
-                .await?;
-
-            let mint_account = mint_account_result.map_account()?;
-
-            if !is_supported_token_program(&mint_account.owner) {
-                return Err(SurfpoolError::invalid_account_data(
-                    mint_pubkey,
-                    "Mint account is not owned by Token or Token-2022 program",
-                    None::<String>,
-                )
-                .into());
-            }
-            let mint_data = svm_locker
-                .with_svm_reader(|svm| {
-                    spl_token_additional_data(
+            // The token account as of the read slot names the mint. A write while the mint is
+            // fetched can change that, so read again until the two agree.
+            let mut mint = None;
+            loop {
+                let mint_account_result = match mint {
+                    Some(mint) => Some(
+                        svm_locker
+                            .get_account(&remote_ctx, &mint, None)
+                            .await?
+                            .inner,
+                    ),
+                    None => None,
+                };
+                let read = svm_locker.with_svm_reader(|svm| {
+                    let read = svm.read_slot(commitment, None)?;
+                    let token_account = svm
+                        .account_at(read.slot(), token_account_result.clone())
+                        .map_account()?;
+                    if !is_supported_token_program(&token_account.owner) {
+                        return Err(SurfpoolError::invalid_account_data(
+                            pubkey,
+                            "Account is not owned by Token or Token-2022 program",
+                            None::<String>,
+                        )
+                        .into());
+                    }
+                    let token_account = TokenAccount::unpack(&token_account.data)?;
+                    let Some(mint_account_result) =
+                        mint_account_result.filter(|_| mint == Some(token_account.mint()))
+                    else {
+                        return Ok(Err(token_account.mint()));
+                    };
+                    let mint_account = svm
+                        .account_at(read.slot(), mint_account_result)
+                        .map_account()?;
+                    if !is_supported_token_program(&mint_account.owner) {
+                        return Err(SurfpoolError::invalid_account_data(
+                            token_account.mint(),
+                            "Mint account is not owned by Token or Token-2022 program",
+                            None::<String>,
+                        )
+                        .into());
+                    }
+                    let mint_data = spl_token_additional_data(
                         &mint_account.data,
-                        svm.inner.get_sysvar::<Clock>().unix_timestamp,
+                        svm.clock_at(read.slot()).unix_timestamp,
                     )
-                })
-                .ok_or_else(SurfpoolError::unpack_mint_account)?;
-
-            Ok(read.respond(Some(token_amount_to_ui_amount_v3(amount, &mint_data))))
+                    .ok_or_else(SurfpoolError::unpack_mint_account)?;
+                    let amount = token_amount_to_ui_amount_v3(token_account.amount(), &mint_data);
+                    Ok::<_, jsonrpc_core::Error>(Ok(read.respond(Some(amount))))
+                })?;
+                match read {
+                    Ok(response) => return Ok(response),
+                    Err(token_mint) => mint = Some(token_mint),
+                }
+            }
         })
     }
 
@@ -587,42 +574,39 @@ impl AccountsData for SurfpoolAccountsDataRpc {
         };
 
         Box::pin(async move {
-            // The locker reads the value under its own guard after any fetch, so take the slot first.
-            let read = svm_locker.read_slot(commitment, None)?;
-            let SvmAccessContext {
-                inner: mint_account_result,
-                ..
-            } = svm_locker
+            let mint_account_result = svm_locker
                 .get_account(&remote_ctx, &mint_pubkey, None)
-                .await?;
+                .await?
+                .inner;
 
-            let mint_account = mint_account_result.map_account()?;
-
-            if !is_supported_token_program(&mint_account.owner) {
-                return Err(SurfpoolError::invalid_account_data(
-                    mint_pubkey,
-                    "Account is not a token mint account",
-                    None::<String>,
-                )
-                .into());
-            }
-
-            let supply = StateWithExtensions::<spl_token_2022_interface::state::Mint>::unpack(
-                &mint_account.data,
-            )
-            .map_err(|_| SurfpoolError::unpack_mint_account())?
-            .base
-            .supply;
-            let mint_data = svm_locker
-                .with_svm_reader(|svm| {
-                    spl_token_additional_data(
-                        &mint_account.data,
-                        svm.inner.get_sysvar::<Clock>().unix_timestamp,
+            svm_locker.with_svm_reader(|svm| {
+                let read = svm.read_slot(commitment, None)?;
+                let mint_account = svm
+                    .account_at(read.slot(), mint_account_result)
+                    .map_account()?;
+                if !is_supported_token_program(&mint_account.owner) {
+                    return Err(SurfpoolError::invalid_account_data(
+                        mint_pubkey,
+                        "Account is not a token mint account",
+                        None::<String>,
                     )
-                })
+                    .into());
+                }
+
+                let supply = StateWithExtensions::<spl_token_2022_interface::state::Mint>::unpack(
+                    &mint_account.data,
+                )
+                .map_err(|_| SurfpoolError::unpack_mint_account())?
+                .base
+                .supply;
+                let mint_data = spl_token_additional_data(
+                    &mint_account.data,
+                    svm.clock_at(read.slot()).unix_timestamp,
+                )
                 .ok_or_else(SurfpoolError::unpack_mint_account)?;
 
-            Ok(read.respond(token_amount_to_ui_amount_v3(supply, &mint_data)))
+                Ok(read.respond(token_amount_to_ui_amount_v3(supply, &mint_data)))
+            })
         })
     }
 }
@@ -633,7 +617,7 @@ mod tests {
     use solana_account_decoder::{
         parse_account_data::SplTokenAdditionalDataV2, parse_token::token_amount_to_ui_amount_v3,
     };
-    use solana_client::rpc_config::RpcContextConfig;
+    use solana_clock::Clock;
     use solana_keypair::Keypair;
     use solana_program_option::COption;
     use solana_program_pack::Pack;
@@ -1383,7 +1367,7 @@ mod tests {
             .get_token_account_balance(
                 Some(client.context.clone()),
                 source_token_address.to_string(),
-                Some(CommitmentConfig::confirmed()),
+                Some(CommitmentConfig::processed()),
             )
             .await
             .unwrap();
@@ -1393,7 +1377,7 @@ mod tests {
             .get_token_account_balance(
                 Some(client.context.clone()),
                 destination_token_address.to_string(),
-                Some(CommitmentConfig::confirmed()),
+                Some(CommitmentConfig::processed()),
             )
             .await
             .unwrap();
@@ -1605,6 +1589,8 @@ mod tests {
                 source_token_address.to_string(),
                 Some(RpcAccountInfoConfig {
                     encoding: Some(solana_account_decoder::UiAccountEncoding::JsonParsed),
+                    // The transfer is processed; its block has not closed yet.
+                    commitment: Some(CommitmentConfig::processed()),
                     ..Default::default()
                 }),
             )
@@ -1618,6 +1604,8 @@ mod tests {
                 destination_token_address.to_string(),
                 Some(RpcAccountInfoConfig {
                     encoding: Some(solana_account_decoder::UiAccountEncoding::JsonParsed),
+                    // The transfer is processed; its block has not closed yet.
+                    commitment: Some(CommitmentConfig::processed()),
                     ..Default::default()
                 }),
             )
@@ -1872,5 +1860,473 @@ mod tests {
 
             assert_eq!(slots, [expected_slot; 9], "{commitment:?}");
         }
+    }
+
+    /// Alpenglow finalizes a block once the next one closes; legacy consensus 31 blocks later.
+    fn consensus(alpenglow: bool) -> surfpool_types::SvmFeatureConfig {
+        let id = agave_feature_set::alpenglow::id();
+        match alpenglow {
+            true => surfpool_types::SvmFeatureConfig::new().enable(id),
+            false => surfpool_types::SvmFeatureConfig::new().disable(id),
+        }
+    }
+
+    /// Like Agave, a read at a commitment returns the accounts as they were at the slot it
+    /// reports, so a transaction shows at a commitment once its block reaches it (#900). The
+    /// Clock answers for that slot too.
+    #[test_case::test_case(true; "alpenglow")]
+    #[test_case::test_case(false; "legacy")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn account_reads_return_the_state_at_their_context_slot(alpenglow: bool) {
+        use solana_account_decoder::UiAccountEncoding;
+        use solana_client::rpc_config::RpcProgramAccountsConfig;
+        use solana_rpc_client_api::response::OptionalContext;
+
+        use crate::rpc::accounts_scan::{AccountsScan, SurfpoolAccountsScanRpc};
+
+        let setup = TestSetup::new_with_features(SurfpoolAccountsDataRpc, consensus(alpenglow));
+        let locker = &setup.context.svm_locker;
+        let depth = locker.with_svm_reader(|svm| svm.finalization_slot_threshold());
+        let (payer, recipient) = (Keypair::new(), Pubkey::new_unique());
+        let funded = 1_000_000_000;
+        locker.airdrop(&payer.pubkey(), funded).unwrap().unwrap();
+        for _ in 0..=depth {
+            locker.confirm_current_block(&None).await.unwrap();
+        }
+        let transfer = Transaction::new_signed_with_payer(
+            &[solana_system_interface::instruction::transfer(
+                &payer.pubkey(),
+                &recipient,
+                1_000_000,
+            )],
+            Some(&payer.pubkey()),
+            &[&payer],
+            locker.with_svm_reader(|svm| svm.latest_blockhash()),
+        );
+        let (status_tx, _status_rx) = crossbeam_channel::unbounded();
+        locker
+            .process_transaction(&None, transfer.into(), status_tx, false, true)
+            .await
+            .unwrap();
+        let landed = locker.get_latest_absolute_slot();
+
+        // The context slots of getAccountInfo, getMultipleAccounts, getBalance,
+        // getProgramAccounts and of a Clock read; the recipient's lamports in the first, second
+        // and fourth; the payer's in the second, third and fourth; and Clock.slot.
+        let read = async |commitment| {
+            let config = RpcAccountInfoConfig {
+                commitment: Some(commitment),
+                encoding: Some(UiAccountEncoding::Base64),
+                ..Default::default()
+            };
+            let info = setup
+                .rpc
+                .get_account_info(
+                    Some(setup.context.clone()),
+                    recipient.to_string(),
+                    Some(config.clone()),
+                )
+                .await
+                .unwrap();
+            let multiple = setup
+                .rpc
+                .get_multiple_accounts(
+                    Some(setup.context.clone()),
+                    vec![recipient.to_string(), payer.pubkey().to_string()],
+                    Some(config.clone()),
+                )
+                .await
+                .unwrap();
+            let balance = SurfpoolMinimalRpc
+                .get_balance(
+                    Some(setup.context.clone()),
+                    payer.pubkey().to_string(),
+                    Some(RpcContextConfig {
+                        commitment: Some(commitment),
+                        min_context_slot: None,
+                    }),
+                )
+                .await
+                .unwrap();
+            let OptionalContext::Context(scan) = SurfpoolAccountsScanRpc
+                .get_program_accounts(
+                    Some(setup.context.clone()),
+                    solana_sdk_ids::system_program::id().to_string(),
+                    Some(RpcProgramAccountsConfig {
+                        account_config: config.clone(),
+                        with_context: Some(true),
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap()
+            else {
+                panic!("getProgramAccounts dropped its context");
+            };
+            let scanned = |pubkey: Pubkey| {
+                scan.value
+                    .iter()
+                    .find(|keyed| keyed.pubkey == pubkey.to_string())
+                    .map(|keyed| keyed.account.lamports)
+            };
+            let clock = setup
+                .rpc
+                .get_account_info(
+                    Some(setup.context.clone()),
+                    solana_sdk_ids::sysvar::clock::ID.to_string(),
+                    Some(config),
+                )
+                .await
+                .unwrap();
+            let clock_data = clock.value.unwrap().data.decode().unwrap();
+            (
+                [
+                    info.context.slot,
+                    multiple.context.slot,
+                    balance.context.slot,
+                    scan.context.slot,
+                    clock.context.slot,
+                ],
+                [
+                    info.value.map(|account| account.lamports),
+                    multiple.value[0].as_ref().map(|account| account.lamports),
+                    scanned(recipient),
+                ],
+                [
+                    multiple.value[1].as_ref().unwrap().lamports,
+                    balance.value,
+                    scanned(payer.pubkey()).unwrap(),
+                ],
+                u64::from_le_bytes(clock_data[..8].try_into().unwrap()),
+            )
+        };
+        let (_, _, [paid, ..], _) = read(CommitmentConfig::processed()).await;
+        assert!(paid < funded - 1_000_000);
+
+        let mut blocks = 0;
+        loop {
+            for commitment in [
+                CommitmentConfig::processed(),
+                CommitmentConfig::confirmed(),
+                CommitmentConfig::finalized(),
+            ] {
+                let slot = locker.get_slot_for_commitment(&commitment);
+                let (slots, recipient_lamports, payer_lamports, clock_slot) =
+                    read(commitment).await;
+                assert_eq!(slots, [slot; 5], "{commitment:?} after {blocks} blocks");
+                assert_eq!(clock_slot, slot, "{commitment:?} after {blocks} blocks");
+                let (expected_recipient, expected_payer) = match slot >= landed {
+                    true => (Some(1_000_000), paid),
+                    false => (None, funded),
+                };
+                assert_eq!(
+                    (recipient_lamports, payer_lamports),
+                    ([expected_recipient; 3], [expected_payer; 3]),
+                    "{commitment:?} at slot {slot}, the transfer landed at {landed}"
+                );
+            }
+            if locker.get_slot_for_commitment(&CommitmentConfig::finalized()) >= landed {
+                break;
+            }
+            locker.confirm_current_block(&None).await.unwrap();
+            blocks += 1;
+        }
+        assert_eq!(blocks, depth, "blocks until the transfer is finalized");
+    }
+
+    /// A cheatcode rewrites an account at every slot a read can still ask for: unlike a
+    /// transaction's write, every commitment sees it at once. That holds for resets too.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cheatcode_writes_show_at_every_commitment() {
+        let setup = TestSetup::new_with_features(SurfpoolAccountsDataRpc, consensus(true));
+        let locker = &setup.context.svm_locker;
+        let pubkey = Pubkey::new_unique();
+        // The airdrop is a transaction: reads at older slots keep the account missing.
+        locker.airdrop(&pubkey, 1_000_000_000).unwrap().unwrap();
+        let read_at_every_commitment = || async {
+            let mut balances = vec![];
+            for commitment in [
+                CommitmentConfig::processed(),
+                CommitmentConfig::confirmed(),
+                CommitmentConfig::finalized(),
+            ] {
+                let read = setup
+                    .rpc
+                    .get_account_info(
+                        Some(setup.context.clone()),
+                        pubkey.to_string(),
+                        Some(RpcAccountInfoConfig {
+                            commitment: Some(commitment),
+                            ..Default::default()
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                balances.push(read.value.map(|account| account.lamports));
+            }
+            balances
+        };
+
+        locker.with_svm_writer(|svm| {
+            let account = Account {
+                lamports: 42_000_000,
+                ..svm.get_account(&pubkey).unwrap().unwrap()
+            };
+            svm.set_account(&pubkey, account).unwrap();
+        });
+        assert_eq!(read_at_every_commitment().await, [Some(42_000_000); 3]);
+
+        locker.airdrop(&pubkey, 1_000_000_000).unwrap().unwrap();
+        locker.reset_account(pubkey, false).unwrap();
+        assert_eq!(read_at_every_commitment().await, [None; 3]);
+    }
+
+    /// Like Agave's `get_additional_mint_data`, token amounts apply a mint's rate-based
+    /// extensions at the clock of the slot a read reports, not the tip's (#904).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn token_amounts_use_the_clock_of_their_context_slot() {
+        use solana_account_decoder::{UiAccountData, UiAccountEncoding};
+        use solana_client::rpc_config::RpcTokenAccountsFilter;
+        use spl_token_2022_interface::{
+            extension::{BaseStateWithExtensionsMut, StateWithExtensionsMut},
+            state::Mint as Token2022Mint,
+        };
+
+        use crate::rpc::accounts_scan::{AccountsScan, SurfpoolAccountsScanRpc};
+
+        let setup = TestSetup::new_with_features(SurfpoolAccountsDataRpc, consensus(true));
+        let locker = &setup.context.svm_locker;
+        let (mint, holder, _) = set_scaled_mint(&setup, 6);
+        let owner = locker.with_svm_reader(|svm| {
+            TokenAccount::unpack(&svm.get_account(&holder).unwrap().unwrap().data)
+                .unwrap()
+                .owner
+        });
+        locker.confirm_current_block(&None).await.unwrap();
+        // The multiplier goes from 1.0 to 2.0 an hour from now; then the clock jumps past it.
+        let now = locker.with_svm_reader(|svm| svm.inner.get_sysvar::<Clock>().unix_timestamp);
+        locker.with_svm_writer(|svm| {
+            let mut account = svm.get_account(&mint).unwrap().unwrap();
+            let mut state =
+                StateWithExtensionsMut::<Token2022Mint>::unpack(&mut account.data).unwrap();
+            state
+                .get_extension_mut::<ScaledUiAmountConfig>()
+                .unwrap()
+                .new_multiplier_effective_timestamp = (now + 3_600).into();
+            svm.set_account(&mint, account).unwrap();
+        });
+        locker.confirm_current_block(&None).await.unwrap();
+        locker.with_svm_writer(|svm| {
+            let clock = svm.inner.get_sysvar::<Clock>();
+            svm.apply_time_travel(Clock {
+                unix_timestamp: now + 3_660,
+                ..clock
+            })
+            .unwrap();
+        });
+
+        for (commitment, ui_amount) in [
+            (CommitmentConfig::processed(), 2.0),
+            (CommitmentConfig::confirmed(), 1.0),
+            (CommitmentConfig::finalized(), 1.0),
+        ] {
+            let context = || Some(setup.context.clone());
+            let parsed = RpcAccountInfoConfig {
+                commitment: Some(commitment),
+                encoding: Some(UiAccountEncoding::JsonParsed),
+                ..Default::default()
+            };
+            let parsed_amount = |data: UiAccountData| {
+                let UiAccountData::Json(parsed) = data else {
+                    panic!("{commitment:?}: the holder was not parsed");
+                };
+                parsed.parsed["info"]["tokenAmount"]["uiAmount"].as_f64()
+            };
+            let amounts = [
+                setup
+                    .rpc
+                    .get_token_account_balance(context(), holder.to_string(), Some(commitment))
+                    .await
+                    .unwrap()
+                    .value
+                    .unwrap()
+                    .ui_amount,
+                setup
+                    .rpc
+                    .get_token_supply(context(), mint.to_string(), Some(commitment))
+                    .await
+                    .unwrap()
+                    .value
+                    .ui_amount,
+                SurfpoolAccountsScanRpc
+                    .get_token_largest_accounts(context(), mint.to_string(), Some(commitment))
+                    .await
+                    .unwrap()
+                    .value[0]
+                    .amount
+                    .ui_amount,
+                parsed_amount(
+                    setup
+                        .rpc
+                        .get_account_info(context(), holder.to_string(), Some(parsed.clone()))
+                        .await
+                        .unwrap()
+                        .value
+                        .unwrap()
+                        .data,
+                ),
+                parsed_amount(
+                    SurfpoolAccountsScanRpc
+                        .get_token_accounts_by_owner(
+                            context(),
+                            owner.to_string(),
+                            RpcTokenAccountsFilter::Mint(mint.to_string()),
+                            Some(parsed),
+                        )
+                        .await
+                        .unwrap()
+                        .value[0]
+                        .account
+                        .data
+                        .clone(),
+                ),
+            ];
+            assert_eq!(amounts, [Some(ui_amount); 5], "{commitment:?}");
+        }
+    }
+
+    /// A network reset rewinds the chain, so the versions saved before it must not answer the
+    /// reads after it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_network_reset_forgets_the_saved_versions() {
+        let setup = TestSetup::new_with_features(SurfpoolAccountsDataRpc, consensus(true));
+        let locker = &setup.context.svm_locker;
+        let pubkey = Pubkey::new_unique();
+        locker.with_svm_writer(|svm| svm.travel_to(10_000)).unwrap();
+        locker.airdrop(&pubkey, 1_000_000_000).unwrap().unwrap();
+        locker
+            .with_svm_writer(|svm| {
+                let epoch_schedule = crate::surfnet::svm::SurfnetSvm::default_epoch_schedule();
+                svm.reset_network(
+                    crate::surfnet::svm::SurfnetSvm::default_epoch_info(&epoch_schedule),
+                    epoch_schedule,
+                )
+            })
+            .unwrap();
+        locker.airdrop(&pubkey, 2_000_000_000).unwrap().unwrap();
+        locker.confirm_current_block(&None).await.unwrap();
+
+        let balance = SurfpoolMinimalRpc
+            .get_balance(
+                Some(setup.context.clone()),
+                pubkey.to_string(),
+                Some(RpcContextConfig {
+                    commitment: Some(CommitmentConfig::confirmed()),
+                    min_context_slot: None,
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(balance.context.slot < 10_000);
+        assert_eq!(balance.value, 2_000_000_000);
+    }
+
+    /// A token account closed after the read slot is still a token account at that slot: its
+    /// balance and parsed amounts come from the version the read returns.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_token_account_closed_since_the_read_slot_still_reads_as_one() {
+        use solana_account_decoder::{UiAccountData, UiAccountEncoding};
+        use spl_token_2022_interface::state::Account as Token2022Account;
+
+        let setup = TestSetup::new_with_features(SurfpoolAccountsDataRpc, consensus(true));
+        let locker = &setup.context.svm_locker;
+        let (mint, _, _) = set_scaled_mint(&setup, 6);
+        let (owner, closed) = (Keypair::new(), Pubkey::new_unique());
+        locker
+            .airdrop(&owner.pubkey(), 1_000_000_000)
+            .unwrap()
+            .unwrap();
+        locker.with_svm_writer(|svm| {
+            let mut data = vec![0; Token2022Account::LEN];
+            Token2022Account {
+                mint,
+                owner: owner.pubkey(),
+                state: spl_token_2022_interface::state::AccountState::Initialized,
+                ..Default::default()
+            }
+            .pack_into_slice(&mut data);
+            let account = Account {
+                lamports: svm.inner.minimum_balance_for_rent_exemption(data.len()),
+                data,
+                owner: spl_token_2022_interface::id(),
+                executable: false,
+                rent_epoch: 0,
+            };
+            svm.set_account(&closed, account).unwrap();
+        });
+        locker.confirm_current_block(&None).await.unwrap();
+        let close = Transaction::new_signed_with_payer(
+            &[spl_token_2022_interface::instruction::close_account(
+                &spl_token_2022_interface::id(),
+                &closed,
+                &owner.pubkey(),
+                &owner.pubkey(),
+                &[],
+            )
+            .unwrap()],
+            Some(&owner.pubkey()),
+            &[&owner],
+            locker.with_svm_reader(|svm| svm.latest_blockhash()),
+        );
+        let (status_tx, _status_rx) = crossbeam_channel::unbounded();
+        locker
+            .process_transaction(&None, close.into(), status_tx, false, true)
+            .await
+            .unwrap();
+
+        let read = |commitment| RpcAccountInfoConfig {
+            commitment: Some(commitment),
+            encoding: Some(UiAccountEncoding::JsonParsed),
+            ..Default::default()
+        };
+        let processed = setup
+            .rpc
+            .get_account_info(
+                Some(setup.context.clone()),
+                closed.to_string(),
+                Some(read(CommitmentConfig::processed())),
+            )
+            .await
+            .unwrap();
+        assert!(processed.value.is_none(), "the close was processed");
+
+        let confirmed = CommitmentConfig::confirmed();
+        let balance = setup
+            .rpc
+            .get_token_account_balance(
+                Some(setup.context.clone()),
+                closed.to_string(),
+                Some(confirmed),
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        assert_eq!((balance.amount.as_str(), balance.decimals), ("0", 6));
+        let account = setup
+            .rpc
+            .get_account_info(
+                Some(setup.context.clone()),
+                closed.to_string(),
+                Some(read(confirmed)),
+            )
+            .await
+            .unwrap()
+            .value
+            .unwrap();
+        let UiAccountData::Json(parsed) = account.data else {
+            panic!("the closed token account was not parsed");
+        };
+        assert_eq!(parsed.parsed["info"]["tokenAmount"]["decimals"], 6);
     }
 }

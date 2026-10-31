@@ -12429,8 +12429,15 @@ async fn test_send_transaction_resend_of_processed_transaction(test_type: TestTy
         .await
         .expect("the first send should succeed");
     let observed_state = async || {
-        let payer = minimal_client.get_balance(payer.pubkey().to_string(), None);
-        let recipient = minimal_client.get_balance(recipient.to_string(), None);
+        // The sends are processed; their blocks have not closed yet.
+        let processed = || {
+            Some(solana_client::rpc_config::RpcContextConfig {
+                commitment: Some(CommitmentConfig::processed()),
+                min_context_slot: None,
+            })
+        };
+        let payer = minimal_client.get_balance(payer.pubkey().to_string(), processed());
+        let recipient = minimal_client.get_balance(recipient.to_string(), processed());
         let transaction_count = minimal_client.get_transaction_count(None);
         (
             payer.await.unwrap().value,

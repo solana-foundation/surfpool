@@ -32,6 +32,7 @@ use solana_client::{
     rpc_config::{RpcAccountInfoConfig, RpcBlockConfig, RpcTransactionLogsFilter},
     rpc_custom_error::RpcCustomError,
     rpc_filter::RpcFilterType,
+    rpc_request::TokenAccountsFilter,
     rpc_response::{
         Response as RpcResponse, RpcBlockUpdate, RpcBlockUpdateError, RpcKeyedAccount,
         RpcLogsResponse, RpcPerfSample, RpcResponseContext,
@@ -593,6 +594,10 @@ pub struct SurfnetSvm {
     /// [`Self::subscribe_startup_status`].
     startup_status_watch_tx: tokio::sync::watch::Sender<SurfnetStartupStatus>,
     pub account_update_slots: HashMap<Pubkey, Slot>,
+    /// Each account a local write changed in a slot after the finalized one, as it was before
+    /// the first write of each such slot, oldest first: what reads at older slots return.
+    /// Fetching an account from the datasource is not a write.
+    account_versions: HashMap<Pubkey, Vec<(Slot, Option<Account>)>>,
     pub streamed_accounts: Box<dyn Storage<String, bool>>,
     pub recent_blockhashes: VecDeque<(SyntheticBlockhash, i64)>,
     pub scheduled_overrides: Box<dyn Storage<u64, Vec<OverrideInstance>>>,
@@ -928,6 +933,8 @@ impl SurfnetSvm {
             // subscribers.
             startup_status_watch_tx: tokio::sync::watch::channel(self.startup_status.clone()).0,
             account_update_slots: self.account_update_slots.clone(),
+            // A sandbox serves no reads; a bundle commit merges the versions it saves.
+            account_versions: HashMap::new(),
             recent_blockhashes: self.recent_blockhashes.clone(),
             offline_accounts: OverlayStorage::wrap(self.offline_accounts.clone_box()),
             genesis_slot: self.genesis_slot,
@@ -1121,6 +1128,13 @@ impl SurfnetSvm {
         self.write_version = svm.write_version;
         for (k, v) in svm.account_update_slots.drain() {
             self.account_update_slots.insert(k, v);
+        }
+        // The sandbox ran on top of this state, so its first version of each account in a slot
+        // is the one to keep unless this state saved one in that slot already.
+        for (pubkey, versions) in svm.account_versions.drain() {
+            for (slot, before) in versions {
+                self.save_version(pubkey, slot, before.as_ref());
+            }
         }
         self.perf_samples = svm.perf_samples.clone();
         self.recent_blockhashes = svm.recent_blockhashes.clone();
@@ -1357,6 +1371,7 @@ impl SurfnetSvm {
             startup_status: SurfnetStartupStatus::default(),
             startup_status_watch_tx: tokio::sync::watch::channel(SurfnetStartupStatus::default()).0,
             account_update_slots: HashMap::new(),
+            account_versions: HashMap::new(),
             streamed_accounts: streamed_accounts_db,
             recent_blockhashes: VecDeque::new(),
             scheduled_overrides: scheduled_overrides_db,
@@ -1488,6 +1503,11 @@ impl SurfnetSvm {
 
         // Capture pre-airdrop balances for the airdrop account, recipient, and system program.
         let airdrop_pubkey = self.inner.airdrop_pubkey();
+        // An airdrop is a transaction: reads at older slots keep what it replaces.
+        let versions = [
+            (airdrop_pubkey, self.get_account(&airdrop_pubkey)?),
+            (*pubkey, self.get_account(pubkey)?),
+        ];
 
         let airdrop_account_before = self
             .get_account(&airdrop_pubkey)?
@@ -1585,7 +1605,11 @@ impl SurfnetSvm {
             self.transactions_queued_for_confirmation
                 .push_back((tx, status_tx.clone(), None));
             if let Some(account) = self.get_account(pubkey)? {
-                self.set_account(pubkey, account)?;
+                // Indexes the write. Unlike a cheatcode's, it keeps the account's saved versions.
+                self.set_account_inner(pubkey, account, true)?;
+            }
+            for (written, before) in versions {
+                self.save_version(written, slot, before.as_ref());
             }
         }
         Ok(res)
@@ -1767,7 +1791,7 @@ impl SurfnetSvm {
             epoch: self.latest_epoch_info.epoch,
             ..clock
         };
-        self.inner.set_sysvar(&clock);
+        self.set_clock(&clock);
         self.simnet_events_tx.system_clock_updated(clock);
         Ok(self.latest_epoch_info.clone())
     }
@@ -2290,8 +2314,14 @@ impl SurfnetSvm {
     ///
     /// # Returns
     /// `Ok(())` on success, or an error if the operation fails.
+    ///
+    /// This is a cheatcode's write: it rewrites the account at every slot a read can still ask
+    /// for, so every commitment sees it at once. Transactions and airdrops keep the version they
+    /// replace instead, see [`Self::save_version`].
     pub fn set_account(&mut self, pubkey: &Pubkey, account: Account) -> SurfpoolResult<()> {
-        self.set_account_inner(pubkey, account, true)
+        self.set_account_inner(pubkey, account, true)?;
+        self.account_versions.remove(pubkey);
+        Ok(())
     }
 
     /// Inserts an upstream account into the fork without publishing a local account update.
@@ -2328,6 +2358,99 @@ impl SurfnetSvm {
         Ok(())
     }
 
+    /// Saves `before`, the version of `pubkey` a local write at `slot` replaces, for the reads at
+    /// older slots, unless an earlier write at `slot` saved one already.
+    pub(crate) fn save_version(&mut self, pubkey: Pubkey, slot: Slot, before: Option<&Account>) {
+        let versions = self.account_versions.entry(pubkey).or_default();
+        if versions.last().is_none_or(|(written, _)| *written < slot) {
+            versions.push((slot, before.cloned()));
+        }
+    }
+
+    /// The version of `pubkey` a read at `slot` returns instead of the live one: the one saved
+    /// before the first local write after `slot`, if any. `None` at the tip.
+    fn saved_version(&self, pubkey: &Pubkey, slot: Slot) -> Option<Option<&Account>> {
+        if slot >= self.get_latest_absolute_slot() {
+            return None;
+        }
+        self.account_versions
+            .get(pubkey)?
+            .iter()
+            .find(|(written, _)| *written > slot)
+            .map(|(_, before)| before.as_ref())
+    }
+
+    /// The account `fetched` names, as a read at `slot` returns it. `fetched` was read under an
+    /// earlier guard and may predate a write since, so the local state wins; it only stands in
+    /// for an account the surfnet doesn't store.
+    pub fn account_at(&self, slot: Slot, fetched: GetAccountResult) -> GetAccountResult {
+        let pubkey = match &fetched {
+            GetAccountResult::None(pubkey) | GetAccountResult::FoundAccount(pubkey, ..) => *pubkey,
+            GetAccountResult::FoundCoupledAccount((pubkey, _), ..) => *pubkey,
+        };
+        match self.saved_version(&pubkey, slot) {
+            None => match self.get_account(&pubkey) {
+                Ok(Some(live)) => GetAccountResult::FoundAccount(pubkey, live, AccountSource::Svm),
+                _ => fetched,
+            },
+            Some(None) => GetAccountResult::None(pubkey),
+            Some(Some(account)) => {
+                GetAccountResult::FoundAccount(pubkey, account.clone(), AccountSource::Svm)
+            }
+        }
+    }
+
+    /// Rewinds a scan of live `items` to `slot`: each account a local write changed after `slot`
+    /// leaves it, and comes back as `at_slot` maps the version a read at `slot` returns.
+    pub fn rewind_scan<T>(
+        &self,
+        slot: Slot,
+        items: &mut Vec<(Pubkey, T)>,
+        at_slot: impl Fn(&Account) -> Option<T>,
+    ) {
+        if slot >= self.get_latest_absolute_slot() {
+            return;
+        }
+        let rewritten: HashMap<Pubkey, Option<&Account>> = self
+            .account_versions
+            .iter()
+            .filter_map(|(pubkey, versions)| {
+                let (_, before) = versions.iter().find(|(written, _)| *written > slot)?;
+                Some((*pubkey, before.as_ref()))
+            })
+            .collect();
+        if rewritten.is_empty() {
+            return;
+        }
+        items.retain(|(pubkey, _)| !rewritten.contains_key(pubkey));
+        items.extend(
+            rewritten
+                .into_iter()
+                .filter_map(|(pubkey, account)| Some((pubkey, at_slot(account?)?))),
+        );
+    }
+
+    /// The Clock of the block at `slot`.
+    pub fn clock_at(&self, slot: Slot) -> Clock {
+        self.saved_version(&solana_sdk_ids::sysvar::clock::ID, slot)
+            .flatten()
+            .and_then(|clock| clock.deserialize_data().ok())
+            .unwrap_or_else(|| self.inner.get_sysvar())
+    }
+
+    /// Moves the Clock to `clock`, keeping the one it replaces for the reads at older slots.
+    fn set_clock(&mut self, clock: &Clock) {
+        let before = self
+            .inner
+            .get_account_no_db(&solana_sdk_ids::sysvar::clock::ID);
+        self.save_version(
+            solana_sdk_ids::sysvar::clock::ID,
+            self.get_latest_absolute_slot(),
+            before.as_ref(),
+        );
+        self.inner.set_sysvar(clock);
+    }
+
     /// Applies an account mutation forged by a scenario and publishes it to subscribers.
     /// Upstream account hydration deliberately uses a different path and remains silent.
     pub(crate) fn set_scenario_override_account(
@@ -2340,7 +2463,11 @@ impl SurfnetSvm {
             return Ok(());
         }
 
-        self.set_account(pubkey, account.clone())?;
+        // A scenario forges the account as a block would, so reads at older slots keep the
+        // version it replaces. It writes the live state, so at the tip whatever slot it targets.
+        let before = self.get_account(pubkey)?;
+        self.set_account_inner(pubkey, account.clone(), true)?;
+        self.save_version(*pubkey, self.get_latest_absolute_slot(), before.as_ref());
         self.account_update_slots.insert(*pubkey, slot);
 
         let write_version = self.increment_write_version();
@@ -2575,6 +2702,7 @@ impl SurfnetSvm {
         self.runbook_executions.clear();
         self.streamed_accounts.clear()?;
         self.scheduled_overrides.clear()?;
+        self.account_versions.clear();
 
         let current_time = chrono::Utc::now().timestamp_millis() as u64;
         self.updated_at = current_time;
@@ -2640,6 +2768,8 @@ impl SurfnetSvm {
         self.remove_from_indexes(pubkey, account)?;
 
         self.inner.delete_account(pubkey)?;
+        // Like a cheatcode write: no read may bring the purged account back.
+        self.account_versions.remove(pubkey);
 
         Ok(())
     }
@@ -3070,8 +3200,13 @@ impl SurfnetSvm {
         // Preserve the established behavior for fetched data: an account that
         // LiteSVM rejects (such as an incomplete program upload) is still
         // returned to the caller, with the insertion failure emitted as an
-        // event for observability.
-        if let Err(error) = self.set_account(&pubkey, account) {
+        // event for observability. Hydrating an account the datasource already had is not a
+        // write, so reads at older slots see it too.
+        let written = match policy {
+            AccountUpdatePolicy::Authoritative => self.set_account(&pubkey, account),
+            AccountUpdatePolicy::HydrateIfAbsent => self.set_account_inner(&pubkey, account, true),
+        };
+        if let Err(error) = written {
             let _ = self.simnet_events_tx.error(error.to_string());
         }
         Ok(())
@@ -3186,6 +3321,13 @@ impl SurfnetSvm {
         let total_transactions = self.latest_epoch_info.transaction_count.unwrap_or(0);
         self.latest_epoch_info.transaction_count = Some(total_transactions + num_transactions);
 
+        // No read answers for a slot before the finalized one.
+        let root = self.slot_for_commitment(&CommitmentConfig::finalized());
+        self.account_versions.retain(|_, versions| {
+            versions.retain(|(written, _)| *written > root);
+            !versions.is_empty()
+        });
+
         // Emit `slotsUpdatesNotification` events for the lifecycle transition
         // we just completed:
         //   * `Frozen`     – the slot that was just closed (`slot`) is now
@@ -3270,7 +3412,7 @@ impl SurfnetSvm {
         );
 
         let _ = self.simnet_events_tx.system_clock_updated(clock.clone());
-        self.inner.set_sysvar(&clock);
+        self.set_clock(&clock);
 
         self.finalize_transactions()?;
 
@@ -4006,7 +4148,13 @@ impl SurfnetSvm {
                     ..Default::default()
                 };
                 let account = self
-                    .account_to_rpc_keyed_account(account_updated_pubkey, account, &config, None)
+                    .account_to_rpc_keyed_account(
+                        account_updated_pubkey,
+                        account,
+                        &config,
+                        None,
+                        self.get_latest_absolute_slot(),
+                    )
                     .account;
                 if tx.send((slot, account)).is_err() {
                     // The receiver has been dropped, so we can skip notifying
@@ -4041,8 +4189,13 @@ impl SurfnetSvm {
                     encoding,
                     ..Default::default()
                 };
-                let keyed_account =
-                    self.account_to_rpc_keyed_account(account_pubkey, account, &config, None);
+                let keyed_account = self.account_to_rpc_keyed_account(
+                    account_pubkey,
+                    account,
+                    &config,
+                    None,
+                    self.get_latest_absolute_slot(),
+                );
                 if tx.send((slot, keyed_account)).is_err() {
                     // The receiver has been dropped, so we can skip notifying
                     continue;
@@ -4156,6 +4309,7 @@ impl SurfnetSvm {
         &self,
         pubkey: &Pubkey,
         token_mint: Option<Pubkey>,
+        slot: Slot,
     ) -> Option<AccountAdditionalDataV3> {
         let token_mint = if let Some(mint) = token_mint {
             Some(mint)
@@ -4168,16 +4322,24 @@ impl SurfnetSvm {
         };
 
         token_mint
-            .and_then(|mint| self.mint_additional_data(&mint))
+            .and_then(|mint| self.mint_additional_data(&mint, slot))
             .map(|data| AccountAdditionalDataV3 {
                 spl_token_additional_data: Some(data),
             })
     }
 
-    /// The cached UI-amount inputs of `mint`, with the rate-based extensions
-    /// evaluated at the current clock like Agave's `get_additional_mint_data`
-    /// (the cache holds the clock of the slot the mint was last written).
-    pub fn mint_additional_data(&self, mint: &Pubkey) -> Option<SplTokenAdditionalDataV2> {
+    /// The UI-amount inputs of `mint` as of `slot`, with the rate-based extensions evaluated at
+    /// that block's clock like Agave's `get_additional_mint_data`. The cache holds the live
+    /// mint, so a mint written since `slot` is parsed from its saved version.
+    pub fn mint_additional_data(
+        &self,
+        mint: &Pubkey,
+        slot: Slot,
+    ) -> Option<SplTokenAdditionalDataV2> {
+        let now = self.clock_at(slot).unix_timestamp;
+        if let Some(saved) = self.saved_version(mint, slot) {
+            return spl_token_additional_data(&saved?.data, now);
+        }
         let cached: AccountAdditionalDataV3 = self
             .account_associated_data
             .get(&mint.to_string())
@@ -4186,7 +4348,6 @@ impl SurfnetSvm {
             .try_into()
             .ok()?;
         let mut data = cached.spl_token_additional_data?;
-        let now = self.inner.get_sysvar::<Clock>().unix_timestamp;
         if let Some((_, ts)) = data.interest_bearing_config.as_mut() {
             *ts = now;
         }
@@ -4196,14 +4357,24 @@ impl SurfnetSvm {
         Some(data)
     }
 
+    /// The mint of `account`, if its data is a token account. Unlike the live index, it also
+    /// knows a version a read rewound to.
+    pub fn token_account_mint(account: &Account) -> Option<Pubkey> {
+        is_supported_token_program(&account.owner)
+            .then(|| TokenAccount::unpack(&account.data).ok())?
+            .map(|token_account| token_account.mint())
+    }
+
+    /// `account` keyed and encoded as a read at `slot` returns it.
     pub fn account_to_rpc_keyed_account<T: ReadableAccount>(
         &self,
         pubkey: &Pubkey,
         account: &T,
         config: &RpcAccountInfoConfig,
         token_mint: Option<Pubkey>,
+        slot: Slot,
     ) -> RpcKeyedAccount {
-        let additional_data = self.get_additional_data(pubkey, token_mint);
+        let additional_data = self.get_additional_data(pubkey, token_mint, slot);
 
         RpcKeyedAccount {
             pubkey: pubkey.to_string(),
@@ -4215,6 +4386,50 @@ impl SurfnetSvm {
                 config.data_slice,
             ),
         }
+    }
+
+    /// The live `token_accounts` of an index scan, rewound to `read`'s slot and encoded: the
+    /// ones `filter` keeps, plus the accounts written since whose version at that slot is a token
+    /// account that `belongs` to the scan.
+    pub fn token_accounts_at(
+        &self,
+        read: ReadSlot,
+        token_accounts: Vec<(Pubkey, TokenAccount)>,
+        filter: &TokenAccountsFilter,
+        config: &RpcAccountInfoConfig,
+        belongs: impl Fn(&TokenAccount) -> bool,
+    ) -> SurfpoolResult<RpcResponse<Vec<RpcKeyedAccount>>> {
+        let mut accounts = token_accounts
+            .into_iter()
+            .filter_map(|(pubkey, token_account)| {
+                let account = self.get_account(&pubkey).transpose()?;
+                Some(account.map(|account| (pubkey, (token_account, account))))
+            })
+            .collect::<SurfpoolResult<Vec<_>>>()?;
+        self.rewind_scan(read.slot(), &mut accounts, |account| {
+            if !is_supported_token_program(&account.owner) {
+                return None;
+            }
+            let token_account = TokenAccount::unpack(&account.data).ok()?;
+            belongs(&token_account).then(|| (token_account, account.clone()))
+        });
+        let keyed_accounts = accounts
+            .iter()
+            .filter(|(_, (token_account, account))| match filter {
+                TokenAccountsFilter::Mint(mint) => token_account.mint() == *mint,
+                TokenAccountsFilter::ProgramId(program_id) => account.owner == *program_id,
+            })
+            .map(|(pubkey, (token_account, account))| {
+                self.account_to_rpc_keyed_account(
+                    pubkey,
+                    account,
+                    config,
+                    Some(token_account.mint()),
+                    read.slot(),
+                )
+            })
+            .collect();
+        Ok(read.respond(keyed_accounts))
     }
 
     /// Gets all token accounts that have delegated authority to a specific delegate.
@@ -4660,7 +4875,8 @@ impl SurfnetSvm {
         account_profile_state: AccountProfileState,
         encoding: &UiAccountEncoding,
     ) -> UiAccountProfileState {
-        let additional_data = self.get_additional_data(pubkey, None);
+        let additional_data =
+            self.get_additional_data(pubkey, None, self.get_latest_absolute_slot());
 
         match account_profile_state {
             AccountProfileState::Readonly => UiAccountProfileState::Readonly,
@@ -5038,11 +5254,11 @@ impl SurfnetSvm {
             } else {
                 *pubkey
             };
-            let additional_data =
-                self.mint_additional_data(&mint)
-                    .map(|data| AccountAdditionalDataV3 {
-                        spl_token_additional_data: Some(data),
-                    });
+            let additional_data = self
+                .mint_additional_data(&mint, self.get_latest_absolute_slot())
+                .map(|data| AccountAdditionalDataV3 {
+                    spl_token_additional_data: Some(data),
+                });
 
             let ui_account =
                 self.encode_ui_account(pubkey, account, encoding, additional_data, None);

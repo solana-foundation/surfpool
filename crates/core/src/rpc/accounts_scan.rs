@@ -4,8 +4,8 @@ use jsonrpc_core::{BoxFuture, Result};
 use jsonrpc_derive::rpc;
 use solana_client::{
     rpc_config::{
-        RpcAccountInfoConfig, RpcLargestAccountsConfig, RpcProgramAccountsConfig, RpcSupplyConfig,
-        RpcTokenAccountsFilter,
+        RpcAccountInfoConfig, RpcContextConfig, RpcLargestAccountsConfig, RpcProgramAccountsConfig,
+        RpcSupplyConfig, RpcTokenAccountsFilter,
     },
     rpc_response::{
         OptionalContext, RpcAccountBalance, RpcKeyedAccount, RpcSupply, RpcTokenAccountBalance,
@@ -18,7 +18,6 @@ use super::{
     RunloopContext, State, SurfnetRpcContext,
     utils::{optimize_filters, verify_filters, verify_pubkey, verify_token_account_filter},
 };
-use crate::surfnet::locker::SvmAccessContext;
 
 #[rpc]
 pub trait AccountsScan {
@@ -489,25 +488,28 @@ impl AccountsScan for SurfpoolAccountsScanRpc {
             }
 
             let account_config = config.account_config;
-            // The locker reads the value under its own guard after any fetch, so take the slot first.
-            let read =
-                svm_locker.read_slot(account_config.commitment, account_config.min_context_slot)?;
+            let at = RpcContextConfig {
+                commitment: account_config.commitment,
+                min_context_slot: account_config.min_context_slot,
+            };
+            // Refuse before asking the datasource; the value's guard reads the slot again.
+            svm_locker.read_slot(at.commitment, at.min_context_slot)?;
 
             // Get program-owned accounts from the account registry
             let program_accounts = svm_locker
                 .get_program_accounts(
                     &remote_ctx.map(|(client, _)| client),
+                    at,
                     &program_id,
                     account_config,
                     filters,
                 )
-                .await?
-                .inner;
+                .await?;
 
             if config.with_context.unwrap_or(false) {
-                Ok(OptionalContext::Context(read.respond(program_accounts)))
+                Ok(OptionalContext::Context(program_accounts))
             } else {
-                Ok(OptionalContext::NoContext(program_accounts))
+                Ok(OptionalContext::NoContext(program_accounts.value))
             }
         })
     }
@@ -527,14 +529,13 @@ impl AccountsScan for SurfpoolAccountsScanRpc {
         };
 
         Box::pin(async move {
-            // The locker reads the value under its own guard after any fetch, so take the slot first.
-            let read = svm_locker.read_slot(config.commitment, None)?;
-            let SvmAccessContext {
-                inner: largest_accounts,
-                ..
-            } = svm_locker.get_largest_accounts(&remote_ctx, config).await?;
-
-            Ok(read.respond(largest_accounts))
+            let at = RpcContextConfig {
+                commitment: config.commitment,
+                min_context_slot: None,
+            };
+            Ok(svm_locker
+                .get_largest_accounts(&remote_ctx, at, config)
+                .await?)
         })
     }
 
@@ -593,16 +594,13 @@ impl AccountsScan for SurfpoolAccountsScanRpc {
         };
 
         Box::pin(async move {
-            // The locker reads the value under its own guard after any fetch, so take the slot first.
-            let read = svm_locker.read_slot(commitment, None)?;
-            let SvmAccessContext {
-                inner: largest_accounts,
-                ..
-            } = svm_locker
-                .get_token_largest_accounts(&remote_ctx, &mint)
-                .await?;
-
-            Ok(read.respond(largest_accounts))
+            let at = RpcContextConfig {
+                commitment,
+                min_context_slot: None,
+            };
+            Ok(svm_locker
+                .get_token_largest_accounts(&remote_ctx, at, &mint)
+                .await?)
         })
     }
 
@@ -628,22 +626,22 @@ impl AccountsScan for SurfpoolAccountsScanRpc {
         };
 
         Box::pin(async move {
-            // The locker reads the value under its own guard after any fetch, so take the slot first.
-            let read = svm_locker.read_slot(config.commitment, config.min_context_slot)?;
             let filter = verify_token_account_filter(token_account_filter)?;
-            let SvmAccessContext {
-                inner: token_accounts,
-                ..
-            } = svm_locker
+            let at = RpcContextConfig {
+                commitment: config.commitment,
+                min_context_slot: config.min_context_slot,
+            };
+            // Refuse before asking the datasource; the value's guard reads the slot again.
+            svm_locker.read_slot(at.commitment, at.min_context_slot)?;
+            Ok(svm_locker
                 .get_token_accounts_by_owner(
                     &remote_ctx.map(|(client, _)| client),
+                    at,
                     owner,
                     &filter,
                     &config,
                 )
-                .await?;
-
-            Ok(read.respond(token_accounts))
+                .await?)
         })
     }
 
@@ -670,18 +668,16 @@ impl AccountsScan for SurfpoolAccountsScanRpc {
 
         Box::pin(async move {
             let filter = verify_token_account_filter(token_account_filter)?;
-
-            // The locker reads the value under its own guard after any fetch, so take the slot first.
-            let read = svm_locker.read_slot(config.commitment, config.min_context_slot)?;
+            let at = RpcContextConfig {
+                commitment: config.commitment,
+                min_context_slot: config.min_context_slot,
+            };
+            // Refuse before asking the datasource; the value's guard reads the slot again.
+            svm_locker.read_slot(at.commitment, at.min_context_slot)?;
             let remote_ctx = remote_ctx.map(|(r, _)| r);
-            let SvmAccessContext {
-                inner: keyed_accounts,
-                ..
-            } = svm_locker
-                .get_token_accounts_by_delegate(&remote_ctx, delegate, &filter, &config)
-                .await?;
-
-            Ok(read.respond(keyed_accounts))
+            Ok(svm_locker
+                .get_token_accounts_by_delegate(&remote_ctx, at, delegate, &filter, &config)
+                .await?)
         })
     }
 }

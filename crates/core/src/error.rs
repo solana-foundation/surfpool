@@ -34,6 +34,12 @@ impl From<SurfpoolError> for Error {
     }
 }
 
+impl From<Error> for SurfpoolError {
+    fn from(e: Error) -> Self {
+        Self(e)
+    }
+}
+
 impl From<EncodeError> for SurfpoolError {
     fn from(e: EncodeError) -> Self {
         let mut error = Error::internal_error();

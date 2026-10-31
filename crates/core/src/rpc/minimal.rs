@@ -603,13 +603,18 @@ impl Minimal for SurfpoolMinimalRpc {
             #[cfg(feature = "prometheus")]
             let rpc_start = std::time::Instant::now();
 
-            // The locker reads the value under its own guard after any fetch, so take the slot first.
-            let read = svm_locker.read_slot(config.commitment, config.min_context_slot)?;
+            // Refuse before asking the datasource; the value's guard reads the slot again.
+            svm_locker.read_slot(config.commitment, config.min_context_slot)?;
             let SvmAccessContext {
                 inner: account_update,
                 ..
             } = svm_locker.get_account(&remote_ctx, &pubkey, None).await?;
 
+            // The read slot and the account come from one guard, as Agave reads both from one bank.
+            let (read, account_update) = svm_locker.with_svm_reader(|svm| {
+                let read = svm.read_slot(config.commitment, config.min_context_slot)?;
+                Ok::<_, jsonrpc_core::Error>((read, svm.account_at(read.slot(), account_update)))
+            })?;
             let balance = match &account_update {
                 GetAccountResult::FoundAccount(_, account, _)
                 | GetAccountResult::FoundCoupledAccount((_, account), _, _) => account.lamports,
@@ -856,7 +861,11 @@ mod tests {
             .get_balance(
                 Some(setup.context.clone()),
                 to_airdrop_pubkey.to_string(),
-                None,
+                // An airdrop is a transaction: its block has not closed yet.
+                Some(RpcContextConfig {
+                    commitment: Some(CommitmentConfig::processed()),
+                    min_context_slot: None,
+                }),
             )
             .await;
 
