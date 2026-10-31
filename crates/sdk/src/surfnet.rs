@@ -53,6 +53,7 @@ pub struct SurfnetBuilder {
     payer: Option<Keypair>,
     feature_config: SvmFeatureConfig,
     cheatcode_lock: Option<CheatcodeFilter>,
+    secret_path: Option<String>,
     snapshots: Vec<SnapshotSource>,
     instruction_profiling: bool,
     max_profiles: usize,
@@ -77,6 +78,7 @@ impl Default for SurfnetBuilder {
             payer: None,
             feature_config: SvmFeatureConfig::default(),
             cheatcode_lock: None,
+            secret_path: None,
             snapshots: vec![],
             instruction_profiling: true,
             max_profiles: DEFAULT_PROFILING_MAP_CAPACITY,
@@ -205,6 +207,19 @@ impl SurfnetBuilder {
         self
     }
 
+    /// Serve RPC only at `/<secret>`, on both the HTTP and WebSocket ports.
+    /// Requests to any other path get a 404 before any method runs, so a
+    /// process that can reach the port but doesn't know the secret can't
+    /// call the surfnet at all, standard methods included. [`Surfnet::rpc_url`]
+    /// and [`Surfnet::ws_url`] carry the path, so everything built from them
+    /// (including [`Surfnet::cheatcodes`]) keeps working.
+    ///
+    /// Use a long random secret: it's the only thing that keeps the port private.
+    pub fn secret_path(mut self, secret: impl Into<String>) -> Self {
+        self.secret_path = Some(secret.into());
+        self
+    }
+
     /// Preload accounts at startup, in the format returned by the
     /// `surfnet_exportSnapshot` RPC method. Mirrors the CLI's `--snapshot` flag.
     ///
@@ -243,6 +258,7 @@ impl SurfnetBuilder {
             payer,
             feature_config,
             cheatcode_lock,
+            secret_path,
             snapshots,
             instruction_profiling,
             max_profiles,
@@ -291,13 +307,17 @@ impl SurfnetBuilder {
                 bind_port,
                 ws_port,
                 cheatcode_lock,
+                secret_path: secret_path.clone(),
                 ..Default::default()
             },
             ..Default::default()
         };
 
-        let rpc_url = format!("http://{bind_host}:{bind_port}");
-        let ws_url = format!("ws://{bind_host}:{ws_port}");
+        let path = secret_path
+            .map(|secret| format!("/{secret}"))
+            .unwrap_or_default();
+        let rpc_url = format!("http://{bind_host}:{bind_port}{path}");
+        let ws_url = format!("ws://{bind_host}:{ws_port}{path}");
 
         let svm_config = SurfnetSvmConfig {
             surfnet_id: surfpool_config.simnets[0].surfnet_id.clone(),

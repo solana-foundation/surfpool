@@ -998,6 +998,12 @@ pub struct RpcConfig {
     /// if by `surfnet_disableCheatcode` with `{"lockout": true}`.
     #[serde(default)]
     pub cheatcode_lock: Option<CheatcodeFilter>,
+    /// When set, the HTTP and WebSocket servers answer only requests to
+    /// `/<secret_path>`; any other path gets a 404 before any method runs,
+    /// standard methods included. Lets a host keep the surfnet's own port
+    /// private from other processes on the machine that can reach it.
+    #[serde(default)]
+    pub secret_path: Option<String>,
 }
 
 impl RpcConfig {
@@ -1019,6 +1025,7 @@ impl Default for RpcConfig {
             tpu_port: DEFAULT_TPU_PORT,
             tpu_quic_port: DEFAULT_TPU_QUIC_PORT,
             cheatcode_lock: None,
+            secret_path: None,
         }
     }
 }
