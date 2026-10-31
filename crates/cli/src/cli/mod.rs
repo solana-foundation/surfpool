@@ -382,6 +382,9 @@ pub struct StartAccountOptions {
         long_help = "JSON account snapshot to preload. Can be specified multiple times.\n\nThe snapshot format matches the surfnet_exportSnapshot RPC output. Account values can be null to fetch the account from the remote RPC. Later files override earlier files for duplicate keys.\n\nExample: surfpool start --snapshot ./snapshot1.json --snapshot ./snapshot2.json"
     )]
     pub snapshot: Vec<String>,
+    /// Fail startup if any snapshot account cannot be loaded.
+    #[arg(long = "strict-snapshot", requires = "snapshot")]
+    pub strict_snapshot: bool,
     /// Database connection URL for persistent Surfnet state.
     #[arg(
         long = "db",
@@ -732,6 +735,7 @@ impl StartSimnet {
             skip_blockhash_check: self.svm.skip_blockhash_check,
             surfnet_id: self.accounts.surfnet_id.clone(),
             snapshot,
+            strict_snapshot: self.accounts.strict_snapshot,
             genesis_hash: self.network.genesis_hash,
         }
     }
@@ -1400,6 +1404,28 @@ mod tests {
             ]
         );
         assert_eq!(cmd.project.runbooks, vec!["deploy", "seed"]);
+    }
+
+    #[test]
+    fn strict_snapshot_requires_snapshot_and_reaches_config() {
+        let err = Opts::try_parse_from(["surfpool", "start", "--strict-snapshot"])
+            .expect_err("strict snapshot requires a snapshot file");
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+
+        let default_cmd = parse_start(&["surfpool", "start"]);
+        assert!(
+            !default_cmd
+                .simnet_config(vec![], BTreeMap::new())
+                .strict_snapshot
+        );
+        let cmd = parse_start(&[
+            "surfpool",
+            "start",
+            "--snapshot",
+            "snapshot.json",
+            "--strict-snapshot",
+        ]);
+        assert!(cmd.simnet_config(vec![], BTreeMap::new()).strict_snapshot);
     }
 
     #[test]

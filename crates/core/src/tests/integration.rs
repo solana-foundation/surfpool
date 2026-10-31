@@ -1069,8 +1069,10 @@ async fn assert_precompile_transaction_succeeds<F>(
     }
 }
 
+#[test_case(false; "best effort")]
+#[test_case(true; "strict")]
 #[tokio::test(flavor = "multi_thread")]
-async fn test_load_snapshot_program_is_invokable() {
+async fn test_load_snapshot_program_is_invokable(strict_snapshot: bool) {
     let snapshot: std::collections::BTreeMap<String, Option<AccountSnapshot>> =
         serde_json::from_str(include_str!("assets/program_snapshot.json"))
             .expect("program snapshot fixture should deserialize");
@@ -1089,6 +1091,7 @@ async fn test_load_snapshot_program_is_invokable() {
             block_production_mode: BlockProductionMode::Manual,
             offline_mode: true,
             snapshot,
+            strict_snapshot,
             ..SimnetConfig::default()
         }],
         rpc: RpcConfig {
