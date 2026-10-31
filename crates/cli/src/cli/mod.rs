@@ -34,6 +34,7 @@ use txtx_core::manifest::WorkspaceManifest;
 use txtx_gql::kit::{helpers::fs::FileLocation, types::frontend::LogLevel};
 
 use crate::{cli::update::handle_update_command, runbook::handle_execute_runbook_command};
+mod profile;
 mod simnet;
 mod update;
 
@@ -121,6 +122,9 @@ enum Command {
     /// Stop a running Surfpool instance
     #[clap(name = "stop", bin_name = "stop")]
     Stop(StopCommand),
+    /// Show where a transaction's compute units went, CPI by CPI
+    #[clap(name = "profile", bin_name = "profile")]
+    Profile(ProfileCommand),
     /// Generate shell completion scripts
     #[clap(name = "completions", bin_name = "completions", aliases = &["completion"])]
     Completions(Completions),
@@ -226,6 +230,33 @@ impl StopCommand {
             .port
             .expect("--port is required when --rpc-url is absent");
         format!("http://{host}:{port}")
+    }
+}
+
+#[derive(Parser, PartialEq, Clone, Debug)]
+pub struct ProfileCommand {
+    /// Signature of the transaction to profile.
+    #[arg(value_name = "SIGNATURE")]
+    pub signature: String,
+    /// RPC URL to read the transaction from: a running Surfpool instance or any Solana RPC.
+    /// Defaults to the local Surfpool instance.
+    #[arg(long = "rpc-url", short = 'u', value_name = "RPC_URL")]
+    pub rpc_url: Option<String>,
+    /// Also write the compute units as collapsed stacks to this file, for a flame graph in
+    /// speedscope.app or inferno-flamegraph.
+    #[arg(long = "folded", value_name = "PATH")]
+    pub folded: Option<PathBuf>,
+    /// Print the invocation tree as JSON.
+    #[arg(long = "json")]
+    pub json: bool,
+}
+
+impl ProfileCommand {
+    fn get_rpc_url(&self) -> String {
+        self.rpc_url
+            .as_deref()
+            .map(|rpc_url| rpc_url.trim_end_matches('/').to_string())
+            .unwrap_or_else(|| format!("http://{DEFAULT_NETWORK_HOST}:{DEFAULT_RPC_PORT}"))
     }
 }
 
@@ -1041,6 +1072,9 @@ fn handle_command(opts: Opts, ctx: &Context) -> Result<(), String> {
             hiro_system_kit::nestable_block_on(simnet::handle_start_local_surfnet_command(cmd, ctx))
         }
         Command::Stop(cmd) => hiro_system_kit::nestable_block_on(handle_stop_command(cmd)),
+        Command::Profile(cmd) => {
+            hiro_system_kit::nestable_block_on(profile::handle_profile_command(cmd))
+        }
         Command::Completions(cmd) => {
             hiro_system_kit::nestable_block_on(generate_completion_helpers(cmd))
         }
@@ -1054,17 +1088,27 @@ fn handle_command(opts: Opts, ctx: &Context) -> Result<(), String> {
 }
 
 async fn handle_stop_command(cmd: StopCommand) -> Result<(), String> {
-    let rpc_url = cmd.get_stop_rpc_url();
+    rpc_request(&cmd.get_stop_rpc_url(), "exit", serde_json::json!([])).await?;
+    println!("Surfpool stop requested");
+    Ok(())
+}
+
+/// Sends one JSON-RPC request and returns its `result`.
+async fn rpc_request(
+    rpc_url: &str,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, String> {
     let response = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|e| format!("failed to create Surfpool RPC client: {e}"))?
-        .post(&rpc_url)
+        .post(rpc_url)
         .json(&serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
-            "method": "exit",
-            "params": [],
+            "method": method,
+            "params": params,
         }))
         .send()
         .await
@@ -1082,13 +1126,11 @@ async fn handle_stop_command(cmd: StopCommand) -> Result<(), String> {
         ));
     }
 
-    parse_stop_response(&body)?;
-    println!("Surfpool stop requested");
-    Ok(())
+    parse_rpc_response(&body)
 }
 
-fn parse_stop_response(body: &str) -> Result<(), String> {
-    let value = serde_json::from_str::<serde_json::Value>(body)
+fn parse_rpc_response(body: &str) -> Result<serde_json::Value, String> {
+    let mut value = serde_json::from_str::<serde_json::Value>(body)
         .map_err(|e| format!("failed to parse Surfpool RPC response: {e}: {body}"))?;
 
     if let Some(error) = value.get("error").filter(|error| !error.is_null()) {
@@ -1112,7 +1154,7 @@ fn parse_stop_response(body: &str) -> Result<(), String> {
         ));
     }
 
-    Ok(())
+    Ok(value["result"].take())
 }
 
 /// The command tree completion scripts are generated from. Subcommands name themselves as bare
@@ -1488,14 +1530,14 @@ mod tests {
     }
 
     #[test]
-    fn parse_stop_response_accepts_success() {
-        parse_stop_response(r#"{"jsonrpc":"2.0","result":null,"id":1}"#)
+    fn parse_rpc_response_accepts_success() {
+        parse_rpc_response(r#"{"jsonrpc":"2.0","result":null,"id":1}"#)
             .expect("successful response should parse");
     }
 
     #[test]
-    fn parse_stop_response_reports_rpc_error_message() {
-        let err = parse_stop_response(
+    fn parse_rpc_response_reports_rpc_error_message() {
+        let err = parse_rpc_response(
             r#"{"jsonrpc":"2.0","error":{"code":-32601,"message":"Method not found"},"id":1}"#,
         )
         .expect_err("rpc error should fail");
@@ -1504,15 +1546,15 @@ mod tests {
     }
 
     #[test]
-    fn parse_stop_response_reports_invalid_json() {
-        let err = parse_stop_response("not json").expect_err("invalid json should fail");
+    fn parse_rpc_response_reports_invalid_json() {
+        let err = parse_rpc_response("not json").expect_err("invalid json should fail");
 
         assert!(err.contains("failed to parse Surfpool RPC response"));
     }
 
     #[test]
-    fn parse_stop_response_rejects_non_rpc_json() {
-        let err = parse_stop_response(r#"{"status":"ok"}"#).expect_err("non-RPC json should fail");
+    fn parse_rpc_response_rejects_non_rpc_json() {
+        let err = parse_rpc_response(r#"{"status":"ok"}"#).expect_err("non-RPC json should fail");
 
         assert_eq!(
             err,
@@ -1521,8 +1563,8 @@ mod tests {
     }
 
     #[test]
-    fn parse_stop_response_rejects_rpc_response_without_result() {
-        let err = parse_stop_response(r#"{"jsonrpc":"2.0","id":1}"#)
+    fn parse_rpc_response_rejects_rpc_response_without_result() {
+        let err = parse_rpc_response(r#"{"jsonrpc":"2.0","id":1}"#)
             .expect_err("RPC response without result should fail");
 
         assert_eq!(
