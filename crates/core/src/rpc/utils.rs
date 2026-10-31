@@ -2,7 +2,6 @@ use std::any::type_name;
 
 use base64::prelude::*;
 use jsonrpc_core::{Error, Result};
-use litesvm::types::TransactionMetadata;
 use solana_client::{
     rpc_config::{RpcTokenAccountsFilter, RpcTransactionConfig},
     rpc_filter::RpcFilterType,
@@ -18,7 +17,10 @@ use solana_pubkey::{ParsePubkeyError, Pubkey};
 use solana_signature::Signature;
 use solana_transaction_status::{TransactionBinaryEncoding, UiTransactionEncoding};
 
-use crate::error::{SurfpoolError, SurfpoolResult};
+use crate::{
+    error::{SurfpoolError, SurfpoolResult},
+    surfnet::backend::TransactionMetadata,
+};
 
 pub fn convert_transaction_metadata_from_canonical(
     transaction_metadata: &TransactionMetadata,
@@ -217,6 +219,19 @@ pub fn decode_rpc_versioned_transaction(
         solana_transaction::versioned::VersionedTransaction,
     >(data, binary_encoding)?;
     Ok(unsanitized_tx)
+}
+
+/// Refuses, as invalid params (the bundle decoders' convention), a decoded transaction whose
+/// signature list does not fit its message, before any of its signatures is read or any state
+/// or account is touched. `prefix` names it ("Transaction", "Bundle transaction 2").
+pub(crate) fn require_signature_structure(
+    tx: &solana_transaction::versioned::VersionedTransaction,
+    prefix: &str,
+) -> Result<()> {
+    match crate::surfnet::backend::signature_structure_error(tx) {
+        Some(reason) => Err(Error::invalid_params(format!("{prefix} {reason}"))),
+        None => Ok(()),
+    }
 }
 
 /// Substrings that, when present in a lowercased error message, indicate the

@@ -4,6 +4,7 @@ export type * from "./AccountAddress.js";
 export type * from "./AccountSnapshot.js";
 export type * from "./AccountUpdate.js";
 export type * from "./CheatcodeControlConfig.js";
+export type * from "./ClockState.js";
 export type * from "./ConfidentialBalanceKeys.js";
 export type * from "./ConfidentialTransferAccountUpdate.js";
 export type * from "./DeriveConfidentialKeysResponse.js";

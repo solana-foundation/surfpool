@@ -103,6 +103,8 @@ pub async fn start_studio_and_scenario_server(
         app
     })
     .workers(5)
+    // The CLI coordinates shutdown of HTTP and the surfnet together.
+    .disable_signals()
     .bind(studio_bind_addr)?
     .run();
     let handle = server.handle();

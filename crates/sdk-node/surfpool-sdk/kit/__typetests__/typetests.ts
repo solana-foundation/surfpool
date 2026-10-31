@@ -15,6 +15,11 @@ void (async () => {
     client.surfnet.stop();
     void client.payer.address;
     void client.cheatcodes.pauseClock();
+    const clockState = await client.cheatcodes.getClockState().send();
+    const paused: boolean = clockState.paused;
+    void paused;
+    // @ts-expect-error clock status has no slot or mutation parameter.
+    client.cheatcodes.getClockState({ absoluteSlot: 42 });
     void client.rpc.getSlot();
     void client.sendTransactions;
 });

@@ -18,7 +18,10 @@ use surfpool_types::{
     SimnetCommand, TransactionStatusEvent,
 };
 
-use super::{RunloopContext, utils::decode_and_deserialize};
+use super::{
+    RunloopContext,
+    utils::{decode_and_deserialize, require_signature_structure},
+};
 use crate::{
     error::SurfpoolResult,
     rpc::full::SurfpoolFullRpc,
@@ -315,6 +318,9 @@ impl Jito for SurfpoolJitoRpc {
                     ),
                     data: e.data,
                 })?;
+                // As simulateBundle does: a signature list that does not fit its message is
+                // refused before the bundle reaches the execution lane.
+                require_signature_structure(&tx, &format!("Bundle transaction {}", idx + 1))?;
                 decoded_txs.push(tx);
             }
 
@@ -561,13 +567,9 @@ impl Jito for SurfpoolJitoRpc {
                 // synthesize a zero-byte placeholder Signature into the
                 // RpcBundleExecutionError::TransactionFailure(Signature, _)
                 // wire variant downstream — that would mislead clients
-                // keying off the sig inside `error`.
-                if tx.signatures.is_empty() {
-                    return Err(Error::invalid_params(format!(
-                        "Bundle transaction {} has no signatures",
-                        idx + 1
-                    )));
-                }
+                // keying off the sig inside `error`. A signature count other than the
+                // message requires is refused the same way.
+                require_signature_structure(&tx, &format!("Bundle transaction {}", idx + 1))?;
                 decoded_txs.push(tx);
             }
 
@@ -589,7 +591,7 @@ impl Jito for SurfpoolJitoRpc {
             // The context slot is the processed slot of the state the sandbox clones.
             let (read, bundle_sandbox) = ctx.svm_locker.with_svm_reader(|svm_reader| {
                 let read = svm_reader.read_slot(Some(CommitmentConfig::processed()), None)?;
-                Ok::<_, Error>((read, svm_reader.clone_for_bundle_sandbox()))
+                Ok::<_, Error>((read, svm_reader.clone_for_bundle_simulation()?))
             })?;
             let BundleSandbox {
                 svm: sandbox_svm,
@@ -660,7 +662,7 @@ impl Jito for SurfpoolJitoRpc {
                 // to recover the variant.
                 if sigverify {
                     if let Err(failed) =
-                        sandbox_locker.with_svm_reader(|svm_reader| svm_reader.sigverify(&tx))
+                        sandbox_locker.with_svm_reader(|svm_reader| svm_reader.sigverify(&tx))?
                     {
                         let post_accounts =
                             snapshot_accounts(&sandbox_locker, &post_pubkeys[idx]).await?;
@@ -709,9 +711,7 @@ impl Jito for SurfpoolJitoRpc {
                         tx,
                         &status_tx,
                         skip_preflight,
-                        // sigverify=false: we already verified above when the
-                        // caller asked for it. Avoids double-work on the hot path.
-                        false,
+                        sigverify,
                         true, // do_propagate -> status_rx receives typed errors
                     )
                     .await;
@@ -747,13 +747,8 @@ impl Jito for SurfpoolJitoRpc {
                                 Ok(TransactionStatusEvent::ExecutionFailure((err, _meta))) => {
                                     Some(err)
                                 }
-                                // VerificationFailure → SignatureFailure: matches
-                                // svm::sigverify and the single-tx simulate path
-                                // in full.rs. Unreachable in our flow (we run the
-                                // inner call with sigverify=false after pre-passing
-                                // it ourselves, so the locker's sigverify gate
-                                // can't fire), but kept for exhaustiveness against
-                                // future locker changes.
+                                // Match the single-transaction simulation's typed
+                                // signature error if the inner verifier refuses.
                                 Ok(TransactionStatusEvent::VerificationFailure(_)) => Some(
                                     solana_transaction_error::TransactionError::SignatureFailure,
                                 ),
@@ -922,8 +917,9 @@ async fn execute_bundle_in_sandbox(
     svm_locker: &SurfnetSvmLocker,
     decoded_txs: &[VersionedTransaction],
 ) -> std::result::Result<(BundleSandbox, Vec<Signature>), String> {
-    let bundle_sandbox =
-        svm_locker.with_svm_reader(|svm_reader| svm_reader.clone_for_bundle_sandbox());
+    let bundle_sandbox = svm_locker
+        .with_svm_reader(|svm_reader| svm_reader.clone_for_bundle_sandbox())
+        .map_err(|e| e.to_string())?;
 
     let BundleSandbox {
         svm: sandbox_svm,
@@ -1468,7 +1464,8 @@ mod tests {
             .with_svm_reader(|svm| svm.latest_blockhash());
         setup.context.svm_locker.with_svm_writer(|svm| {
             svm.inner
-                .svm
+                .local_mut_for_tests()
+                .svm_mut()
                 .add_builtin(PauseBundleBuiltin::ID, PauseBundleBuiltin::register);
             svm.airdrop(&bundle_payer.pubkey(), 2 * LAMPORTS_PER_SOL)
                 .expect("bundle payer airdrop should be accepted")
@@ -3027,6 +3024,71 @@ mod tests {
             "expected explicit no-signatures rejection (got {})",
             err.message,
         );
+    }
+
+    /// One payer's transfer, carrying `signatures` placeholders whatever the message requires.
+    fn bundle_tx_with_signatures(setup: &TestSetup<SurfpoolJitoRpc>, signatures: usize) -> String {
+        let recent_blockhash = setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm| svm.latest_blockhash());
+        let payer = Keypair::new();
+        let msg = VersionedMessage::V0(
+            V0Message::try_compile(
+                &payer.pubkey(),
+                &[system_instruction::transfer(
+                    &payer.pubkey(),
+                    &Pubkey::new_unique(),
+                    1_000,
+                )],
+                &[],
+                recent_blockhash,
+            )
+            .unwrap(),
+        );
+        let tx = VersionedTransaction {
+            signatures: vec![Signature::default(); signatures],
+            message: msg,
+        };
+        bs58::encode(bincode::serialize(&tx).unwrap()).into_string()
+    }
+
+    /// sendBundle refuses a transaction whose signature list does not fit its message (none,
+    /// or more than the message requires) as invalid params, as simulateBundle does, before the
+    /// bundle reaches the execution lane; simulateBundle refuses a count mismatch the same way.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_bundles_reject_a_signature_list_that_does_not_fit_its_message() {
+        use base64::Engine;
+        let setup = TestSetup::new(SurfpoolJitoRpc);
+        for (signatures, reason) in [
+            (0, "has no signatures"),
+            (2, "has 2 signatures but its message requires 1 signature"),
+        ] {
+            let tx = bundle_tx_with_signatures(&setup, signatures);
+            let sent = setup
+                .rpc
+                .send_bundle(Some(setup.context.clone()), vec![tx.clone()], None)
+                .await
+                .unwrap_err();
+            assert_eq!(sent.code, jsonrpc_core::ErrorCode::InvalidParams);
+            assert_eq!(sent.message, format!("Bundle transaction 1 {reason}"));
+
+            let tx_b64 = base64::engine::general_purpose::STANDARD
+                .encode(bs58::decode(&tx).into_vec().unwrap());
+            let simulated = setup
+                .rpc
+                .simulate_bundle(
+                    Some(setup.context.clone()),
+                    RpcBundleRequest {
+                        encoded_transactions: vec![tx_b64],
+                    },
+                    None,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(simulated.code, jsonrpc_core::ErrorCode::InvalidParams);
+            assert_eq!(simulated.message, format!("Bundle transaction 1 {reason}"));
+        }
     }
 
     /// Pins the partial-config behavior. Reviewer @copilot flagged that

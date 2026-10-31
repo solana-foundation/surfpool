@@ -425,6 +425,13 @@ impl AccountsData for SurfpoolAccountsDataRpc {
             Err(e) => return e.into(),
         };
 
+        if pubkeys.len() > 100 && svm_locker.is_historical() {
+            return SurfpoolError::invalid_params(
+                "historical getMultipleAccounts accepts at most 100 accounts",
+            )
+            .into();
+        }
+
         #[cfg(feature = "prometheus")]
         let rpc_start = std::time::Instant::now();
 
@@ -556,10 +563,7 @@ impl AccountsData for SurfpoolAccountsDataRpc {
             }
             let mint_data = svm_locker
                 .with_svm_reader(|svm| {
-                    spl_token_additional_data(
-                        &mint_account.data,
-                        svm.inner.get_sysvar::<Clock>().unix_timestamp,
-                    )
+                    spl_token_additional_data(&mint_account.data, svm.inner.clock().unix_timestamp)
                 })
                 .ok_or_else(SurfpoolError::unpack_mint_account)?;
 
@@ -615,10 +619,7 @@ impl AccountsData for SurfpoolAccountsDataRpc {
             .supply;
             let mint_data = svm_locker
                 .with_svm_reader(|svm| {
-                    spl_token_additional_data(
-                        &mint_account.data,
-                        svm.inner.get_sysvar::<Clock>().unix_timestamp,
-                    )
+                    spl_token_additional_data(&mint_account.data, svm.inner.clock().unix_timestamp)
                 })
                 .ok_or_else(SurfpoolError::unpack_mint_account)?;
 
@@ -657,7 +658,7 @@ mod tests {
         surfnet::{
             AccountSource, GetAccountResult, remote::SurfnetRemoteClient, svm::AccountUpdatePolicy,
         },
-        tests::helpers::TestSetup,
+        tests::helpers::{TestSetup, recording_canned_rpc},
     };
 
     #[ignore = "connection-required"]
@@ -891,9 +892,9 @@ mod tests {
         let (mint, holder, config) = set_scaled_mint(&setup, 6);
         // The new multiplier takes effect after the mint was indexed.
         setup.context.svm_locker.with_svm_writer(|svm| {
-            let mut clock = svm.inner.get_sysvar::<solana_clock::Clock>();
+            let mut clock = svm.inner.clock();
             clock.unix_timestamp = 2_000;
-            svm.inner.set_sysvar(&clock);
+            svm.inner.local_mut_for_tests().set_sysvar(&clock);
         });
         let expected = token_amount_to_ui_amount_v3(
             1_000_000,
@@ -945,7 +946,7 @@ mod tests {
         let t0 = setup
             .context
             .svm_locker
-            .with_svm_reader(|svm| svm.inner.get_sysvar::<Clock>().unix_timestamp);
+            .with_svm_reader(|svm| svm.inner.clock().unix_timestamp);
         let t1 = t0 + 365 * 24 * 60 * 60;
 
         let len = ExtensionType::try_calculate_account_len::<Token2022Mint>(&[
@@ -991,9 +992,9 @@ mod tests {
                 };
                 svm.set_account(&pubkey, account).unwrap();
             }
-            let mut clock = svm.inner.get_sysvar::<Clock>();
+            let mut clock = svm.inner.clock();
             clock.unix_timestamp = t1;
-            svm.inner.set_sysvar(&clock);
+            svm.inner.local_mut_for_tests().set_sysvar(&clock);
         });
 
         let amount_at = |ts| {
@@ -1648,14 +1649,15 @@ mod tests {
         }
     }
 
-    #[ignore = "requires-network"]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_get_multiple_accounts_with_remote_preserves_order() {
         // This test checks that order is preserved when mixing local and remote accounts
         let mut setup = TestSetup::new(SurfpoolAccountsDataRpc);
 
-        // Add a remote client to trigger get_multiple_accounts_with_remote_fallback path
-        let remote_client = SurfnetRemoteClient::new("https://api.mainnet-beta.solana.com");
+        // The controlled datasource guarantees absence; new_unique keys may exist on mainnet.
+        let (url, requests) =
+            recording_canned_rpc(r#"{"context":{"slot":123},"value":[null]}"#).await;
+        let remote_client = SurfnetRemoteClient::new(url);
         setup.context.remote_rpc_client = Some(remote_client);
 
         // Create three accounts with different lamport amounts
@@ -1702,7 +1704,7 @@ mod tests {
             .unwrap();
 
         // Request accounts in order: [pk1, pk2, pk3]
-        // pk1 and pk3 are local, pk2 is missing (will try remote fetch and fail)
+        // pk1 and pk3 are local; the datasource returns a successful, absent pk2.
         let pubkeys_str = vec![pk1.to_string(), pk2.to_string(), pk3.to_string()];
 
         let response = setup
@@ -1714,6 +1716,17 @@ mod tests {
             )
             .await
             .unwrap();
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "only the missing key needs a remote lookup"
+        );
+        let (_, body) = requests[0].split_once("\r\n\r\n").unwrap();
+        let request: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(request["method"], "getMultipleAccounts");
+        assert_eq!(request["params"][0], serde_json::json!([pk2.to_string()]));
 
         // Verify we got 3 results
         assert_eq!(response.value.len(), 3);

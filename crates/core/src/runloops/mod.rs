@@ -36,15 +36,16 @@ use solana_pubkey::Pubkey;
 use solana_transaction::sanitized::{MessageHash, SanitizedTransaction};
 use solana_transaction_status::RewardsAndNumPartitions;
 use surfpool_types::{
-    BlockProductionMode, ClockCommand, ClockEvent, DEFAULT_MAINNET_RPC_URL, DataIndexingCommand,
-    SimnetCommand, SimnetConfig, SimnetEvent, SimnetEventsTx, StartupPlanner, SurfnetStartupTask,
-    SurfpoolConfig, TransactionConfirmationStatus, TransactionStatusEvent,
+    BlockProductionMode, ClockCommand, ClockEvent, ClockState, DEFAULT_MAINNET_RPC_URL,
+    DataIndexingCommand, SimnetCommand, SimnetConfig, SimnetEvent, SimnetEventsTx, StartupPlanner,
+    SurfnetStartupTask, SurfpoolConfig, TransactionConfirmationStatus, TransactionStatusEvent,
 };
 type PluginConstructor = unsafe fn() -> *mut dyn GeyserPlugin;
 use txtx_addon_kit::helpers::fs::FileLocation;
 
 use crate::{
     PluginInfo,
+    error::SurfpoolError,
     rpc::{
         self, RunloopContext, SurfpoolMiddleware, SurfpoolWebsocketMeta,
         SurfpoolWebsocketMiddleware, accounts_data::AccountsData, accounts_scan::AccountsScan,
@@ -204,7 +205,18 @@ pub async fn start_local_surfnet_runloop(
     let startup_planner = config.startup_planner;
     let block_production_mode = simnet.block_production_mode.clone();
 
-    let remote_rpc_client = match simnet.offline_mode {
+    // A historical surfnet has no datasource: SVM Replay supplies every account, pinned to
+    // the boundary, and nothing is read from a current chain.
+    let historical = svm_locker.is_historical();
+    if historical && simnet.genesis_hash.is_some() {
+        return Err(SurfpoolError::historical(
+            "UNSUPPORTED_IN_HISTORICAL_MODE",
+            "the historical genesis hash is pinned by SVM Replay and cannot be overridden",
+            None,
+        )
+        .into());
+    }
+    let remote_rpc_client = match simnet.offline_mode || historical {
         true => None,
         false => Some(SurfnetRemoteClient::try_new(
             simnet
@@ -212,6 +224,21 @@ pub async fn start_local_surfnet_runloop(
                 .as_ref()
                 .unwrap_or(&DEFAULT_MAINNET_RPC_URL.to_string()),
         )?),
+    };
+
+    let simnet_events_tx_cc = svm_locker.simnet_events_tx();
+    let (plugin_commands_tx, plugin_commands_rx) = unbounded::<PluginCommand>();
+    // Drain startup events before initialization or snapshots can fill the bounded queue.
+    match start_geyser_runloop(
+        config.plugin_config_path.clone(),
+        simnet_events_tx_cc.clone(),
+        geyser_events_rx,
+        plugin_commands_rx,
+    ) {
+        Ok(_) => {}
+        Err(e) => {
+            simnet_events_tx_cc.error(format!("Geyser plugin failed: {e}"));
+        }
     };
 
     svm_locker.initialize(&remote_rpc_client).await?;
@@ -233,6 +260,7 @@ pub async fn start_local_surfnet_runloop(
         .epoch_info_update(svm_locker.get_epoch_info());
 
     svm_locker.airdrop_pubkeys(simnet.airdrop_token_amount, &simnet.airdrop_addresses);
+    svm_locker.fund_session_addresses(simnet.airdrop_token_amount, &simnet.session_addresses);
 
     // Load snapshot accounts if provided
     if !simnet.snapshot.is_empty() {
@@ -261,16 +289,12 @@ pub async fn start_local_surfnet_runloop(
         }
     }
 
-    let simnet_events_tx_cc = svm_locker.simnet_events_tx();
-
-    let (plugin_commands_tx, plugin_commands_rx) = unbounded::<PluginCommand>();
-
     // Plugins see the end of startup and the open slot before RPC binds, so no traffic can
     // send data for a slot they don't track yet.
     svm_locker.with_svm_writer(|svm| {
         let _ = svm.geyser_events_tx.send(GeyserEvent::EndOfStartup);
-        svm.announce_open_slot();
-    });
+        svm.announce_open_slot()
+    })?;
 
     let (_rpc_handle, _ws_handle, shutdown_rpc_servers) = start_rpc_servers_runloop(
         &config,
@@ -282,25 +306,15 @@ pub async fn start_local_surfnet_runloop(
 
     let simnet_config = simnet.clone();
 
-    match start_geyser_runloop(
-        config.plugin_config_path.clone(),
-        simnet_events_tx_cc.clone(),
-        geyser_events_rx,
-        plugin_commands_rx,
-    ) {
-        Ok(_) => {}
-        Err(e) => {
-            let _ = simnet_events_tx_cc.error(format!("Geyser plugin failed: {e}"));
-        }
-    };
-
     let (coalesced_slots, clock_driven) =
         svm_locker.with_svm_reader(|svm| (svm.coalesced_slots.clone(), svm.clock_driven.clone()));
-    let (clock_event_rx, clock_command_tx) = start_clock_runloop(
+    // A historical fork starts frozen; resumeClock, timeTravel and SlotForward advance it.
+    let (clock_event_rx, clock_command_tx) = start_clock(
         simnet_config.slot_time,
         Some(simnet_events_tx_cc.clone()),
         coalesced_slots,
         clock_driven,
+        !historical,
     );
 
     // Emit TransactionProcessed events for each stored transaction before Ready
@@ -340,7 +354,7 @@ pub async fn start_local_surfnet_runloop(
                         return_data: tx_meta.meta.return_data.clone().unwrap_or_default(),
                         fee: tx_meta.meta.fee,
                         // Stored Solana transaction status does not include this measurement.
-                        loaded_accounts_data_size: 0,
+                        loaded_accounts_data_size: Some(0),
                     };
 
                     events.push((
@@ -371,6 +385,7 @@ pub async fn start_local_surfnet_runloop(
         }
     }
     simnet_events_tx_cc.core_started(initial_transaction_count);
+    svm_locker.with_svm_reader(|svm_reader| svm_reader.mark_core_started());
 
     start_block_production_runloop(
         clock_event_rx,
@@ -400,6 +415,10 @@ pub async fn start_block_production_runloop(
     simnet_config: &SimnetConfig,
     mut shutdown_rpc_servers: Option<Box<dyn FnOnce() + Send>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // This surfnet's own historical backend, held outside the VM lock so Terminate can end it
+    // even while a request still waits on it; other surfnets in this process are untouched.
+    let historical_session =
+        svm_locker.with_svm_reader(|svm_reader| svm_reader.inner.historical_session());
     let remote_client_with_commitment = remote_rpc_client.as_ref().map(|c| {
         (
             c.clone(),
@@ -416,7 +435,7 @@ pub async fn start_block_production_runloop(
     let (scheduled_block_tx, scheduled_block_rx) = bounded::<()>(1);
     // Whether the clock is paused as this loop sees it: a tick the clock thread queued before
     // it read a Pause is no slot, and a pause is acknowledged only after no tick can follow.
-    let mut clock_paused = false;
+    let mut clock_paused = historical_session.is_some();
     let clock_driven = svm_locker.with_svm_reader(|svm| svm.clock_driven.clone());
     loop {
         clock_driven.store(
@@ -430,7 +449,17 @@ pub async fn start_block_production_runloop(
                 match event {
                     ClockEvent::Tick if clock_paused => continue,
                     ClockEvent::Tick => {
-                        if block_production_mode.eq(&BlockProductionMode::Clock) {
+                        if svm_locker.is_historical() {
+                            // The clock ticks only once resumed: each tick is one local slot
+                            // inside SVM Replay. At the boundary epoch's end it pauses again.
+                            if let Err(e) = svm_locker.advance_historical_tick() {
+                                svm_locker.simnet_events_tx().error(format!(
+                                    "Historical clock stopped: {e}"
+                                ));
+                                clock_paused = true;
+                                let _ = clock_command_tx.send(ClockCommand::Pause);
+                            }
+                        } else if block_production_mode.eq(&BlockProductionMode::Clock) {
                             do_produce_block = true;
                         }
 
@@ -454,10 +483,25 @@ pub async fn start_block_production_runloop(
                 match event {
                     SimnetCommand::SlotForward(_key) => {
                         block_production_mode = BlockProductionMode::Manual;
-                        do_produce_block = true;
+                        if svm_locker.is_historical() {
+                            // A deliberate step: one local slot inside SVM Replay.
+                            if let Err(e) = svm_locker.advance_historical(1, None, false) {
+                                svm_locker.simnet_events_tx().error(format!(
+                                    "Failed to advance the historical fork: {e}"
+                                ));
+                            }
+                        } else {
+                            do_produce_block = true;
+                        }
                     }
                     SimnetCommand::SlotBackward(_key) => {
 
+                    }
+                    SimnetCommand::GetClockState(response_tx) => {
+                        if let Err(error) = response_tx.send(ClockState { paused: clock_paused }) {
+                            svm_locker.simnet_events_tx().warn(format!("Clock state reply was not received: {error}"));
+                        }
+                        continue
                     }
                     SimnetCommand::CommandClock(_, update) => {
                         if let ClockCommand::UpdateSlotInterval(updated_slot_time) = update {
@@ -516,6 +560,16 @@ pub async fn start_block_production_runloop(
                         }
                         continue
                     }
+                    // A historical clock moves only inside SVM Replay (`time_travel` advances it
+                    // there); a clock written by Surfpool would be a second, invented clock.
+                    SimnetCommand::UpdateInternalClock(..)
+                    | SimnetCommand::UpdateInternalClockWithConfirmation(..)
+                        if svm_locker.is_historical() =>
+                    {
+                        svm_locker.simnet_events_tx().error(
+                            "A historical fork's clock moves only by advancing it inside SVM Replay",
+                        );
+                    }
                     SimnetCommand::UpdateInternalClock(_, clock) => {
                         // Confirm the current block to materialize any scheduled overrides for this slot
                         if let Err(e) = svm_locker.confirm_current_block(&remote_client_with_commitment).await {
@@ -540,8 +594,9 @@ pub async fn start_block_production_runloop(
                             .with_svm_writer(|svm_writer| svm_writer.apply_time_travel(clock))
                             .map_err(|e| e.to_string());
 
-                        // Send confirmation back
-                        let _ = response_tx.send(epoch_info);
+                        if let Err(error) = response_tx.send(epoch_info) {
+                            svm_locker.simnet_events_tx().error(format!("Clock confirmation receiver closed: {error}"));
+                        }
                     }
                     SimnetCommand::UpdateBlockProductionMode(update) => {
                         block_production_mode = update;
@@ -568,7 +623,10 @@ pub async fn start_block_production_runloop(
                        if let Err(e) = result {
                             svm_locker.simnet_events_tx().error(format!("Failed to process transaction: {}", e));
                        }
-                       if block_production_mode.eq(&BlockProductionMode::Transaction) {
+                       // A historical fork confirms in its frozen slot right away.
+                       if block_production_mode.eq(&BlockProductionMode::Transaction)
+                           || svm_locker.is_historical()
+                       {
                            do_produce_block = true;
                        }
                     }
@@ -579,19 +637,28 @@ pub async fn start_block_production_runloop(
                             transactions,
                         )
                         .await;
-                        if result.is_ok() && block_production_mode.eq(&BlockProductionMode::Transaction) {
+                        if result.is_ok()
+                            && (block_production_mode.eq(&BlockProductionMode::Transaction)
+                                || svm_locker.is_historical())
+                        {
                             do_produce_block = true;
                         }
                         let _ = reply_tx.send(result);
                     }
                     SimnetCommand::ProcessSerialVmMutation(task) => {
                         if task.run().await == surfpool_types::SerialVmMutationResult::ProduceBlock
-                            && block_production_mode.eq(&BlockProductionMode::Transaction)
+                            && (block_production_mode.eq(&BlockProductionMode::Transaction)
+                                || svm_locker.is_historical())
                         {
                             do_produce_block = true;
                         }
                     }
                     SimnetCommand::Terminate(_) => {
+                        // End this surfnet's SVM Replay backend first, without its locks, so
+                        // no request still waiting on it can hold up the shutdown.
+                        if let Some(session) = &historical_session {
+                            session.terminate();
+                        }
                         // Explicitly shutdown storage to trigger WAL checkpoint before exiting
                         svm_locker.shutdown();
                         // Close RPC servers on a separate thread to avoid dropping
@@ -645,39 +712,46 @@ pub async fn start_block_production_runloop(
                     SimnetCommand::FetchRemoteAccounts(pubkeys, remote_url) => {
                         // The submitter already marked RemoteAccounts as started;
                         // StartStartupTask precedes this command on the same channel.
-                        let fetch_result = match SurfnetRemoteClient::try_new(&remote_url) {
-                            Ok(remote_client) => match svm_locker
-                                .get_multiple_accounts_with_remote_fallback(
-                                    &remote_client,
-                                    &pubkeys,
-                                    CommitmentConfig::confirmed(),
+                        // A historical fork's datasource is its archive: cloned accounts
+                        // resolve from the fork, and one absent at the boundary stays absent,
+                        // never hydrated from a tip RPC.
+                        let account_updates = if svm_locker.is_historical() {
+                            svm_locker.get_multiple_accounts_local(&pubkeys).map_err(|error| {
+                                format!(
+                                    "Failed to read cloned accounts {pubkeys:?} from the historical fork: {error}"
                                 )
-                                .await
-                            {
-                                Ok(account_updates) => {
-                                    // A cloned account the datasource does not have is not a
-                                    // failure: hydration did complete, and some workflows clone
-                                    // addresses that do not exist yet. Warn, though, because the
-                                    // surfnet reaches Ready with the account absent.
-                                    let absent =
-                                        absent_after_hydration(&svm_locker, &account_updates.inner);
-                                    if !absent.is_empty() {
-                                        svm_locker.simnet_events_tx().warn(format!(
-                                            "Cloned accounts not found on the datasource, and \
-                                             absent locally: {}",
-                                            absent.iter().map(|key| key.to_string()).join(", ")
-                                        ));
-                                    }
-                                    Ok(())
+                            })
+                        } else {
+                            match SurfnetRemoteClient::try_new(&remote_url) {
+                                Ok(remote_client) => svm_locker
+                                    .get_multiple_accounts_with_remote_fallback(
+                                        &remote_client,
+                                        &pubkeys,
+                                        CommitmentConfig::confirmed(),
+                                    )
+                                    .await
+                                    .map_err(|error| {
+                                        format!("Failed to fetch remote accounts {pubkeys:?}: {error}")
+                                    }),
+                                Err(error) => {
+                                    Err(format!("Unable to initialize remote RPC client: {error}"))
                                 }
-                                Err(error) => Err(format!(
-                                    "Failed to fetch remote accounts {pubkeys:?}: {error}"
-                                )),
-                            },
-                            Err(error) => Err(format!(
-                                "Unable to initialize remote RPC client: {error}"
-                            )),
+                            }
                         };
+                        let fetch_result = account_updates.map(|account_updates| {
+                            // A cloned account the datasource does not have is not a failure:
+                            // hydration did complete, and some workflows clone addresses that do
+                            // not exist yet. Warn, though, because the surfnet reaches Ready with
+                            // the account absent.
+                            let absent = absent_after_hydration(&svm_locker, &account_updates.inner);
+                            if !absent.is_empty() {
+                                svm_locker.simnet_events_tx().warn(format!(
+                                    "Cloned accounts not found on the datasource, and \
+                                     absent locally: {}",
+                                    absent.iter().map(|key| key.to_string()).join(", ")
+                                ));
+                            }
+                        });
 
                         if let Err(error) = &fetch_result {
                             svm_locker
@@ -738,18 +812,39 @@ pub async fn start_block_production_runloop(
 /// `BlockProductionMode::Clock`) is counted in `coalesced_slots`. In other
 /// modes ticks produce no block, so a dropped one isn't a late slot.
 pub fn start_clock_runloop(
+    slot_time: u64,
+    simnet_events_tx: Option<SimnetEventsTx>,
+    coalesced_slots: Arc<AtomicU64>,
+    clock_driven: Arc<AtomicBool>,
+) -> (Receiver<ClockEvent>, Sender<ClockCommand>) {
+    start_clock(
+        slot_time,
+        simnet_events_tx,
+        coalesced_slots,
+        clock_driven,
+        true,
+    )
+}
+
+/// The clock thread, ticking from its start only when `running`: a clock that must start
+/// paused is never sent a Pause after it may already have ticked.
+fn start_clock(
     mut slot_time: u64,
     simnet_events_tx: Option<SimnetEventsTx>,
     coalesced_slots: Arc<AtomicU64>,
     clock_driven: Arc<AtomicBool>,
+    running: bool,
 ) -> (Receiver<ClockEvent>, Sender<ClockCommand>) {
     // One tick in flight at most: a tick sent while the last is unconsumed is
     // coalesced into it.
     let (clock_event_tx, clock_event_rx) = bounded::<ClockEvent>(1);
     let (clock_command_tx, clock_command_rx) = unbounded::<ClockCommand>();
+    if let (false, Some(simnet_events_tx)) = (running, &simnet_events_tx) {
+        let _ = simnet_events_tx.clock_update(ClockCommand::Pause);
+    }
 
     let _handle = hiro_system_kit::thread_named("clock").spawn(move || {
-        let mut enabled = true;
+        let mut enabled = running;
         let period = |slot_time: u64| Duration::from_millis(slot_time.max(1));
         let mut next_tick = Instant::now() + period(slot_time);
         // Warn once per stretch of lag, not on every dropped tick.

@@ -4,6 +4,7 @@ import type {
     AccountSnapshot,
     AccountUpdate,
     CheatcodeControlConfig,
+    ClockState,
     ConfidentialBalanceKeys,
     DeriveConfidentialKeysResponse,
     ExportSnapshotConfig,
@@ -95,6 +96,9 @@ export type SurfnetTimeTravelApi = {
 };
 export type SurfnetPauseClockApi = {
     pauseClock(): EpochInfo;
+};
+export type SurfnetGetClockStateApi = {
+    getClockState(): ClockState;
 };
 export type SurfnetResumeClockApi = {
     resumeClock(): EpochInfo;
@@ -211,6 +215,7 @@ export type SurfnetCheatcodesApi = SurfnetCloneProgramAccountApi &
     SurfnetGetTransactionProfileApi &
     SurfnetOfflineAccountApi &
     SurfnetPauseClockApi &
+    SurfnetGetClockStateApi &
     SurfnetProfileTransactionApi &
     SurfnetRegisterIdlApi &
     SurfnetRegisterScenarioApi &

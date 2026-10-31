@@ -3,6 +3,7 @@ mod backend;
 mod diesel_common;
 mod fifo_map;
 mod hash_map;
+pub mod historical_lease;
 mod overlay;
 #[cfg(feature = "postgres")]
 mod postgres;

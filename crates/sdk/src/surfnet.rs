@@ -2,23 +2,25 @@ use std::{
     collections::BTreeMap,
     net::TcpListener,
     path::PathBuf,
+    sync::{Arc, atomic::AtomicU64},
     thread::sleep,
     time::{Duration, Instant},
 };
 
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use solana_commitment_config::CommitmentConfig;
 use solana_keypair::Keypair;
 use solana_pubkey::Pubkey;
 use solana_rpc_client::rpc_client::RpcClient;
 use solana_signer::Signer;
-use surfpool_core::surfnet::{
-    locker::SurfnetSvmLocker,
-    svm::{SurfnetSvm, SurfnetSvmConfig},
+use surfpool_core::{
+    lifecycle::SurfnetInstance,
+    surfnet::{locker::SurfnetSvmLocker, svm::SurfnetSvmConfig},
 };
 use surfpool_types::{
     AccountSnapshot, BlockProductionMode, CheatcodeFilter, DEFAULT_PROFILING_MAP_CAPACITY,
-    RpcConfig, SimnetCommand, SimnetConfig, SimnetEvent, SurfpoolConfig, SvmFeatureConfig,
+    HistoricalSessionOptions, HistoricalSimnetConfig, RpcConfig, SimnetCommand, SimnetConfig,
+    SimnetEvent, SurfpoolConfig, SvmFeatureConfig,
 };
 
 use crate::{
@@ -52,6 +54,7 @@ pub struct SurfnetBuilder {
     skip_blockhash_check: bool,
     payer: Option<Keypair>,
     feature_config: SvmFeatureConfig,
+    historical: Option<HistoricalSessionOptions>,
     cheatcode_lock: Option<CheatcodeFilter>,
     snapshots: Vec<SnapshotSource>,
     instruction_profiling: bool,
@@ -76,6 +79,7 @@ impl Default for SurfnetBuilder {
             skip_blockhash_check: false,
             payer: None,
             feature_config: SvmFeatureConfig::default(),
+            historical: None,
             cheatcode_lock: None,
             snapshots: vec![],
             instruction_profiling: true,
@@ -85,6 +89,14 @@ impl Default for SurfnetBuilder {
 }
 
 impl SurfnetBuilder {
+    /// Fork historical state: SVM Replay executes the surfnet from the boundary in `options`
+    /// (after a transaction or slot), with no datasource. The payer is funded with a local
+    /// account definition, not an airdrop.
+    pub fn historical(mut self, options: HistoricalSessionOptions) -> Self {
+        self.historical = Some(options);
+        self
+    }
+
     /// Profile every instruction of every transaction. Default: `true`.
     ///
     /// Each profile re-executes the transaction instruction by instruction
@@ -242,6 +254,7 @@ impl SurfnetBuilder {
             skip_blockhash_check,
             payer,
             feature_config,
+            historical,
             cheatcode_lock,
             snapshots,
             instruction_profiling,
@@ -252,18 +265,41 @@ impl SurfnetBuilder {
                 .map_err(|e| SurfnetError::Startup(format!("cannot lock cheatcodes: {e}")))?;
         }
         let payer = payer.unwrap_or_else(Keypair::new);
+        let historical = historical
+            .map(HistoricalSimnetConfig::session)
+            .transpose()
+            .map_err(SurfnetError::Runtime)?;
+        if historical.is_some()
+            && (remote_rpc_url.is_some()
+                || skip_blockhash_check
+                || feature_config != SvmFeatureConfig::default())
+        {
+            return Err(SurfnetError::Runtime(
+                "a historical surfnet has no datasource and takes its features and admission rules from SVM Replay".into(),
+            ));
+        }
         let snapshot = merge_snapshots(snapshots)?;
 
         let bind_port = get_free_port()?;
         let ws_port = get_free_port()?;
         let bind_host = "127.0.0.1".to_string();
 
-        let mut startup_airdrop_addresses = vec![payer.pubkey()];
+        // Define historical payers during startup, before RPC cheatcode locks apply.
+        let session_addresses = if historical.is_some() {
+            vec![payer.pubkey()]
+        } else {
+            vec![]
+        };
+        let mut startup_airdrop_addresses = match historical {
+            Some(_) => vec![],
+            None => vec![payer.pubkey()],
+        };
         startup_airdrop_addresses.extend(airdrop_addresses);
         // Startup airdrops land before the snapshot loads, so an address the
         // snapshot restores keeps its restored balance: only wait for the rest.
         let startup_airdrop_addresses_for_rpc: Vec<Pubkey> = startup_airdrop_addresses
             .iter()
+            .chain(&session_addresses)
             .filter(|address| !matches!(snapshot.get(&address.to_string()), Some(Some(_))))
             .copied()
             .collect();
@@ -274,11 +310,12 @@ impl SurfnetBuilder {
         // ready with no pending compat entry).
         let surfpool_config = SurfpoolConfig {
             simnets: vec![SimnetConfig {
-                offline_mode,
+                offline_mode: offline_mode || historical.is_some(),
                 remote_rpc_url,
                 slot_time: slot_time_ms,
                 block_production_mode,
                 airdrop_addresses: startup_airdrop_addresses,
+                session_addresses,
                 airdrop_token_amount: airdrop_lamports,
                 skip_blockhash_check,
                 snapshot,
@@ -307,49 +344,63 @@ impl SurfnetBuilder {
             log_bytes_limit: surfpool_config.simnets[0].log_bytes_limit,
             feature_config,
             skip_blockhash_check,
+            historical: historical.clone(),
         };
-        let (surfnet_svm, simnet_events_rx, geyser_events_rx) = SurfnetSvm::new(svm_config)
+        let (instance, simnet_events_rx) = SurfnetInstance::open(None, svm_config)
             .map_err(|e| SurfnetError::Runtime(format!("failed to initialize Surfnet SVM: {e}")))?;
         let (simnet_commands_tx, simnet_commands_rx) = crossbeam_channel::unbounded();
 
-        let svm_locker = SurfnetSvmLocker::new(surfnet_svm);
-        let svm_locker_clone = svm_locker.clone();
+        let svm_locker = instance.locker().cloned();
+        let coalesced_slots = instance.coalesced_slots_counter();
         let simnet_commands_tx_clone = simnet_commands_tx.clone();
+        let simnet_events_tx = instance.simnet_events_tx();
 
-        let _handle = std::thread::Builder::new()
+        let runloop = std::thread::Builder::new()
             .name("surfnet-sdk".into())
             .spawn(move || {
-                let future = surfpool_core::runloops::start_local_surfnet_runloop(
-                    svm_locker_clone,
+                let future = instance.run(
                     surfpool_config,
                     simnet_commands_tx_clone,
                     simnet_commands_rx,
-                    geyser_events_rx,
                 );
                 if let Err(e) = hiro_system_kit::nestable_block_on(future) {
                     log::error!("Surfnet exited with error: {e}");
+                    // Startup waits for this: nothing else ends that wait once the runloop fails.
+                    simnet_events_tx.aborted(e.to_string());
                 }
             })
             .map_err(|e| SurfnetError::Runtime(e.to_string()))?;
 
-        // Wait for the runtime to signal ready
-        wait_for_ready(&simnet_events_rx)?;
-        wait_for_startup_airdrops(
-            &rpc_url,
-            &startup_airdrop_addresses_for_rpc,
-            airdrop_lamports,
-        )?;
-
-        Ok(Surfnet {
+        // Wait for the runtime to signal ready; whatever still runs of a surfnet that failed
+        // to start is stopped with it.
+        if let Err(error) = wait_for_ready(&simnet_events_rx, &runloop) {
+            let _ = simnet_commands_tx.send(SimnetCommand::Terminate(None));
+            return Err(error);
+        }
+        let mut surfnet = Surfnet {
             rpc_url,
             ws_url,
             payer,
             simnet_commands_tx,
             simnet_events_rx,
             svm_locker,
+            coalesced_slots,
             instance_id: uuid::Uuid::new_v4().to_string(),
             stopped: false,
-        })
+        };
+        // A surfnet whose startup funding failed is stopped: no caller holds it to stop it.
+        let funded = wait_for_startup_airdrops(
+            &surfnet.rpc_url,
+            &startup_airdrop_addresses_for_rpc,
+            airdrop_lamports,
+        );
+        if let Err(error) = funded {
+            if let Err(stop) = surfnet.stop() {
+                log::error!("Surfnet that failed to start did not stop cleanly: {stop}");
+            }
+            return Err(error);
+        }
+        Ok(surfnet)
     }
 }
 
@@ -368,7 +419,9 @@ pub struct Surfnet {
     simnet_commands_tx: Sender<SimnetCommand>,
     simnet_events_rx: Receiver<SimnetEvent>,
     #[allow(dead_code)] // retained for future direct profiling access
-    svm_locker: SurfnetSvmLocker,
+    // None for a historical instance: its state is built on the fork when it runs.
+    svm_locker: Option<SurfnetSvmLocker>,
+    coalesced_slots: Arc<AtomicU64>,
     instance_id: String,
     stopped: bool,
 }
@@ -416,10 +469,8 @@ impl Surfnet {
     /// time. Read it before and after a run: a non-zero difference means the
     /// run's timing was degraded and wall-clock-sensitive results may differ.
     pub fn coalesced_slots(&self) -> u64 {
-        self.svm_locker.with_svm_reader(|svm| {
-            svm.coalesced_slots
-                .load(std::sync::atomic::Ordering::Relaxed)
-        })
+        self.coalesced_slots
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Get a reference to the simnet events receiver for observing runtime events.
@@ -532,22 +583,40 @@ fn get_free_port() -> SurfnetResult<u16> {
     Ok(port)
 }
 
-fn wait_for_ready(events_rx: &Receiver<SimnetEvent>) -> SurfnetResult<()> {
+/// Waits for the runloop to start. A runloop that ends first (an error or a panic) is a
+/// failed startup, never a wait without end: this side holds an events sender too.
+fn wait_for_ready(
+    events_rx: &Receiver<SimnetEvent>,
+    runloop: &std::thread::JoinHandle<()>,
+) -> SurfnetResult<()> {
     loop {
-        match events_rx.recv() {
-            Ok(SimnetEvent::CoreStarted(_)) => return Ok(()),
-            Ok(SimnetEvent::Aborted(err)) => return Err(SurfnetError::Aborted(err)),
-            Ok(SimnetEvent::Shutdown) => {
-                return Err(SurfnetError::Aborted(
-                    "surfnet shut down during startup".into(),
-                ));
-            }
-            Ok(_) => continue,
+        let event = match events_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(event) => event,
+            Err(RecvTimeoutError::Timeout) if !runloop.is_finished() => continue,
+            // A finished runloop's last events are already queued.
+            Err(RecvTimeoutError::Timeout) => match events_rx.try_recv() {
+                Ok(event) => event,
+                Err(_) => {
+                    return Err(SurfnetError::Aborted(
+                        "the surfnet runloop ended during startup".into(),
+                    ));
+                }
+            },
             Err(e) => {
                 return Err(SurfnetError::Startup(format!(
                     "events channel closed unexpectedly: {e}"
                 )));
             }
+        };
+        match event {
+            SimnetEvent::CoreStarted(_) => return Ok(()),
+            SimnetEvent::Aborted(err) => return Err(SurfnetError::Aborted(err)),
+            SimnetEvent::Shutdown => {
+                return Err(SurfnetError::Aborted(
+                    "surfnet shut down during startup".into(),
+                ));
+            }
+            _ => continue,
         }
     }
 }

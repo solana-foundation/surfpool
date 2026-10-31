@@ -165,7 +165,7 @@ async fn scenario_keeps_the_trader_usable_as_the_clock_moves_on() {
     };
 
     let (unplayed, graph) = phoenix_behavior_locker().await;
-    unplayed.with_svm_writer(|svm| svm.inner.set_sysvar(&later(&graph)));
+    unplayed.with_svm_writer(|svm| svm.inner.local_mut_for_tests().set_sysvar(&later(&graph)));
     let refused = try_hawkeye_margin(&unplayed, &graph)
         .expect_err("with no Phoenix scenario played, the aged readings are refused");
     assert!(
@@ -203,7 +203,7 @@ async fn scenario_keeps_the_trader_usable_as_the_clock_moves_on() {
     .await;
     let prepared = hawkeye_margin(&locker, &graph);
 
-    locker.with_svm_writer(|svm| svm.inner.set_sysvar(&later(&graph)));
+    locker.with_svm_writer(|svm| svm.inner.local_mut_for_tests().set_sysvar(&later(&graph)));
     let kept = hawkeye_margin(&locker, &graph);
     assert_eq!(
         (
@@ -296,16 +296,24 @@ async fn phoenix_surfnet(graph: &PhoenixMainnetGraph) -> SurfnetSvmLocker {
     let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
     let locker = SurfnetSvmLocker::new(svm);
     locker.with_svm_writer(|svm_writer| {
-        svm_writer.inner.set_sysvar(&graph.clock);
-        svm_writer.inner.set_sysvar(&graph.last_restart_slot);
         svm_writer
             .inner
-            .svm
+            .local_mut_for_tests()
+            .set_sysvar(&graph.clock);
+        svm_writer
+            .inner
+            .local_mut_for_tests()
+            .set_sysvar(&graph.last_restart_slot);
+        svm_writer
+            .inner
+            .local_mut_for_tests()
+            .svm_mut()
             .add_program(PHOENIX_PROGRAM_ID, &eternal_program)
             .unwrap();
         svm_writer
             .inner
-            .svm
+            .local_mut_for_tests()
+            .svm_mut()
             .add_program(HAWKEYE_PROGRAM_ID, &hawkeye_program)
             .unwrap();
         for (address, account) in &graph.accounts {
@@ -466,7 +474,10 @@ fn try_hawkeye_view(
     .map(|address| AccountMeta::new_readonly(*address, false))
     .collect();
     locker.with_svm_writer(|svm| {
-        svm.inner.airdrop(&payer.pubkey(), 1_000_000_000).unwrap();
+        svm.inner
+            .local_mut_for_tests()
+            .airdrop(&payer.pubkey(), 1_000_000_000)
+            .unwrap();
         let transaction = Transaction::new_signed_with_payer(
             &[
                 ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
@@ -478,9 +489,10 @@ fn try_hawkeye_view(
             ],
             Some(&payer.pubkey()),
             &[&payer],
-            svm.inner.svm.latest_blockhash(),
+            svm.inner.local().unwrap().svm().latest_blockhash(),
         );
         svm.inner
+            .local_mut_for_tests()
             .send_transaction(transaction)
             .map(|meta| meta.return_data.data)
             .map_err(|failed| format!("{:?}, logs: {:?}", failed.err, failed.meta.logs))
@@ -925,7 +937,10 @@ impl LocalTrader {
         }
         .pack_into_slice(&mut data);
         locker.with_svm_writer(|svm| {
-            svm.inner.airdrop(&wallet, 10_000_000_000).unwrap();
+            svm.inner
+                .local_mut_for_tests()
+                .airdrop(&wallet, 10_000_000_000)
+                .unwrap();
             let lamports = svm.inner.minimum_balance_for_rent_exemption(data.len());
             svm.set_account(
                 &token_account,
@@ -1413,7 +1428,10 @@ fn send_signed(
     instruction: Instruction,
 ) -> Result<(), String> {
     locker.with_svm_writer(|svm| {
-        svm.inner.airdrop(&signer.pubkey(), 1_000_000_000).unwrap();
+        svm.inner
+            .local_mut_for_tests()
+            .airdrop(&signer.pubkey(), 1_000_000_000)
+            .unwrap();
         let transaction = Transaction::new_signed_with_payer(
             &[
                 ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
@@ -1424,6 +1442,7 @@ fn send_signed(
             svm.latest_blockhash(),
         );
         svm.send_transaction(transaction.into(), false, true)
+            .map_err(|error| error.to_string())?
             .map(|_| ())
             .map_err(|failed| format!("{:?}, logs: {:?}", failed.err, failed.meta.logs))
     })
@@ -1512,7 +1531,7 @@ fn advance_slots(locker: &SurfnetSvmLocker, graph: &PhoenixMainnetGraph, slots: 
     let mut clock = graph.clock.clone();
     clock.slot += slots;
     clock.unix_timestamp += (slots * 2 / 5) as i64;
-    locker.with_svm_writer(|svm| svm.inner.set_sysvar(&clock));
+    locker.with_svm_writer(|svm| svm.inner.local_mut_for_tests().set_sysvar(&clock));
     clock.slot
 }
 

@@ -6,7 +6,7 @@ use std::{
         RangeInclusive,
     },
     str::FromStr,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::SystemTime,
 };
 
@@ -16,12 +16,7 @@ use base64::{Engine, prelude::BASE64_STANDARD};
 use chrono::Utc;
 use convert_case::Casing;
 use crossbeam_channel::{Receiver, Sender, unbounded};
-use litesvm::{
-    LiteSVM,
-    types::{
-        FailedTransactionMetadata, SimulatedTransactionInfo, TransactionMetadata, TransactionResult,
-    },
-};
+use litesvm::LiteSVM;
 use solana_account::{Account, AccountSharedData, ReadableAccount};
 use solana_account_decoder::{
     UiAccount, UiAccountData, UiAccountEncoding, UiDataSliceConfig, encode_ui_account,
@@ -37,28 +32,21 @@ use solana_client::{
         RpcLogsResponse, RpcPerfSample, RpcResponseContext,
     },
 };
-use solana_clock::{Clock, Slot};
+use solana_clock::Slot;
 use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_epoch_info::EpochInfo;
 use solana_epoch_schedule::EpochSchedule;
-use solana_fee::{FeeFeatures, calculate_fee};
 use solana_genesis_config::GenesisConfig;
 use solana_hash::Hash;
 use solana_inflation::Inflation;
 use solana_loader_v3_interface::state::UpgradeableLoaderState;
-use solana_message::{
-    Message, SanitizedMessage, SanitizedVersionedMessage, SimpleAddressLoader, VersionedMessage,
-    v0::LoadedAddresses,
-};
+use solana_message::{Message, VersionedMessage, v0::LoadedAddresses};
 use solana_program_option::COption;
 use solana_pubkey::Pubkey;
 use solana_rpc_client_api::response::{SlotInfo, SlotTransactionStats, SlotUpdate};
-use solana_runtime_transaction::transaction_meta::TransactionConfiguration;
 use solana_sdk_ids::{bpf_loader, system_program};
 use solana_signature::Signature;
-use solana_slot_hashes::{MAX_ENTRIES as MAX_SLOT_HASHES_ENTRIES, SlotHashes};
 use solana_system_interface::instruction as system_instruction;
-use solana_sysvar::slot_history::SlotHistory;
 use solana_transaction::versioned::VersionedTransaction;
 use solana_transaction_error::TransactionError;
 use solana_transaction_status::{
@@ -110,10 +98,14 @@ use crate::{
         },
         template_registry,
     },
-    storage::{OverlayStorage, Storage, StorageBackend},
+    storage::{OverlayStorage, Storage, StorageBackend, historical_lease::HistoricalStoreLease},
     surfnet::{
-        BlockSubscriptionData, LogsSubscriptionData, locker::is_supported_token_program,
-        surfnet_lite_svm::SurfnetLiteSvm,
+        BlockSubscriptionData, LogsSubscriptionData,
+        backend::{
+            Admission, AdmissionAuthority, Backend, FailedTransactionMetadata, HistoricalFork,
+            IsProcessed, SimulatedTransactionInfo, TransactionResult,
+        },
+        is_supported_token_program,
     },
     types::{
         GeyserAccountUpdate, MintAccount, OfflineAccountConfig, SerializableAccountAdditionalData,
@@ -126,6 +118,12 @@ pub const GARBAGE_COLLECTION_INTERVAL_MS: u64 = 60 * 60 * 1000;
 
 /// Simulated time between checkpoints of the latest slot to storage.
 pub const CHECKPOINT_INTERVAL_MS: u64 = 60 * 1000;
+
+/// Where a historical fork's store records its current slot, and its last commit: the
+/// revision and how many of SVM Replay's journal records it had seen then.
+pub const HISTORICAL_SLOT_CHECKPOINT: &str = "historical_slot";
+pub const HISTORICAL_JOURNAL_CHECKPOINT: &str = "historical_journal";
+pub const HISTORICAL_REVISION_CHECKPOINT: &str = "historical_revision";
 
 lazy_static::lazy_static! {
     /// Overrides the garbage collection interval with a fixed number of slots.
@@ -437,7 +435,7 @@ impl ReadSlot {
     /// Like Agave's `bank.get_epoch_info()` on the bank at this slot.
     pub fn epoch_info(self, svm: &SurfnetSvm) -> EpochInfo {
         let tip = &svm.latest_epoch_info;
-        let schedule = svm.inner.get_sysvar::<EpochSchedule>();
+        let schedule = svm.inner.epoch_schedule();
         let (epoch, slot_index) = schedule.get_epoch_and_slot_index(self.0);
         EpochInfo {
             epoch,
@@ -476,6 +474,9 @@ pub struct SurfnetSvmConfig {
     pub max_profiles: usize,
     pub log_bytes_limit: Option<usize>,
     pub skip_blockhash_check: bool,
+    /// `surfpool start --after`: SVM Replay's backend executes this surfnet on historical
+    /// state. The core lifecycle selects the mode from it before anything is seeded.
+    pub historical: Option<surfpool_types::HistoricalSimnetConfig>,
 }
 
 impl Default for SurfnetSvmConfig {
@@ -488,8 +489,48 @@ impl Default for SurfnetSvmConfig {
             max_profiles: DEFAULT_PROFILING_MAP_CAPACITY,
             log_bytes_limit: DEFAULT_LOG_BYTES_LIMIT,
             skip_blockhash_check: false,
+            historical: None,
         }
     }
+}
+
+/// The channels a surfnet publishes on, created before it is built so that an instance's
+/// frontends can observe (and its startup can report) a slow start such as a historical fork's
+/// preparation.
+pub(crate) struct SurfnetChannels {
+    pub(crate) simnet_events_tx: SimnetEventsTx,
+    pub(crate) geyser_events_tx: Sender<GeyserEvent>,
+    pub(crate) startup_status_watch_tx: tokio::sync::watch::Sender<SurfnetStartupStatus>,
+    pub(crate) core_started_watch_tx: tokio::sync::watch::Sender<bool>,
+}
+
+impl SurfnetChannels {
+    pub(crate) fn new() -> (Self, Receiver<SimnetEvent>, Receiver<GeyserEvent>) {
+        let (simnet_events_tx, simnet_events_rx) = SimnetEventsTx::channel(1024);
+        let (geyser_events_tx, geyser_events_rx) = crossbeam_channel::bounded(1024);
+        (
+            Self {
+                simnet_events_tx,
+                geyser_events_tx,
+                startup_status_watch_tx: tokio::sync::watch::channel(
+                    SurfnetStartupStatus::default(),
+                )
+                .0,
+                core_started_watch_tx: tokio::sync::watch::channel(false).0,
+            },
+            simnet_events_rx,
+            geyser_events_rx,
+        )
+    }
+}
+
+/// The supply figures a caller set with `surfnet_setSupply`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SupplyOverrides {
+    pub total: bool,
+    pub circulating: bool,
+    pub non_circulating: bool,
+    pub non_circulating_accounts: bool,
 }
 
 /// `SurfnetSvm` provides a lightweight Solana Virtual Machine (SVM) for testing and simulation.
@@ -500,7 +541,7 @@ impl Default for SurfnetSvmConfig {
 /// It also exposes channels to listen for simulation events (`SimnetEvent`) and Geyser plugin events (`GeyserEvent`).
 #[derive(Clone)]
 pub struct SurfnetSvm {
-    pub inner: SurfnetLiteSvm,
+    pub inner: Backend,
     pub remote_rpc_url: Option<String>,
     pub chain_tip: BlockIdentifier,
     pub blocks: Box<dyn Storage<u64, BlockHeader>>,
@@ -577,6 +618,7 @@ pub struct SurfnetSvm {
     /// Bundle sandboxes record it at clone time so a commit can detect live-state
     /// mutations (cheatcodes, account writes) that happened during sandbox execution.
     pub state_revision: u64,
+    pub(crate) disposable_simulation: bool,
     pub registered_idls: Box<dyn Storage<String, Vec<VersionedIdl>>>,
     pub feature_set: FeatureSet,
     pub instruction_profiling_enabled: bool,
@@ -593,9 +635,32 @@ pub struct SurfnetSvm {
     /// private so that all writes go through the state machine; subscribe via
     /// [`Self::subscribe_startup_status`].
     startup_status_watch_tx: tokio::sync::watch::Sender<SurfnetStartupStatus>,
+    /// Turns true once the core runloop serves (`CoreStarted`): an embedder can wait for a
+    /// slow start, such as a historical fork's preparation, without reading the event stream.
+    core_started_watch_tx: tokio::sync::watch::Sender<bool>,
     pub account_update_slots: HashMap<Pubkey, Slot>,
     pub streamed_accounts: Box<dyn Storage<String, bool>>,
     pub recent_blockhashes: VecDeque<(SyntheticBlockhash, i64)>,
+    /// A historical fork's earlier local blockhashes, oldest first, as SVM Replay reported
+    /// them after each explicit advance.
+    pub historical_blockhashes: Vec<Hash>,
+    /// Which supply figures `surfnet_setSupply` defined. A historical fork reports only
+    /// these: its real supply would sum every account at the slot.
+    pub supply_overrides: SupplyOverrides,
+    /// A historical fork's chunked program uploads still in progress: the ELF bytes received
+    /// so far, applied to the fork only once complete (see `write_historical_program`).
+    pub(crate) historical_uploads: HashMap<Pubkey, super::locker::program_upload::ProgramUpload>,
+    /// A historical fork's current slot and its block while still open: stored in `blocks`
+    /// only when the fork leaves the slot, with the blockhash SVM Replay then registers.
+    pub historical_open_block: Option<(Slot, BlockHeader)>,
+    /// A historical fork's boundary slot and position: how many archived transactions of
+    /// the boundary block precede the fork's own.
+    pub historical_boundary: Option<(Slot, u64)>,
+    /// A journaled historical fork's last store commit: its revision, and how many of SVM
+    /// Replay's journal records the store had seen then.
+    pub historical_commit: (u64, u64),
+    /// Whether the store failed a write, after which it commits no historical write.
+    pub historical_commits_stopped: bool,
     pub scheduled_overrides: Box<dyn Storage<u64, Vec<OverrideInstance>>>,
     /// Tracks accounts that should not be downloaded from the remote RPC.
     /// This includes accounts explicitly closed locally and accounts marked offline via cheatcodes.
@@ -616,18 +681,22 @@ pub struct SurfnetSvm {
     /// The slot each time travel lands on, mapped to the slot of its parent block and
     /// its time in milliseconds. The slots between the two are skipped: they hold no block.
     /// A landing with no gap only sets the time, as a travel to the open slot does.
-    landings: BTreeMap<Slot, (Slot, u64)>,
+    pub(super) landings: BTreeMap<Slot, (Slot, u64)>,
     /// `landings`, persisted.
-    landings_db: Box<dyn Storage<Slot, (Slot, u64)>>,
+    pub(super) landings_db: Box<dyn Storage<Slot, (Slot, u64)>>,
     /// The slot each restart reopened, mapped to its time in milliseconds. Unlike a landing, a
     /// restart is not a time travel: it skips no slot and keeps the epoch's start.
-    restarts: BTreeMap<Slot, u64>,
+    pub(super) restarts: BTreeMap<Slot, u64>,
     /// `restarts`, persisted.
-    restarts_db: Box<dyn Storage<Slot, u64>>,
+    pub(super) restarts_db: Box<dyn Storage<Slot, u64>>,
     /// The storage backend every kv store above was opened on. Owns the
     /// surfnet's database connections; kept so shutdown has one place to
     /// flush and so the connections live exactly as long as the surfnet.
-    storage_backend: StorageBackend,
+    pub(crate) storage_backend: StorageBackend,
+    /// The namespace lease taken before the store was opened (exclusive for a historical
+    /// writer, shared for a normal surfnet; none in memory): clones share it, and it ends
+    /// with the last handle of the instance.
+    store_lease: Option<Arc<Mutex<HistoricalStoreLease>>>,
 }
 
 /// The mint inputs `token_amount_to_ui_amount_v3` needs, with the rate-based
@@ -813,15 +882,17 @@ impl SurfnetSvm {
     /// Explicitly shutdown the SVM, performing cleanup like WAL checkpoint for SQLite.
     /// This should be called before the application exits to ensure data is persisted.
     pub fn shutdown(&mut self) {
-        // Checkpoint the last block, so a restart opens the slot after it.
-        let last_block = self.parent_slot(self.get_latest_absolute_slot());
-        if let Err(e) = self
-            .slot_checkpoint
-            .store("latest_slot".to_string(), last_block)
-        {
-            self.simnet_events_tx.error(format!(
-                "Failed to checkpoint slot {last_block} on shutdown: {e}"
-            ));
+        // Historical stores recover through SVM Replay's journal, not a local chain checkpoint.
+        if !self.inner.is_historical() {
+            let last_block = self.parent_slot(self.get_latest_absolute_slot());
+            if let Err(e) = self
+                .slot_checkpoint
+                .store("latest_slot".to_string(), last_block)
+            {
+                self.simnet_events_tx.error(format!(
+                    "Failed to checkpoint slot {last_block} on shutdown: {e}"
+                ));
+            }
         }
         self.storage_backend.shutdown();
     }
@@ -842,12 +913,12 @@ impl SurfnetSvm {
     /// buffered channels whose receivers are kept on the sandbox under `sandbox_simnet_events_rx`
     /// and `sandbox_geyser_events_rx`. Bundle commit code can drain these to replay the events
     /// on the original VM's channels.
-    pub fn clone_for_profiling(&self) -> Self {
+    pub fn clone_for_profiling(&self) -> SurfpoolResult<Self> {
         let (dummy_simnet_tx, _) = SimnetEventsTx::channel(1);
         let (dummy_geyser_tx, _) = crossbeam_channel::bounded(1);
 
-        Self {
-            inner: self.inner.clone_for_profiling(),
+        Ok(Self {
+            inner: self.inner.clone_for_profiling()?,
             remote_rpc_url: self.remote_rpc_url.clone(),
             chain_tip: self.chain_tip.clone(),
 
@@ -917,6 +988,7 @@ impl SurfnetSvm {
             inflation: self.inflation,
             write_version: self.write_version,
             state_revision: self.state_revision,
+            disposable_simulation: self.disposable_simulation,
             feature_set: self.feature_set.clone(),
             instruction_profiling_enabled: self.instruction_profiling_enabled,
             max_profiles: self.max_profiles,
@@ -928,8 +1000,16 @@ impl SurfnetSvm {
             // fresh watch channel so nothing it does can reach live startup
             // subscribers.
             startup_status_watch_tx: tokio::sync::watch::channel(self.startup_status.clone()).0,
+            core_started_watch_tx: tokio::sync::watch::channel(false).0,
             account_update_slots: self.account_update_slots.clone(),
             recent_blockhashes: self.recent_blockhashes.clone(),
+            historical_blockhashes: self.historical_blockhashes.clone(),
+            supply_overrides: self.supply_overrides,
+            historical_uploads: self.historical_uploads.clone(),
+            historical_open_block: self.historical_open_block.clone(),
+            historical_boundary: self.historical_boundary,
+            historical_commit: self.historical_commit,
+            historical_commits_stopped: self.historical_commits_stopped,
             offline_accounts: OverlayStorage::wrap(self.offline_accounts.clone_box()),
             genesis_slot: self.genesis_slot,
             genesis_updated_at: self.genesis_updated_at,
@@ -940,7 +1020,8 @@ impl SurfnetSvm {
             restarts: self.restarts.clone(),
             restarts_db: OverlayStorage::wrap(self.restarts_db.clone_box()),
             storage_backend: self.storage_backend.clone(),
-        }
+            store_lease: self.store_lease.clone(),
+        })
     }
 
     pub(crate) fn default_epoch_schedule() -> EpochSchedule {
@@ -959,7 +1040,7 @@ impl SurfnetSvm {
         }
     }
 
-    fn register_builtin_template_idls(&mut self) {
+    pub(super) fn register_builtin_template_idls(&mut self) {
         let registry = TemplateRegistry::new();
         for (_, template) in registry.templates.into_iter() {
             // Templates for programs with no IDL have nothing to register; they write through
@@ -981,20 +1062,26 @@ impl SurfnetSvm {
     /// On bundle failure, simply dropping the returned [`BundleSandbox`] discards every
     /// buffered event, every overlay write, and the cloned `LiteSVM` state — the original
     /// VM is left byte-identical to its pre-bundle state.
-    pub fn clone_for_bundle_sandbox(&self) -> BundleSandbox {
+    pub fn clone_for_bundle_sandbox(&self) -> SurfpoolResult<BundleSandbox> {
         let confirmation_queue_base_len = self.transactions_queued_for_confirmation.len();
-        let mut svm = self.clone_for_profiling();
+        let mut svm = self.clone_for_profiling()?;
         let (geyser_tx, geyser_rx) = crossbeam_channel::unbounded();
         let (simnet_tx, simnet_rx) = SimnetEventsTx::unbounded();
         svm.geyser_events_tx = geyser_tx;
         svm.simnet_events_tx = simnet_tx;
-        BundleSandbox {
+        Ok(BundleSandbox {
             svm,
             geyser_rx,
             simnet_rx,
             confirmation_queue_base_len,
             base_state_revision: self.state_revision,
-        }
+        })
+    }
+
+    pub(crate) fn clone_for_bundle_simulation(&self) -> SurfpoolResult<BundleSandbox> {
+        let mut sandbox = self.clone_for_bundle_sandbox()?;
+        sandbox.svm.disposable_simulation = true;
+        Ok(sandbox)
     }
 
     /// Records an exclusive write access. Called by `SurfnetSvmLocker` for every writer.
@@ -1044,6 +1131,11 @@ impl SurfnetSvm {
         sandbox: BundleSandbox,
         bundle_status_tx: Sender<TransactionStatusEvent>,
     ) -> SurfpoolResult<Vec<Signature>> {
+        if sandbox.svm.disposable_simulation {
+            return Err(SurfpoolError::internal(
+                "a simulation sandbox cannot be committed",
+            ));
+        }
         if self.is_stale_bundle_sandbox(&sandbox) {
             return Err(SurfpoolError::bundle_sandbox_stale(
                 sandbox.base_state_revision,
@@ -1058,6 +1150,13 @@ impl SurfnetSvm {
             confirmation_queue_base_len,
             base_state_revision: _,
         } = sandbox;
+
+        // A historical sandbox commits its branch before anything else is touched: SVM
+        // Replay still refuses it if the live branch changed since the sandbox forked.
+        let historical = self.inner.is_historical();
+        if historical {
+            svm.inner.commit_into(&mut self.inner)?;
+        }
 
         // 1. Drain all overlay storages onto self's real storages.
         commit_overlay_storage(svm.blocks.as_ref(), self.blocks.as_mut())?;
@@ -1108,13 +1207,17 @@ impl SurfnetSvm {
         )?;
         commit_overlay_storage(svm.slot_checkpoint.as_ref(), self.slot_checkpoint.as_mut())?;
 
-        // 2. Move the sandbox's executed LiteSVM accounts state onto self.
-        std::mem::swap(&mut self.inner.svm, &mut svm.inner.svm);
+        // 2. Move the sandbox's executed LiteSVM accounts state onto self (done above for a
+        //    historical branch).
+        if !historical {
+            svm.inner.commit_into(&mut self.inner)?;
+        }
 
         // 3. Drain sandbox's account-DB overlay onto self.inner.db.
-        if let (Some(sandbox_db), Some(target_db)) = (svm.inner.db.as_ref(), self.inner.db.as_mut())
+        if let (Some(sandbox_db), Some(target_db)) =
+            (svm.inner.account_db(), self.inner.account_db_mut())
         {
-            commit_overlay_storage(sandbox_db.as_ref(), target_db.as_mut())?;
+            commit_overlay_storage(sandbox_db, target_db.as_mut())?;
         }
 
         // 4. Counter/version/queue state.
@@ -1197,37 +1300,85 @@ impl SurfnetSvm {
         database_url: Option<&str>,
         config: SurfnetSvmConfig,
     ) -> SurfpoolResult<(Self, Receiver<SimnetEvent>, Receiver<GeyserEvent>)> {
-        let (simnet_events_tx, simnet_events_rx) = SimnetEventsTx::channel(1024);
-        let (geyser_events_tx, geyser_events_rx) = crossbeam_channel::bounded(1024);
-        let surfnet_id = config.surfnet_id;
+        // These constructors build a normal surfnet; a historical one needs its backend
+        // attached first, which only the lifecycle does.
+        if config.historical.is_some() {
+            return Err(SurfpoolError::historical(
+                "UNSUPPORTED_IN_HISTORICAL_MODE",
+                "a historical surfnet starts through lifecycle::SurfnetInstance, which attaches SVM Replay before anything is seeded",
+                None,
+            ));
+        }
+        // A persistent store is leased (shared, so it cannot race a historical writer)
+        // before it is opened.
+        let store_lease = HistoricalStoreLease::normal(database_url, &config.surfnet_id)
+            .map_err(SurfpoolError::store_lease)?
+            .map(|lease| Arc::new(Mutex::new(lease)));
+        let (channels, simnet_events_rx, geyser_events_rx) = SurfnetChannels::new();
+        let storage_backend = StorageBackend::open(&database_url, &config.surfnet_id)?;
+        crate::lifecycle::check_store(&storage_backend, None)?;
+        let svm = Self::build_with(storage_backend, store_lease, channels, config, None)?;
+        Ok((svm, simnet_events_rx, geyser_events_rx))
+    }
+
+    /// A surfnet on an opened store and its instance's channels: the local VM, seeded as always,
+    /// or an attached historical fork (`historical`), which seeds nothing: its slot, blockhash,
+    /// clock and accounts come from SVM Replay, and its accounts are indexed as they load.
+    pub(crate) fn build_with(
+        storage_backend: StorageBackend,
+        store_lease: Option<Arc<Mutex<HistoricalStoreLease>>>,
+        channels: SurfnetChannels,
+        config: SurfnetSvmConfig,
+        historical: Option<HistoricalFork>,
+    ) -> SurfpoolResult<Self> {
+        let SurfnetChannels {
+            simnet_events_tx,
+            geyser_events_tx,
+            startup_status_watch_tx,
+            core_started_watch_tx,
+        } = channels;
 
         // Compose the final feature set up front (mainnet baseline +
         // config.enable - config.disable) so that the inner LiteSVM is
         // constructed exactly once, with the correct features and feature
         // accounts loaded. See `compose_feature_set` for the composition rules.
         let feature_set = compose_feature_set(&config.feature_config);
-        let storage_backend = StorageBackend::open(&database_url, &surfnet_id)?;
-        let inner = SurfnetLiteSvm::new(&storage_backend, feature_set.clone())?;
-
-        let native_mint_account = inner
-            .get_account(&spl_token_interface::native_mint::ID)?
-            .unwrap();
-
-        let native_mint_associated_data = AccountAdditionalDataV3 {
-            spl_token_additional_data: spl_token_additional_data(
-                &native_mint_account.data,
-                inner.get_sysvar::<Clock>().unix_timestamp,
-            ),
+        let inner = match historical {
+            Some(fork) => Backend::historical(fork),
+            None => Backend::new_local(&storage_backend, feature_set.clone())?,
         };
-        let parsed_mint_account = MintAccount::unpack(&native_mint_account.data).unwrap();
+
+        let native_mint = match inner.is_historical() {
+            true => None,
+            false => {
+                let native_mint_account = inner
+                    .get_account(&spl_token_interface::native_mint::ID)?
+                    .unwrap();
+
+                let native_mint_associated_data = AccountAdditionalDataV3 {
+                    spl_token_additional_data: spl_token_additional_data(
+                        &native_mint_account.data,
+                        inner.clock().unix_timestamp,
+                    ),
+                };
+                let parsed_mint_account = MintAccount::unpack(&native_mint_account.data).unwrap();
+                Some((
+                    native_mint_account,
+                    native_mint_associated_data,
+                    parsed_mint_account,
+                ))
+            }
+        };
 
         // Load native mint into owned account and token mint indexes
         let mut accounts_by_owner_db: Box<dyn Storage<String, Vec<String>>> =
             storage_backend.open_store("accounts_by_owner")?;
-        accounts_by_owner_db.store(
-            native_mint_account.owner.to_string(),
-            vec![spl_token_interface::native_mint::ID.to_string()],
-        )?;
+        if let Some((native_mint_account, _, _)) = &native_mint {
+            accounts_by_owner_db.store(
+                native_mint_account.owner.to_string(),
+                vec![spl_token_interface::native_mint::ID.to_string()],
+            )?;
+        }
         let blocks_db = storage_backend.open_store("blocks")?;
         let transactions_db = storage_backend.open_store("transactions")?;
         let jito_bundles_db = storage_backend.open_store("jito_bundles")?;
@@ -1238,14 +1389,16 @@ impl SurfnetSvm {
             dyn Storage<String, SerializableAccountAdditionalData>,
         > = storage_backend.open_store("account_associated_data")?;
         // Store initial account associated data (native mint)
-        account_associated_data_db.store(
-            spl_token_interface::native_mint::ID.to_string(),
-            native_mint_associated_data.into(),
-        )?;
-        token_mints_db.store(
-            spl_token_interface::native_mint::ID.to_string(),
-            parsed_mint_account,
-        )?;
+        if let Some((_, native_mint_associated_data, parsed_mint_account)) = native_mint {
+            account_associated_data_db.store(
+                spl_token_interface::native_mint::ID.to_string(),
+                native_mint_associated_data.into(),
+            )?;
+            token_mints_db.store(
+                spl_token_interface::native_mint::ID.to_string(),
+                parsed_mint_account,
+            )?;
+        }
         let token_accounts_by_owner_db: Box<dyn Storage<String, Vec<String>>> =
             storage_backend.open_store("token_accounts_by_owner")?;
         let token_accounts_by_delegate_db: Box<dyn Storage<String, Vec<String>>> =
@@ -1289,9 +1442,13 @@ impl SurfnetSvm {
 
         // Recover chain state: the slot after the last block, checkpointed or stored, or the slot
         // a time travel landed on since.
-        let last_block = slot_checkpoint_db
-            .get(&"latest_slot".to_string())?
-            .max(blocks_db.keys()?.into_iter().max());
+        let last_block = if inner.is_historical() {
+            None
+        } else {
+            slot_checkpoint_db
+                .get(&"latest_slot".to_string())?
+                .max(blocks_db.keys()?.into_iter().max())
+        };
         let recovered_slot = last_block
             .map(|slot| slot + 1)
             .max(landings.last_key_value().map(|(&slot, _)| slot));
@@ -1348,6 +1505,7 @@ impl SurfnetSvm {
             inflation: Inflation::default(),
             write_version: 0,
             state_revision: 0,
+            disposable_simulation: false,
             registered_idls: registered_idls_db,
             feature_set,
             instruction_profiling_enabled: config.instruction_profiling_enabled,
@@ -1356,10 +1514,18 @@ impl SurfnetSvm {
             skip_signature_verification: false,
             runbook_executions: Vec::new(),
             startup_status: SurfnetStartupStatus::default(),
-            startup_status_watch_tx: tokio::sync::watch::channel(SurfnetStartupStatus::default()).0,
+            startup_status_watch_tx,
+            core_started_watch_tx,
             account_update_slots: HashMap::new(),
             streamed_accounts: streamed_accounts_db,
             recent_blockhashes: VecDeque::new(),
+            historical_blockhashes: Vec::new(),
+            supply_overrides: SupplyOverrides::default(),
+            historical_uploads: HashMap::new(),
+            historical_open_block: None,
+            historical_boundary: None,
+            historical_commit: (0, 0),
+            historical_commits_stopped: false,
             scheduled_overrides: scheduled_overrides_db,
             offline_accounts: offline_accounts_db,
             genesis_slot: default_genesis_slot,
@@ -1371,10 +1537,16 @@ impl SurfnetSvm {
             restarts,
             restarts_db,
             storage_backend,
+            store_lease,
         };
 
-        svm.inner.set_log_bytes_limit(config.log_bytes_limit);
-        svm.inner.set_sysvar(&epoch_schedule);
+        if svm.inner.is_historical() {
+            svm.register_builtin_template_idls();
+            svm.initialize_historical()?;
+            return Ok(svm);
+        }
+        svm.configure_local_vm(config.log_bytes_limit)?;
+        svm.apply_local_epoch_schedule(&epoch_schedule)?;
         let anchor = |key: &str| svm.slot_checkpoint.get(&key.to_string());
         let genesis = (anchor("genesis_slot")?, anchor("genesis_height")?);
         let genesis_updated_at = anchor("genesis_updated_at")?;
@@ -1397,14 +1569,14 @@ impl SurfnetSvm {
                     svm.genesis_slot = slot;
                     svm.set_latest_absolute_slot(slot);
                 }
-                svm.chain_tip = svm.new_blockhash();
+                svm.chain_tip = svm.new_blockhash()?;
                 svm.store_genesis_anchor()?;
             }
         }
         svm.register_builtin_template_idls();
-        svm.reconstruct_sysvars();
+        svm.reconstruct_sysvars()?;
 
-        Ok((svm, simnet_events_rx, geyser_events_rx))
+        Ok(svm)
     }
 
     pub fn increment_write_version(&mut self) -> u64 {
@@ -1424,7 +1596,7 @@ impl SurfnetSvm {
         epoch_info: EpochInfo,
         epoch_schedule: EpochSchedule,
     ) -> SurfpoolResult<()> {
-        self.inner.set_sysvar(&epoch_schedule);
+        self.apply_local_epoch_schedule(&epoch_schedule)?;
         // A restart keeps the chain it recovered: the open slot is past genesis.
         if self.get_latest_absolute_slot() == self.genesis_slot {
             // The remote's block at its slot has its height: the local chain opens the slot after
@@ -1441,7 +1613,7 @@ impl SurfnetSvm {
         }
 
         // Reconstruct all sysvars (RecentBlockhashes, SlotHashes, Clock)
-        self.reconstruct_sysvars();
+        self.reconstruct_sysvars()?;
         Ok(())
     }
 
@@ -1488,7 +1660,8 @@ impl SurfnetSvm {
         }
 
         // Capture pre-airdrop balances for the airdrop account, recipient, and system program.
-        let airdrop_pubkey = self.inner.airdrop_pubkey();
+        let prepared_transaction = self.inner.prepare_airdrop(pubkey, lamports)?;
+        let airdrop_pubkey = self.inner.airdrop_pubkey()?;
 
         let airdrop_account_before = self
             .get_account(&airdrop_pubkey)?
@@ -1500,7 +1673,7 @@ impl SurfnetSvm {
             .get_account(&system_program::id())?
             .unwrap_or_else(|| Account::default());
 
-        let res = self.inner.airdrop(pubkey, lamports);
+        let res = self.inner.airdrop(pubkey, lamports)?;
         let (status_tx, _rx) = unbounded();
         if let Ok(ref tx_result) = res {
             let slot = self.latest_epoch_info.absolute_slot;
@@ -1515,17 +1688,20 @@ impl SurfnetSvm {
                 .get_account(&system_program::id())?
                 .unwrap_or_else(|| Account::default());
 
-            // Construct a synthetic transaction that mirrors the underlying airdrop.
-            let tx = VersionedTransaction {
-                signatures: vec![tx_result.signature],
-                message: VersionedMessage::Legacy(Message::new(
-                    &[system_instruction::transfer(
-                        &airdrop_pubkey,
-                        pubkey,
-                        lamports,
-                    )],
-                    Some(&airdrop_pubkey),
-                )),
+            // Store the signed historical transfer exactly; normal airdrops retain their existing representation.
+            let tx = match prepared_transaction {
+                Some(tx) => tx,
+                None => VersionedTransaction {
+                    signatures: vec![tx_result.signature],
+                    message: VersionedMessage::Legacy(Message::new(
+                        &[system_instruction::transfer(
+                            &airdrop_pubkey,
+                            pubkey,
+                            lamports,
+                        )],
+                        Some(&airdrop_pubkey),
+                    )),
+                },
             };
 
             let transaction_with_status_meta = TransactionWithStatusMeta {
@@ -1533,7 +1709,7 @@ impl SurfnetSvm {
                 transaction: tx.clone(),
                 meta: TransactionStatusMeta {
                     status: Ok(()),
-                    fee: 5000,
+                    fee: tx_result.fee,
                     pre_balances: vec![
                         airdrop_account_before.lamports,
                         recipient_account_before.lamports,
@@ -1671,7 +1847,7 @@ impl SurfnetSvm {
     /// How much later a block's time is than the Clock its transactions read: under Alpenglow
     /// the block footer stamps the block as it ends (`Bank::update_clock_from_footer`), under
     /// TowerBFT the block's time is that Clock (`Bank::update_clock`).
-    fn block_time_lag(&self) -> u64 {
+    pub(super) fn block_time_lag(&self) -> u64 {
         if self
             .feature_set
             .is_active(&agave_feature_set::alpenglow::id())
@@ -1713,79 +1889,15 @@ impl SurfnetSvm {
         slot >= self.genesis_slot && slot <= latest_slot
     }
 
-    /// Moves the open slot to `slot` for a time travel, and records the time `updated_at` holds
-    /// there, even if `slot` is already open. Moving forward skips the slots in between, as a
-    /// leader's missed slots are: the block at `slot` is built on the last one, even if the open
-    /// slot was itself a landing.
-    pub(crate) fn travel_to(&mut self, slot: Slot) -> SurfpoolResult<()> {
-        let open = self.get_latest_absolute_slot();
-        // The block `slot` is built on: the last one before the open slot, or before `slot` if
-        // it travels back.
-        let parent = self.block_at_or_before(slot.min(open).saturating_sub(1));
-        // A landing or restart at the open slot is replaced; one past a backward travel never
-        // happened. Write the store before memory, so a failed write leaves the chain in memory
-        // as it was; the store may then have dropped stale landings and restarts already.
-        for &stale in self.landings.range(slot.min(open)..).map(|(s, _)| s) {
-            if stale != slot {
-                self.landings_db.take(&stale)?;
-            }
-        }
-        for &stale in self.restarts.range(slot.min(open)..).map(|(s, _)| s) {
-            self.restarts_db.take(&stale)?;
-        }
-        self.landings_db.store(slot, (parent, self.updated_at))?;
-        self.landings.split_off(&slot.min(open));
-        self.restarts.split_off(&slot.min(open));
-        self.landings.insert(slot, (parent, self.updated_at));
-        self.set_latest_absolute_slot(slot);
-        // Announce the slot it lands on, as its bank is created; a skipped slot gets none.
-        if slot > open {
-            // The open slot's SlotHashes entry moves with it: the skipped slot holds none.
-            let slot_hashes: Vec<_> = self
-                .inner
-                .get_sysvar::<SlotHashes>()
-                .iter()
-                .map(|&(key, hash)| (if key == open { slot } else { key }, hash))
-                .collect();
-            self.inner.set_sysvar(&SlotHashes::new(&slot_hashes));
-            self.announce_open_slot();
-        }
-        Ok(())
-    }
-
-    /// Applies a time travel's `clock`: records its landing, then moves the Clock, the time and
-    /// the open slot to it. A slot already closed, as the one open when the travel was asked for
-    /// is by now, lands on the open slot: only its time changes. If the landing can't be
-    /// recorded, nothing changes in memory.
-    pub(crate) fn apply_time_travel(&mut self, clock: Clock) -> SurfpoolResult<EpochInfo> {
-        let slot = clock.slot.max(self.get_latest_absolute_slot());
-        let clock = Clock {
-            slot,
-            epoch: self.inner.get_sysvar::<EpochSchedule>().get_epoch(slot),
-            ..clock
-        };
-        let previous = std::mem::replace(&mut self.updated_at, clock.unix_timestamp as u64 * 1_000);
-        let previous_clock = self.inner.get_sysvar::<Clock>();
-        // The Clock is set before the landing is announced, so Geyser streams the landing's.
-        self.inner.set_sysvar(&clock);
-        if let Err(e) = self.travel_to(slot) {
-            self.updated_at = previous;
-            self.inner.set_sysvar(&previous_clock);
-            return Err(e);
-        }
-        self.simnet_events_tx.system_clock_updated(clock);
-        Ok(self.latest_epoch_info.clone())
-    }
-
     /// The parent of the block at `slot`: the slot before it, unless a time travel landed there.
-    fn parent_slot(&self, slot: Slot) -> Slot {
+    pub(super) fn parent_slot(&self, slot: Slot) -> Slot {
         self.landings
             .get(&slot)
             .map_or(slot.saturating_sub(1), |&(parent, _)| parent)
     }
 
     /// `slot`, or the last slot before it with a block if a time travel skipped it.
-    fn block_at_or_before(&self, slot: Slot) -> Slot {
+    pub(super) fn block_at_or_before(&self, slot: Slot) -> Slot {
         match self.landings.range(slot + 1..).next() {
             Some((_, &(parent, _))) if parent < slot => parent,
             _ => slot,
@@ -1877,158 +1989,15 @@ impl SurfnetSvm {
         }
     }
 
-    /// Reconstructs RecentBlockhashes, SlotHashes, and Clock sysvars deterministically
-    /// from the current slot. Called on startup and after garbage collection to ensure
-    /// consistent sysvar state without requiring database persistence.
-    ///
-    /// Note: SyntheticBlockhash uses chain_tip.index (relative index), while SlotHashes
-    /// and Clock use absolute slots (chain_tip.index + genesis_slot).
-    #[allow(deprecated)]
-    pub fn reconstruct_sysvars(&mut self) {
-        use solana_slot_hashes::SlotHashes;
-        use solana_sysvar::recent_blockhashes::{IterItem, RecentBlockhashes};
-
-        let current_index = self.chain_tip.index;
-        let current_absolute_slot = self.get_latest_absolute_slot();
-
-        // Calculate range for blockhashes - use relative indices for SyntheticBlockhash
-        let start_index = current_index.saturating_sub(MAX_RECENT_BLOCKHASHES_STANDARD as u64 - 1);
-
-        // Generate all synthetic blockhashes using relative indices (chain_tip.index style)
-        // This matches how new_blockhash() generates hashes
-        let synthetic_hashes: Vec<_> = (start_index..=current_index)
-            .rev()
-            .map(SyntheticBlockhash::new)
-            .collect();
-
-        // 1. Reconstruct RecentBlockhashes (last 150 blockhashes)
-        let recent_blockhashes_vec: Vec<_> = synthetic_hashes
-            .iter()
-            .enumerate()
-            .map(|(index, hash)| IterItem(index as u64, hash.hash(), 0))
-            .collect();
-        let recent_blockhashes = RecentBlockhashes::from_iter(recent_blockhashes_vec);
-        self.inner.set_sysvar(&recent_blockhashes);
-
-        // 2. Reconstruct SlotHashes as `new_blockhash` keys it: the open slot and each block before
-        // it, newest first, up to 512, the open slot with the latest blockhash and each block one
-        // index lower. Skipped slots have no entry. The local ledger starts
-        // at genesis_slot, but finalized commitment can point before it during warmup, so seed
-        // those slots too; their indices count down past zero, wrapping, so their hashes stay
-        // distinct from local ones.
-        let finalized = self.slot_for_commitment(&CommitmentConfig::finalized());
-        let runs = self.block_runs(self.genesis_slot.min(finalized), current_absolute_slot);
-        let slot_hashes_vec: Vec<_> = runs
-            .into_iter()
-            .rev()
-            .flat_map(|run| run.rev())
-            .take(MAX_SLOT_HASHES_ENTRIES)
-            .zip(1..)
-            .map(|(slot, depth)| {
-                let index = current_index.wrapping_sub(depth);
-                (slot, *SyntheticBlockhash::new(index).hash())
-            })
-            .collect();
-        let slot_hashes = SlotHashes::new(&slot_hashes_vec);
-        self.inner.set_sysvar(&slot_hashes);
-
-        // 3. Reconstruct Clock using absolute slot: the time the open slot opened at
-        let unix_timestamp = self
-            .calculate_block_time_for_slot(current_absolute_slot)
-            .saturating_sub(self.block_time_lag())
-            / 1_000;
-        // Nothing restores when this epoch started on this chain, so it starts now, as a warp
-        // starts it at the Clock's time (`Bank::warp_from_parent`). After a restart the rebuilt
-        // Clock can run ahead of `updated_at`, the time the next blocks write, so take the
-        // earlier of the two: the epoch never starts after a time a program reads.
-        let clock = Clock {
-            epoch_start_timestamp: (unix_timestamp as i64).min((self.updated_at / 1_000) as i64),
-            ..clock_for_slot(
-                current_absolute_slot,
-                unix_timestamp as i64,
-                None,
-                &self.inner.get_sysvar::<EpochSchedule>(),
-            )
-        };
-        self.inner.set_sysvar(&clock);
-    }
-
-    /// Generates and sets a new blockhash, updating the RecentBlockhashes sysvar.
-    ///
-    /// # Returns
-    /// A new `BlockIdentifier` for the updated blockhash.
-    #[allow(deprecated)]
-    fn new_blockhash(&mut self) -> BlockIdentifier {
-        use solana_slot_hashes::SlotHashes;
-        use solana_sysvar::recent_blockhashes::{IterItem, RecentBlockhashes};
-        // Backup the current block hashes
-        let recent_blockhashes_backup = self.inner.get_sysvar::<RecentBlockhashes>();
-        let num_blockhashes_expected = recent_blockhashes_backup
-            .len()
-            .min(MAX_RECENT_BLOCKHASHES_STANDARD);
-        // Invalidate the current block hash.
-        // LiteSVM bug / feature: calling this method empties `sysvar::<RecentBlockhashes>()`
-        self.inner.expire_blockhash();
-        // Rebuild recent blockhashes
-        let mut recent_blockhashes = Vec::with_capacity(num_blockhashes_expected);
-        let recent_blockhashes_overriden = self.inner.get_sysvar::<RecentBlockhashes>();
-        let latest_entry = recent_blockhashes_overriden
-            .first()
-            .expect("Latest blockhash not found");
-
-        let new_synthetic_blockhash = SyntheticBlockhash::new(self.chain_tip.index);
-        let new_synthetic_blockhash_str = new_synthetic_blockhash.to_string();
-
-        recent_blockhashes.push(IterItem(
-            0,
-            new_synthetic_blockhash.hash(),
-            latest_entry.fee_calculator.lamports_per_signature,
-        ));
-
-        // Append the previous blockhashes, ignoring the first one
-        for (index, entry) in recent_blockhashes_backup.iter().enumerate() {
-            if recent_blockhashes.len() >= MAX_RECENT_BLOCKHASHES_STANDARD {
-                break;
-            }
-            recent_blockhashes.push(IterItem(
-                (index + 1) as u64,
-                &entry.blockhash,
-                entry.fee_calculator.lamports_per_signature,
-            ));
-        }
-
-        self.inner
-            .set_sysvar(&RecentBlockhashes::from_iter(recent_blockhashes));
-
-        // Surfpool's processed slot is the open one, where transactions run, so it has an entry,
-        // as Agave's processed (frozen) slot has for the bank after it: the slot that opens next
-        // holds the blockhash its transactions use. A time travel re-keys it to where it lands.
-        let mut slot_hashes = self.inner.get_sysvar::<SlotHashes>();
-        slot_hashes.add(
-            self.get_latest_absolute_slot() + 1,
-            *new_synthetic_blockhash.hash(),
-        );
-        self.inner.set_sysvar(&SlotHashes::new(&slot_hashes));
-
-        BlockIdentifier::new(
-            self.chain_tip.index + 1,
-            new_synthetic_blockhash_str.as_str(),
-        )
-    }
-
     /// Checks if the provided blockhash is recent (present in the RecentBlockhashes sysvar).
     ///
     /// # Arguments
     /// * `recent_blockhash` - The blockhash to check.
     ///
     /// # Returns
-    /// `true` if the blockhash is recent, `false` otherwise.
-    pub fn check_blockhash_is_recent(&self, recent_blockhash: &Hash) -> bool {
-        #[allow(deprecated)]
-        self.inner
-            .get_sysvar::<solana_sysvar::recent_blockhashes::RecentBlockhashes>()
-            .iter()
-            .any(|entry| entry.blockhash == *recent_blockhash)
+    /// `true` if the blockhash is recent, `false` otherwise; an error when that cannot be decided.
+    pub fn check_blockhash_is_recent(&self, recent_blockhash: &Hash) -> SurfpoolResult<bool> {
+        self.inner.blockhash_is_recent(recent_blockhash)
     }
 
     /// Returns the finalization depth: one slot with Alpenglow, otherwise 31 slots.
@@ -2043,9 +2012,13 @@ impl SurfnetSvm {
         }
     }
 
-    /// Returns the slot visible at `commitment`.
+    /// Returns the slot visible at `commitment`. A historical fork finalizes immediately, so
+    /// every commitment sees its current slot rather than invented earlier ones.
     pub fn slot_for_commitment(&self, commitment: &CommitmentConfig) -> Slot {
         let slot = self.get_latest_absolute_slot();
+        if self.inner.is_historical() {
+            return slot;
+        }
         match commitment.commitment {
             CommitmentLevel::Processed => slot,
             CommitmentLevel::Confirmed => self.block_at_or_before(slot.saturating_sub(1)),
@@ -2086,15 +2059,22 @@ impl SurfnetSvm {
         }
     }
 
-    /// Recent blockhashes from the chain tip back, newest first.
+    /// Recent blockhashes from the chain tip back, newest first: Surfpool's RPC projection (the
+    /// historical hash-age authority stays SVM Replay's, see `check_blockhash_is_recent`). A
+    /// historical fork's tip is SVM Replay's latest blockhash, followed by the local blockhashes
+    /// it produced on explicit advances.
     fn blockhashes_from_tip(&self) -> Vec<Hash> {
         let tip = self.latest_blockhash();
-        #[allow(deprecated)]
-        let mut blockhashes: Vec<Hash> = self
-            .inner
-            .get_sysvar::<solana_sysvar::recent_blockhashes::RecentBlockhashes>()
-            .iter()
-            .map(|entry| entry.blockhash)
+        let Some(local) = self.inner.local() else {
+            let mut blockhashes = vec![tip];
+            blockhashes.extend(self.historical_blockhashes.iter().rev().copied());
+            blockhashes.dedup();
+            blockhashes.truncate(solana_clock::MAX_PROCESSING_AGE + 1);
+            return blockhashes;
+        };
+        let mut blockhashes: Vec<Hash> = local
+            .recent_blockhashes()
+            .into_iter()
             .skip_while(|blockhash| *blockhash != tip)
             .collect();
         // `reconstruct_sysvars` seeds one blockhash past the tip, which the next block repeats.
@@ -2167,38 +2147,11 @@ impl SurfnetSvm {
     ///
     /// # Returns
     /// The fee in lamports, or an error if the message cannot be sanitized.
-    pub fn estimate_fee_for_message(&self, message: &VersionedMessage) -> SurfpoolResult<u64> {
-        let address_loader = match message {
-            VersionedMessage::V0(_) => SimpleAddressLoader::Enabled(LoadedAddresses::default()),
-            VersionedMessage::Legacy(_) | VersionedMessage::V1(_) => SimpleAddressLoader::Disabled,
-        };
-
-        let sanitized_versioned_message = SanitizedVersionedMessage::try_from(message.clone())
-            .map_err(|e| SurfpoolError::invalid_params(format!("Invalid message: {e:?}")))?;
-        let sanitized_message = SanitizedMessage::try_new(
-            sanitized_versioned_message,
-            address_loader,
-            &HashSet::new(), // reserved keys only drive writability, which fees ignore
-        )
-        .map_err(|e| SurfpoolError::invalid_params(format!("Invalid message: {e:?}")))?;
-
-        let configuration = TransactionConfiguration::try_from_sanitized_message(
-            &sanitized_message,
-            &self.feature_set,
-        )?;
-
-        Ok(calculate_fee(
-            &sanitized_message,
-            self.lamports_per_signature(),
-            configuration.priority_fee_lamports,
-            FeeFeatures {},
-        ))
-    }
-
-    /// The rate execution charges per signature. Not the RecentBlockhashes sysvar, whose fee
-    /// calculator LiteSVM leaves zeroed.
-    fn lamports_per_signature(&self) -> u64 {
-        self.inner.svm.get_fee_structure().lamports_per_signature
+    pub fn estimate_fee_for_message(
+        &self,
+        message: &VersionedMessage,
+    ) -> SurfpoolResult<Option<u64>> {
+        self.inner.fee_for_message(message, &self.feature_set)
     }
 
     /// Validates a transaction's lifetime as Agave's `check_transactions` does: a recent blockhash,
@@ -2209,45 +2162,12 @@ impl SurfnetSvm {
     ///
     /// # Returns
     /// `true` if the transaction blockhash is valid, `false` otherwise.
-    pub fn validate_transaction_blockhash(&self, tx: &VersionedTransaction) -> bool {
-        self.skip_blockhash_check
-            || self.check_blockhash_is_recent(tx.message.recent_blockhash())
-            || self.check_durable_nonce(&tx.message)
-    }
-
-    /// Agave's strict `check_nonce_account`: the nonce account is a system-owned, current-version
-    /// nonce holding the message's blockhash, and its authority signed the advance instruction.
-    ///
-    /// V0 lookup tables are left unresolved, so a nonce account loaded from one is not found.
-    fn check_durable_nonce(&self, message: &VersionedMessage) -> bool {
-        let Some(message) = SanitizedVersionedMessage::try_from(message.clone())
-            .ok()
-            .and_then(|message| {
-                SanitizedMessage::try_new(
-                    message,
-                    SimpleAddressLoader::Enabled(LoadedAddresses::default()),
-                    &agave_reserved_account_keys::ReservedAccountKeys::new_all_activated().active,
-                )
-                .ok()
-            })
-        else {
-            return false;
-        };
-        message
-            .get_durable_nonce()
-            .and_then(|address| self.get_account(address).ok().flatten())
-            .filter(|account| account.data.len() == solana_nonce::state::State::size())
-            .and_then(|account| {
-                solana_nonce_account::verify_nonce_account(
-                    &account.into(),
-                    message.recent_blockhash(),
-                )
-            })
-            .is_some_and(|nonce| {
-                message
-                    .get_ix_signers(solana_nonce::NONCED_TX_MARKER_IX_INDEX as usize)
-                    .any(|signer| signer == &nonce.authority)
-            })
+    pub fn validate_transaction_blockhash(
+        &self,
+        tx: &VersionedTransaction,
+    ) -> SurfpoolResult<bool> {
+        self.inner
+            .transaction_lifetime_is_valid(tx, self.skip_blockhash_check)
     }
 
     /// Verifies the signature of a transaction and validates that it hasn't already been processed.
@@ -2257,21 +2177,13 @@ impl SurfnetSvm {
     /// So, if the user is trying to skip signature verification for a simulation, we'd need to unset and set this value,
     /// requiring a mutable reference to the SVM, which we don't have/want in the simulation path.
     /// Additionally, having this function internally lets us do this check before we start fetching accounts from mainnet.
-    pub fn sigverify(&self, tx: &VersionedTransaction) -> Result<(), FailedTransactionMetadata> {
-        if tx.verify_with_results().iter().any(|valid| !*valid) {
-            return Err(FailedTransactionMetadata {
-                err: TransactionError::SignatureFailure,
-                meta: TransactionMetadata::default(),
-            });
-        }
-
-        if self.processed_slot(tx).is_some() {
-            return Err(FailedTransactionMetadata {
-                err: TransactionError::AlreadyProcessed,
-                meta: TransactionMetadata::default(),
-            });
-        }
-        Ok(())
+    pub fn sigverify(
+        &self,
+        tx: &VersionedTransaction,
+    ) -> SurfpoolResult<Result<(), FailedTransactionMetadata>> {
+        // The backend's signature rules; whether a signature was processed is Surfpool's store.
+        self.inner
+            .verify_transaction(tx, &|tx| self.processed_slot(tx).is_some())
     }
 
     /// The slot that processed `tx`. Agave's status cache keys by message hash, so a stored
@@ -2310,10 +2222,19 @@ impl SurfnetSvm {
         account: Account,
         notify_subscribers: bool,
     ) -> SurfpoolResult<()> {
-        let before = self.get_account(pubkey)?;
+        let before = match self.inner.historical_fork() {
+            // Index maintenance needs only what the fork already holds: an account it never
+            // loaded was never indexed, and overwriting it needs no historical image.
+            Some(fork) => fork.peek(pubkey)?.flatten(),
+            None => self.get_account(pubkey)?,
+        };
         self.inner
             .set_account(*pubkey, account.clone())
-            .map_err(|e| SurfpoolError::set_account(*pubkey, e))?;
+            // A historical backend failure keeps its typed code and provider details.
+            .map_err(|e| match e.historical_code() {
+                Some(_) => e,
+                None => SurfpoolError::set_account(*pubkey, e),
+            })?;
 
         self.account_update_slots
             .insert(*pubkey, self.get_latest_absolute_slot());
@@ -2409,6 +2330,40 @@ impl SurfnetSvm {
         Ok(())
     }
 
+    /// Index historical token inputs without writing their images back to the fork.
+    pub(crate) fn index_historical_transaction_tokens(
+        &mut self,
+        pubkeys: &[Pubkey],
+    ) -> SurfpoolResult<()> {
+        for pubkey in pubkeys {
+            let key = pubkey.to_string();
+            if self.token_accounts.get(&key)?.is_none() && self.token_mints.get(&key)?.is_none() {
+                let Some(account) = self.inner.get_account(pubkey)? else {
+                    continue;
+                };
+                if is_supported_token_program(&account.owner) {
+                    self.index_token_account_variant(pubkey, &key, &account)?;
+                    self.index_mint_account_variant(pubkey, &account)?;
+                    self.index_token_2022_mint_extensions(pubkey, &account)?;
+                }
+            }
+            let Some(token) = self.token_accounts.get(&key)? else {
+                continue;
+            };
+            let mint = token.mint();
+            if self.token_mints.get(&mint.to_string())?.is_none() {
+                let Some(account) = self.inner.get_account(&mint)? else {
+                    continue;
+                };
+                if is_supported_token_program(&account.owner) {
+                    self.index_mint_account_variant(&mint, &account)?;
+                    self.index_token_2022_mint_extensions(&mint, &account)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// If `account.data` decodes as a token account, add it to the
     /// owner/mint/delegate indexes and cache the unpacked `TokenAccount`.
     /// A decode failure is treated as "not a token account" (not an error);
@@ -2469,10 +2424,9 @@ impl SurfnetSvm {
         pubkey: &Pubkey,
         account: &Account,
     ) -> SurfpoolResult<()> {
-        let Some(data) = spl_token_additional_data(
-            &account.data,
-            self.inner.get_sysvar::<Clock>().unix_timestamp,
-        ) else {
+        let Some(data) =
+            spl_token_additional_data(&account.data, self.inner.clock().unix_timestamp)
+        else {
             return Ok(());
         };
         let additional_data: SerializableAccountAdditionalData = AccountAdditionalDataV3 {
@@ -2525,12 +2479,13 @@ impl SurfnetSvm {
         epoch_info: EpochInfo,
         epoch_schedule: EpochSchedule,
     ) -> SurfpoolResult<()> {
+        if self.inner.is_historical() {
+            return self.reset_historical_network();
+        }
         // A fresh LiteSVM starts LastRestartSlot at 0; keep the one loaded from the datasource.
-        let last_restart_slot = self
-            .inner
-            .get_sysvar::<solana_sysvar::last_restart_slot::LastRestartSlot>();
+        let last_restart_slot = self.local_last_restart_slot()?;
         self.inner.reset(self.feature_set.clone())?;
-        self.inner.set_sysvar(&last_restart_slot);
+        self.apply_local_last_restart_slot(&last_restart_slot)?;
 
         let native_mint_account = self
             .inner
@@ -2540,7 +2495,7 @@ impl SurfnetSvm {
         let native_mint_associated_data = AccountAdditionalDataV3 {
             spl_token_additional_data: spl_token_additional_data(
                 &native_mint_account.data,
-                self.inner.get_sysvar::<Clock>().unix_timestamp,
+                self.inner.clock().unix_timestamp,
             ),
         };
 
@@ -2585,7 +2540,7 @@ impl SurfnetSvm {
         self.updated_at = current_time;
         self.genesis_updated_at = current_time;
         self.latest_epoch_info = epoch_info.clone();
-        self.inner.set_sysvar(&epoch_schedule);
+        self.apply_local_epoch_schedule(&epoch_schedule)?;
         // As in `initialize`: the local chain opens the slot after the remote's block.
         self.genesis_slot = epoch_info.absolute_slot + 1;
         self.set_latest_absolute_slot(self.genesis_slot);
@@ -2595,13 +2550,13 @@ impl SurfnetSvm {
         self.restarts.clear();
         self.restarts_db.clear()?;
         // Rebuild sysvars so getLatestBlockhash / sendTransaction stay aligned after reset.
-        self.reconstruct_sysvars();
+        self.reconstruct_sysvars()?;
         // Reset checkpoint state to avoid recovering stale chain tips after a reset.
         self.slot_checkpoint.clear()?;
         self.last_checkpoint_slot = self.genesis_slot;
         self.store_genesis_anchor()?;
         self.recent_blockhashes.clear();
-        self.announce_open_slot();
+        self.announce_open_slot()?;
 
         Ok(())
     }
@@ -2644,7 +2599,12 @@ impl SurfnetSvm {
     ) -> SurfpoolResult<()> {
         self.remove_from_indexes(pubkey, account)?;
 
-        self.inner.delete_account(pubkey)?;
+        // Locally the account is evicted and fetched again on next access; historically it
+        // returns to its boundary image, never to an invented absence.
+        match self.inner.historical_fork() {
+            Some(fork) => fork.restore(std::slice::from_ref(pubkey))?,
+            None => self.inner.delete_account(pubkey)?,
+        }
 
         Ok(())
     }
@@ -2743,9 +2703,45 @@ impl SurfnetSvm {
         tx: VersionedTransaction,
         cu_analysis_enabled: bool,
         sigverify: bool,
-    ) -> TransactionResult {
+    ) -> SurfpoolResult<TransactionResult> {
+        if self.inner.admission_authority() == AdmissionAuthority::Engine {
+            // SVM Replay admits historically: signatures, blockhash age, durable nonces and
+            // duplicates are its rules, never Surfpool's current ones. Unverified prefixes
+            // use the separate disposable profiling path, never a live send.
+            self.transactions_processed += 1;
+            let transactions = &self.transactions;
+            let is_processed = |tx: &VersionedTransaction| {
+                matches!(
+                    transactions.get(&tx.signatures[0].to_string()),
+                    Ok(Some(SurfnetTransactionStatus::Processed(processed)))
+                        if processed.0.transaction.message.hash() == tx.message.hash()
+                )
+            };
+            let admission = Admission {
+                sigverify: sigverify.then_some(&is_processed as IsProcessed<'_>),
+                skip_blockhash_check: self.skip_blockhash_check,
+            };
+            let result = if let Some(fork) = self
+                .inner
+                .historical_fork()
+                .filter(|_| self.disposable_simulation && !sigverify)
+            {
+                fork.send_simulated(&tx)?
+            } else {
+                self.inner.send_transaction(tx, &admission)?
+            };
+            if let Err(tx_failure) = &result {
+                let transaction_meta =
+                    convert_transaction_metadata_from_canonical(&tx_failure.meta);
+                self.simnet_events_tx
+                    .transaction_processed(transaction_meta, Some(tx_failure.err.clone()));
+            }
+            return Ok(result);
+        }
         if sigverify {
-            self.sigverify(&tx)?;
+            if let Err(failure) = self.sigverify(&tx)? {
+                return Ok(Err(failure));
+            }
         }
 
         if cu_analysis_enabled {
@@ -2763,28 +2759,36 @@ impl SurfnetSvm {
         }
         self.transactions_processed += 1;
 
-        if !self.validate_transaction_blockhash(&tx) {
-            let meta = TransactionMetadata::default();
-            let err = solana_transaction_error::TransactionError::BlockhashNotFound;
-
-            let transaction_meta = convert_transaction_metadata_from_canonical(&meta);
-
-            self.simnet_events_tx
-                .transaction_processed(transaction_meta, Some(err.clone()));
-            return Err(FailedTransactionMetadata { err, meta });
-        }
-
-        match self.inner.send_transaction(tx.clone()) {
-            Ok(res) => Ok(res),
+        // The backend admits the transaction's lifetime (a recent blockhash or a durable nonce)
+        // and executes it; a refusal and a failure are reported the same way, as before.
+        let admission = Admission {
+            sigverify: None,
+            skip_blockhash_check: self.skip_blockhash_check,
+        };
+        match self.inner.send_transaction(tx.clone(), &admission)? {
+            Ok(res) => Ok(Ok(res)),
             Err(tx_failure) => {
                 let transaction_meta =
                     convert_transaction_metadata_from_canonical(&tx_failure.meta);
 
                 self.simnet_events_tx
                     .transaction_processed(transaction_meta, Some(tx_failure.err.clone()));
-                Err(tx_failure)
+                Ok(Err(tx_failure))
             }
         }
+    }
+
+    /// Executes a partial instruction list only on the disposable instruction-profiling copy.
+    pub(crate) fn send_profile_prefix(
+        &mut self,
+        tx: VersionedTransaction,
+    ) -> SurfpoolResult<TransactionResult> {
+        if !self.inner.is_historical() {
+            return self.send_transaction(tx, false, false);
+        }
+        self.transactions_processed += 1;
+        self.inner
+            .send_profile_prefix(tx, self.skip_blockhash_check)
     }
 
     /// Estimates the compute units that a transaction will consume by simulating it.
@@ -2800,7 +2804,50 @@ impl SurfnetSvm {
         &self,
         transaction: &VersionedTransaction,
     ) -> ComputeUnitsEstimationResult {
-        if !self.validate_transaction_blockhash(transaction) {
+        if self.inner.admission_authority() == AdmissionAuthority::Engine {
+            // SVM Replay checks the blockhash age inside the simulation.
+            let admission = Admission {
+                sigverify: None,
+                skip_blockhash_check: self.skip_blockhash_check,
+            };
+            return match self
+                .inner
+                .simulate_transaction(transaction.clone(), &admission)
+            {
+                Ok(Ok(sim_info)) => ComputeUnitsEstimationResult {
+                    success: true,
+                    compute_units_consumed: sim_info.meta.compute_units_consumed,
+                    log_messages: Some(sim_info.meta.logs),
+                    error_message: None,
+                },
+                Ok(Err(failed_meta)) => ComputeUnitsEstimationResult {
+                    success: false,
+                    compute_units_consumed: failed_meta.meta.compute_units_consumed,
+                    log_messages: Some(failed_meta.meta.logs),
+                    error_message: Some(failed_meta.err.to_string()),
+                },
+                // The estimate failed before the runtime ran; report that, not a zero result.
+                Err(error) => ComputeUnitsEstimationResult {
+                    success: false,
+                    compute_units_consumed: 0,
+                    log_messages: None,
+                    error_message: Some(error.to_string()),
+                },
+            };
+        }
+        let lifetime = match self.validate_transaction_blockhash(transaction) {
+            Ok(valid) => valid,
+            // The estimate could not run; report why, not a zero result.
+            Err(error) => {
+                return ComputeUnitsEstimationResult {
+                    success: false,
+                    compute_units_consumed: 0,
+                    log_messages: None,
+                    error_message: Some(error.to_string()),
+                };
+            }
+        };
+        if !lifetime {
             return ComputeUnitsEstimationResult {
                 success: false,
                 compute_units_consumed: 0,
@@ -2811,18 +2858,33 @@ impl SurfnetSvm {
             };
         }
 
-        match self.inner.simulate_transaction(transaction.clone()) {
-            Ok(sim_info) => ComputeUnitsEstimationResult {
+        // The lifetime was checked above; simulate without admitting it again.
+        let admission = Admission {
+            sigverify: None,
+            skip_blockhash_check: true,
+        };
+        match self
+            .inner
+            .simulate_transaction(transaction.clone(), &admission)
+        {
+            Ok(Ok(sim_info)) => ComputeUnitsEstimationResult {
                 success: true,
                 compute_units_consumed: sim_info.meta.compute_units_consumed,
                 log_messages: Some(sim_info.meta.logs),
                 error_message: None,
             },
-            Err(failed_meta) => ComputeUnitsEstimationResult {
+            Ok(Err(failed_meta)) => ComputeUnitsEstimationResult {
                 success: false,
                 compute_units_consumed: failed_meta.meta.compute_units_consumed,
                 log_messages: Some(failed_meta.meta.logs),
                 error_message: Some(failed_meta.err.to_string()),
+            },
+            // The estimate failed before the runtime ran; report that, not a zero result.
+            Err(error) => ComputeUnitsEstimationResult {
+                success: false,
+                compute_units_consumed: 0,
+                log_messages: None,
+                error_message: Some(error.to_string()),
             },
         }
     }
@@ -2839,18 +2901,13 @@ impl SurfnetSvm {
         &self,
         tx: VersionedTransaction,
         sigverify: bool,
-    ) -> Result<SimulatedTransactionInfo, FailedTransactionMetadata> {
-        if sigverify {
-            self.sigverify(&tx)?;
-        }
-
-        if !self.validate_transaction_blockhash(&tx) {
-            let meta = TransactionMetadata::default();
-            let err = TransactionError::BlockhashNotFound;
-
-            return Err(FailedTransactionMetadata { err, meta });
-        }
-        self.inner.simulate_transaction(tx)
+    ) -> SurfpoolResult<Result<SimulatedTransactionInfo, FailedTransactionMetadata>> {
+        let is_processed = |tx: &VersionedTransaction| self.processed_slot(tx).is_some();
+        let admission = Admission {
+            sigverify: sigverify.then_some(&is_processed as IsProcessed<'_>),
+            skip_blockhash_check: self.skip_blockhash_check,
+        };
+        self.inner.simulate_transaction(tx, &admission)
     }
 
     /// Confirms transactions queued for confirmation, updates epoch/slot, and sends events.
@@ -2861,7 +2918,7 @@ impl SurfnetSvm {
     /// `Err(SurfpoolError)` on error. The failure count powers the `stats`
     /// field of `SlotUpdate::Frozen` notifications emitted to
     /// `slotsUpdatesSubscribe` clients.
-    fn confirm_transactions(&mut self) -> Result<(Vec<Signature>, u64), SurfpoolError> {
+    pub(super) fn confirm_transactions(&mut self) -> Result<(Vec<Signature>, u64), SurfpoolError> {
         let mut confirmed_transactions = vec![];
         let mut num_failed: u64 = 0;
         let current_slot = self.latest_epoch_info.absolute_slot;
@@ -2921,7 +2978,7 @@ impl SurfnetSvm {
     ///
     /// # Returns
     /// `Ok(())` on success, or `Err(SurfpoolError)` on error.
-    fn finalize_transactions(&mut self) -> Result<(), SurfpoolError> {
+    pub(super) fn finalize_transactions(&mut self) -> Result<(), SurfpoolError> {
         let finalized = self.slot_for_commitment(&CommitmentConfig::finalized());
         let mut requeue = VecDeque::new();
         while let Some((slot, tx, status_tx, error)) =
@@ -3077,6 +3134,11 @@ impl SurfnetSvm {
         // returned to the caller, with the insertion failure emitted as an
         // event for observability.
         if let Err(error) = self.set_account(&pubkey, account) {
+            // Historically a refused write is the caller's error; chunked program uploads
+            // have their own staging path.
+            if self.inner.is_historical() {
+                return Err(error);
+            }
             let _ = self.simnet_events_tx.error(error.to_string());
         }
         Ok(())
@@ -3121,7 +3183,7 @@ impl SurfnetSvm {
     /// Moves the chain to `absolute_slot`, at the epoch, slot index and epoch length the epoch
     /// schedule gives it.
     pub(crate) fn set_latest_absolute_slot(&mut self, absolute_slot: Slot) {
-        let epoch_schedule = self.inner.get_sysvar::<EpochSchedule>();
+        let epoch_schedule = self.inner.epoch_schedule();
         let (epoch, slot_index) = epoch_schedule.get_epoch_and_slot_index(absolute_slot);
         self.latest_epoch_info.absolute_slot = absolute_slot;
         self.latest_epoch_info.epoch = epoch;
@@ -3140,9 +3202,9 @@ impl SurfnetSvm {
         let parent = self.parent_slot(slot);
         if slot.is_multiple_of(self.garbage_collection_interval_slots()) {
             debug!("Clearing liteSVM cache at slot {}", slot);
-            self.inner.garbage_collect(self.feature_set.clone());
+            self.collect_local_garbage()?;
         }
-        self.chain_tip = self.new_blockhash();
+        self.chain_tip = self.new_blockhash()?;
         // Confirm processed transactions
         let (confirmed_signatures, num_failed_transactions) = self.confirm_transactions()?;
 
@@ -3214,18 +3276,14 @@ impl SurfnetSvm {
             },
         });
 
-        // Agave writes SlotHistory and RecentBlockhashes as it freezes a block. Yellowstone
-        // publishes a block only once it has seen them, along with the slot's Clock and SlotHashes.
-        let mut slot_history = self.inner.get_sysvar::<SlotHistory>();
-        slot_history.add(slot);
-        self.inner.set_sysvar(&slot_history);
-        self.stream_sysvars(
+        self.record_local_slot_history(slot)?;
+        self.stream_local_sysvars(
             slot,
             [
                 solana_sdk_ids::sysvar::slot_history::ID,
                 solana_sdk_ids::sysvar::recent_blockhashes::ID,
             ],
-        );
+        )?;
 
         // The block's entry goes before its metadata: Yellowstone drops the metadata of an empty
         // block whose entry arrives after it.
@@ -3269,8 +3327,8 @@ impl SurfnetSvm {
         self.emit_slot_status(slot, None, GeyserSlotStatus::Confirmed, slots_update_ts);
         self.notify_block_subscribers(slot, CommitmentLevel::Confirmed);
 
-        let epoch_schedule = self.inner.get_sysvar::<EpochSchedule>();
-        let mut closed = self.inner.get_sysvar::<Clock>();
+        let epoch_schedule = self.inner.epoch_schedule();
+        let mut closed = self.inner.clock();
         // Under Alpenglow the footer of an epoch's first block starts the epoch at the time the
         // block ended, the time the next slot opens at (`Bank::update_clock_from_footer`).
         if self
@@ -3288,7 +3346,7 @@ impl SurfnetSvm {
         );
 
         let _ = self.simnet_events_tx.system_clock_updated(clock.clone());
-        self.inner.set_sysvar(&clock);
+        self.apply_local_clock(&clock)?;
 
         self.finalize_transactions()?;
 
@@ -3309,7 +3367,7 @@ impl SurfnetSvm {
         }
 
         // The next slot is announced last, so none of its data can precede it.
-        self.announce_open_slot();
+        self.announce_open_slot()?;
 
         // Evict the accounts marked as streamed from cache to enforce them to be fetched again
         let accounts_to_reset: Vec<_> = self.streamed_accounts.into_iter()?.collect();
@@ -4204,7 +4262,7 @@ impl SurfnetSvm {
             .try_into()
             .ok()?;
         let mut data = cached.spl_token_additional_data?;
-        let now = self.inner.get_sysvar::<Clock>().unix_timestamp;
+        let now = self.inner.clock().unix_timestamp;
         if let Some((_, ts)) = data.interest_bearing_config.as_mut() {
             *ts = now;
         }
@@ -4396,7 +4454,7 @@ impl SurfnetSvm {
 
     /// Sends a slot status to Geyser plugins and mirrors it to `slotsUpdatesSubscribe`, so the
     /// two streams can't disagree.
-    fn emit_slot_status(
+    pub(super) fn emit_slot_status(
         &mut self,
         slot: Slot,
         parent: Option<Slot>,
@@ -4429,37 +4487,37 @@ impl SurfnetSvm {
 
     /// Announces the open slot on its parent block, as Agave does when it creates the slot's
     /// bank: at startup, after each block, after a time travel and a reset. A skipped slot gets
-    /// none. Geyser first receives the Clock and SlotHashes sysvars as the open slot's account
-    /// writes, as Agave writes them while it creates the bank.
-    pub fn announce_open_slot(&mut self) {
+    /// none. Normal surfnets stream the open bank's Clock and SlotHashes first.
+    pub fn announce_open_slot(&mut self) -> SurfpoolResult<()> {
         let slot = self.get_latest_absolute_slot();
-        let parent = self.parent_slot(slot);
+        let parent = if self.inner.is_historical() {
+            match &self.historical_open_block {
+                Some((open, header)) if *open == slot => header.parent_slot,
+                _ => {
+                    return Err(SurfpoolError::historical(
+                        "SESSION_INTEGRITY",
+                        "the historical slot announcement lacks its matching open block",
+                        None,
+                    ));
+                }
+            }
+        } else {
+            self.parent_slot(slot)
+        };
         let root = self.slot_for_commitment(&CommitmentConfig::finalized());
         self.notify_slot_subscribers(slot, parent, root);
-        self.stream_sysvars(
-            slot,
-            [
-                solana_sdk_ids::sysvar::clock::ID,
-                solana_sdk_ids::sysvar::slot_hashes::ID,
-            ],
-        );
+        if !self.inner.is_historical() {
+            self.stream_local_sysvars(
+                slot,
+                [
+                    solana_sdk_ids::sysvar::clock::ID,
+                    solana_sdk_ids::sysvar::slot_hashes::ID,
+                ],
+            )?;
+        }
         let timestamp = Utc::now().timestamp_millis().max(0) as u64;
         self.emit_slot_status(slot, Some(parent), GeyserSlotStatus::CreatedBank, timestamp);
-    }
-
-    /// Sends the current accounts of `sysvars` to Geyser plugins as account writes in `slot`.
-    fn stream_sysvars(&mut self, slot: Slot, sysvars: [Pubkey; 2]) {
-        for pubkey in sysvars {
-            let Some(account) = self.inner.get_account_no_db(&pubkey) else {
-                continue;
-            };
-            let write_version = self.increment_write_version();
-            self.geyser_events_tx
-                .send(GeyserEvent::UpdateAccount(
-                    GeyserAccountUpdate::block_update(pubkey, account, slot, write_version),
-                ))
-                .ok();
-        }
+        Ok(())
     }
 
     pub fn write_simulated_profile_result(
@@ -5002,6 +5060,16 @@ impl SurfnetSvm {
         self.startup_status_watch_tx.subscribe()
     }
 
+    /// Subscribes to the core runloop starting to serve (see `core_started_watch_tx`).
+    pub fn subscribe_core_started(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.core_started_watch_tx.subscribe()
+    }
+
+    /// Marks the core runloop as serving.
+    pub(crate) fn mark_core_started(&self) {
+        self.core_started_watch_tx.send_replace(true);
+    }
+
     /// Publishes an accepted transition on both channels: the watch channel
     /// for readers that want the current status, and the event channel for
     /// readers that want the sequence.
@@ -5207,12 +5275,14 @@ mod tests {
     use borsh::BorshSerialize;
     // use test_log::test; // uncomment to get logs from litesvm
     use solana_account::Account;
+    use solana_clock::Clock;
     use solana_hash::Hash;
     use solana_keypair::Keypair;
     use solana_loader_v3_interface::get_program_data_address;
     use solana_message::VersionedMessage;
     use solana_program_pack::Pack;
     use solana_signer::Signer;
+    use solana_slot_hashes::{MAX_ENTRIES as MAX_SLOT_HASHES_ENTRIES, SlotHashes};
     use solana_system_interface::instruction as system_instruction;
     use solana_transaction::Transaction;
     use solana_transaction_error::TransactionError;
@@ -5256,6 +5326,24 @@ mod tests {
     }
 
     #[test]
+    fn simulation_sandbox_cannot_commit() {
+        let (mut live, _events, _geyser) = SurfnetSvm::default();
+        let sandbox = live.clone_for_bundle_simulation().unwrap();
+        assert!(
+            sandbox
+                .svm
+                .clone_for_profiling()
+                .unwrap()
+                .disposable_simulation
+        );
+        let before = live.state_revision;
+        let (status, _receiver) = unbounded();
+        let error = live.commit_sandbox(sandbox, status).unwrap_err();
+        assert!(error.to_string().contains("cannot be committed"));
+        assert_eq!(live.state_revision, before);
+    }
+
+    #[test]
     fn bundle_commit_appends_only_new_queue_entries_and_geyser_indices() {
         let (mut live_svm, _events_rx, geyser_rx) = SurfnetSvm::default();
         let first_recipient = Pubkey::new_unique();
@@ -5264,7 +5352,7 @@ mod tests {
             .airdrop(&first_recipient, 1_000_000)
             .expect("initial airdrop should be accepted")
             .expect("initial airdrop should succeed");
-        let mut sandbox = live_svm.clone_for_bundle_sandbox();
+        let mut sandbox = live_svm.clone_for_bundle_sandbox().unwrap();
         let second = sandbox
             .svm
             .airdrop(&second_recipient, 1_000_000)
@@ -5303,7 +5391,9 @@ mod tests {
     async fn bundle_commit_rejects_sandbox_after_live_write_without_slot_change() {
         let (live_svm, _events_rx, geyser_rx) = SurfnetSvm::default();
         let locker = SurfnetSvmLocker::new(live_svm);
-        let sandbox = locker.with_svm_reader(|svm| svm.clone_for_bundle_sandbox());
+        let sandbox = locker
+            .with_svm_reader(|svm| svm.clone_for_bundle_sandbox())
+            .unwrap();
         let slot_before = locker.get_latest_absolute_slot();
 
         // A cheatcode-style write lands while the bundle executes; the slot does not move.
@@ -5552,7 +5642,7 @@ mod tests {
             svm.chain_tip = BlockIdentifier::new(index, "test_hash");
 
             // Generate the synthetic blockhash
-            let new_blockhash = svm.new_blockhash();
+            let new_blockhash = svm.new_blockhash().unwrap();
 
             // Verify the blockhash string contains our expected pattern
             let blockhash_str = new_blockhash.hash.clone();
@@ -5564,7 +5654,7 @@ mod tests {
 
             // Verify it's deterministic - same index should produce same blockhash
             svm.chain_tip = BlockIdentifier::new(index, "test_hash");
-            let new_blockhash2 = svm.new_blockhash();
+            let new_blockhash2 = svm.new_blockhash().unwrap();
             assert_eq!(new_blockhash.hash, new_blockhash2.hash);
         }
     }
@@ -5615,7 +5705,7 @@ mod tests {
         // Generate multiple blockhashes and verify they're consistent
         let mut previous_hash: Option<BlockIdentifier> = None;
         for i in 0..5 {
-            let new_blockhash = svm.new_blockhash();
+            let new_blockhash = svm.new_blockhash().unwrap();
             println!(
                 "Call {}: index={}, hash={}",
                 i, new_blockhash.index, new_blockhash.hash
@@ -5907,7 +5997,7 @@ mod tests {
             svm.get_account(&token_primary).unwrap(),
             Some(local_primary.clone())
         );
-        assert!(svm.inner.get_account_no_db(&token_mint).is_none());
+        assert!(svm.inner.get_account_no_db(&token_mint).unwrap().is_none());
 
         let program_primary = Pubkey::new_unique();
         let programdata = Pubkey::new_unique();
@@ -5926,7 +6016,7 @@ mod tests {
             svm.get_account(&program_primary).unwrap(),
             Some(local_primary)
         );
-        assert!(svm.inner.get_account_no_db(&programdata).is_none());
+        assert!(svm.inner.get_account_no_db(&programdata).unwrap().is_none());
     }
 
     #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
@@ -6428,7 +6518,7 @@ mod tests {
     #[test]
     fn test_default_uses_no_db_storage() {
         let (svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
-        assert!(svm.inner.db.is_none());
+        assert!(svm.inner.account_db().is_none());
     }
 
     #[cfg(feature = "sqlite")]
@@ -6436,7 +6526,7 @@ mod tests {
     fn test_new_with_db_uses_sqlite_storage() {
         let (svm, _events_rx, _geyser_rx) =
             SurfnetSvm::new_with_db(Some(":memory:"), SurfnetSvmConfig::default()).unwrap();
-        assert!(svm.inner.db.is_some());
+        assert!(svm.inner.account_db().is_some());
     }
 
     #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
@@ -6476,7 +6566,7 @@ mod tests {
         assert_eq!(svm.get_latest_absolute_slot(), open);
         assert_eq!(svm.latest_epoch_info.block_height, height);
         assert_eq!(svm.chain_tip, tip);
-        assert_eq!(svm.inner.get_sysvar::<Clock>().slot, open);
+        assert_eq!(svm.inner.clock().slot, open);
 
         svm.confirm_current_block().unwrap();
         assert_eq!(
@@ -6549,7 +6639,10 @@ mod tests {
         assert_eq!(read(&svm, &blocks), before);
         // SlotHashes holds the open slot and the blocks, each with the blockhash its
         // transactions used (the block before's), and no skipped slot.
-        let slot_hashes = svm.inner.get_sysvar::<solana_slot_hashes::SlotHashes>();
+        let slot_hashes = svm
+            .inner
+            .read_sysvar::<solana_slot_hashes::SlotHashes>()
+            .unwrap();
         let hashes: Vec<_> = blocks[1..]
             .iter()
             .chain([&open])
@@ -6634,6 +6727,7 @@ mod tests {
             max_profiles: 17,
             log_bytes_limit: None,
             skip_blockhash_check: true,
+            historical: None,
         };
         let (svm, _events_rx, _geyser_rx) = SurfnetSvm::new(config).unwrap();
 
@@ -6644,7 +6738,7 @@ mod tests {
         assert_eq!(svm.genesis_slot, INITIAL_SLOT);
         assert!(!svm.feature_set.is_active(&disable_fees_sysvar::id()));
 
-        let epoch_schedule = svm.inner.get_sysvar::<EpochSchedule>();
+        let epoch_schedule = svm.inner.epoch_schedule();
         assert!(!epoch_schedule.warmup);
 
         let registry = TemplateRegistry::new();
@@ -6673,6 +6767,7 @@ mod tests {
             max_profiles: 23,
             log_bytes_limit: None,
             skip_blockhash_check: false,
+            historical: None,
         };
         let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::new(config).unwrap();
         let epoch_info = EpochInfo {
@@ -6703,7 +6798,7 @@ mod tests {
         let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
         svm.skip_blockhash_check = true;
 
-        let profiling_clone = svm.clone_for_profiling();
+        let profiling_clone = svm.clone_for_profiling().unwrap();
         assert!(profiling_clone.skip_blockhash_check);
     }
 
@@ -6750,10 +6845,14 @@ mod tests {
         let invalid_blockhash = Hash::new_unique();
 
         svm.airdrop(&payer.pubkey(), 2 * lamports).unwrap().unwrap();
-        assert!(!svm.check_blockhash_is_recent(&invalid_blockhash));
+        assert!(!svm.check_blockhash_is_recent(&invalid_blockhash).unwrap());
 
         let tx = build_transfer_transaction(&payer, &recipient, lamports, invalid_blockhash);
-        let err = svm.send_transaction(tx, false, false).unwrap_err().err;
+        let err = svm
+            .send_transaction(tx, false, false)
+            .unwrap()
+            .unwrap_err()
+            .err;
 
         assert_eq!(err, TransactionError::BlockhashNotFound);
     }
@@ -6771,7 +6870,7 @@ mod tests {
 
         svm.skip_blockhash_check = true;
         svm.airdrop(&payer.pubkey(), 2 * lamports).unwrap().unwrap();
-        assert!(!svm.check_blockhash_is_recent(&invalid_blockhash));
+        assert!(!svm.check_blockhash_is_recent(&invalid_blockhash).unwrap());
 
         let tx = build_transfer_transaction(&payer, &recipient, lamports, invalid_blockhash);
 
@@ -6782,14 +6881,14 @@ mod tests {
             estimate.error_message
         );
 
-        let simulation = svm.simulate_transaction(tx.clone(), false);
+        let simulation = svm.simulate_transaction(tx.clone(), false).unwrap();
         assert!(
             simulation.is_ok(),
             "simulation should succeed when skip_blockhash_check is enabled: {:?}",
             simulation.err()
         );
 
-        let send_result = svm.send_transaction(tx, false, false);
+        let send_result = svm.send_transaction(tx, false, false).unwrap();
         assert!(
             send_result.is_ok(),
             "send should succeed when skip_blockhash_check is enabled: {:?}",
@@ -6888,6 +6987,7 @@ mod tests {
         let tx = VersionedTransaction::try_new(message, &signers).unwrap();
         let result = svm
             .send_transaction(tx, false, false)
+            .unwrap()
             .map(|_| ())
             .map_err(|e| e.err);
         (svm, nonce, *stored.as_hash(), result)
@@ -7101,11 +7201,15 @@ mod tests {
             last_restart_slot: 246_464_040,
         };
         let (mut svm, _events_rx, _geyser_rx) = TestType::in_memory().initialize_svm();
-        svm.inner.set_sysvar(&last_restart_slot);
+        svm.inner
+            .local_mut_for_tests()
+            .set_sysvar(&last_restart_slot);
 
-        svm.inner.garbage_collect(svm.feature_set.clone());
+        svm.inner
+            .local_mut_for_tests()
+            .garbage_collect(svm.feature_set.clone());
         assert_eq!(
-            svm.inner.get_sysvar::<LastRestartSlot>(),
+            svm.inner.read_sysvar::<LastRestartSlot>().expect("sysvar"),
             last_restart_slot,
             "after garbage collection"
         );
@@ -7117,27 +7221,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            svm.inner.get_sysvar::<LastRestartSlot>(),
+            svm.inner.read_sysvar::<LastRestartSlot>().expect("sysvar"),
             last_restart_slot,
             "after a network reset"
         );
-    }
-
-    /// Garbage collection rebuilds LiteSVM as a block closes, just before the block records its
-    /// slot in SlotHistory, so the blocks recorded before it must survive the rebuild.
-    #[test]
-    fn slot_history_survives_garbage_collection() {
-        let (mut svm, _events_rx, _geyser_rx) = TestType::in_memory().initialize_svm();
-        let gc_slot = svm.garbage_collection_interval_slots();
-        svm.latest_epoch_info.absolute_slot = gc_slot - 1;
-        svm.latest_epoch_info.slot_index = gc_slot - 1;
-        svm.confirm_current_block().unwrap();
-        let mut expected = svm.inner.get_sysvar::<SlotHistory>();
-        expected.add(gc_slot);
-
-        svm.confirm_current_block().unwrap();
-
-        assert!(svm.inner.get_sysvar::<SlotHistory>() == expected);
     }
 
     #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
@@ -7419,6 +7506,114 @@ mod tests {
         assert!(result.is_none(), "should return None for slot after latest");
     }
 
+    /// Garbage collection must preserve the blocks already recorded in SlotHistory.
+    #[test]
+    fn slot_history_survives_garbage_collection() {
+        use solana_sysvar::slot_history::SlotHistory;
+
+        let (mut svm, _events_rx, _geyser_rx) = TestType::in_memory().initialize_svm();
+        let gc_slot = svm.garbage_collection_interval_slots();
+        svm.latest_epoch_info.absolute_slot = gc_slot - 1;
+        svm.latest_epoch_info.slot_index = gc_slot - 1;
+        svm.confirm_current_block().unwrap();
+        let mut expected = svm.inner.read_sysvar::<SlotHistory>().unwrap();
+        expected.add(gc_slot);
+
+        svm.confirm_current_block().unwrap();
+
+        assert!(svm.inner.read_sysvar::<SlotHistory>().unwrap() == expected);
+    }
+
+    /// Yellowstone v16 needs each block's four sysvar writes and the landing's Clock.
+    #[test]
+    fn geyser_writes_the_sysvars_of_each_block() {
+        use solana_sdk_ids::sysvar::{clock, recent_blockhashes, slot_hashes, slot_history};
+        use solana_sysvar::slot_history::SlotHistory;
+
+        let sysvar_writes = |events: &[GeyserEvent], slot: Slot| -> Vec<(Pubkey, Account)> {
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    GeyserEvent::UpdateAccount(update) if update.slot == slot => {
+                        Some((update.pubkey, update.account.clone()))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let (mut svm, _events_rx, geyser_rx) = SurfnetSvm::default();
+        svm.announce_open_slot().unwrap();
+        let slot = svm.get_latest_absolute_slot();
+        svm.confirm_current_block().unwrap();
+
+        let events: Vec<_> = geyser_rx.try_iter().collect();
+        let written: Vec<Pubkey> = sysvar_writes(&events, slot)
+            .into_iter()
+            .map(|(pubkey, _)| pubkey)
+            .collect();
+        assert_eq!(
+            written,
+            [
+                clock::ID,
+                slot_hashes::ID,
+                slot_history::ID,
+                recent_blockhashes::ID
+            ]
+        );
+        assert_eq!(
+            svm.inner.read_sysvar::<SlotHistory>().unwrap().next_slot,
+            slot + 1
+        );
+
+        let landing = svm
+            .inner
+            .epoch_schedule()
+            .get_first_slot_in_epoch(svm.latest_epoch_info.epoch + 1);
+        let clock = svm.inner.clock();
+        svm.apply_time_travel(Clock {
+            slot: landing,
+            ..clock
+        })
+        .unwrap();
+        let events: Vec<_> = geyser_rx.try_iter().collect();
+        let (pubkey, account) = &sysvar_writes(&events, landing)[0];
+        assert_eq!(*pubkey, clock::ID);
+        let streamed: Clock = bincode::deserialize(&account.data).unwrap();
+        assert_eq!(streamed.slot, landing);
+        assert_eq!(streamed.epoch, svm.latest_epoch_info.epoch);
+        assert_eq!(streamed.epoch, clock.epoch + 1);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn failed_time_travel_restores_clock_and_timestamp() {
+        use surfpool_db::diesel::{Connection, RunQueryDsl, SqliteConnection, sql_query};
+
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("landing-rollback.db");
+        let path = database.to_str().unwrap();
+        let (mut svm, _events, _geyser) =
+            SurfnetSvm::new_with_db(Some(path), SurfnetSvmConfig::default()).unwrap();
+        let clock = svm.inner.clock();
+        let before = (svm.updated_at, svm.get_latest_absolute_slot());
+        let mut connection = SqliteConnection::establish(path).unwrap();
+        sql_query("DROP TABLE landings")
+            .execute(&mut connection)
+            .unwrap();
+
+        let error = svm
+            .apply_time_travel(Clock {
+                slot: before.1 + 1,
+                unix_timestamp: clock.unix_timestamp + 7,
+                ..clock.clone()
+            })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("landings"), "{error}");
+        assert_eq!(svm.inner.clock(), clock);
+        assert_eq!((svm.updated_at, svm.get_latest_absolute_slot()), before);
+    }
+
     /// The blocks Geyser announced, and the slots it rooted, in the order it sent them.
     fn streamed_blocks_and_roots(events: &[GeyserEvent]) -> (Vec<GeyserBlockMetadata>, Vec<Slot>) {
         let (mut blocks, mut roots) = (vec![], vec![]);
@@ -7477,10 +7672,7 @@ mod tests {
         let mut clock_times = vec![];
         for _ in 0..5 {
             let opened = svm.updated_at as i64;
-            assert_eq!(
-                svm.inner.get_sysvar::<Clock>().unix_timestamp,
-                opened / 1_000
-            );
+            assert_eq!(svm.inner.clock().unix_timestamp, opened / 1_000);
             clock_times.push(opened);
             svm.confirm_current_block().unwrap();
         }
@@ -7494,58 +7686,6 @@ mod tests {
         let streamed: Vec<_> = blocks.iter().map(|block| block.block_time).collect();
         assert_eq!(streamed, expected);
         assert_blocks_read_as_streamed(&svm, &blocks);
-    }
-
-    /// Yellowstone gRPC v16 publishes a block only once Geyser has written its Clock,
-    /// SlotHashes, SlotHistory and RecentBlockhashes in that slot; without them its slot, block
-    /// and confirmed streams stay empty. A time travel's landing gets its own Clock.
-    #[test]
-    fn geyser_writes_the_sysvars_of_each_block() {
-        use solana_sdk_ids::sysvar::{clock, recent_blockhashes, slot_hashes, slot_history};
-        let sysvar_writes = |events: &[GeyserEvent], slot: Slot| -> Vec<(Pubkey, Account)> {
-            events
-                .iter()
-                .filter_map(|event| match event {
-                    GeyserEvent::UpdateAccount(update) if update.slot == slot => {
-                        Some((update.pubkey, update.account.clone()))
-                    }
-                    _ => None,
-                })
-                .collect()
-        };
-        let (mut svm, _events_rx, geyser_rx) = SurfnetSvm::default();
-        svm.announce_open_slot();
-        let slot = svm.get_latest_absolute_slot();
-        svm.confirm_current_block().unwrap();
-
-        let events: Vec<_> = geyser_rx.try_iter().collect();
-        let written: Vec<Pubkey> = sysvar_writes(&events, slot)
-            .into_iter()
-            .map(|(pubkey, _)| pubkey)
-            .collect();
-        assert_eq!(
-            written,
-            [
-                clock::ID,
-                slot_hashes::ID,
-                slot_history::ID,
-                recent_blockhashes::ID
-            ]
-        );
-        assert_eq!(svm.inner.get_sysvar::<SlotHistory>().next_slot, slot + 1);
-
-        let landing = svm.get_latest_absolute_slot() + 100;
-        let clock = svm.inner.get_sysvar::<Clock>();
-        svm.apply_time_travel(Clock {
-            slot: landing,
-            ..clock
-        })
-        .unwrap();
-        let events: Vec<_> = geyser_rx.try_iter().collect();
-        let (pubkey, account) = &sysvar_writes(&events, landing)[0];
-        assert_eq!(*pubkey, clock::ID);
-        let streamed: Clock = bincode::deserialize(&account.data).unwrap();
-        assert_eq!(streamed.slot, landing);
     }
 
     /// A forward time travel skips the slots it jumps, as a leader's missed slots are: the
@@ -7572,7 +7712,7 @@ mod tests {
             last_block
         );
         // The open slot's SlotHashes entry moved to the landing: no skipped slot has one.
-        let slot_hashes = svm.inner.get_sysvar::<SlotHashes>();
+        let slot_hashes = svm.inner.read_sysvar::<SlotHashes>().unwrap();
         assert_eq!(
             slot_hashes[..2],
             [(landing, svm.latest_blockhash()), slot_hashes[1]]
@@ -7702,10 +7842,13 @@ mod tests {
         svm.genesis_slot = 0;
         svm.latest_epoch_info.absolute_slot = 10;
 
-        svm.reconstruct_sysvars();
+        svm.reconstruct_sysvars().unwrap();
 
         // Verify RecentBlockhashes sysvar
-        let recent_blockhashes = svm.inner.get_sysvar::<RecentBlockhashes>();
+        let recent_blockhashes = svm
+            .inner
+            .read_sysvar::<RecentBlockhashes>()
+            .expect("sysvar");
 
         // Should have 11 entries (indices 0 through 10)
         assert_eq!(recent_blockhashes.len(), 11);
@@ -7744,10 +7887,10 @@ mod tests {
         svm.genesis_slot = 100;
         svm.latest_epoch_info.absolute_slot = 105;
 
-        svm.reconstruct_sysvars();
+        svm.reconstruct_sysvars().unwrap();
 
         // Verify SlotHashes sysvar
-        let slot_hashes = svm.inner.get_sysvar::<SlotHashes>();
+        let slot_hashes = svm.inner.read_sysvar::<SlotHashes>().expect("sysvar");
 
         // Should include the finalized warmup window even though slots 74-99
         // are before the local genesis slot.
@@ -7774,7 +7917,7 @@ mod tests {
         let open_hash = svm.latest_blockhash();
         svm.confirm_current_block().unwrap();
         assert_eq!(
-            svm.inner.get_sysvar::<SlotHashes>()[..2],
+            svm.inner.read_sysvar::<SlotHashes>().unwrap()[..2],
             [(106, svm.latest_blockhash()), (105, open_hash)]
         );
     }
@@ -7794,9 +7937,9 @@ mod tests {
         svm.genesis_slot = INITIAL_SLOT;
         svm.latest_epoch_info.absolute_slot = 40;
 
-        svm.reconstruct_sysvars();
+        svm.reconstruct_sysvars().unwrap();
 
-        let slot_hashes = svm.inner.get_sysvar::<SlotHashes>();
+        let slot_hashes = svm.inner.read_sysvar::<SlotHashes>().expect("sysvar");
 
         assert_eq!(
             slot_hashes.len(),
@@ -7828,10 +7971,10 @@ mod tests {
         // As after a restart, block production resumes earlier than the rebuilt Clock.
         svm.updated_at = 2_010_000;
 
-        svm.reconstruct_sysvars();
+        svm.reconstruct_sysvars().unwrap();
 
         // Verify Clock sysvar
-        let clock = svm.inner.get_sysvar::<Clock>();
+        let clock = svm.inner.clock();
 
         assert_eq!(clock.slot, 2_161_050, "Clock slot should be absolute slot");
         assert_eq!(
@@ -7865,10 +8008,13 @@ mod tests {
         svm.genesis_slot = 0;
         svm.latest_epoch_info.absolute_slot = 600;
 
-        svm.reconstruct_sysvars();
+        svm.reconstruct_sysvars().unwrap();
 
         // Verify RecentBlockhashes sysvar is capped at MAX_RECENT_BLOCKHASHES_STANDARD
-        let recent_blockhashes = svm.inner.get_sysvar::<RecentBlockhashes>();
+        let recent_blockhashes = svm
+            .inner
+            .read_sysvar::<RecentBlockhashes>()
+            .expect("sysvar");
 
         assert_eq!(
             recent_blockhashes.len(),
@@ -7876,7 +8022,7 @@ mod tests {
             "RecentBlockhashes should be capped at MAX_RECENT_BLOCKHASHES_STANDARD"
         );
 
-        let slot_hashes = svm.inner.get_sysvar::<SlotHashes>();
+        let slot_hashes = svm.inner.read_sysvar::<SlotHashes>().expect("sysvar");
         assert_eq!(
             slot_hashes.len(),
             MAX_SLOT_HASHES_ENTRIES,
@@ -7929,16 +8075,22 @@ mod tests {
         svm.slot_time = 400;
 
         // First reconstruction
-        svm.reconstruct_sysvars();
-        let blockhashes_1 = svm.inner.get_sysvar::<RecentBlockhashes>();
-        let slot_hashes_1 = svm.inner.get_sysvar::<SlotHashes>();
-        let clock_1 = svm.inner.get_sysvar::<Clock>();
+        svm.reconstruct_sysvars().unwrap();
+        let blockhashes_1 = svm
+            .inner
+            .read_sysvar::<RecentBlockhashes>()
+            .expect("sysvar");
+        let slot_hashes_1 = svm.inner.read_sysvar::<SlotHashes>().expect("sysvar");
+        let clock_1 = svm.inner.clock();
 
         // Second reconstruction with same state
-        svm.reconstruct_sysvars();
-        let blockhashes_2 = svm.inner.get_sysvar::<RecentBlockhashes>();
-        let slot_hashes_2 = svm.inner.get_sysvar::<SlotHashes>();
-        let clock_2 = svm.inner.get_sysvar::<Clock>();
+        svm.reconstruct_sysvars().unwrap();
+        let blockhashes_2 = svm
+            .inner
+            .read_sysvar::<RecentBlockhashes>()
+            .expect("sysvar");
+        let slot_hashes_2 = svm.inner.read_sysvar::<SlotHashes>().expect("sysvar");
+        let clock_2 = svm.inner.clock();
 
         // Verify determinism - results should be identical
         assert_eq!(blockhashes_1.len(), blockhashes_2.len());
@@ -9127,7 +9279,7 @@ mod tests {
             EpochSchedule::custom(432_000, 432_000, true),
         ] {
             let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
-            svm.inner.set_sysvar(&schedule);
+            svm.inner.local_mut_for_tests().set_sysvar(&schedule);
             let mut seen = vec![SurfnetSvm::default_epoch_info(&schedule)];
             svm.latest_epoch_info.absolute_slot = schedule.get_first_slot_in_epoch(1) - 2;
             for _ in 0..3 {
@@ -9179,18 +9331,19 @@ mod tests {
         svm.slot_time = 1_000;
         svm.updated_at = 1_000_000;
         svm.latest_epoch_info.absolute_slot = 431_998;
-        svm.inner.set_sysvar(&Clock {
+        svm.apply_local_clock(&Clock {
             slot: 431_998,
             epoch_start_timestamp: 7,
             epoch: 0,
             leader_schedule_epoch: 1,
             unix_timestamp: 1_000,
-        });
+        })
+        .unwrap();
 
         let mut seen = vec![];
         for _ in 0..3 {
             svm.confirm_current_block().unwrap();
-            let clock = svm.inner.get_sysvar::<Clock>();
+            let clock = svm.inner.clock();
             seen.push((
                 clock.slot,
                 clock.unix_timestamp,
@@ -9225,7 +9378,7 @@ mod tests {
         let info = &svm.latest_epoch_info;
         assert_eq!(
             (
-                svm.inner.get_sysvar::<EpochSchedule>(),
+                svm.inner.epoch_schedule(),
                 info.absolute_slot,
                 info.epoch,
                 info.slot_index

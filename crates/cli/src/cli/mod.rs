@@ -34,6 +34,7 @@ use txtx_core::manifest::WorkspaceManifest;
 use txtx_gql::kit::{helpers::fs::FileLocation, types::frontend::LogLevel};
 
 use crate::{cli::update::handle_update_command, runbook::handle_execute_runbook_command};
+mod historical;
 mod simnet;
 mod update;
 
@@ -180,6 +181,8 @@ pub struct StartSimnet {
     pub runtime: StartRuntimeOptions,
     #[command(flatten)]
     pub svm: StartSvmOptions,
+    #[command(flatten)]
+    pub historical: historical::Options,
     #[command(flatten)]
     pub observability: StartObservabilityOptions,
     /// Deprecated; accepted for backward compatibility.
@@ -361,7 +364,6 @@ pub struct StartAccountOptions {
     #[arg(
         long = "airdrop-keypair-path",
         short = 'k',
-        default_value = DEFAULT_SOLANA_KEYPAIR_PATH.as_str(),
         value_name = "KEYPAIR_PATH",
         long_help = "Keypair path whose pubkey should receive an airdrop. Can be specified multiple times.\n\nExample: surfpool start --airdrop-keypair-path ~/.config/solana/id.json"
     )]
@@ -583,6 +585,11 @@ impl StartSimnet {
     pub fn get_airdrop_addresses(&self) -> (Vec<Pubkey>, Vec<SimnetEvent>) {
         let mut airdrop_addresses = vec![];
         let mut events = vec![];
+        if self.historical.after.is_some() {
+            events.push(SimnetEvent::warn(
+                "Historical mode does not fund the implicit Solana CLI keypair. Use disposable keys: signatures with a recent blockhash or a durable nonce may also be valid on the source network. Explicit -k/--airdrop opts into funding; this mitigation is not cryptographic domain separation.",
+            ));
+        }
 
         for address in self.accounts.airdrop_addresses.iter() {
             match Pubkey::from_str(address).map_err(|e| e.to_string()) {
@@ -598,6 +605,9 @@ impl StartSimnet {
         }
 
         let airdrop_keypair_path = self.accounts.airdrop_keypair_path.clone();
+        if airdrop_keypair_path.is_empty() && self.historical.after.is_some() {
+            return (airdrop_addresses, events);
+        }
 
         if airdrop_keypair_path.is_empty() {
             let default_resolved_path = resolve_path(&DEFAULT_SOLANA_KEYPAIR_PATH);
@@ -699,6 +709,8 @@ impl StartSimnet {
                 Some(self.observability.log_bytes_limit)
             },
             skip_blockhash_check: self.svm.skip_blockhash_check,
+            // Set by `simnet` once `--after` has been resolved to SVM Replay's backend.
+            historical: None,
         }
     }
 
@@ -732,6 +744,7 @@ impl StartSimnet {
             skip_blockhash_check: self.svm.skip_blockhash_check,
             surfnet_id: self.accounts.surfnet_id.clone(),
             snapshot,
+            session_addresses: vec![],
             genesis_hash: self.network.genesis_hash,
         }
     }
@@ -1303,7 +1316,7 @@ mod tests {
             .iter()
             .find(|line| line.starts_with("opts="))
             .expect("start options");
-        for flag in ["--rpc-url", "--port", "--no-tui"] {
+        for flag in ["--after", "--rpc-url", "--port", "--no-tui"] {
             assert!(
                 opts.split(['"', ' ']).any(|word| word == flag),
                 "{flag} missing from {opts}"
@@ -1344,6 +1357,71 @@ mod tests {
     }
 
     #[test]
+    fn start_historical_mode_accepts_provider_and_keeps_default_datasource_unset() {
+        let cmd = parse_start(&[
+            "surfpool",
+            "start",
+            "--after",
+            "slot:123",
+            "--historical-provider",
+            "alchemy",
+            "--key",
+            "env:API_ALCHEMY",
+        ]);
+        assert!(cmd.network.rpc_url.is_none());
+        assert!(!cmd.network.offline);
+    }
+
+    #[test]
+    fn start_historical_options_require_a_boundary_and_conflict_with_current_rpc() {
+        for args in [
+            vec!["surfpool", "start", "--historical-provider", "alchemy"],
+            vec![
+                "surfpool",
+                "start",
+                "--after",
+                "slot:123",
+                "--rpc-url",
+                "http://localhost:8999",
+            ],
+            vec!["surfpool", "start", "--after", "slot:123", "--offline"],
+            vec![
+                "surfpool",
+                "start",
+                "--after",
+                "slot:123",
+                "--genesis-hash",
+                "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d",
+            ],
+            vec![
+                "surfpool",
+                "start",
+                "--after",
+                "slot:123",
+                "--block-production-mode",
+                "clock",
+            ],
+        ] {
+            assert!(Opts::try_parse_from(args).is_err());
+        }
+        // Snapshots (explicit account overrides) and watched redeploys work on a historical
+        // fork through Surfpool's own RPC.
+        for args in [
+            vec![
+                "surfpool",
+                "start",
+                "--after",
+                "slot:123",
+                "--snapshot",
+                "missing.json",
+            ],
+            vec!["surfpool", "start", "--after", "slot:123", "--watch"],
+        ] {
+            assert!(Opts::try_parse_from(args).is_ok());
+        }
+    }
+
+    #[test]
     fn start_help_groups_related_flags() {
         let help = start_long_help();
 
@@ -1353,6 +1431,7 @@ mod tests {
             "Accounts & State",
             "Runtime & UI",
             "SVM Behavior",
+            "Historical state",
             "Observability & Performance",
         ] {
             assert!(help.contains(heading), "missing heading {heading}");
@@ -1372,6 +1451,18 @@ mod tests {
         assert!(!help.contains("--subgraph-db"));
         assert!(help.contains("Examples:"));
         assert!(help.contains("surfpool start --network devnet"));
+        for flag in ["--help", "-h"] {
+            let help = Opts::try_parse_from(["surfpool", "start", flag])
+                .expect_err("help should exit")
+                .to_string();
+            let svm = help.find("SVM Behavior:").expect("SVM heading");
+            let historical = help.find("Historical state:").expect("historical heading");
+            assert!(help.contains("--after <SIGNATURE|SLOT>"), "{help}");
+            let observability = help
+                .find("Observability & Performance:")
+                .expect("observability heading");
+            assert!(svm < historical && historical < observability, "{help}");
+        }
     }
 
     #[test]

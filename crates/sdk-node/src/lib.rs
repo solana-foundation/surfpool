@@ -112,6 +112,20 @@ impl Surfnet {
             }
         }
 
+        if let Some(historical) = config.historical {
+            builder = builder.historical(surfpool_types::HistoricalSessionOptions {
+                after: historical.after,
+                program: historical.svm_replay_bin,
+                data_dir: historical.data_dir.map(PathBuf::from),
+                provider: historical.provider,
+                config: historical.config.map(PathBuf::from),
+                key: historical.key_env.map(|name| format!("env:{name}")),
+                key_file: historical.key_file.map(PathBuf::from),
+                runtime_registry: None,
+                journal: None,
+            });
+        }
+
         let inner =
             hiro_system_kit::nestable_block_on(builder.start()).map_err(sdk_error_to_napi)?;
         Ok(Self { inner })
@@ -515,6 +529,29 @@ pub struct SurfnetConfig {
     pub disable_features: Option<Vec<String>>,
     /// Activate all known agave feature gates. Applied before explicit enable/disable.
     pub all_features: Option<bool>,
+    /// Fork historical state: SVM Replay executes the surfnet from this boundary, with no
+    /// datasource; feature and datasource options are refused alongside it.
+    pub historical: Option<HistoricalConfig>,
+}
+
+/// Where a historical surfnet forks and how SVM Replay reads history. Credentials are
+/// referenced (an environment variable or a file), never passed as values.
+#[napi(object)]
+pub struct HistoricalConfig {
+    /// A transaction signature or slot number to fork after.
+    pub after: String,
+    /// The `svm-replay` executable; `$SVM_REPLAY_BIN`, else `svm-replay` on `PATH`.
+    pub svm_replay_bin: Option<String>,
+    /// Where cached history and runs live.
+    pub data_dir: Option<String>,
+    /// The historical provider adapter name, not a key.
+    pub provider: Option<String>,
+    /// Provider settings file.
+    pub config: Option<String>,
+    /// The environment variable holding the provider credential.
+    pub key_env: Option<String>,
+    /// A file holding the provider credential.
+    pub key_file: Option<String>,
 }
 
 #[napi(object)]
@@ -762,6 +799,17 @@ impl From<SimnetEvent> for SimnetEventValue {
                 let mut value = Self::new("runbookCompleted");
                 value.runbook_id = Some(runbook_id);
                 value.runbook_errors = errors;
+                value
+            }
+            SimnetEvent::NetworkReset(clock) => {
+                let mut value = Self::new("networkReset");
+                value.clock = Some(ClockValue {
+                    slot: clock.slot as f64,
+                    epoch_start_timestamp: clock.epoch_start_timestamp as f64,
+                    epoch: clock.epoch as f64,
+                    leader_schedule_epoch: clock.leader_schedule_epoch as f64,
+                    unix_timestamp: clock.unix_timestamp as f64,
+                });
                 value
             }
         }

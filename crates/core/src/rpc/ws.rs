@@ -2083,6 +2083,18 @@ impl Rpc for SurfpoolWsRpc {
             }
         };
 
+        if svm_locker.is_historical() {
+            let error = crate::error::SurfpoolError::historical(
+                "UNSUPPORTED_IN_HISTORICAL_MODE",
+                "blockSubscribe cannot prove the archived prefix of a historical boundary block",
+                None,
+            );
+            if subscriber.reject(error.into()).is_err() {
+                log::error!("Failed to reject historical block subscription");
+            }
+            return;
+        }
+
         let id = self.uid.fetch_add(1, atomic::Ordering::SeqCst);
         let sub_id = SubscriptionId::Number(id as u64);
         let Ok(sink) = subscriber.assign_id(sub_id.clone()) else {

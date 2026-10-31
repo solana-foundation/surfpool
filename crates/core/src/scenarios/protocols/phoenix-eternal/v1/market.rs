@@ -9,7 +9,6 @@ use phoenix_rise_accounts::{
     trader::TraderHeader,
 };
 use solana_account::Account;
-use solana_clock::Clock;
 use solana_commitment_config::CommitmentConfig;
 use solana_instruction::Instruction;
 use solana_pubkey::Pubkey;
@@ -219,7 +218,7 @@ impl MarketContext {
 
         // A spline refuses an update slot below its last one, and a running surfnet's slot trails
         // the mainnet slot that last update came from.
-        let slot = svm.inner.get_sysvar::<Clock>().slot;
+        let slot = svm.inner.clock().slot;
         let oracle_authority = Pubkey::new_from_array(exchange.config.oracle_authority());
         let mut loaded = Vec::with_capacity(markets.len());
         let mut dependencies = Vec::new();
@@ -257,7 +256,7 @@ impl MarketContext {
         hydrate(svm, remote_ctx, &dependencies).await?;
 
         // An oracle refuses a report older than its last one.
-        let clock_ms = (svm.inner.get_sysvar::<Clock>().unix_timestamp.max(0) as u64) * 1000;
+        let clock_ms = (svm.inner.clock().unix_timestamp.max(0) as u64) * 1000;
         let config = local_account(svm, &PHOENIX_GLOBAL_CONFIG)?;
         loaded
             .into_iter()
@@ -441,7 +440,7 @@ pub async fn move_market(
     target_ticks: u64,
 ) -> SurfpoolResult<Vec<(Pubkey, Account)>> {
     let mut context = MarketContext::load(svm, remote_ctx, symbol).await?;
-    let mut sandbox = Sandbox::new(svm);
+    let mut sandbox = Sandbox::new(svm)?;
     context.move_in(&mut sandbox, target_ticks)?;
     sandbox.writes()
 }
@@ -455,7 +454,7 @@ pub async fn uncross_market(
 ) -> SurfpoolResult<Vec<(Pubkey, Account)>> {
     let mut context = MarketContext::load(svm, remote_ctx, symbol).await?;
     hydrate(svm, remote_ctx, &[HAWKEYE_PROGRAM_ID]).await?;
-    let mut sandbox = Sandbox::new(svm);
+    let mut sandbox = Sandbox::new(svm)?;
     context
         .uncross_in(&mut sandbox)
         .map_err(explain_move_failure)?;

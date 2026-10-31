@@ -14,6 +14,7 @@ use solana_rpc_client_api::response::Response as RpcResponse;
 use super::{RunloopContext, SurfnetRpcContext};
 use crate::{
     SURFPOOL_IDENTITY_PUBKEY,
+    error::SurfpoolError,
     rpc::{State, utils::verify_pubkey},
     surfnet::{GetAccountResult, locker::SvmAccessContext},
 };
@@ -657,8 +658,16 @@ impl Minimal for SurfpoolMinimalRpc {
         })
     }
 
-    fn get_health(&self, _meta: Self::Metadata) -> Result<String> {
+    fn get_health(&self, meta: Self::Metadata) -> Result<String> {
         // todo: we could check the time from the state clock and compare
+        // A historical fork is healthy only while SVM Replay's executing backend is.
+        if let Some(meta) = &meta
+            && let Some(session) = meta
+                .svm_locker
+                .with_svm_reader(|svm_reader| svm_reader.inner.historical_session())
+        {
+            session.check()?;
+        }
         Ok("ok".to_string())
     }
 
@@ -712,7 +721,27 @@ impl Minimal for SurfpoolMinimalRpc {
         })
     }
 
-    fn get_version(&self, _: Self::Metadata) -> Result<SurfpoolRpcVersionInfo> {
+    fn get_version(&self, meta: Self::Metadata) -> Result<SurfpoolRpcVersionInfo> {
+        // A historical fork executes on the runtime SVM Replay selected for it; this binary's
+        // own runtime version and feature set describe nothing that runs there.
+        if let Some(meta) = &meta
+            && let Some(session) = meta
+                .svm_locker
+                .with_svm_reader(|svm_reader| svm_reader.inner.historical_session())
+        {
+            let runtime = session.pins().runtime.clone().ok_or_else(|| {
+                SurfpoolError::historical(
+                    "HISTORICAL_BACKEND",
+                    "historical pins lack the runtime version",
+                    None,
+                )
+            })?;
+            return Ok(SurfpoolRpcVersionInfo {
+                surfnet_version: SURFPOOL_VERSION.to_string(),
+                solana_core: runtime,
+                feature_set: None,
+            });
+        }
         let version = solana_version::Version::default();
 
         Ok(SurfpoolRpcVersionInfo {

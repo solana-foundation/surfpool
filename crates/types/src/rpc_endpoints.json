@@ -824,9 +824,15 @@
         },
         {
           "method": "surfnet_pauseClock",
-          "description": "A cheat code to freeze the Surfnet clock. Slot production and time progression halt until resumed. The paused state is not reported by any other method.",
+          "description": "A cheat code to freeze the Surfnet clock. Slot production and time progression halt until resumed. Read surfnet_getClockState to check the current paused state.",
           "params": [],
           "returns": "An `EpochInfo` object describing the clock at the moment of the pause. It carries no timestamp: read the Clock sysvar with getAccountInfo on SysvarC1ock11111111111111111111111111111111 (jsonParsed) for the simulated unix time."
+        },
+        {
+          "method": "surfnet_getClockState",
+          "description": "Read the current clock pause state without changing slot production or time. Works for normal and historical surfnets.",
+          "params": [],
+          "returns": "An object with a boolean paused field, for example {\"paused\": true}."
         },
         {
           "method": "surfnet_resumeClock",

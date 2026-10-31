@@ -3,7 +3,6 @@ use std::str::FromStr;
 use itertools::Itertools;
 use jsonrpc_core::{BoxFuture, Error, Result};
 use jsonrpc_derive::rpc;
-use litesvm::types::TransactionMetadata;
 use solana_account_decoder::UiAccount;
 use solana_client::{
     rpc_config::{
@@ -39,7 +38,7 @@ use surfpool_types::{
 use super::{
     RunloopContext, State, SurfnetRpcContext,
     utils::{
-        decode_and_deserialize, decode_rpc_versioned_transaction,
+        decode_and_deserialize, decode_rpc_versioned_transaction, require_signature_structure,
         verify_and_parse_signatures_for_address_params, verify_pubkey,
     },
 };
@@ -47,8 +46,8 @@ use crate::{
     SURFPOOL_IDENTITY_PUBKEY,
     error::{SurfpoolError, SurfpoolResult},
     rpc::utils::{adjust_default_transaction_config, get_default_transaction_config},
-    surfnet::GetTransactionResult,
-    types::{SurfnetTransactionStatus, surfpool_tx_metadata_to_litesvm_tx_metadata},
+    surfnet::{GetTransactionResult, backend::TransactionMetadata, locker::SvmAccessContext},
+    types::SurfnetTransactionStatus,
 };
 
 const MAX_PRIORITIZATION_FEE_BLOCKS_CACHE: usize = 150;
@@ -1655,6 +1654,12 @@ impl Full for SurfpoolFullRpc {
             Ok(res) => res,
             Err(e) => return e.into(),
         };
+        if signatures.len() > 256 && svm_locker.is_historical() {
+            return SurfpoolError::invalid_params(
+                "historical getSignatureStatuses accepts at most 256 signatures",
+            )
+            .into();
+        }
         let remote_client = if search_transaction_history {
             remote_ctx.map(|(remote_client, _)| remote_client)
         } else {
@@ -1667,10 +1672,27 @@ impl Full for SurfpoolFullRpc {
             let read = svm_locker.read_slot(Some(CommitmentConfig::processed()), None)?;
 
             let mut responses = Vec::with_capacity(signatures.len());
+            let historical = svm_locker.archive_reader();
             for signature in signatures.into_iter() {
-                let res = svm_locker
-                    .get_transaction(&remote_client, &signature, get_default_transaction_config())
-                    .await?;
+                // A historical fork's archive answers as a datasource does: only with
+                // searchTransactionHistory beyond the boundary block's own transactions.
+                let res = match &historical {
+                    Some(reader) => svm_locker.get_transaction_local_then_archive(
+                        reader,
+                        &signature,
+                        &get_default_transaction_config(),
+                        search_transaction_history,
+                    )?,
+                    None => {
+                        svm_locker
+                            .get_transaction(
+                                &remote_client,
+                                &signature,
+                                get_default_transaction_config(),
+                            )
+                            .await?
+                    }
+                };
 
                 let mut status = res.map_some_transaction_status();
                 if let Some(confirmation_status) =
@@ -1755,8 +1777,6 @@ impl Full for SurfpoolFullRpc {
 
             let config = config.unwrap_or_default();
             let unsanitized_tx = decode_rpc_versioned_transaction(data, config.base.encoding)?;
-            let signatures = unsanitized_tx.signatures.clone();
-            let signature = signatures[0];
             // Clone the message before moving the transaction, as we'll need it for error reporting
             let tx_message = unsanitized_tx.message.clone();
 
@@ -1776,6 +1796,16 @@ impl Full for SurfpoolFullRpc {
             };
             ctx.svm_locker
                 .read_slot(Some(preflight_commitment), config.base.min_context_slot)?;
+            // With or without preflight, a signature list that does not fit its message is refused
+            // before any signature is read or any state is touched.
+            require_signature_structure(&unsanitized_tx, "Transaction")?;
+            if ctx.svm_locker.is_historical() && config.skip_sig_verify == Some(true) {
+                return Err(crate::surfnet::backend::engine_owned(
+                    "skipping signatures for a live send",
+                )
+                .into());
+            }
+            let signature = unsanitized_tx.signatures[0];
 
             if !config.base.skip_preflight {
                 // Agave verifies the signatures, then simulates at the preflight bank: lifetime
@@ -1794,21 +1824,24 @@ impl Full for SurfpoolFullRpc {
                             .is_some_and(|slot| {
                                 slot <= svm_reader.slot_for_commitment(&preflight_commitment)
                             });
-                    if sigverify && unsanitized_tx.verify_with_results().contains(&false) {
-                        Some(TransactionError::SignatureFailure)
-                    } else if !svm_reader.is_blockhash_visible_at(
-                        tx_message.recent_blockhash(),
-                        &preflight_commitment,
-                    ) || (duplicate
-                        && !svm_reader.validate_transaction_blockhash(&unsanitized_tx))
-                    {
-                        Some(TransactionError::BlockhashNotFound)
-                    } else if duplicate {
-                        Some(TransactionError::AlreadyProcessed)
-                    } else {
-                        None
-                    }
-                });
+                    Ok::<_, SurfpoolError>(
+                        if sigverify && unsanitized_tx.verify_with_results().contains(&false) {
+                            Some(TransactionError::SignatureFailure)
+                        } else if !svm_reader.is_blockhash_visible_at(
+                            tx_message.recent_blockhash(),
+                            &preflight_commitment,
+                        ) || (duplicate
+                            && !svm_reader.inner.is_historical()
+                            && !svm_reader.validate_transaction_blockhash(&unsanitized_tx)?)
+                        {
+                            Some(TransactionError::BlockhashNotFound)
+                        } else if duplicate {
+                            Some(TransactionError::AlreadyProcessed)
+                        } else {
+                            None
+                        },
+                    )
+                })?;
                 if let Some(error) = preflight_error {
                     return Err(Error {
                         data: Some(
@@ -1875,14 +1908,14 @@ impl Full for SurfpoolFullRpc {
                     return Err(Error {
                         data: Some(
                             serde_json::to_value(get_simulate_transaction_result(
-                                surfpool_tx_metadata_to_litesvm_tx_metadata(&metadata),
+                                metadata.clone(),
                                 None,
                                 Some(error.clone()),
                                 None,
                                 false,
                                 &tx_message,
                                 None, // No loaded addresses available in error reporting context
-                                Some(metadata.loaded_accounts_data_size),
+                                metadata.loaded_accounts_data_size,
                             ))
                             .map_err(|e| {
                                 Error::invalid_params(format!(
@@ -1986,6 +2019,30 @@ impl Full for SurfpoolFullRpc {
         };
 
         Box::pin(async move {
+            svm_locker.read_slot(config.commitment, config.min_context_slot)?;
+            require_signature_structure(&unsanitized_tx, "Transaction")?;
+            // Reject invalid signatures before acquiring lookup tables or historical accounts.
+            let refusal = if config.sig_verify {
+                let (read, verdict) = svm_locker.with_svm_reader(|svm_reader| {
+                    let read = svm_reader.read_slot(config.commitment, config.min_context_slot)?;
+                    Ok::<_, jsonrpc_core::Error>((read, svm_reader.sigverify(&unsanitized_tx)?))
+                })?;
+                verdict.err().map(|refused| (read, refused))
+            } else {
+                None
+            };
+            if let Some((read, refused)) = refusal {
+                return Ok(read.respond(get_simulate_transaction_result(
+                    refused.meta,
+                    None,
+                    Some(refused.err),
+                    None,
+                    config.inner_instructions,
+                    &unsanitized_tx.message,
+                    None,
+                    None,
+                )));
+            }
             let loaded_addresses = svm_locker
                 .get_loaded_addresses(&remote_ctx, &unsanitized_tx.message)
                 .await?;
@@ -2018,7 +2075,7 @@ impl Full for SurfpoolFullRpc {
                     // Clone the message before moving the transaction for result formatting
                     let tx_message = unsanitized_tx.message.clone();
                     let simulation =
-                        svm_reader.simulate_transaction(unsanitized_tx, config.sig_verify);
+                        svm_reader.simulate_transaction(unsanitized_tx, config.sig_verify)?;
                     Ok::<_, jsonrpc_core::Error>((
                         read,
                         replacement_blockhash,
@@ -2063,7 +2120,7 @@ impl Full for SurfpoolFullRpc {
                         config.inner_instructions,
                         &tx_message,
                         loaded_addresses_data.as_ref(),
-                        Some(loaded_accounts_data_size),
+                        loaded_accounts_data_size,
                     )
                 }
                 Err(tx_info) => get_simulate_transaction_result(
@@ -2074,7 +2131,7 @@ impl Full for SurfpoolFullRpc {
                     config.inner_instructions,
                     &tx_message,
                     loaded_addresses_data.as_ref(),
-                    Some(loaded_accounts_data_size),
+                    loaded_accounts_data_size,
                 ),
             };
 
@@ -2140,6 +2197,9 @@ impl Full for SurfpoolFullRpc {
         };
 
         Box::pin(async move {
+            if let Some(reader) = svm_locker.archive_reader() {
+                return Ok(svm_locker.historical_block_time(&reader, slot)?);
+            }
             let block = svm_locker.with_svm_reader(|svm| svm.get_block_or_reconstruct(slot))?;
             Ok(block.map(|block| block.block_time))
         })
@@ -2192,6 +2252,21 @@ impl Full for SurfpoolFullRpc {
                 .map(|end| end.min(committed_latest_slot))
                 .unwrap_or(committed_latest_slot);
 
+            if let Some(reader) = svm_locker.archive_reader() {
+                if effective_end_slot.saturating_sub(start_slot) > MAX_SLOT_RANGE {
+                    return Err(Error::invalid_params(format!(
+                        "Slot range too large. Maximum: {}, Requested: {}",
+                        MAX_SLOT_RANGE,
+                        effective_end_slot.saturating_sub(start_slot)
+                    )));
+                }
+                return Ok(svm_locker.historical_blocks(
+                    &reader,
+                    start_slot,
+                    effective_end_slot,
+                    usize::MAX,
+                )?);
+            }
             if effective_end_slot.saturating_sub(start_slot) > MAX_SLOT_RANGE {
                 return Err(Error::invalid_params(format!(
                     "Slot range too large. Maximum: {}, Requested: {}",
@@ -2302,6 +2377,14 @@ impl Full for SurfpoolFullRpc {
             let committed_latest_slot = svm_locker
                 .read_slot(Some(commitment), config.min_context_slot)?
                 .slot();
+            if let Some(reader) = svm_locker.archive_reader() {
+                return Ok(svm_locker.historical_blocks(
+                    &reader,
+                    start_slot,
+                    committed_latest_slot,
+                    limit,
+                )?);
+            }
             let genesis_slot = svm_locker.with_svm_reader(|svm| svm.genesis_slot);
 
             // With sparse block storage, all slots from genesis_slot onwards are valid
@@ -2523,7 +2606,7 @@ impl Full for SurfpoolFullRpc {
             let read = svm_reader.read_slot(config.commitment, config.min_context_slot)?;
             // Agave checks the blockhash queue of the bank at the commitment.
             Ok(read.respond(
-                svm_reader.check_blockhash_is_recent(&hash)
+                svm_reader.check_blockhash_is_recent(&hash)?
                     && svm_reader
                         .is_blockhash_visible_at(&hash, &config.commitment.unwrap_or_default()),
             ))
@@ -2543,7 +2626,7 @@ impl Full for SurfpoolFullRpc {
         let svm_locker = meta.get_svm_locker()?;
         svm_locker.with_svm_reader(|svm_reader| {
             let read = svm_reader.read_slot(config.commitment, config.min_context_slot)?;
-            Ok(read.respond(Some(svm_reader.estimate_fee_for_message(&message)?)))
+            Ok(read.respond(svm_reader.estimate_fee_for_message(&message)?))
         })
     }
 
@@ -3285,6 +3368,21 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn security_normal_signature_status_count_behavior_is_preserved() {
+        let setup = TestSetup::new(SurfpoolFullRpc);
+        let result = setup
+            .rpc
+            .get_signature_statuses(
+                Some(setup.context),
+                vec![Signature::new_unique().to_string(); 257],
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.value.len(), 257);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_get_signature_statuses() {
         let pks = (0..10).map(|_| Pubkey::new_unique());
         let valid_txs = pks.len();
@@ -3866,6 +3964,351 @@ mod tests {
         );
     }
 
+    /// Records every datasource request and answers each with a transport failure.
+    struct RecordsAndFails(Arc<Mutex<Vec<RpcRequest>>>);
+
+    #[async_trait]
+    impl RpcSender for RecordsAndFails {
+        async fn send(
+            &self,
+            request: RpcRequest,
+            _params: serde_json::Value,
+        ) -> ClientResult<serde_json::Value> {
+            self.0.lock().unwrap().push(request);
+            Err(solana_client::client_error::ClientErrorKind::Custom(
+                "datasource unavailable".to_string(),
+            )
+            .into())
+        }
+
+        fn get_transport_stats(&self) -> RpcTransportStats {
+            RpcTransportStats::default()
+        }
+
+        fn url(&self) -> String {
+            "http://records-and-fails.example".to_string()
+        }
+    }
+
+    /// With sigVerify, a transaction whose signature does not verify is refused before any of
+    /// its accounts or lookup tables is acquired: the datasource is never asked, and the refusal
+    /// reports the slot selected by the requested commitment, like a full simulation. Without
+    /// sigVerify the same transaction's accounts are acquired as before.
+    #[test_case(false ; "legacy")]
+    #[test_case(true ; "v0 with an address lookup table")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_simulate_refuses_a_bad_signature_before_acquiring_accounts(lookup_table: bool) {
+        let requests = Arc::new(Mutex::new(vec![]));
+        let mut setup = TestSetup::new(SurfpoolFullRpc);
+        // Past the finalization lag, so the latest and finalized slots differ.
+        confirm_blocks(&setup, 40);
+        let latest = setup.context.svm_locker.get_latest_absolute_slot();
+        assert!(
+            setup
+                .context
+                .svm_locker
+                .get_slot_for_commitment(&CommitmentConfig::finalized())
+                < latest
+        );
+        setup.context.remote_rpc_client = Some(SurfnetRemoteClient {
+            client: RpcClient::new_sender(
+                RecordsAndFails(Arc::clone(&requests)),
+                RpcClientConfig::default(),
+            )
+            .into(),
+        });
+        let recent_blockhash = setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm_reader| svm_reader.latest_blockhash());
+        // Neither the payer nor the lookup table is known locally.
+        let payer = Keypair::new();
+        let recipient = Pubkey::new_unique();
+        let transfer = system_instruction::transfer(&payer.pubkey(), &recipient, 1);
+        let mut tx = if lookup_table {
+            let message = V0Message {
+                header: MessageHeader {
+                    num_required_signatures: 1,
+                    num_readonly_signed_accounts: 0,
+                    num_readonly_unsigned_accounts: 1,
+                },
+                account_keys: vec![payer.pubkey(), recipient, system_program::id()],
+                recent_blockhash,
+                instructions: vec![solana_message::compiled_instruction::CompiledInstruction {
+                    program_id_index: 2,
+                    accounts: vec![0, 1],
+                    data: transfer.data.clone(),
+                }],
+                address_table_lookups: vec![solana_message::v0::MessageAddressTableLookup {
+                    account_key: Pubkey::new_unique(),
+                    writable_indexes: vec![],
+                    readonly_indexes: vec![0],
+                }],
+            };
+            VersionedTransaction::try_new(solana_message::VersionedMessage::V0(message), &[&payer])
+                .unwrap()
+        } else {
+            build_legacy_transaction(
+                &payer.pubkey(),
+                &[&payer.insecure_clone()],
+                &[transfer],
+                &recent_blockhash,
+            )
+        };
+        tx.signatures[0] = solana_signature::Signature::from([7u8; 64]);
+        let encoded = bs58::encode(wincode::serialize(&tx).unwrap()).into_string();
+        let config = |sig_verify, commitment| {
+            Some(RpcSimulateTransactionConfig {
+                sig_verify,
+                commitment,
+                ..RpcSimulateTransactionConfig::default()
+            })
+        };
+
+        for commitment in [
+            CommitmentConfig::processed(),
+            CommitmentConfig::confirmed(),
+            CommitmentConfig::finalized(),
+        ] {
+            let refused = setup
+                .rpc
+                .simulate_transaction(
+                    Some(setup.context.clone()),
+                    encoded.clone(),
+                    config(true, Some(commitment)),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(&refused.value.err).unwrap(),
+                serde_json::json!("SignatureFailure")
+            );
+            assert_eq!(
+                refused.context.slot,
+                setup
+                    .context
+                    .svm_locker
+                    .get_slot_for_commitment(&commitment)
+            );
+            assert_eq!(
+                *requests.lock().unwrap(),
+                vec![],
+                "the datasource was asked"
+            );
+        }
+
+        // Without sigVerify the accounts are acquired: here the datasource fails, and that is
+        // what the simulation reports, never a signature failure.
+        let unverified = setup
+            .rpc
+            .simulate_transaction(Some(setup.context), encoded, config(false, None))
+            .await;
+        assert!(!requests.lock().unwrap().is_empty());
+        assert!(
+            !format!("{unverified:?}").contains("SignatureFailure"),
+            "{unverified:?}"
+        );
+    }
+
+    /// A message in which every signer funds a new account (above its rent-exempt minimum), so
+    /// it requires one signature per signer.
+    fn message_signed_by(
+        v0: bool,
+        signers: &[Keypair],
+        recent_blockhash: Hash,
+    ) -> solana_message::VersionedMessage {
+        let to = Pubkey::new_unique();
+        let instructions: Vec<_> = signers
+            .iter()
+            .map(|signer| transfer(&signer.pubkey(), &to, 1_000_000))
+            .collect();
+        let payer = signers[0].pubkey();
+        if v0 {
+            solana_message::VersionedMessage::V0(
+                V0Message::try_compile(&payer, &instructions, &[], recent_blockhash).unwrap(),
+            )
+        } else {
+            let mut message = LegacyMessage::new(&instructions, Some(&payer));
+            message.recent_blockhash = recent_blockhash;
+            solana_message::VersionedMessage::Legacy(message)
+        }
+    }
+
+    /// A signature list that does not fit its message (none; more or fewer than the message
+    /// requires) is refused as invalid params, with or without sigVerify, before any signature
+    /// is read or any lookup table or account is acquired: the datasource is never asked.
+    #[test_case(false, 1, 0, true ; "legacy without signatures, sigVerify")]
+    #[test_case(false, 1, 0, false ; "legacy without signatures, no sigVerify")]
+    #[test_case(true, 1, 0, true ; "v0 without signatures, sigVerify")]
+    #[test_case(true, 1, 0, false ; "v0 without signatures, no sigVerify")]
+    #[test_case(false, 1, 2, true ; "legacy with more signatures than required, sigVerify")]
+    #[test_case(true, 1, 2, false ; "v0 with more signatures than required, no sigVerify")]
+    #[test_case(false, 2, 1, false ; "legacy with fewer signatures than required, no sigVerify")]
+    #[test_case(true, 2, 1, true ; "v0 with fewer signatures than required, sigVerify")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_simulate_refuses_a_signature_list_that_does_not_fit_its_message(
+        v0: bool,
+        required: usize,
+        given: usize,
+        sig_verify: bool,
+    ) {
+        let requests = Arc::new(Mutex::new(vec![]));
+        let mut setup = TestSetup::new(SurfpoolFullRpc);
+        setup.context.remote_rpc_client = Some(SurfnetRemoteClient {
+            client: RpcClient::new_sender(
+                RecordsAndFails(Arc::clone(&requests)),
+                RpcClientConfig::default(),
+            )
+            .into(),
+        });
+        let recent_blockhash = setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm_reader| svm_reader.latest_blockhash());
+        let signers: Vec<Keypair> = (0..required).map(|_| Keypair::new()).collect();
+        let tx = VersionedTransaction {
+            signatures: vec![solana_signature::Signature::default(); given],
+            message: message_signed_by(v0, &signers, recent_blockhash),
+        };
+        let refused = setup
+            .rpc
+            .simulate_transaction(
+                Some(setup.context.clone()),
+                bs58::encode(wincode::serialize(&tx).unwrap()).into_string(),
+                Some(RpcSimulateTransactionConfig {
+                    sig_verify,
+                    ..RpcSimulateTransactionConfig::default()
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code, jsonrpc_core::ErrorCode::InvalidParams);
+        let expected = if given == 0 {
+            "Transaction has no signatures".to_string()
+        } else {
+            let count = |n: usize| match n {
+                1 => "1 signature".to_string(),
+                n => format!("{n} signatures"),
+            };
+            format!(
+                "Transaction has {} but its message requires {}",
+                count(given),
+                count(required)
+            )
+        };
+        assert_eq!(refused.message, expected);
+        assert_eq!(
+            *requests.lock().unwrap(),
+            vec![],
+            "the datasource was asked"
+        );
+    }
+
+    /// A well-formed v0 transaction carrying zeroed placeholder signatures (unsigned) still
+    /// simulates without sigVerify, and fails only the cryptographic check with it (the legacy
+    /// case is `test_simulate_transaction_no_signers` and `..._no_signers_err`).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_simulate_an_unsigned_v0_transaction_with_and_without_sigverify() {
+        let setup = TestSetup::new_with_serial_vm_executor(SurfpoolFullRpc);
+        let payer = Keypair::new();
+        let _ = setup
+            .rpc
+            .request_airdrop(
+                Some(setup.context.clone()),
+                payer.pubkey().to_string(),
+                LAMPORTS_PER_SOL,
+                None,
+            )
+            .unwrap();
+        let recent_blockhash = setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm_reader| svm_reader.latest_blockhash());
+        let unsigned = VersionedTransaction {
+            signatures: vec![solana_signature::Signature::default()],
+            message: message_signed_by(true, &[payer], recent_blockhash),
+        };
+        let encoded = bs58::encode(wincode::serialize(&unsigned).unwrap()).into_string();
+        let simulate = |sig_verify| {
+            setup.rpc.simulate_transaction(
+                Some(setup.context.clone()),
+                encoded.clone(),
+                Some(RpcSimulateTransactionConfig {
+                    sig_verify,
+                    ..RpcSimulateTransactionConfig::default()
+                }),
+            )
+        };
+        assert_eq!(simulate(false).await.unwrap().value.err, None);
+        assert_eq!(
+            simulate(true).await.unwrap().value.err,
+            Some(TransactionError::SignatureFailure.into())
+        );
+    }
+
+    /// With or without preflight, a send whose signature list does not fit its message is
+    /// refused as invalid params before anything is queued: nothing reaches the runloop, and no
+    /// signature is marked pending.
+    #[test_case(false, 1, 0, false ; "legacy without signatures, preflight")]
+    #[test_case(true, 1, 0, true ; "v0 without signatures, skipPreflight")]
+    #[test_case(false, 1, 2, true ; "legacy with more signatures than required, skipPreflight")]
+    #[test_case(true, 2, 1, false ; "v0 with fewer signatures than required, preflight")]
+    fn test_send_refuses_a_signature_list_that_does_not_fit_its_message(
+        v0: bool,
+        required: usize,
+        given: usize,
+        skip_preflight: bool,
+    ) {
+        let (mempool_tx, mempool_rx) = crossbeam_channel::unbounded();
+        let setup = TestSetup::new_with_mempool(SurfpoolFullRpc, mempool_tx);
+        let recent_blockhash = setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm_reader| svm_reader.latest_blockhash());
+        let signers: Vec<Keypair> = (0..required).map(|_| Keypair::new()).collect();
+        let tx = VersionedTransaction {
+            signatures: vec![solana_signature::Signature::new_unique(); given],
+            message: message_signed_by(v0, &signers, recent_blockhash),
+        };
+        // Sent on its own thread: a queued transaction would wait for a status that this setup's
+        // runloop-less mempool never produces, so the wait is bounded.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let (rpc, context) = (setup.rpc.clone(), setup.context.clone());
+        let encoded = bs58::encode(wincode::serialize(&tx).unwrap()).into_string();
+        std::thread::spawn(move || {
+            let _ = done_tx.send(hiro_system_kit::nestable_block_on(rpc.send_transaction(
+                Some(context),
+                encoded,
+                Some(SurfpoolRpcSendTransactionConfig {
+                    base: RpcSendTransactionConfig {
+                        skip_preflight,
+                        ..RpcSendTransactionConfig::default()
+                    },
+                    ..SurfpoolRpcSendTransactionConfig::default()
+                }),
+            )));
+        });
+        let refused = match done_rx.recv_timeout(std::time::Duration::from_secs(30)) {
+            Ok(result) => result.unwrap_err(),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("sendTransaction never returned: the transaction was queued")
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("sendTransaction panicked")
+            }
+        };
+        assert_eq!(refused.code, jsonrpc_core::ErrorCode::InvalidParams);
+        assert!(
+            refused.message.starts_with("Transaction has "),
+            "{}",
+            refused.message
+        );
+        assert!(mempool_rx.try_recv().is_err(), "a command was queued");
+        if let Some(signature) = tx.signatures.first() {
+            assert!(!setup.context.svm_locker.is_transaction_pending(signature));
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn test_simulate_transaction_oversized_base64_returns_invalid_params() {
         let setup = TestSetup::new(SurfpoolFullRpc);
@@ -3898,10 +4341,9 @@ mod tests {
         let pk = Pubkey::new_unique();
         let lamports = LAMPORTS_PER_SOL;
         let setup = TestSetup::new_with_serial_vm_executor(SurfpoolFullRpc);
-        setup
-            .context
-            .svm_locker
-            .with_svm_writer(|svm_writer| svm_writer.inner.set_sigverify(false));
+        setup.context.svm_locker.with_svm_writer(|svm_writer| {
+            svm_writer.inner.local_mut_for_tests().set_sigverify(false)
+        });
         let recent_blockhash = setup
             .context
             .svm_locker
@@ -3982,10 +4424,9 @@ mod tests {
                 None,
             )
             .unwrap();
-        setup
-            .context
-            .svm_locker
-            .with_svm_writer(|svm_writer| svm_writer.inner.set_sigverify(false));
+        setup.context.svm_locker.with_svm_writer(|svm_writer| {
+            svm_writer.inner.local_mut_for_tests().set_sigverify(false)
+        });
 
         //build_legacy_transaction
         let mut msg = LegacyMessage::new(
@@ -6436,7 +6877,9 @@ mod tests {
             let tx = build_transaction_with_invalid_blockhash(&payer, &recipient, lamports);
             assert!(
                 !setup.context.svm_locker.with_svm_reader(|svm_reader| {
-                    svm_reader.check_blockhash_is_recent(tx.message.recent_blockhash())
+                    svm_reader
+                        .check_blockhash_is_recent(tx.message.recent_blockhash())
+                        .unwrap()
                 }),
                 "test transaction should use a non-recent blockhash"
             );
@@ -6493,7 +6936,9 @@ mod tests {
             let tx = build_transaction_with_invalid_blockhash(&payer, &recipient, lamports);
             assert!(
                 !setup.context.svm_locker.with_svm_reader(|svm_reader| {
-                    svm_reader.check_blockhash_is_recent(tx.message.recent_blockhash())
+                    svm_reader
+                        .check_blockhash_is_recent(tx.message.recent_blockhash())
+                        .unwrap()
                 }),
                 "test transaction should use a non-recent blockhash"
             );

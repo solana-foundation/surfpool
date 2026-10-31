@@ -13,7 +13,6 @@ use phoenix_rise_accounts::{
     },
 };
 use solana_account::Account;
-use solana_clock::Clock;
 use solana_commitment_config::CommitmentConfig;
 use solana_compute_budget_interface::ComputeBudgetInstruction;
 use solana_instruction::{AccountMeta, Instruction};
@@ -366,20 +365,18 @@ pub struct Sandbox<'a> {
 }
 
 impl<'a> Sandbox<'a> {
-    pub fn new(live: &'a SurfnetSvm) -> Self {
-        let mut svm = live.clone_for_profiling();
-        svm.inner.set_sigverify(false);
-        Self {
+    pub fn new(live: &'a SurfnetSvm) -> SurfpoolResult<Self> {
+        Ok(Self {
             live,
-            svm,
+            svm: live.clone_for_profiling()?,
             written: Vec::new(),
-        }
+        })
     }
 
     /// Runs the instructions in order; the first failing one fails the run.
     pub fn run(&mut self, instructions: &[Instruction]) -> SurfpoolResult<()> {
         for (index, instruction) in instructions.iter().enumerate() {
-            self.send(instruction)
+            self.send(instruction)?
                 .map_err(|e| SurfpoolError::internal(format!("instruction {index} failed: {e}")))?;
             for meta in &instruction.accounts {
                 if meta.is_writable && !self.written.contains(&meta.pubkey) {
@@ -392,7 +389,7 @@ impl<'a> Sandbox<'a> {
 
     /// The return data of a read-only instruction, such as a Hawkeye view.
     pub fn view(&mut self, instruction: &Instruction) -> SurfpoolResult<Vec<u8>> {
-        self.send(instruction).map_err(SurfpoolError::internal)
+        self.send(instruction)?.map_err(SurfpoolError::internal)
     }
 
     /// An account as the instructions run so far left it.
@@ -402,10 +399,10 @@ impl<'a> Sandbox<'a> {
 
     /// Moves the copy's Clock one slot on. Phoenix fixes the mark it uses for risk for the rest of
     /// a slot once a risk action, such as a cancel, has read it.
-    pub fn next_slot(&mut self) {
-        let mut clock = self.svm.inner.get_sysvar::<Clock>();
+    pub fn next_slot(&mut self) -> SurfpoolResult<()> {
+        let mut clock = self.svm.inner.clock();
         clock.slot += 1;
-        self.svm.inner.set_sysvar(&clock);
+        self.svm.apply_local_clock(&clock)
     }
 
     /// Every account the instructions run so far changed, as it now is.
@@ -422,13 +419,19 @@ impl<'a> Sandbox<'a> {
         Ok(changed)
     }
 
-    fn send(&mut self, instruction: &Instruction) -> Result<Vec<u8>, String> {
+    fn send(&mut self, instruction: &Instruction) -> SurfpoolResult<Result<Vec<u8>, String>> {
         // A fresh payer gives every transaction its own signature.
         let payer = Keypair::new();
-        self.svm
+        if let Err(failed) = self
+            .svm
             .inner
-            .airdrop(&payer.pubkey(), FEE_PAYER_LAMPORTS)
-            .map_err(|failed| format!("funding the fee payer failed: {:?}", failed.err))?;
+            .airdrop(&payer.pubkey(), FEE_PAYER_LAMPORTS)?
+        {
+            return Ok(Err(format!(
+                "funding the fee payer failed: {:?}",
+                failed.err
+            )));
+        }
         let mut transaction = Transaction::new_with_payer(
             &[
                 ComputeBudgetInstruction::set_compute_unit_limit(COMPUTE_UNIT_LIMIT),
@@ -436,12 +439,17 @@ impl<'a> Sandbox<'a> {
             ],
             Some(&payer.pubkey()),
         );
-        transaction.partial_sign(&[&payer], self.svm.inner.svm.latest_blockhash());
-        self.svm
+        let blockhash = match self.svm.inner.historical_fork() {
+            Some(fork) => fork.latest_blockhash()?.0,
+            None => self.svm.latest_blockhash(),
+        };
+        transaction.partial_sign(&[&payer], blockhash);
+        Ok(self
+            .svm
             .inner
-            .send_transaction(transaction)
+            .send_profile_prefix(transaction.into(), true)?
             .map(|meta| meta.return_data.data)
-            .map_err(|failed| format!("{:?}; logs: {:?}", failed.err, failed.meta.logs))
+            .map_err(|failed| format!("{:?}; logs: {:?}", failed.err, failed.meta.logs)))
     }
 }
 
@@ -496,7 +504,7 @@ pub fn run_instructions(
     svm: &SurfnetSvm,
     instructions: &[Instruction],
 ) -> SurfpoolResult<Vec<(Pubkey, Account)>> {
-    let mut sandbox = Sandbox::new(svm);
+    let mut sandbox = Sandbox::new(svm)?;
     sandbox.run(instructions)?;
     sandbox.writes()
 }
@@ -880,7 +888,7 @@ pub(crate) async fn keep_markets_usable(
     let kept = async {
         hydrate(svm, remote_ctx, &[PHOENIX_PERP_ASSET_MAP]).await?;
         let map = local_account(svm, &PHOENIX_PERP_ASSET_MAP)?;
-        let clock = svm.inner.get_sysvar::<Clock>();
+        let clock = svm.inner.clock();
         let raised = raise_stale_thresholds(&PHOENIX_PERP_ASSET_MAP, &map.data)?;
         let now = u64::try_from(clock.unix_timestamp).unwrap_or(0);
         let rewound = rewind_funding_timestamps(
@@ -1674,7 +1682,10 @@ pub(crate) mod tests {
 
     fn funded_svm(owner: &Pubkey) -> SurfnetSvm {
         let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
-        svm.inner.airdrop(owner, 5_000_000_000).unwrap();
+        svm.inner
+            .local_mut_for_tests()
+            .airdrop(owner, 5_000_000_000)
+            .unwrap();
         svm
     }
 

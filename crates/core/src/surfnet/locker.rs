@@ -6,9 +6,6 @@ use std::{
 
 use crossbeam_channel::{Receiver, Sender};
 use itertools::Itertools;
-use litesvm::types::{
-    FailedTransactionMetadata, SimulatedTransactionInfo, TransactionMetadata, TransactionResult,
-};
 use solana_account::{Account, ReadableAccount, state_traits::StateMut};
 use solana_account_decoder::{
     UiAccount, UiAccountEncoding, UiDataSliceConfig,
@@ -16,7 +13,7 @@ use solana_account_decoder::{
     parse_bpf_loader::{BpfUpgradeableLoaderAccountType, UiProgram, parse_bpf_upgradeable_loader},
     parse_token::token_amount_to_ui_amount_v3,
 };
-use solana_address_lookup_table_interface::state::AddressLookupTable;
+use solana_address_lookup_table_interface::state::{AddressLookupTable, LookupTableMeta};
 use solana_client::{
     rpc_client::SerializableTransaction,
     rpc_config::{
@@ -33,7 +30,6 @@ use solana_client::{
 use solana_clock::{Clock, Slot, UnixTimestamp};
 use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_epoch_info::EpochInfo;
-use solana_epoch_schedule::EpochSchedule;
 use solana_hash::Hash;
 use solana_loader_v3_interface::{get_program_data_address, state::UpgradeableLoaderState};
 use solana_message::{
@@ -68,6 +64,8 @@ use super::{
     AccountFactory, AccountSource, CoupledAccount, GetAccountResult, GetTransactionResult,
     GeyserEvent, GeyserTransactionEvent, LocalSignatureStatusOrSubscription,
     SignatureSubscriptionType, SurfnetSvm,
+    backend::ArchiveReader,
+    historical_archive,
     remote::SurfnetRemoteClient,
     svm::{AccountUpdatePolicy, ReadSlot},
 };
@@ -83,11 +81,19 @@ use crate::{
         },
         utils::{convert_transaction_metadata_from_canonical, verify_pubkey},
     },
+    storage::StorageResult,
+    surfnet::backend::{
+        FailedTransactionMetadata, SimulatedTransactionInfo, TransactionMetadata, TransactionResult,
+    },
     types::{
         GeyserAccountUpdate, OfflineAccountConfig, RemoteRpcResult, SurfnetTransactionStatus,
         TimeTravelConfig, TokenAccount, TransactionLoadedAddresses, TransactionWithStatusMeta,
     },
 };
+
+mod historical_history;
+mod historical_tokens;
+pub(crate) mod program_upload;
 
 struct LocalTransactionLookup {
     result: GetTransactionResult,
@@ -246,7 +252,9 @@ impl SurfnetSvmLocker {
             let mut write_guard = write_lock.blocking_write();
             // Bump after the closure so a writer can compare against the revision it
             // observed (e.g. a bundle commit checking its sandbox is not stale).
+            write_guard.begin_historical_write();
             let result = writer(&mut write_guard);
+            write_guard.end_historical_write();
             write_guard.bump_state_revision();
             result
         })
@@ -277,9 +285,7 @@ impl SurfnetSvmLocker {
 
         self.with_svm_writer(move |svm_writer| {
             svm_writer.cached_genesis_hash = some_genesis_hash;
-            svm_writer
-                .inner
-                .set_sysvar(&last_restart_slot.unwrap_or_default());
+            svm_writer.apply_local_last_restart_slot(&last_restart_slot.unwrap_or_default())?;
             svm_writer.initialize(epoch_info, epoch_schedule)
         })
     }
@@ -452,11 +458,27 @@ impl SurfnetSvmLocker {
             .collect()
     }
 
-    /// Retrieves a local account from the SVM cache, returning a contextualized result.
-    pub fn get_account_local(&self, pubkey: &Pubkey) -> SvmAccessContext<GetAccountResult> {
-        self.with_contextualized_svm_reader(|svm_reader| {
-            return svm_reader.inner.get_account_result(pubkey).unwrap();
-        })
+    /// Retrieves a local account from the SVM cache, returning a contextualized result. A
+    /// read that fails (a database error, or SVM Replay unable to supply a historical image)
+    /// is an error, never an absent account.
+    pub fn get_account_local(
+        &self,
+        pubkey: &Pubkey,
+    ) -> SurfpoolContextualizedResult<GetAccountResult> {
+        let SvmAccessContext {
+            slot,
+            latest_epoch_info,
+            latest_blockhash,
+            inner,
+        } = self.with_contextualized_svm_reader(|svm_reader| {
+            svm_reader.inner.get_account_result(pubkey)
+        });
+        Ok(SvmAccessContext::new(
+            slot,
+            latest_epoch_info,
+            latest_blockhash,
+            inner?,
+        ))
     }
 
     /// Attempts local retrieval, then fetches from remote if missing, returning a contextualized result.
@@ -468,7 +490,7 @@ impl SurfnetSvmLocker {
         pubkey: &Pubkey,
         commitment_config: CommitmentConfig,
     ) -> SurfpoolContextualizedResult<GetAccountResult> {
-        let result = self.get_account_local(pubkey);
+        let result = self.get_account_local(pubkey)?;
 
         if result.inner.is_none() {
             let is_offline = self.is_account_offline(pubkey);
@@ -505,7 +527,7 @@ impl SurfnetSvmLocker {
             self.get_account_local_then_remote(remote_client, pubkey, *commitment_config)
                 .await?
         } else {
-            let result = self.get_account_local(pubkey);
+            let result = self.get_account_local(pubkey)?;
             if result
                 .inner
                 .source()
@@ -530,17 +552,24 @@ impl SurfnetSvmLocker {
     pub fn get_multiple_accounts_local(
         &self,
         pubkeys: &[Pubkey],
-    ) -> SvmAccessContext<Vec<GetAccountResult>> {
-        self.with_contextualized_svm_reader(|svm_reader| {
-            let mut accounts = vec![];
-
-            for pubkey in pubkeys {
-                let result = svm_reader.inner.get_account_result(pubkey).unwrap();
-                if result.is_none() {};
-                accounts.push(result);
-            }
-            accounts
-        })
+    ) -> SurfpoolContextualizedResult<Vec<GetAccountResult>> {
+        let SvmAccessContext {
+            slot,
+            latest_epoch_info,
+            latest_blockhash,
+            inner,
+        } = self.with_contextualized_svm_reader(|svm_reader| {
+            pubkeys
+                .iter()
+                .map(|pubkey| svm_reader.inner.get_account_result(pubkey))
+                .collect::<SurfpoolResult<Vec<_>>>()
+        });
+        Ok(SvmAccessContext::new(
+            slot,
+            latest_epoch_info,
+            latest_blockhash,
+            inner?,
+        ))
     }
 
     /// Retrieves multiple accounts from local storage, with remote fallback for missing accounts.
@@ -559,7 +588,7 @@ impl SurfnetSvmLocker {
             latest_epoch_info,
             latest_blockhash,
             inner: local_results,
-        } = self.get_multiple_accounts_local(pubkeys);
+        } = self.get_multiple_accounts_local(pubkeys)?;
 
         // Collect missing pubkeys that are not offline (local_results is already in correct order from pubkeys).
         let mut missing_accounts = Vec::new();
@@ -627,7 +656,7 @@ impl SurfnetSvmLocker {
             )
             .await?
         } else {
-            let results = self.get_multiple_accounts_local(pubkeys);
+            let results = self.get_multiple_accounts_local(pubkeys)?;
             if results.inner.iter().any(|result| {
                 result
                     .source()
@@ -818,12 +847,14 @@ impl SurfnetSvmLocker {
                 // its value, as `initialize` does from a remote. Programs that
                 // check it (Phoenix halts on a mismatch) otherwise read 0 after
                 // an offline restore.
-                if pubkey == solana_sysvar::last_restart_slot::ID {
+                if pubkey == solana_sysvar::last_restart_slot::ID
+                    && let Some(local) = svm.inner.local_mut()
+                {
                     match account.data.get(..8).map(|bytes| {
                         u64::from_le_bytes(bytes.try_into().expect("8 bytes"))
                     }) {
                         Some(last_restart_slot) => {
-                            svm.inner.set_sysvar(
+                            local.set_sysvar(
                                 &solana_sysvar::last_restart_slot::LastRestartSlot {
                                     last_restart_slot,
                                 },
@@ -863,12 +894,22 @@ impl SurfnetSvmLocker {
                 // LiteSVM rejects an account (for example, an incomplete program).
                 // A DB hit alone must not produce a Geyser startup update for an
                 // account that is not actually available in the live SVM.
-                let Some(account) = svm.inner.get_account_no_db(&pubkey) else {
-                    let _ = svm.simnet_events_tx.warn(format!(
-                        "Account '{}' was not present after snapshot load",
-                        pubkey
-                    ));
-                    continue;
+                let account = match svm.inner.get_account_no_db(&pubkey) {
+                    Ok(Some(account)) => account,
+                    Ok(None) => {
+                        let _ = svm.simnet_events_tx.warn(format!(
+                            "Account '{}' was not present after snapshot load",
+                            pubkey
+                        ));
+                        continue;
+                    }
+                    Err(e) => {
+                        let _ = svm.simnet_events_tx.warn(format!(
+                            "Account '{}' could not be read after snapshot load: {}",
+                            pubkey, e
+                        ));
+                        continue;
+                    }
                 };
 
                 // Send startup account update to geyser
@@ -997,6 +1038,7 @@ impl SurfnetSvmLocker {
         remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
         config: RpcLargestAccountsConfig,
     ) -> SurfpoolContextualizedResult<Vec<RpcAccountBalance>> {
+        self.refuse_historical_scan("getLargestAccounts")?;
         if let Some((remote_client, commitment_config)) = remote_ctx {
             self.get_largest_accounts_local_then_remote(remote_client, config, *commitment_config)
                 .await
@@ -1129,9 +1171,12 @@ fn signature_positions_in_blocks(
     let unique_slots: HashSet<u64> = slots.into_iter().collect();
     let mut positions = HashMap::new();
     for slot in unique_slots {
-        if let Ok(Some(block_header)) = svm_reader.blocks.get(&slot) {
+        // A historical fork's current block is still open, and its boundary block starts with
+        // the archived transactions before the fork position.
+        if let Ok(Some(block_header)) = svm_reader.historical_block_header(slot) {
+            let offset = svm_reader.historical_block_offset(slot) as usize;
             for (idx, block_sig) in block_header.signatures.iter().enumerate() {
-                positions.insert(block_sig.to_string(), idx);
+                positions.insert(block_sig.to_string(), offset + idx);
             }
         }
     }
@@ -1207,9 +1252,168 @@ impl SurfnetSvmLocker {
         pubkey: &Pubkey,
         config: &RpcGetTransactionsForAddressConfig,
     ) -> SurfpoolResult<SvmAccessContext<RpcTransactionsForAddressResult>> {
+        if let Some(reader) = self.archive_reader() {
+            return self.get_transactions_for_address_local_then_archive(&reader, pubkey, config);
+        }
         // Intentionally local-only for now
         let _ = remote_ctx;
         self.get_transactions_for_address_local(pubkey, config)
+    }
+
+    /// A historical fork's address history: local entries first, then its archived history
+    /// before the fork position, newest first, filtered and paged like the local entries; a
+    /// page token continues into the archive. Oldest first and owner token-account filters
+    /// read SVM Replay's provider-index query instead (`historical_history`).
+    pub fn get_transactions_for_address_local_then_archive(
+        &self,
+        reader: &ArchiveReader,
+        pubkey: &Pubkey,
+        config: &RpcGetTransactionsForAddressConfig,
+    ) -> SurfpoolResult<SvmAccessContext<RpcTransactionsForAddressResult>> {
+        const PAGE: usize = 1000;
+        const PAGES: usize = 10;
+        if config.sort_order.unwrap_or_default() == SortOrder::Asc {
+            return self.historical_history_ascending(reader, pubkey, config);
+        }
+        let page =
+            |before: Option<&String>, limit: usize| -> SurfpoolResult<Vec<serde_json::Value>> {
+                let listed = reader.signatures_before(pubkey, before, limit)?;
+                serde_json::from_value(listed).map_err(|e| {
+                    SurfpoolError::historical(
+                        "SOURCE_INTEGRITY",
+                        &format!("archived signatures are malformed: {e}"),
+                        None,
+                    )
+                })
+            };
+        let archived_token = match &config.pagination_token {
+            Some(token) => self
+                .with_svm_reader(|r| r.transactions.get(token))?
+                .is_none(),
+            None => false,
+        };
+        let mut result = match archived_token {
+            // Every local entry is newer than archived history: an archived token is past them.
+            true => self.with_contextualized_svm_reader(|_| RpcTransactionsForAddressResult {
+                data: vec![],
+                pagination_token: None,
+            }),
+            false => self.get_transactions_for_address_local(pubkey, config)?,
+        };
+        let full =
+            config.transaction_details.unwrap_or_default() == TransactionsForAddressDetails::Full;
+        let limit = config
+            .limit
+            .unwrap_or(PAGE)
+            .min(if full { 100 } else { PAGE });
+        if result.inner.data.len() >= limit {
+            return Ok(result);
+        }
+        let filters = config.filters.as_ref();
+        if filters.and_then(|f| f.token_accounts).unwrap_or_default()
+            != TransactionsForAddressTokenFilter::None
+        {
+            let archived = archived_token
+                .then(|| config.pagination_token.clone())
+                .flatten();
+            return self
+                .historical_history_token_accounts(reader, pubkey, config, result, archived);
+        }
+        let status = filters.and_then(|f| f.status).unwrap_or_default();
+        let mut cursor = archived_token
+            .then(|| config.pagination_token.clone())
+            .flatten();
+        // Without filters every archived entry matches: read exactly what the page still needs.
+        let filtered = filters
+            .is_some_and(|f| f.slot.is_some() || f.block_time.is_some() || f.status.is_some());
+        let (mut scanned, mut exhausted) = (0, false);
+        while result.inner.data.len() < limit && !exhausted && scanned < PAGES {
+            let size = match filtered {
+                true => PAGE,
+                false => limit - result.inner.data.len(),
+            };
+            let entries = page(cursor.as_ref(), size)?;
+            scanned += 1;
+            exhausted = entries.len() < size;
+            for entry in entries {
+                let malformed = || {
+                    SurfpoolError::historical(
+                        "SOURCE_INTEGRITY",
+                        "an archived signature entry is malformed",
+                        None,
+                    )
+                };
+                let signature = entry["signature"]
+                    .as_str()
+                    .ok_or_else(malformed)?
+                    .to_owned();
+                cursor = Some(signature.clone());
+                let slot = entry["slot"].as_u64().ok_or_else(malformed)?;
+                let block_time = entry["blockTime"].as_i64();
+                let err: Option<TransactionError> =
+                    serde_json::from_value(entry["err"].clone()).map_err(|_| malformed())?;
+                let time_filter = filters.and_then(|f| f.block_time.as_ref());
+                let matches = comparison_matches(&slot, filters.and_then(|f| f.slot.as_ref()))
+                    && match block_time {
+                        Some(time) => comparison_matches(&time, time_filter),
+                        None => time_filter.is_none(),
+                    }
+                    && match status {
+                        TransactionsForAddressStatusFilter::Succeeded => err.is_none(),
+                        TransactionsForAddressStatusFilter::Failed => err.is_some(),
+                        _ => true,
+                    };
+                if !matches {
+                    continue;
+                }
+                let index = entry["transactionIndex"]
+                    .as_u64()
+                    .map(|index| index as usize);
+                result.inner.data.push(if full {
+                    let record = reader.transaction(&signature)?;
+                    let (transaction, block_time) =
+                        historical_archive::archived_transaction(&record)?;
+                    RpcTransactionForAddressEntry::Full(Box::new(
+                        RpcTransactionForAddressFullInfo {
+                            slot,
+                            transaction_index: record["transactionIndex"]
+                                .as_u64()
+                                .map(|index| index as usize),
+                            block_time,
+                            transaction: VersionedTransactionWithStatusMeta::from(transaction)
+                                .encode(
+                                    config.encoding.unwrap_or(UiTransactionEncoding::Json),
+                                    config.max_supported_transaction_version,
+                                    true,
+                                )?,
+                        },
+                    ))
+                } else {
+                    RpcTransactionForAddressEntry::Signature(
+                        RpcTransactionForAddressSignatureInfo {
+                            signature,
+                            slot,
+                            transaction_index: index,
+                            err,
+                            memo: entry["memo"].as_str().map(str::to_owned),
+                            block_time,
+                            confirmation_status: Some(
+                                SolanaTransactionConfirmationStatus::Finalized,
+                            ),
+                        },
+                    )
+                });
+                if result.inner.data.len() == limit {
+                    break;
+                }
+            }
+        }
+        // A full page, or a scan stopped by its bound, continues from the last entry examined.
+        result.inner.pagination_token = match result.inner.data.len() == limit || !exhausted {
+            true => cursor,
+            false => None,
+        };
+        Ok(result)
     }
 
     /// Collects matching local transactions, orders them by `(slot, intra-block
@@ -1326,7 +1530,12 @@ impl SurfnetSvmLocker {
                             meta: tx_with_meta.meta.clone(),
                         });
 
-                        let confirmation_status = svm_reader.confirmation_status(slot);
+                        let confirmation_status = tx_with_meta
+                            .transaction
+                            .signatures
+                            .first()
+                            .and_then(|signature| svm_reader.historical_confirmation(signature))
+                            .unwrap_or_else(|| svm_reader.confirmation_status(slot));
 
                         Some(Record {
                             signature: sig,
@@ -1535,7 +1744,11 @@ impl SurfnetSvmLocker {
                         }
 
                         // Determine confirmation status
-                        let confirmation_status = svm_reader.confirmation_status(slot);
+                        let confirmation_status = transaction
+                            .signatures
+                            .first()
+                            .and_then(|signature| svm_reader.historical_confirmation(signature))
+                            .unwrap_or_else(|| svm_reader.confirmation_status(slot));
 
                         // Reconstruct the memo summary the same way a full Agave validator
                         // does, reusing its canonical extractor. `account_keys()` on the
@@ -1684,11 +1897,74 @@ impl SurfnetSvmLocker {
         let results = if let Some((remote_client, _)) = remote_ctx {
             self.get_signatures_for_address_local_then_remote(remote_client, pubkey, config)
                 .await?
+        } else if let Some(reader) = self.archive_reader() {
+            self.get_signatures_for_address_local_then_archive(&reader, pubkey, config)?
         } else {
             self.get_signatures_for_address_local(pubkey, config)?
         };
 
         Ok(results)
+    }
+
+    /// A historical fork's signatures for an address: local first, newest first, then its
+    /// history before the fork position as SVM Replay lists it, with a datasource's cursor
+    /// rules across the seam.
+    pub fn get_signatures_for_address_local_then_archive(
+        &self,
+        reader: &ArchiveReader,
+        pubkey: &Pubkey,
+        config: Option<&RpcSignaturesForAddressConfig>,
+    ) -> SurfpoolContextualizedResult<Vec<RpcConfirmedTransactionStatusWithSignature>> {
+        let SvmAccessContext {
+            slot,
+            latest_blockhash,
+            latest_epoch_info,
+            inner: mut combined,
+        } = self.get_signatures_for_address_local(pubkey, config)?;
+        let limit = config.and_then(|c| c.limit).unwrap_or(1000);
+        if combined.len() < limit {
+            let (before_is_local, until_is_local) =
+                self.with_svm_reader(|svm_reader| -> StorageResult<(bool, bool)> {
+                    let is_local = |sig: Option<&String>| -> StorageResult<bool> {
+                        Ok(match sig {
+                            Some(sig) => svm_reader.transactions.get(sig)?.is_some(),
+                            None => false,
+                        })
+                    };
+                    Ok((
+                        is_local(config.and_then(|c| c.before.as_ref()))?,
+                        is_local(config.and_then(|c| c.until.as_ref()))?,
+                    ))
+                })?;
+            if let Some(archive) = signatures_for_address_remote_config(
+                config,
+                before_is_local,
+                until_is_local,
+                limit - combined.len(),
+            ) {
+                let page = reader.signatures(
+                    pubkey,
+                    archive.before.as_ref(),
+                    archive.until.as_ref(),
+                    archive.limit,
+                )?;
+                let mut archived: Vec<RpcConfirmedTransactionStatusWithSignature> =
+                    serde_json::from_value(page).map_err(|e| {
+                        SurfpoolError::historical(
+                            "SOURCE_INTEGRITY",
+                            &format!("archived signatures are malformed: {e}"),
+                            None,
+                        )
+                    })?;
+                combined.append(&mut archived);
+            }
+        }
+        Ok(SvmAccessContext::new(
+            slot,
+            latest_epoch_info,
+            latest_blockhash,
+            combined,
+        ))
     }
 }
 
@@ -1723,9 +1999,38 @@ impl SurfnetSvmLocker {
         if let Some(remote_client) = remote_ctx {
             self.get_transaction_local_then_remote(remote_client, signature, config)
                 .await
+        } else if let Some(reader) = self.archive_reader() {
+            self.get_transaction_local_then_archive(&reader, signature, &config, true)
         } else {
             self.get_transaction_local(signature, &config)
         }
+    }
+
+    /// A historical fork's transaction: local first, then its history before the fork
+    /// position as SVM Replay reads it (with `history`, older archive; otherwise only the
+    /// boundary block). Archived transactions are finalized.
+    pub fn get_transaction_local_then_archive(
+        &self,
+        reader: &ArchiveReader,
+        signature: &Signature,
+        config: &RpcTransactionConfig,
+        history: bool,
+    ) -> SurfpoolResult<GetTransactionResult> {
+        let local = self.get_transaction_local(signature, config)?;
+        if !matches!(local, GetTransactionResult::None(_)) {
+            return Ok(local);
+        }
+        let record = reader.transaction_with_history(&signature.to_string(), history)?;
+        if record.is_null() {
+            return Ok(local);
+        }
+        let encoded = historical_archive::encoded_transaction(&record, config)?;
+        let latest_slot = self.get_latest_absolute_slot();
+        let blocks_after = latest_slot.saturating_sub(encoded.slot);
+        Ok(
+            GetTransactionResult::found_transaction(*signature, encoded, blocks_after, latest_slot)
+                .finalized_on_historical_fork(),
+        )
     }
 
     /// Stores a bundle's signatures under the given bundle ID.
@@ -1782,30 +2087,37 @@ impl SurfnetSvmLocker {
                 .as_processed()
                 .expect("only processed transactions are stored");
             let slot = transaction_with_status_meta.slot;
-            // `None` (spec: null) when the block isn't stored — never a fake 0.
+            // `None` (spec: null) when the block isn't stored — never a fake 0. A historical
+            // fork's still-open current block has its time already.
             let block_time = svm_reader
-                .blocks
-                .get(&slot)?
+                .historical_block_header(slot)?
                 .map(|b| b.block_time as UnixTimestamp);
+            let transaction_index = svm_reader.historical_transaction_index(slot, signature)?;
             let encoded = VersionedTransactionWithStatusMeta::from(transaction_with_status_meta)
                 .encode(
                     config.encoding.unwrap_or(UiTransactionEncoding::Json),
                     config.max_supported_transaction_version,
                     true,
                 )?;
+            let result = GetTransactionResult::found_transaction(
+                *signature,
+                EncodedConfirmedTransactionWithStatusMeta {
+                    slot,
+                    transaction: encoded,
+                    block_time,
+                    transaction_index,
+                },
+                svm_reader.blocks_after(slot),
+                finalized_slot,
+            );
+            let result = match svm_reader.historical_confirmation(signature) {
+                Some(SolanaTransactionConfirmationStatus::Finalized) => {
+                    result.finalized_on_historical_fork()
+                }
+                _ => result,
+            };
             Ok(LocalTransactionLookup {
-                result: GetTransactionResult::found_transaction(
-                    *signature,
-                    EncodedConfirmedTransactionWithStatusMeta {
-                        slot,
-                        transaction: encoded,
-                        block_time,
-                        transaction_index: None,
-                    },
-                    // Skipped slots are no confirmations: count the blocks, as finalization does.
-                    svm_reader.blocks_after(slot),
-                    finalized_slot,
-                ),
+                result,
                 is_pending,
                 latest_absolute_slot,
                 finalized_slot,
@@ -1845,7 +2157,7 @@ impl SurfnetSvmLocker {
         &self,
         transaction: VersionedTransaction,
         sigverify: bool,
-    ) -> Result<SimulatedTransactionInfo, FailedTransactionMetadata> {
+    ) -> SurfpoolResult<Result<SimulatedTransactionInfo, FailedTransactionMetadata>> {
         self.with_svm_reader(move |svm_reader| {
             svm_reader.simulate_transaction(transaction, sigverify)
         })
@@ -1918,7 +2230,7 @@ impl SurfnetSvmLocker {
     ) -> SurfpoolContextualizedResult<Uuid> {
         // Use clone_for_profiling to wrap all storage fields with overlay storage,
         // ensuring mutations during profiling don't affect the underlying database
-        let svm_clone = self.with_svm_reader(|svm_reader| svm_reader.clone_for_profiling());
+        let svm_clone = self.with_svm_reader(|svm_reader| svm_reader.clone_for_profiling())?;
 
         let svm_locker = SurfnetSvmLocker::new(svm_clone);
 
@@ -1957,11 +2269,18 @@ impl SurfnetSvmLocker {
         sigverify: bool,
         do_propagate: bool,
     ) -> SurfpoolResult<KeyedProfileResult> {
+        if !sigverify
+            && self.with_svm_reader(|svm| svm.inner.is_historical() && !svm.disposable_simulation)
+        {
+            return Err(super::backend::engine_owned(
+                "skipping signatures for a live send",
+            ));
+        }
         let signature = transaction.signatures[0];
 
         // Sigverify the transaction upfront before doing any account fetching or other pre-processing.
         if sigverify {
-            self.with_svm_reader(|svm_reader| svm_reader.sigverify(&transaction))
+            self.with_svm_reader(|svm_reader| svm_reader.sigverify(&transaction))?
                 .map_err(|e| Into::<SurfpoolError>::into(e.err))?;
         }
 
@@ -2025,21 +2344,16 @@ impl SurfnetSvmLocker {
         )
         .await?;
 
-        let readonly_account_states = transaction_accounts
-            .iter()
-            .enumerate()
-            .filter_map(|(i, pubkey)| {
-                if transaction.message.is_maybe_writable(i, None) {
-                    None
-                } else {
-                    self.get_account_local(pubkey)
-                        .inner
-                        .map_account()
-                        .ok()
-                        .map(|a| (*pubkey, a))
-                }
-            })
-            .collect::<HashMap<_, _>>();
+        let mut readonly_account_states = HashMap::new();
+        for (i, pubkey) in transaction_accounts.iter().enumerate() {
+            if transaction.message.is_maybe_writable(i, None) {
+                continue;
+            }
+            // An unreadable account fails the transaction's processing; an absent one is skipped.
+            if let Ok(account) = self.get_account_local(pubkey)?.inner.map_account() {
+                readonly_account_states.insert(*pubkey, account);
+            }
+        }
 
         let pre_execution_capture = {
             let mut capture = ExecutionCapture::new();
@@ -2056,6 +2370,12 @@ impl SurfnetSvmLocker {
             }
             capture
         };
+
+        if self.is_historical() {
+            self.with_svm_writer(|svm| {
+                svm.index_historical_transaction_tokens(&transaction_accounts)
+            })?;
+        }
 
         let (accounts_before, token_accounts_before, token_programs) =
             self.with_svm_reader(|svm_reader| {
@@ -2136,6 +2456,7 @@ impl SurfnetSvmLocker {
                 pre_execution_capture,
                 &status_tx,
                 do_propagate,
+                false,
             )
             .await?;
 
@@ -2213,7 +2534,8 @@ impl SurfnetSvmLocker {
                     pre_execution_capture_cursor.insert(pubkey, pre_account);
                 }
             }
-            let mut svm_clone = self.with_svm_reader(|svm_reader| svm_reader.clone_for_profiling());
+            let mut svm_clone =
+                self.with_svm_reader(|svm_reader| svm_reader.clone_for_profiling())?;
 
             let (dummy_simnet_tx, _) = SimnetEventsTx::channel(1);
             let (dummy_geyser_tx, _) = crossbeam_channel::bounded(1);
@@ -2234,6 +2556,7 @@ impl SurfnetSvmLocker {
                     pre_execution_capture_cursor,
                     status_tx,
                     do_propagate,
+                    true,
                 )
                 .await?;
 
@@ -2464,7 +2787,7 @@ impl SurfnetSvmLocker {
             let accounts_after = pubkeys_from_message
                 .iter()
                 .map(|p| svm_writer.inner.get_account_no_db(p))
-                .collect::<Vec<Option<Account>>>();
+                .collect::<SurfpoolResult<Vec<Option<Account>>>>()?;
             let (sanitized_transaction, versioned_transaction) = if do_propagate {
                 let address_loader = match (&transaction.message, &loaded_addresses) {
                     (VersionedMessage::V0(_), Some(loaded_addresses)) => {
@@ -2545,6 +2868,18 @@ impl SurfnetSvmLocker {
                 post_execution_capture.insert(*pubkey, account.clone());
 
                 if let Some(token_account) = token_account {
+                    if svm_writer.inner.is_historical()
+                        && svm_writer
+                            .token_mints
+                            .get(&token_account.mint().to_string())?
+                            .is_none()
+                    {
+                        svm_writer.simnet_events_tx.warn(format!(
+                            "Historical token balance for {pubkey} omitted: mint {} is absent or invalid",
+                            token_account.mint()
+                        ));
+                        continue;
+                    }
                     token_accounts_after.push((i, token_account));
                     post_token_program_ids.push(
                         account
@@ -2655,11 +2990,12 @@ impl SurfnetSvmLocker {
         pre_execution_capture: ExecutionCapture,
         status_tx: &Sender<TransactionStatusEvent>,
         do_propagate: bool,
+        profiling_prefix: bool,
     ) -> SurfpoolResult<ProfileResult> {
         if !skip_preflight {
             if let Err(failed) = self.with_svm_reader(|svm_reader| {
                 svm_reader.simulate_transaction(transaction.clone(), sigverify)
-            }) {
+            })? {
                 return Ok(self.handle_simulation_failure(
                     transaction.signatures[0],
                     failed,
@@ -2673,8 +3009,15 @@ impl SurfnetSvmLocker {
 
         let mut svm_writer = self.0.write().await;
         svm_writer.bump_state_revision();
-        match svm_writer.send_transaction(transaction.clone(), false, sigverify) {
-            Ok(transaction_metadata) => Self::handle_execution_success(
+        svm_writer.begin_historical_write();
+        let execution = if profiling_prefix {
+            svm_writer.send_profile_prefix(transaction.clone())
+        } else {
+            svm_writer.send_transaction(transaction.clone(), false, sigverify)
+        };
+        let processed = match execution {
+            Err(error) => Err(error),
+            Ok(Ok(transaction_metadata)) => Self::handle_execution_success(
                 &mut svm_writer,
                 transaction_metadata,
                 transaction,
@@ -2687,7 +3030,7 @@ impl SurfnetSvmLocker {
                 status_tx,
                 do_propagate,
             ),
-            Err(failed) => {
+            Ok(Err(failed)) => {
                 debug!("Transaction execution failure: {:?}", failed.meta);
                 Self::handle_execution_failure(
                     &mut svm_writer,
@@ -2703,7 +3046,9 @@ impl SurfnetSvmLocker {
                     do_propagate,
                 )
             }
-        }
+        };
+        svm_writer.end_historical_write();
+        processed
     }
 }
 
@@ -2767,10 +3112,18 @@ impl SurfnetSvmLocker {
         };
         epoch_info.transaction_count = None;
 
+        let historical = self.is_historical();
         self.with_svm_writer(move |svm_writer| {
-            let _ = svm_writer.reset_network(epoch_info, epoch_schedule);
-            let _ = svm_writer.offline_accounts.clear();
-        });
+            svm_writer.reset_network(epoch_info, epoch_schedule)?;
+            svm_writer.offline_accounts.clear()?;
+            Ok::<_, SurfpoolError>(())
+        })?;
+        // Outside the SVM lock: a historical fork's frontends drop their views of its local
+        // transactions and show the clock it restarts from.
+        if historical {
+            let clock = self.with_svm_reader(|svm_reader| svm_reader.inner.clock());
+            simnet_events_tx.network_reset(clock);
+        }
         Ok(())
     }
 
@@ -2898,9 +3251,12 @@ impl SurfnetSvmLocker {
     ) -> SurfpoolResult<()> {
         let mut svm_writer = self.0.write().await;
         svm_writer.bump_state_revision();
-        svm_writer
+        svm_writer.begin_historical_write();
+        let materialized = svm_writer
             .materialize_overrides_for_slot(remote_ctx, slot)
-            .await
+            .await;
+        svm_writer.end_historical_write();
+        materialized
     }
 }
 
@@ -2914,6 +3270,9 @@ impl SurfnetSvmLocker {
         filter: &TokenAccountsFilter,
         config: &RpcAccountInfoConfig,
     ) -> SurfpoolContextualizedResult<Vec<RpcKeyedAccount>> {
+        if let Some(reader) = self.archive_reader() {
+            return self.historical_token_accounts_by_owner(&reader, owner, filter, config);
+        }
         if let Some(remote_client) = remote_ctx {
             self.get_token_accounts_by_owner_local_then_remote(owner, filter, remote_client, config)
                 .await
@@ -3019,6 +3378,7 @@ impl SurfnetSvmLocker {
         filter: &TokenAccountsFilter,
         config: &RpcAccountInfoConfig,
     ) -> SurfpoolContextualizedResult<Vec<RpcKeyedAccount>> {
+        self.refuse_historical_scan("getTokenAccountsByDelegate")?;
         // Validate that the program is supported if using ProgramId filter
         if let TokenAccountsFilter::ProgramId(program_id) = filter {
             if !is_supported_token_program(program_id) {
@@ -3225,6 +3585,9 @@ impl SurfnetSvmLocker {
         remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
         mint: &Pubkey,
     ) -> SurfpoolContextualizedResult<Vec<RpcTokenAccountBalance>> {
+        if let Some(reader) = self.archive_reader() {
+            return self.historical_token_largest_accounts(&reader, mint);
+        }
         if let Some((remote_client, commitment_config)) = remote_ctx {
             self.get_token_largest_accounts_local_then_remote(
                 remote_client,
@@ -3297,17 +3660,6 @@ impl SurfnetSvmLocker {
             .map_account()?;
 
         if table_account.owner == solana_sdk_ids::address_lookup_table::id() {
-            let SvmAccessContext {
-                slot: current_slot,
-                inner: slot_hashes,
-                ..
-            } = self.with_contextualized_svm_reader(|svm_reader| {
-                svm_reader
-                    .inner
-                    .get_sysvar::<solana_slot_hashes::SlotHashes>()
-            });
-
-            //let current_slot = self.get_latest_absolute_slot(); // or should i use this?
             let data = &table_account.data.clone();
             let lookup_table = AddressLookupTable::deserialize(data).map_err(|_ix_err| {
                 SurfpoolError::invalid_account_data(
@@ -3316,6 +3668,23 @@ impl SurfnetSvmLocker {
                     Some("Attempted to lookup addresses from an invalid account"),
                 )
             })?;
+            let SvmAccessContext {
+                slot: current_slot,
+                inner: slot_hashes,
+                ..
+            } = self.with_contextualized_svm_reader(|svm_reader| {
+                if !lookup_status_needs_slot_hashes(
+                    &lookup_table.meta,
+                    svm_reader.get_latest_absolute_slot(),
+                ) {
+                    return Ok(solana_slot_hashes::SlotHashes::default());
+                }
+                // Fallible across backends: real slot hashes or the backend's typed error.
+                svm_reader
+                    .inner
+                    .read_sysvar::<solana_slot_hashes::SlotHashes>()
+            });
+            let slot_hashes = slot_hashes?;
 
             let writable = lookup_table
                 .lookup(
@@ -3363,6 +3732,14 @@ impl SurfnetSvmLocker {
             ))
         }
     }
+}
+
+/// Whether a lookup table's status depends on SlotHashes. Only a table deactivated in an earlier
+/// slot is cooling down (or done), which SlotHashes measure; an active table, or one deactivating
+/// in the current slot, never consults them, so they are not required to use it. The extension
+/// warmup depends on the current slot alone.
+fn lookup_status_needs_slot_hashes(meta: &LookupTableMeta, current_slot: Slot) -> bool {
+    meta.deactivation_slot != Slot::MAX && meta.deactivation_slot != current_slot
 }
 
 /// Profiling helper functions
@@ -3757,6 +4134,7 @@ impl SurfnetSvmLocker {
         account_config: RpcAccountInfoConfig,
         filters: Option<Vec<RpcFilterType>>,
     ) -> SurfpoolContextualizedResult<Vec<RpcKeyedAccount>> {
+        self.refuse_historical_scan("getProgramAccounts")?;
         if let Some(remote_client) = remote_ctx {
             self.get_program_accounts_local_then_remote(
                 remote_client,
@@ -3898,7 +4276,9 @@ impl SurfnetSvmLocker {
 
         let first_local_slot = self.get_first_local_slot();
 
-        let result = if first_local_slot.is_some() && first_local_slot.unwrap() > *slot {
+        let result = if let Some(reader) = self.archive_reader() {
+            self.get_historical_block(&reader, *slot, config)?
+        } else if first_local_slot.is_some() && first_local_slot.unwrap() > *slot {
             match remote_ctx {
                 Some(remote_client) => Some(remote_client.get_block(slot, *config).await?),
                 None => return Err(SurfpoolError::slot_too_old(*slot)),
@@ -3915,6 +4295,90 @@ impl SurfnetSvmLocker {
                 .unwrap_or_default(),
             inner: result,
         })
+    }
+
+    /// A historical fork's block: archived blocks before the boundary (SVM Replay), the
+    /// boundary block once the fork left it (archived transactions before the fork position,
+    /// then local ones, under the fork-local blockhash), and local blocks after it. The
+    /// current slot's block is not complete yet, and slots an advance passed over have none.
+    fn get_historical_block(
+        &self,
+        reader: &ArchiveReader,
+        slot: Slot,
+        config: &RpcBlockConfig,
+    ) -> SurfpoolResult<Option<UiConfirmedBlock>> {
+        let (boundary, open, header, local) = self.with_svm_reader(|svm_reader| {
+            let header = svm_reader.blocks.get(&slot)?;
+            let local = header
+                .iter()
+                .flat_map(|header| header.signatures.iter())
+                .map(|signature| {
+                    svm_reader
+                        .transactions
+                        .get(&signature.to_string())?
+                        .and_then(|status| status.as_processed().map(|(tx, _)| tx.clone()))
+                        .ok_or_else(|| {
+                            SurfpoolError::internal(format!(
+                                "local transaction {signature} of block {slot} is missing"
+                            ))
+                        })
+                })
+                .collect::<SurfpoolResult<Vec<_>>>()?;
+            let open = svm_reader
+                .historical_open_block
+                .as_ref()
+                .map(|(open, _)| *open);
+            Ok::<_, SurfpoolError>((svm_reader.genesis_slot, open, header, local))
+        })?;
+        if Some(slot) == open {
+            return Err(SurfpoolError::block_not_available(
+                slot,
+                "the historical fork is still in this slot; its block completes when the fork advances",
+            ));
+        }
+        if slot < boundary {
+            let archived =
+                reader
+                    .block(slot)
+                    .map_err(|error| match error.historical_rpc_code() {
+                        Some(code @ (-32007 | -32009)) => {
+                            SurfpoolError::historical_slot_skipped(slot, code)
+                        }
+                        _ => error,
+                    })?;
+            let blockhash = archived["blockhash"]
+                .as_str()
+                .ok_or_else(|| SurfpoolError::internal("archived block lacks its blockhash"))?
+                .to_owned();
+            let transactions = archived["transactions"]
+                .as_array()
+                .ok_or_else(|| SurfpoolError::internal("archived block lacks transactions"))?
+                .iter()
+                .map(|record| historical_archive::archived_transaction(record).map(|(tx, _)| tx))
+                .collect::<SurfpoolResult<Vec<_>>>()?;
+            return historical_archive::encoded_block(&archived, blockhash, transactions, config)
+                .map(Some);
+        }
+        let Some(header) = header else {
+            return Err(SurfpoolError::block_not_available(
+                slot,
+                "the historical fork advanced past this slot in one step; it has no block",
+            ));
+        };
+        let mut transactions = Vec::new();
+        if slot == boundary {
+            let prefix = reader.boundary_block()?;
+            for record in prefix["transactions"]
+                .as_array()
+                .ok_or_else(|| SurfpoolError::internal("boundary block lacks transactions"))?
+            {
+                transactions.push(historical_archive::archived_transaction(record)?.0);
+            }
+        }
+        transactions.extend(local);
+        let fields = serde_json::json!({"previousBlockhash":header.previous_blockhash,"parentSlot":header.parent_slot,
+            "blockTime":header.block_time,"blockHeight":header.block_height});
+        historical_archive::encoded_block(&fields, header.hash, transactions, config).map(Some)
     }
 
     pub fn get_block_local(
@@ -3972,11 +4436,70 @@ impl SurfnetSvmLocker {
         simnet_command_tx: Sender<SimnetCommand>,
         config: TimeTravelConfig,
     ) -> SurfpoolResult<EpochInfo> {
+        if self.is_historical() {
+            // SVM Replay moves a historical clock, forward only: a slot keeps the time
+            // unchanged; a timestamp or epoch maps to a slot with Surfpool's usual slot time.
+            // A target in a later epoch is an explicit synthetic test warp: the Clock enters
+            // that epoch while runtime, features, stakes and rewards stay at the boundary.
+            let (epoch_info, synthetic_epoch) = self.with_svm_writer(|svm_writer| {
+                let current = svm_writer.get_latest_absolute_slot();
+                let (target, unix_timestamp) = match config {
+                    TimeTravelConfig::AbsoluteSlot(slot) => (slot, None),
+                    _ => {
+                        let (epoch_info, epoch_schedule, slot_time, updated_at) = (
+                            svm_writer.latest_epoch_info.clone(),
+                            svm_writer.inner.epoch_schedule(),
+                            svm_writer.slot_time,
+                            svm_writer.updated_at,
+                        );
+                        let clock = calculate_time_travel_clock(
+                            &config,
+                            updated_at,
+                            slot_time,
+                            &epoch_info,
+                            &epoch_schedule,
+                        )
+                        .map_err(|e| SurfpoolError::internal(e.to_string()))?;
+                        (clock.slot, Some(clock.unix_timestamp.max(0) as u64 * 1_000))
+                    }
+                };
+                if target <= current {
+                    return Err(SurfpoolError::historical(
+                        "UNSUPPORTED_IN_HISTORICAL_MODE",
+                        &format!(
+                            "a historical fork only advances: slot {target} is not after {current}"
+                        ),
+                        None,
+                    ));
+                }
+                let schedule = svm_writer.inner.epoch_schedule();
+                let synthetic_epoch = schedule.get_epoch(target) != schedule.get_epoch(current);
+                svm_writer.bump_state_revision();
+                let epoch_info = svm_writer.advance_historical(
+                    target - current,
+                    unix_timestamp,
+                    synthetic_epoch,
+                )?;
+                Ok::<_, SurfpoolError>((epoch_info, synthetic_epoch))
+            })?;
+            if synthetic_epoch {
+                self.simnet_events_tx().warn(format!(
+                    "Synthetic epoch warp to slot {} (epoch {}): no epoch rewards, stake or feature changes were applied",
+                    epoch_info.absolute_slot, epoch_info.epoch
+                ));
+            } else {
+                self.simnet_events_tx().info(format!(
+                    "Advanced the historical fork to slot {} (epoch {})",
+                    epoch_info.absolute_slot, epoch_info.epoch
+                ));
+            }
+            return Ok(epoch_info);
+        }
         let (epoch_info, epoch_schedule, slot_time, updated_at) =
             self.with_svm_reader(|svm_reader| {
                 (
                     svm_reader.latest_epoch_info.clone(),
-                    svm_reader.inner.get_sysvar::<EpochSchedule>(),
+                    svm_reader.inner.epoch_schedule(),
                     svm_reader.slot_time,
                     svm_reader.updated_at,
                 )
@@ -4069,6 +4592,35 @@ impl SurfnetSvmLocker {
         self.with_svm_writer(|svm_writer| svm_writer.airdrop_pubkeys(lamports, addresses))
     }
 
+    /// Funds keys created for this session with `lamports`: on a historical fork a fresh key has
+    /// no archived image, so each is defined as a new system account; otherwise airdropped.
+    pub fn fund_session_addresses(&self, lamports: u64, addresses: &[Pubkey]) {
+        if !self.is_historical() {
+            return self.airdrop_pubkeys(lamports, addresses);
+        }
+        if lamports == 0 {
+            return;
+        }
+        for address in addresses {
+            let account = Account {
+                lamports,
+                ..Account::default()
+            };
+            let defined = self.with_svm_writer(|svm_writer| {
+                svm_writer.bump_state_revision();
+                svm_writer.set_account(address, account)
+            });
+            match defined {
+                Ok(()) => self.simnet_events_tx().info(format!(
+                    "Defined session account {address}: {lamports} lamports"
+                )),
+                Err(e) => self
+                    .simnet_events_tx()
+                    .error(format!("Session account {address} not defined: {e}")),
+            }
+        }
+    }
+
     /// Confirms the current block on the underlying SVM, returning `Ok(())` or an error.
     pub async fn confirm_current_block(
         &self,
@@ -4078,8 +4630,183 @@ impl SurfnetSvmLocker {
         // This prevents lock contention and potential deadlocks from mixing blocking and async locks
         let mut svm_writer = self.0.write().await;
         svm_writer.bump_state_revision();
-        svm_writer.confirm_current_block()?;
-        svm_writer.materialize_overrides(remote_ctx).await
+        svm_writer.begin_historical_write();
+        let confirmed = if svm_writer.inner.is_historical() {
+            // The historical slot stays frozen; only its queued transactions settle.
+            svm_writer.confirm_historical_block()
+        } else {
+            svm_writer.confirm_current_block()
+        };
+        let confirmed = match confirmed {
+            Ok(()) => svm_writer.materialize_overrides(remote_ctx).await,
+            error => error,
+        };
+        svm_writer.end_historical_write();
+        confirmed
+    }
+
+    /// Whether SVM Replay executes this surfnet (`surfpool start --after`).
+    pub fn is_historical(&self) -> bool {
+        self.with_svm_reader(|svm_reader| svm_reader.inner.is_historical())
+    }
+
+    /// The historical fork's archive reader, taken out of the lock: archive reads may wait on
+    /// SVM Replay's sources without holding up the VM.
+    pub(crate) fn archive_reader(&self) -> Option<ArchiveReader> {
+        self.with_svm_reader(|svm_reader| svm_reader.inner.archive_reader())
+    }
+
+    /// A historical fork's produced blocks from `start` up to `end`, ascending and at most
+    /// `limit`: archived ones before the boundary (SVM Replay, in bounded windows when no end
+    /// is given), then the fork's own completed blocks. The still-open current block and the
+    /// slots an advance passed over are not blocks.
+    pub fn historical_blocks(
+        &self,
+        reader: &ArchiveReader,
+        start: Slot,
+        end: Slot,
+        limit: usize,
+    ) -> SurfpoolResult<Vec<Slot>> {
+        const WINDOWS: usize = 4;
+        const MAX_SCAN_SLOTS: u64 = 500_001;
+        if end < start || limit == 0 {
+            return Ok(vec![]);
+        }
+        let boundary = self.with_svm_reader(|svm_reader| svm_reader.genesis_slot);
+        let mut slots: Vec<Slot> = Vec::new();
+        let mut from = start;
+        let mut remaining_scan = MAX_SCAN_SLOTS;
+        let window = (limit as u64).saturating_mul(2).clamp(64, 500_000);
+        for _ in 0..WINDOWS {
+            if remaining_scan == 0 {
+                break;
+            }
+            let to = end
+                .min(boundary.saturating_sub(1))
+                .min(from.saturating_add(window.min(remaining_scan) - 1));
+            if from >= boundary || to < from || slots.len() >= limit {
+                break;
+            }
+            let archived = reader.blocks(from, to)?;
+            slots.extend(serde_json::from_value::<Vec<Slot>>(archived).map_err(|e| {
+                SurfpoolError::historical(
+                    "SOURCE_INTEGRITY",
+                    &format!("archived block list is malformed: {e}"),
+                    None,
+                )
+            })?);
+            remaining_scan -= to - from + 1;
+            from = to + 1;
+        }
+        if slots.len() < limit && from <= end.min(boundary.saturating_sub(1)) && from < boundary {
+            return Err(SurfpoolError::historical_unavailable(
+                "getBlocksWithLimit",
+                "the archived produced-slot search reached its four-window/500001-slot work bound; narrow the search",
+            ));
+        }
+        if end >= boundary {
+            // The open current slot's block is stored too, but it is not complete yet.
+            let (stored, open) = self.with_svm_reader(|svm_reader| {
+                Ok::<_, SurfpoolError>((
+                    svm_reader.blocks.keys()?,
+                    svm_reader
+                        .historical_open_block
+                        .as_ref()
+                        .map(|(open, _)| *open),
+                ))
+            })?;
+            let mut local: Vec<Slot> = stored
+                .into_iter()
+                .filter(|slot| (start.max(boundary)..=end).contains(slot) && Some(*slot) != open)
+                .collect();
+            local.sort_unstable();
+            slots.extend(local);
+        }
+        slots.truncate(limit);
+        Ok(slots)
+    }
+
+    /// A historical fork's block time: archived before the boundary, its completed blocks'
+    /// own, none yet for the open current slot, none for slots an advance passed over.
+    pub fn historical_block_time(
+        &self,
+        reader: &ArchiveReader,
+        slot: Slot,
+    ) -> SurfpoolResult<Option<UnixTimestamp>> {
+        let (boundary, open, header) = self.with_svm_reader(|svm_reader| {
+            Ok::<_, SurfpoolError>((
+                svm_reader.genesis_slot,
+                svm_reader
+                    .historical_open_block
+                    .as_ref()
+                    .map(|(open, _)| *open),
+                svm_reader.blocks.get(&slot)?,
+            ))
+        })?;
+        if slot < boundary {
+            let archived =
+                reader
+                    .block(slot)
+                    .map_err(|error| match error.historical_rpc_code() {
+                        Some(code @ (-32007 | -32009)) => {
+                            SurfpoolError::historical_slot_skipped(slot, code)
+                        }
+                        _ => error,
+                    })?;
+            return match &archived["blockTime"] {
+                serde_json::Value::Null => Ok(None),
+                time => time.as_i64().map(Some).ok_or_else(|| {
+                    SurfpoolError::historical("SOURCE_INTEGRITY", "archived block time", None)
+                }),
+            };
+        }
+        match (header, open) {
+            (_, Some(open)) if slot == open => Err(SurfpoolError::block_not_available(
+                slot,
+                "the historical fork is still in this slot; its block completes when the fork advances",
+            )),
+            (Some(header), _) => Ok(Some(header.block_time)),
+            (None, Some(open)) if slot > open => Ok(None),
+            _ => Err(SurfpoolError::block_not_available(
+                slot,
+                "the historical fork advanced past this slot in one step; it has no block",
+            )),
+        }
+    }
+
+    /// Complete account scans need an index of every account at the fork's slot, which does
+    /// not exist for historical state. Surfpool's own index holds only the accounts this fork
+    /// loaded, so answering from it would silently drop accounts.
+    pub fn refuse_historical_scan(&self, method: &str) -> SurfpoolResult<()> {
+        if self.is_historical() {
+            return Err(SurfpoolError::historical_unavailable(
+                method,
+                "no index of every account exists at a historical slot, and Surfpool's index covers only the accounts this fork loaded",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Advances a historical fork by explicit local slots inside SVM Replay; its time moves
+    /// to `unix_time_ms` when given. Only `synthetic_epoch` lets it enter a later epoch.
+    pub fn advance_historical(
+        &self,
+        slots: u64,
+        unix_time_ms: Option<u64>,
+        synthetic_epoch: bool,
+    ) -> SurfpoolResult<EpochInfo> {
+        self.with_svm_writer(|svm_writer| {
+            svm_writer.bump_state_revision();
+            svm_writer.advance_historical(slots, unix_time_ms, synthetic_epoch)
+        })
+    }
+
+    /// One tick of a resumed historical clock: one local slot inside SVM Replay, its time
+    /// moving by the slot time as Surfpool's own blocks do. A tick never warps epochs.
+    pub fn advance_historical_tick(&self) -> SurfpoolResult<EpochInfo> {
+        self.with_svm_writer(|svm| {
+            svm.advance_historical(1, Some(svm.updated_at + svm.slot_time), false)
+        })
     }
 
     /// Subscribes for signature updates (confirmed/finalized) and returns a receiver of events.
@@ -4317,6 +5044,20 @@ impl SurfnetSvmLocker {
     }
 }
 
+/// The uploaded bytes must fit beside the loader metadata in one Solana account.
+pub(crate) fn program_write_end(offset: usize, len: usize) -> SurfpoolResult<usize> {
+    let max = solana_system_interface::MAX_PERMITTED_DATA_LENGTH as usize
+        - solana_loader_v3_interface::state::UpgradeableLoaderState::size_of_programdata_metadata();
+    offset
+        .checked_add(len)
+        .filter(|end| *end <= max)
+        .ok_or_else(|| {
+            SurfpoolError::invalid_params(format!(
+                "program write exceeds maximum program data length of {max} bytes"
+            ))
+        })
+}
+
 /// Helpers for writing program accounts
 impl SurfnetSvmLocker {
     pub async fn write_program(
@@ -4327,6 +5068,10 @@ impl SurfnetSvmLocker {
         data: &[u8],
         remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
     ) -> SurfpoolResult<()> {
+        program_write_end(offset, data.len())?;
+        if self.is_historical() {
+            return self.write_historical_program(program_id, authority, offset, data);
+        }
         let program_data_address = get_program_data_address(&program_id);
 
         let program_account = self
@@ -4359,6 +5104,109 @@ impl SurfnetSvmLocker {
             ));
         }
 
+        Ok(())
+    }
+
+    /// SVM Replay validates a program whenever its program data changes, unlike LiteSVM, so a
+    /// chunked upload never writes a partial program into the fork: the chunks collect as a
+    /// pending upload, and once the ELF holds everything its own headers describe, the
+    /// program data and program account are written as one atomic change. A program the
+    /// runtime refuses leaves the fork, including any program it replaces, unchanged.
+    fn write_historical_program(
+        &self,
+        program_id: Pubkey,
+        authority: Option<Pubkey>,
+        offset: usize,
+        data: &[u8],
+    ) -> SurfpoolResult<()> {
+        let end = program_write_end(offset, data.len())?;
+        let program_data_address = get_program_data_address(&program_id);
+        let written = self.with_svm_writer(|svm_writer| {
+            if let Some(account) = svm_writer.inner.get_account(&program_id)? {
+                if account.owner != solana_sdk_ids::bpf_loader_upgradeable::id()
+                    || !account.executable
+                {
+                    return Err(SurfpoolError::invalid_program_account(
+                        &program_id,
+                        "Account is not an executable BPF Upgradeable Loader program",
+                    ));
+                }
+            }
+            // The upgrade authority: the one given, else the existing program data's, else none
+            // (the system program, as local uploads default to).
+            let existing_authority = match svm_writer.inner.get_account(&program_data_address)? {
+                None => None,
+                Some(account) => match bincode::deserialize(&account.data) {
+                    Ok(
+                        solana_loader_v3_interface::state::UpgradeableLoaderState::ProgramData {
+                            upgrade_authority_address,
+                            ..
+                        },
+                    ) => upgrade_authority_address,
+                    _ => None,
+                },
+            };
+            let upgrade_authority_address = authority
+                .or(existing_authority)
+                .or(Some(solana_system_interface::program::id()));
+            let upload = svm_writer.historical_uploads.entry(program_id).or_default();
+            let Some(elf) = upload.stage(offset, end, data) else {
+                return Ok(None);
+            };
+            let serialize = |state| {
+                bincode::serialize(&state).map_err(|e| {
+                    SurfpoolError::internal(format!("Failed to serialize program state: {e}"))
+                })
+            };
+            let mut program_data = serialize(
+                solana_loader_v3_interface::state::UpgradeableLoaderState::ProgramData {
+                    slot: svm_writer.get_latest_absolute_slot(),
+                    upgrade_authority_address,
+                },
+            )?;
+            program_data.extend_from_slice(&elf);
+            let program = serialize(
+                solana_loader_v3_interface::state::UpgradeableLoaderState::Program {
+                    programdata_address: program_data_address,
+                },
+            )?;
+            let rent = |len| svm_writer.inner.minimum_balance_for_rent_exemption(len);
+            let accounts = vec![
+                (
+                    program_data_address,
+                    Account {
+                        lamports: rent(program_data.len()),
+                        data: program_data,
+                        owner: solana_sdk_ids::bpf_loader_upgradeable::id(),
+                        executable: false,
+                        rent_epoch: 0,
+                    },
+                ),
+                (
+                    program_id,
+                    Account {
+                        lamports: rent(program.len()),
+                        data: program,
+                        owner: solana_sdk_ids::bpf_loader_upgradeable::id(),
+                        executable: true,
+                        rent_epoch: 0,
+                    },
+                ),
+            ];
+            svm_writer.bump_state_revision();
+            svm_writer.set_historical_accounts(accounts)?;
+            svm_writer.historical_uploads.remove(&program_id);
+            Ok::<_, SurfpoolError>(Some(elf.len()))
+        })?;
+        match written {
+            Some(bytes) => self.simnet_events_tx().info(format!(
+                "Program {program_id} written ({bytes} bytes); callable from the next slot"
+            )),
+            None => self.simnet_events_tx().info(format!(
+                "Staged {} bytes of program {program_id} at offset {offset}; it activates once complete",
+                data.len()
+            )),
+        };
         Ok(())
     }
 
@@ -4458,6 +5306,7 @@ impl SurfnetSvmLocker {
         data: &[u8],
         remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
     ) -> SurfpoolResult<Account> {
+        program_write_end(offset, data.len())?;
         // Get or create program data account
         let SvmAccessContext {
             inner: program_data_result,
@@ -4627,9 +5476,48 @@ pub(crate) fn apply_rpc_filters(account_data: &[u8], filters: &[RpcFilterType]) 
     })
 }
 
-// used in the remote.rs
-pub fn is_supported_token_program(program_id: &Pubkey) -> bool {
-    *program_id == spl_token_interface::ID || *program_id == spl_token_2022_interface::ID
+pub use super::is_supported_token_program;
+
+/// Whether an uploaded ELF holds everything its own headers describe: the program and
+/// section header tables and every segment. A shorter upload is still in progress.
+fn elf_is_complete(elf: &[u8]) -> bool {
+    let number = |at: usize, len: usize| {
+        elf.get(at..at + len).map(|bytes| {
+            let mut value = [0u8; 8];
+            value[..len].copy_from_slice(bytes);
+            u64::from_le_bytes(value)
+        })
+    };
+    let (Some(phoff), Some(shoff), Some(phentsize), Some(phnum), Some(shentsize), Some(shnum)) = (
+        number(0x20, 8),
+        number(0x28, 8),
+        number(0x36, 2),
+        number(0x38, 2),
+        number(0x3A, 2),
+        number(0x3C, 2),
+    ) else {
+        return false;
+    };
+    if !elf.starts_with(b"\x7fELF") {
+        return false;
+    }
+    let mut end = shoff.saturating_add(shentsize.saturating_mul(shnum));
+    end = end.max(phoff.saturating_add(phentsize.saturating_mul(phnum)));
+    for index in 0..phnum {
+        let header = phoff.saturating_add(index.saturating_mul(phentsize));
+        let (Some(offset), Some(size)) = (
+            usize::try_from(header + 8)
+                .ok()
+                .and_then(|at| number(at, 8)),
+            usize::try_from(header + 32)
+                .ok()
+                .and_then(|at| number(at, 8)),
+        ) else {
+            return false;
+        };
+        end = end.max(offset.saturating_add(size));
+    }
+    elf.len() as u64 >= end
 }
 
 fn update_programdata_account(
@@ -4672,6 +5560,55 @@ fn update_programdata_account(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn security_program_upload_end_includes_metadata_and_rejects_overflow() {
+        let metadata =
+            solana_loader_v3_interface::state::UpgradeableLoaderState::size_of_programdata_metadata(
+            );
+        let max = solana_system_interface::MAX_PERMITTED_DATA_LENGTH as usize - metadata;
+        assert_eq!(super::program_write_end(max - 1, 1).unwrap(), max);
+        assert_eq!(super::program_write_end(0, max).unwrap(), max);
+        for (offset, len) in [
+            (max, 1),
+            (0, max + 1),
+            (usize::MAX, 1),
+            (usize::MAX, usize::MAX),
+        ] {
+            let error: jsonrpc_core::Error =
+                super::program_write_end(offset, len).unwrap_err().into();
+            assert_eq!(error.code, jsonrpc_core::ErrorCode::InvalidParams);
+        }
+    }
+
+    /// Only a table deactivated in an earlier slot is judged by SlotHashes.
+    #[test]
+    fn only_a_table_deactivated_earlier_needs_slot_hashes() {
+        use solana_address_lookup_table_interface::state::LookupTableMeta;
+        use solana_clock::Slot;
+        let meta = |deactivation_slot| LookupTableMeta {
+            deactivation_slot,
+            ..LookupTableMeta::default()
+        };
+        assert!(!super::lookup_status_needs_slot_hashes(
+            &meta(Slot::MAX),
+            100
+        ));
+        assert!(!super::lookup_status_needs_slot_hashes(&meta(100), 100));
+        assert!(super::lookup_status_needs_slot_hashes(&meta(99), 100));
+    }
+
+    #[test]
+    fn an_uploaded_elf_is_complete_only_once_everything_its_headers_describe_arrived() {
+        let elf = crate::surfnet::noop_program::NOOP_PROGRAM_ELF;
+        assert!(super::elf_is_complete(elf));
+        for cut in [0, 4, 63, 64, elf.len() / 2, elf.len() - 1] {
+            assert!(!super::elf_is_complete(&elf[..cut]), "{cut} bytes");
+        }
+        let mut not_elf = elf.to_vec();
+        not_elf[0] = 0;
+        assert!(!super::elf_is_complete(&not_elf));
+    }
+
     use std::{
         collections::HashMap,
         sync::{
@@ -4822,7 +5759,8 @@ mod tests {
         assert_eq!(
             svm_locker.with_svm_reader(|svm| {
                 svm.inner
-                    .get_sysvar::<solana_sysvar::last_restart_slot::LastRestartSlot>()
+                    .read_sysvar::<solana_sysvar::last_restart_slot::LastRestartSlot>()
+                    .expect("sysvar")
                     .last_restart_slot
             }),
             246_464_040
@@ -4854,10 +5792,12 @@ mod tests {
 
         // This represents a request that observed the account as absent and
         // is now blocked on its upstream response.
-        assert!(
-            locker
-                .with_svm_reader(|svm| { svm.inner.get_account_no_db(&created_pubkey).is_none() })
-        );
+        assert!(locker.with_svm_reader(|svm| {
+            svm.inner
+                .get_account_no_db(&created_pubkey)
+                .unwrap()
+                .is_none()
+        }));
 
         let _ = locker.airdrop(&payer.pubkey(), 1_000_000_000).unwrap();
         let rent_exempt_lamports =
@@ -4899,11 +5839,11 @@ mod tests {
             let in_memory = svm
                 .inner
                 .get_account_no_db(&created_pubkey)
+                .unwrap()
                 .expect("locally created account should remain in LiteSVM");
             let in_db: Account = svm
                 .inner
-                .db
-                .as_ref()
+                .account_db()
                 .expect("configured account database should exist")
                 .get(&created_pubkey.to_string())
                 .unwrap()
@@ -4972,12 +5912,13 @@ mod tests {
 
         locker.with_svm_reader(|svm| {
             assert_eq!(
-                svm.inner.get_account_no_db(&dependency),
+                svm.inner.get_account_no_db(&dependency).unwrap(),
                 Some(local_dependency)
             );
             assert_eq!(
                 svm.inner
                     .get_account_no_db(&primary)
+                    .unwrap()
                     .expect("primary account should be hydrated")
                     .lamports,
                 5
@@ -5044,12 +5985,13 @@ mod tests {
 
         locker.with_svm_reader(|svm| {
             assert_eq!(
-                svm.inner.get_account_no_db(&locally_written),
+                svm.inner.get_account_no_db(&locally_written).unwrap(),
                 Some(local_account)
             );
             assert_eq!(
                 svm.inner
                     .get_account_no_db(&missing)
+                    .unwrap()
                     .expect("missing account should be hydrated")
                     .lamports,
                 2
@@ -6325,7 +7267,7 @@ mod tests {
         snapshot.insert(Pubkey::new_unique().to_string(), None);
 
         // Clock sysvar (rejected: surfpool maintains it)
-        let clock_before = locker.with_svm_reader(|svm| svm.inner.get_sysvar::<Clock>());
+        let clock_before = locker.with_svm_reader(|svm| svm.inner.clock());
         snapshot.insert(
             solana_sdk_ids::sysvar::clock::ID.to_string(),
             Some(AccountSnapshot {
@@ -6350,7 +7292,7 @@ mod tests {
             .unwrap();
         assert_eq!(loaded, 1);
         assert_eq!(
-            locker.with_svm_reader(|svm| svm.inner.get_sysvar::<Clock>()),
+            locker.with_svm_reader(|svm| svm.inner.clock()),
             clock_before
         );
 
@@ -7290,7 +8232,7 @@ mod tests {
             .expect("initialize should succeed");
 
         let epoch_schedule =
-            svm_locker.with_svm_reader(|svm_reader| svm_reader.inner.get_sysvar::<EpochSchedule>());
+            svm_locker.with_svm_reader(|svm_reader| svm_reader.inner.epoch_schedule());
 
         assert!(
             !epoch_schedule.warmup,
