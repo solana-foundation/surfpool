@@ -2262,6 +2262,7 @@ impl SurfnetSvm {
             return Err(FailedTransactionMetadata {
                 err: TransactionError::SignatureFailure,
                 meta: TransactionMetadata::default(),
+                fee_charged: false,
             });
         }
 
@@ -2269,6 +2270,7 @@ impl SurfnetSvm {
             return Err(FailedTransactionMetadata {
                 err: TransactionError::AlreadyProcessed,
                 meta: TransactionMetadata::default(),
+                fee_charged: false,
             });
         }
         Ok(())
@@ -2771,7 +2773,11 @@ impl SurfnetSvm {
 
             self.simnet_events_tx
                 .transaction_processed(transaction_meta, Some(err.clone()));
-            return Err(FailedTransactionMetadata { err, meta });
+            return Err(FailedTransactionMetadata {
+                err,
+                meta,
+                fee_charged: false,
+            });
         }
 
         match self.inner.send_transaction(tx.clone()) {
@@ -2848,7 +2854,11 @@ impl SurfnetSvm {
             let meta = TransactionMetadata::default();
             let err = TransactionError::BlockhashNotFound;
 
-            return Err(FailedTransactionMetadata { err, meta });
+            return Err(FailedTransactionMetadata {
+                err,
+                meta,
+                fee_charged: false,
+            });
         }
         self.inner.simulate_transaction(tx)
     }
