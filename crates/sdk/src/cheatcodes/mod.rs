@@ -10,6 +10,7 @@ use solana_pubkey::Pubkey;
 use solana_rpc_client::rpc_client::RpcClient;
 use solana_signer::Signer;
 use spl_associated_token_account_interface::address::get_associated_token_address_with_program_id;
+use surfpool_types::CheatcodeFilter;
 
 use crate::error::{SurfnetError, SurfnetResult};
 pub mod builders;
@@ -300,6 +301,32 @@ impl<'a> Cheatcodes<'a> {
         self.time_travel(serde_json::json!([{ "absoluteTimestamp": timestamp }]))
     }
 
+    /// Move Surfnet to an absolute slot reached at a given Unix timestamp in
+    /// milliseconds, instead of a timestamp extrapolated from the slot time.
+    ///
+    /// Use it to restore a mainnet snapshot at the slot and time it was taken:
+    /// programs that compare the clock's slot and unix time (oracle staleness,
+    /// funding, expiries) then see the same clock they saw on mainnet.
+    ///
+    /// ```rust
+    /// use surfpool_sdk::Surfnet;
+    ///
+    /// # async fn example() {
+    /// let surfnet = Surfnet::start().await.unwrap();
+    /// let cheats = surfnet.cheatcodes();
+    ///
+    /// let epoch_info = cheats
+    ///     .time_travel_to_slot_at(462_246_025, 1_761_523_200_000)
+    ///     .unwrap();
+    /// assert_eq!(epoch_info.absolute_slot, 462_246_025);
+    /// # }
+    /// ```
+    pub fn time_travel_to_slot_at(&self, slot: u64, timestamp: u64) -> SurfnetResult<EpochInfo> {
+        self.time_travel(serde_json::json!([{
+            "absoluteSlotAt": { "slot": slot, "timestamp": timestamp }
+        }]))
+    }
+
     /// Deploy a program from local workspace artifacts.
     ///
     /// This looks for:
@@ -430,6 +457,36 @@ impl<'a> Cheatcodes<'a> {
     }
 
     /// Internal helper for cheatcodes that return `()`.
+    /// Lock cheatcodes for the life of the surfnet: `surfnet_disableCheatcode`
+    /// with `{"lockout": true}`. Nothing turns them back on.
+    ///
+    /// [`CheatcodeFilter::all`] locks the whole surfnet: every `surfnet_*`
+    /// method (this one and `surfnet_enableCheatcode` included),
+    /// `requestAirdrop`, and the admin methods that stop the surfnet or load
+    /// plugins. Use it to hand a surfnet to untrusted code after setting it
+    /// up. [`CheatcodeFilter::list`] locks only those methods; the rest keep
+    /// working and can be locked later.
+    ///
+    /// ```rust
+    /// use surfpool_sdk::{CheatcodeFilter, Pubkey, Surfnet};
+    ///
+    /// # async fn example() {
+    /// let surfnet = Surfnet::start().await.unwrap();
+    /// let cheats = surfnet.cheatcodes();
+    /// let player = Pubkey::new_unique();
+    /// cheats.fund_sol(&player, 1_000_000_000).unwrap();
+    ///
+    /// cheats.lock(CheatcodeFilter::all()).unwrap();
+    /// assert!(cheats.fund_sol(&player, 2_000_000_000).is_err());
+    /// # }
+    /// ```
+    pub fn lock(&self, cheatcodes: CheatcodeFilter) -> SurfnetResult<()> {
+        self.call_cheatcode(
+            "surfnet_disableCheatcode",
+            serde_json::json!([cheatcodes, { "lockout": true }]),
+        )
+    }
+
     fn call_cheatcode(&self, method: &'static str, params: serde_json::Value) -> SurfnetResult<()> {
         let client = self.rpc_client();
         client

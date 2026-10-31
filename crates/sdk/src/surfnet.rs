@@ -1,5 +1,7 @@
 use std::{
+    collections::BTreeMap,
     net::TcpListener,
+    path::PathBuf,
     thread::sleep,
     time::{Duration, Instant},
 };
@@ -15,8 +17,8 @@ use surfpool_core::surfnet::{
     svm::{SurfnetSvm, SurfnetSvmConfig},
 };
 use surfpool_types::{
-    BlockProductionMode, RpcConfig, SimnetCommand, SimnetConfig, SimnetEvent, SurfpoolConfig,
-    SvmFeatureConfig,
+    AccountSnapshot, BlockProductionMode, CheatcodeFilter, DEFAULT_PROFILING_MAP_CAPACITY,
+    RpcConfig, SimnetCommand, SimnetConfig, SimnetEvent, SurfpoolConfig, SvmFeatureConfig,
 };
 
 use crate::{
@@ -50,6 +52,16 @@ pub struct SurfnetBuilder {
     skip_blockhash_check: bool,
     payer: Option<Keypair>,
     feature_config: SvmFeatureConfig,
+    cheatcode_lock: Option<CheatcodeFilter>,
+    snapshots: Vec<SnapshotSource>,
+    instruction_profiling: bool,
+    max_profiles: usize,
+}
+
+/// Accounts to preload at startup, in the order they were added to the builder.
+enum SnapshotSource {
+    Accounts(BTreeMap<String, Option<AccountSnapshot>>),
+    File(PathBuf),
 }
 
 impl Default for SurfnetBuilder {
@@ -64,11 +76,35 @@ impl Default for SurfnetBuilder {
             skip_blockhash_check: false,
             payer: None,
             feature_config: SvmFeatureConfig::default(),
+            cheatcode_lock: None,
+            snapshots: vec![],
+            instruction_profiling: true,
+            max_profiles: DEFAULT_PROFILING_MAP_CAPACITY,
         }
     }
 }
 
 impl SurfnetBuilder {
+    /// Profile every instruction of every transaction. Default: `true`.
+    ///
+    /// Each profile re-executes the transaction instruction by instruction
+    /// and keeps the accounts it touched before and after. That is what
+    /// `surfnet_getTransactionProfile` serves, and it costs CPU and memory
+    /// per transaction: turn it off for surfnets that run many transactions
+    /// over large accounts.
+    pub fn instruction_profiling(mut self, enabled: bool) -> Self {
+        self.instruction_profiling = enabled;
+        self
+    }
+
+    /// How many transaction profiles to keep, executed and simulated each,
+    /// oldest dropped first. Default: [`DEFAULT_PROFILING_MAP_CAPACITY`].
+    /// At least 1.
+    pub fn max_profiles(mut self, max: usize) -> Self {
+        self.max_profiles = max.max(1);
+        self
+    }
+
     /// Run in offline mode (no mainnet RPC fallback). Default: `true`.
     pub fn offline(mut self, offline: bool) -> Self {
         self.offline_mode = offline;
@@ -137,6 +173,63 @@ impl SurfnetBuilder {
         self
     }
 
+    /// Lock cheatcodes before the surfnet accepts its first request, as if
+    /// by `surfnet_disableCheatcode` with `{"lockout": true}`. Nothing can
+    /// unlock them.
+    ///
+    /// [`CheatcodeFilter::all`] locks the whole surfnet: every `surfnet_*`
+    /// method, `requestAirdrop`, the `snapshotSubscribe` WebSocket import,
+    /// and the admin methods that stop the surfnet or load plugins, so it behaves like a plain validator RPC for every
+    /// client. [`CheatcodeFilter::list`] locks only those methods;
+    /// [`Self::start`] fails with [`SurfnetError::Startup`] if one of them
+    /// isn't a cheatcode.
+    ///
+    /// Startup airdrops (the payer, [`Self::airdrop_addresses`]) still land,
+    /// and [`Surfnet::stop`] still works: neither goes through RPC. To set up
+    /// state with cheatcodes first, leave this off and call
+    /// [`Cheatcodes::lock`] once setup is done.
+    ///
+    /// ```rust
+    /// use surfpool_sdk::{CheatcodeFilter, Surfnet};
+    ///
+    /// # async fn example() {
+    /// let sandbox = Surfnet::builder()
+    ///     .lock_cheatcodes(CheatcodeFilter::all())
+    ///     .start()
+    ///     .await
+    ///     .unwrap();
+    /// # }
+    /// ```
+    pub fn lock_cheatcodes(mut self, cheatcodes: CheatcodeFilter) -> Self {
+        self.cheatcode_lock = Some(cheatcodes);
+        self
+    }
+
+    /// Preload accounts at startup, in the format returned by the
+    /// `surfnet_exportSnapshot` RPC method. Mirrors the CLI's `--snapshot` flag.
+    ///
+    /// Keys are base58 pubkeys. A `None` value fetches the account from the
+    /// remote RPC, so it is skipped when running offline. Can be called
+    /// multiple times, together with [`Self::snapshot_file`]: when two
+    /// snapshots hold the same pubkey, the one added last wins. A snapshot
+    /// also wins over startup airdrops: restoring the payer, or one of
+    /// [`Self::airdrop_addresses`], keeps the restored balance.
+    pub fn snapshot(mut self, accounts: BTreeMap<String, Option<AccountSnapshot>>) -> Self {
+        self.snapshots.push(SnapshotSource::Accounts(accounts));
+        self
+    }
+
+    /// Preload accounts at startup from a JSON file written from the
+    /// `surfnet_exportSnapshot` RPC output. Mirrors the CLI's `--snapshot` flag.
+    ///
+    /// The file is read when [`Self::start`] runs, which returns
+    /// [`SurfnetError::Startup`] if it can't be read or parsed. See
+    /// [`Self::snapshot`] for how multiple snapshots are merged.
+    pub fn snapshot_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.snapshots.push(SnapshotSource::File(path.into()));
+        self
+    }
+
     /// Start the surfnet with the configured options.
     pub async fn start(self) -> SurfnetResult<Surfnet> {
         let SurfnetBuilder {
@@ -149,8 +242,17 @@ impl SurfnetBuilder {
             skip_blockhash_check,
             payer,
             feature_config,
+            cheatcode_lock,
+            snapshots,
+            instruction_profiling,
+            max_profiles,
         } = self;
+        if let Some(lock) = &cheatcode_lock {
+            lock.validate()
+                .map_err(|e| SurfnetError::Startup(format!("cannot lock cheatcodes: {e}")))?;
+        }
         let payer = payer.unwrap_or_else(Keypair::new);
+        let snapshot = merge_snapshots(snapshots)?;
 
         let bind_port = get_free_port()?;
         let ws_port = get_free_port()?;
@@ -158,7 +260,13 @@ impl SurfnetBuilder {
 
         let mut startup_airdrop_addresses = vec![payer.pubkey()];
         startup_airdrop_addresses.extend(airdrop_addresses);
-        let startup_airdrop_addresses_for_rpc = startup_airdrop_addresses.clone();
+        // Startup airdrops land before the snapshot loads, so an address the
+        // snapshot restores keeps its restored balance: only wait for the rest.
+        let startup_airdrop_addresses_for_rpc: Vec<Pubkey> = startup_airdrop_addresses
+            .iter()
+            .filter(|address| !matches!(snapshot.get(&address.to_string()), Some(Some(_))))
+            .copied()
+            .collect();
 
         // The default StartupPlanner::Runloop makes the runloop seal an empty
         // startup plan before announcing Ready, so wait_for_ready below
@@ -173,12 +281,16 @@ impl SurfnetBuilder {
                 airdrop_addresses: startup_airdrop_addresses,
                 airdrop_token_amount: airdrop_lamports,
                 skip_blockhash_check,
+                snapshot,
+                instruction_profiling_enabled: instruction_profiling,
+                max_profiles,
                 ..Default::default()
             }],
             rpc: RpcConfig {
                 bind_host: bind_host.clone(),
                 bind_port,
                 ws_port,
+                cheatcode_lock,
                 ..Default::default()
             },
             ..Default::default()
@@ -297,6 +409,19 @@ impl Surfnet {
         Cheatcodes::new(&self.rpc_url)
     }
 
+    /// Slots that arrived late, in [`BlockProductionMode::Clock`]: clock ticks
+    /// coalesced because block production fell behind (a starved CPU, a host
+    /// that slept). The chain stretched instead of bursting, so clients still
+    /// saw every slot, but each of those slots lasted longer than the slot
+    /// time. Read it before and after a run: a non-zero difference means the
+    /// run's timing was degraded and wall-clock-sensitive results may differ.
+    pub fn coalesced_slots(&self) -> u64 {
+        self.svm_locker.with_svm_reader(|svm| {
+            svm.coalesced_slots
+                .load(std::sync::atomic::Ordering::Relaxed)
+        })
+    }
+
     /// Get a reference to the simnet events receiver for observing runtime events.
     pub fn events(&self) -> &Receiver<SimnetEvent> {
         &self.simnet_events_rx
@@ -367,6 +492,33 @@ impl Drop for Surfnet {
             let _ = self.simnet_commands_tx.send(SimnetCommand::Terminate(None));
         }
     }
+}
+
+fn merge_snapshots(
+    sources: Vec<SnapshotSource>,
+) -> SurfnetResult<BTreeMap<String, Option<AccountSnapshot>>> {
+    let mut merged = BTreeMap::new();
+    for source in sources {
+        let accounts = match source {
+            SnapshotSource::Accounts(accounts) => accounts,
+            SnapshotSource::File(path) => {
+                let contents = std::fs::read_to_string(&path).map_err(|e| {
+                    SurfnetError::Startup(format!(
+                        "failed to read snapshot file '{}': {e}",
+                        path.display()
+                    ))
+                })?;
+                serde_json::from_str(&contents).map_err(|e| {
+                    SurfnetError::Startup(format!(
+                        "failed to parse snapshot file '{}': {e}",
+                        path.display()
+                    ))
+                })?
+            }
+        };
+        merged.extend(accounts);
+    }
+    Ok(merged)
 }
 
 fn get_free_port() -> SurfnetResult<u16> {

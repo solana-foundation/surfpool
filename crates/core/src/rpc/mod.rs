@@ -14,7 +14,7 @@ use jsonrpc_core::{
 };
 use jsonrpc_pubsub::{PubSubMetadata, Session};
 use solana_clock::Slot;
-use surfpool_types::{CheatcodeConfig, SimnetCommand, types::RpcConfig};
+use surfpool_types::{CheatcodeConfig, SimnetCommand, is_gated_method, types::RpcConfig};
 
 use crate::{
     error::{SurfpoolError, SurfpoolResult},
@@ -136,7 +136,7 @@ impl SurfpoolMiddleware {
             simnet_commands_tx: simnet_commands_tx.clone(),
             config: config.clone(),
             remote_rpc_client: remote_rpc_client.clone(),
-            cheatcode_config: CheatcodeConfig::new(),
+            cheatcode_config: CheatcodeConfig::with_lock(config.cheatcode_lock.as_ref()),
             plugin_commands_tx,
         }
     }
@@ -144,7 +144,7 @@ impl SurfpoolMiddleware {
     /// `Some` when the call must not reach the handler. Cheatcode gating sits above the method
     /// table rather than in it, so it has to run once per batch element, not once per request.
     fn disabled_cheatcode_error(&self, method_name: &str) -> Option<Error> {
-        if !method_name.starts_with("surfnet_") {
+        if !is_gated_method(method_name) {
             return None;
         }
 
@@ -381,6 +381,30 @@ impl SurfpoolWebsocketMiddleware {
             .collect::<HashSet<_>>();
         let mut notification_ids = HashSet::new();
 
+        // Gated methods are refused per element, as over HTTP.
+        let mut rejected = Vec::new();
+        let calls: Vec<Call> = calls
+            .into_iter()
+            .filter(|call| {
+                let (method, id, jsonrpc) = match call {
+                    Call::MethodCall(c) => (&c.method, Some(&c.id), c.jsonrpc),
+                    Call::Notification(n) => (&n.method, None, n.jsonrpc),
+                    Call::Invalid { .. } => return true,
+                };
+                let Some(error) = self.surfpool_middleware.disabled_cheatcode_error(method) else {
+                    return true;
+                };
+                if let Some(id) = id {
+                    rejected.push(Output::from(Err(error), id.clone(), jsonrpc));
+                }
+                false
+            })
+            .collect();
+        if calls.is_empty() {
+            let response = (!rejected.is_empty()).then_some(Response::Batch(rejected));
+            return Either::Left(Box::pin(async move { response }));
+        }
+
         let calls = calls
             .into_iter()
             .enumerate()
@@ -410,8 +434,10 @@ impl SurfpoolWebsocketMiddleware {
             move |response| match response {
                 Some(Response::Batch(mut outputs)) => {
                     outputs.retain(|output| !notification_ids.contains(output.id()));
+                    outputs.extend(rejected);
                     (!outputs.is_empty()).then_some(Response::Batch(outputs))
                 }
+                None if !rejected.is_empty() => Some(Response::Batch(rejected)),
                 response => response,
             },
         )))
@@ -447,7 +473,25 @@ impl Middleware<Option<SurfpoolWebsocketMeta>> for SurfpoolWebsocketMiddleware {
             .or(self.session.clone());
         let meta = Some(SurfpoolWebsocketMeta::new(runloop_context, session));
 
+        // A locked surfnet refuses gated methods over WebSocket too
+        // (`snapshotSubscribe` would otherwise overwrite accounts).
+        let disabled = |method: &str| self.surfpool_middleware.disabled_cheatcode_error(method);
         match request {
+            Request::Single(Call::MethodCall(method_call))
+                if let Some(error) = disabled(&method_call.method) =>
+            {
+                let response = Response::Single(Output::from(
+                    Err(error),
+                    method_call.id,
+                    method_call.jsonrpc,
+                ));
+                Either::Left(Box::pin(async move { Some(response) }))
+            }
+            Request::Single(Call::Notification(notification))
+                if disabled(&notification.method).is_some() =>
+            {
+                Either::Left(Box::pin(async { None }))
+            }
             Request::Single(Call::Notification(notification)) => {
                 // WebSocket unsubscribe RPCs are registered as methods. Dispatch notifications
                 // through those handlers, then discard every possible result.
@@ -650,6 +694,91 @@ mod tests {
         });
 
         (io, unsubscribe_counter)
+    }
+
+    /// A WebSocket handler whose `snapshotSubscribe` counts the calls that reach it.
+    fn locked_websocket_handler(
+        lock_all: bool,
+    ) -> (
+        MetaIoHandler<Option<SurfpoolWebsocketMeta>, SurfpoolWebsocketMiddleware>,
+        Arc<AtomicUsize>,
+    ) {
+        let (surfnet_svm, _events_rx, _) = SurfnetSvm::default();
+        let (simnet_commands_tx, _rx) = crossbeam_channel::unbounded();
+        let (plugin_commands_tx, _rx) = crossbeam_channel::unbounded();
+        let middleware = SurfpoolMiddleware::new(
+            SurfnetSvmLocker::new(surfnet_svm),
+            &simnet_commands_tx,
+            &RpcConfig::default(),
+            &None,
+            plugin_commands_tx,
+        );
+        if lock_all {
+            middleware.cheatcode_config.lock().unwrap().lock_all();
+        }
+
+        let mut io =
+            MetaIoHandler::with_middleware(SurfpoolWebsocketMiddleware::new(middleware, None));
+        io.add_method_with_meta("getSlot", |_params, _meta| async { Ok(Value::from(45)) });
+        let imports = Arc::new(AtomicUsize::new(0));
+        let counter = imports.clone();
+        io.add_method_with_meta("snapshotSubscribe", move |_params, _meta| {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok(Value::from(1))
+            }
+        });
+        (io, imports)
+    }
+
+    /// A fully locked surfnet refuses snapshot imports over WebSocket, alone,
+    /// in a batch, and as a notification, while other methods still answer.
+    #[tokio::test]
+    async fn a_full_lock_refuses_websocket_snapshot_imports() {
+        let (handler, imports) = locked_websocket_handler(true);
+        let refused = json!({
+            "code": -32600,
+            "message": "Cheatcode rpc method: snapshotSubscribe is currently disabled"
+        });
+
+        let single =
+            r#"{"jsonrpc":"2.0","id":1,"method":"snapshotSubscribe","params":["http://x"]}"#;
+        let response = handler.handle_request(single, None).await.unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&response).unwrap(),
+            json!({"jsonrpc": "2.0", "error": refused, "id": 1})
+        );
+
+        let batch = r#"[{"jsonrpc":"2.0","id":2,"method":"getSlot"},{"jsonrpc":"2.0","id":3,"method":"snapshotSubscribe","params":["http://x"]},{"jsonrpc":"2.0","method":"snapshotSubscribe","params":["http://x"]}]"#;
+        let response = handler.handle_request(batch, None).await.unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&response).unwrap(),
+            json!([
+                {"jsonrpc": "2.0", "result": 45, "id": 2},
+                {"jsonrpc": "2.0", "error": refused, "id": 3}
+            ])
+        );
+
+        let notification =
+            r#"{"jsonrpc":"2.0","method":"snapshotSubscribe","params":["http://x"]}"#;
+        assert_eq!(handler.handle_request(notification, None).await, None);
+        assert_eq!(imports.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn an_unlocked_surfnet_accepts_websocket_snapshot_imports() {
+        let (handler, imports) = locked_websocket_handler(false);
+        let single =
+            r#"{"jsonrpc":"2.0","id":1,"method":"snapshotSubscribe","params":["http://x"]}"#;
+
+        let response = handler.handle_request(single, None).await.unwrap();
+
+        assert_eq!(
+            serde_json::from_str::<Value>(&response).unwrap(),
+            json!({"jsonrpc": "2.0", "result": 1, "id": 1})
+        );
+        assert_eq!(imports.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
