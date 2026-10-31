@@ -180,7 +180,7 @@ tracing = { version = "0.1.41", default-features = false }
 url = { version = "1.7.2", default-features = false }
 uuid = "1.15.1"
 wincode = "0.6"
-zip = { version = "0.6", features = ["deflate"], default-features = false }
+zip = { version = "9.0", features = ["deflate"], default-features = false }
 sha2 = { version = "0.10" }
 
 surfpool-core = { path = "crates/core", default-features = false, version = "1.7.0"}
