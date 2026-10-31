@@ -586,6 +586,15 @@ pub struct SurfnetSvm {
     pub updated_at: u64,
     pub slot_time: u64,
     pub start_time: SystemTime,
+    /// Clock-mode ticks the clock dropped because block production was
+    /// behind: each is a slot that came later than `slot_time` promised,
+    /// instead of arriving in a burst. Shared with the clock thread.
+    pub coalesced_slots: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Whether blocks are produced in `BlockProductionMode::Clock`, so a
+    /// dropped tick is a late slot. Set by block production, read by the
+    /// clock thread: ticks dropped in other modes produce no block and
+    /// aren't counted in `coalesced_slots`.
+    pub clock_driven: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub accounts_by_owner: Box<dyn Storage<String, Vec<String>>>,
     pub account_associated_data: Box<dyn Storage<String, SerializableAccountAdditionalData>>,
     pub token_accounts: Box<dyn Storage<String, TokenAccount>>,
@@ -967,6 +976,8 @@ impl SurfnetSvm {
             updated_at: self.updated_at,
             slot_time: self.slot_time,
             start_time: self.start_time,
+            coalesced_slots: self.coalesced_slots.clone(),
+            clock_driven: self.clock_driven.clone(),
 
             total_supply: self.total_supply,
             circulating_supply: self.circulating_supply,
@@ -1404,18 +1415,20 @@ impl SurfnetSvm {
             storage_backend.open_store("registered_idls")?;
         let profile_tag_map_db: Box<dyn Storage<String, Vec<UuidOrSignature>>> =
             storage_backend.open_store("profile_tag_map")?;
+        // Ensure max_profiles is at least 1 to avoid creating a zero-capacity FifoMap
+        let max_profiles = max(1, config.max_profiles);
+        // Use FifoMap for both profile stores to maintain FIFO eviction behavior
+        // (when no on-disk DB is provided)
         let simulated_transaction_profiles_db: Box<dyn Storage<String, KeyedProfileResult>> =
-            storage_backend.open_store("simulated_transaction_profiles")?;
-        let executed_transaction_profiles_db: Box<dyn Storage<String, KeyedProfileResult>> = {
-            // Ensure max_profiles is at least 1 to avoid creating a zero-capacity FifoMap
-            let max_profiles = max(1, config.max_profiles);
-            storage_backend.open_store_with_default(
-                "executed_transaction_profiles",
-                // Use FifoMap for executed_transaction_profiles to maintain FIFO eviction behavior
-                // (when no on-disk DB is provided)
-                move || Box::new(FifoMap::<String, KeyedProfileResult>::new(max_profiles)),
-            )?
-        };
+            storage_backend
+                .open_store_with_default("simulated_transaction_profiles", move || {
+                    Box::new(FifoMap::<String, KeyedProfileResult>::new(max_profiles))
+                })?;
+        let executed_transaction_profiles_db: Box<dyn Storage<String, KeyedProfileResult>> =
+            storage_backend
+                .open_store_with_default("executed_transaction_profiles", move || {
+                    Box::new(FifoMap::<String, KeyedProfileResult>::new(max_profiles))
+                })?;
         let epoch_schedule = Self::default_epoch_schedule();
         let epoch_info = Self::default_epoch_info(&epoch_schedule);
         let default_genesis_slot = epoch_info.absolute_slot;
@@ -1474,6 +1487,8 @@ impl SurfnetSvm {
             updated_at,
             slot_time: config.slot_time,
             start_time: SystemTime::now(),
+            coalesced_slots: Default::default(),
+            clock_driven: Default::default(),
             accounts_by_owner: accounts_by_owner_db,
             account_associated_data: account_associated_data_db,
             token_accounts: token_accounts_db,
@@ -2311,6 +2326,40 @@ impl SurfnetSvm {
             self.index_token_account_variant(pubkey, &pubkey_str, account)?;
             self.index_mint_account_variant(pubkey, account)?;
             self.index_token_2022_mint_extensions(pubkey, account)?;
+        }
+        Ok(())
+    }
+
+    /// Index historical token inputs without writing their images back to the fork.
+    pub(crate) fn index_historical_transaction_tokens(
+        &mut self,
+        pubkeys: &[Pubkey],
+    ) -> SurfpoolResult<()> {
+        for pubkey in pubkeys {
+            let key = pubkey.to_string();
+            if self.token_accounts.get(&key)?.is_none() && self.token_mints.get(&key)?.is_none() {
+                let Some(account) = self.inner.get_account(pubkey)? else {
+                    continue;
+                };
+                if is_supported_token_program(&account.owner) {
+                    self.index_token_account_variant(pubkey, &key, &account)?;
+                    self.index_mint_account_variant(pubkey, &account)?;
+                    self.index_token_2022_mint_extensions(pubkey, &account)?;
+                }
+            }
+            let Some(token) = self.token_accounts.get(&key)? else {
+                continue;
+            };
+            let mint = token.mint();
+            if self.token_mints.get(&mint.to_string())?.is_none() {
+                let Some(account) = self.inner.get_account(&mint)? else {
+                    continue;
+                };
+                if is_supported_token_program(&account.owner) {
+                    self.index_mint_account_variant(&mint, &account)?;
+                    self.index_token_2022_mint_extensions(&mint, &account)?;
+                }
+            }
         }
         Ok(())
     }
@@ -3226,6 +3275,15 @@ impl SurfnetSvm {
                 max_transactions_per_entry: num_transactions,
             },
         });
+
+        self.record_local_slot_history(slot)?;
+        self.stream_local_sysvars(
+            slot,
+            [
+                solana_sdk_ids::sysvar::slot_history::ID,
+                solana_sdk_ids::sysvar::recent_blockhashes::ID,
+            ],
+        )?;
 
         // The block's entry goes before its metadata: Yellowstone drops the metadata of an empty
         // block whose entry arrives after it.
@@ -4429,7 +4487,7 @@ impl SurfnetSvm {
 
     /// Announces the open slot on its parent block, as Agave does when it creates the slot's
     /// bank: at startup, after each block, after a time travel and a reset. A skipped slot gets
-    /// none.
+    /// none. Normal surfnets stream the open bank's Clock and SlotHashes first.
     pub fn announce_open_slot(&mut self) -> SurfpoolResult<()> {
         let slot = self.get_latest_absolute_slot();
         let parent = if self.inner.is_historical() {
@@ -4448,6 +4506,15 @@ impl SurfnetSvm {
         };
         let root = self.slot_for_commitment(&CommitmentConfig::finalized());
         self.notify_slot_subscribers(slot, parent, root);
+        if !self.inner.is_historical() {
+            self.stream_local_sysvars(
+                slot,
+                [
+                    solana_sdk_ids::sysvar::clock::ID,
+                    solana_sdk_ids::sysvar::slot_hashes::ID,
+                ],
+            )?;
+        }
         let timestamp = Utc::now().timestamp_millis().max(0) as u64;
         self.emit_slot_status(slot, Some(parent), GeyserSlotStatus::CreatedBank, timestamp);
         Ok(())
@@ -7437,6 +7504,114 @@ mod tests {
         // Request slot after latest
         let result = svm.get_block_or_reconstruct(200).unwrap();
         assert!(result.is_none(), "should return None for slot after latest");
+    }
+
+    /// Garbage collection must preserve the blocks already recorded in SlotHistory.
+    #[test]
+    fn slot_history_survives_garbage_collection() {
+        use solana_sysvar::slot_history::SlotHistory;
+
+        let (mut svm, _events_rx, _geyser_rx) = TestType::in_memory().initialize_svm();
+        let gc_slot = svm.garbage_collection_interval_slots();
+        svm.latest_epoch_info.absolute_slot = gc_slot - 1;
+        svm.latest_epoch_info.slot_index = gc_slot - 1;
+        svm.confirm_current_block().unwrap();
+        let mut expected = svm.inner.read_sysvar::<SlotHistory>().unwrap();
+        expected.add(gc_slot);
+
+        svm.confirm_current_block().unwrap();
+
+        assert!(svm.inner.read_sysvar::<SlotHistory>().unwrap() == expected);
+    }
+
+    /// Yellowstone v16 needs each block's four sysvar writes and the landing's Clock.
+    #[test]
+    fn geyser_writes_the_sysvars_of_each_block() {
+        use solana_sdk_ids::sysvar::{clock, recent_blockhashes, slot_hashes, slot_history};
+        use solana_sysvar::slot_history::SlotHistory;
+
+        let sysvar_writes = |events: &[GeyserEvent], slot: Slot| -> Vec<(Pubkey, Account)> {
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    GeyserEvent::UpdateAccount(update) if update.slot == slot => {
+                        Some((update.pubkey, update.account.clone()))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let (mut svm, _events_rx, geyser_rx) = SurfnetSvm::default();
+        svm.announce_open_slot().unwrap();
+        let slot = svm.get_latest_absolute_slot();
+        svm.confirm_current_block().unwrap();
+
+        let events: Vec<_> = geyser_rx.try_iter().collect();
+        let written: Vec<Pubkey> = sysvar_writes(&events, slot)
+            .into_iter()
+            .map(|(pubkey, _)| pubkey)
+            .collect();
+        assert_eq!(
+            written,
+            [
+                clock::ID,
+                slot_hashes::ID,
+                slot_history::ID,
+                recent_blockhashes::ID
+            ]
+        );
+        assert_eq!(
+            svm.inner.read_sysvar::<SlotHistory>().unwrap().next_slot,
+            slot + 1
+        );
+
+        let landing = svm
+            .inner
+            .epoch_schedule()
+            .get_first_slot_in_epoch(svm.latest_epoch_info.epoch + 1);
+        let clock = svm.inner.clock();
+        svm.apply_time_travel(Clock {
+            slot: landing,
+            ..clock
+        })
+        .unwrap();
+        let events: Vec<_> = geyser_rx.try_iter().collect();
+        let (pubkey, account) = &sysvar_writes(&events, landing)[0];
+        assert_eq!(*pubkey, clock::ID);
+        let streamed: Clock = bincode::deserialize(&account.data).unwrap();
+        assert_eq!(streamed.slot, landing);
+        assert_eq!(streamed.epoch, svm.latest_epoch_info.epoch);
+        assert_eq!(streamed.epoch, clock.epoch + 1);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn failed_time_travel_restores_clock_and_timestamp() {
+        use surfpool_db::diesel::{Connection, RunQueryDsl, SqliteConnection, sql_query};
+
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("landing-rollback.db");
+        let path = database.to_str().unwrap();
+        let (mut svm, _events, _geyser) =
+            SurfnetSvm::new_with_db(Some(path), SurfnetSvmConfig::default()).unwrap();
+        let clock = svm.inner.clock();
+        let before = (svm.updated_at, svm.get_latest_absolute_slot());
+        let mut connection = SqliteConnection::establish(path).unwrap();
+        sql_query("DROP TABLE landings")
+            .execute(&mut connection)
+            .unwrap();
+
+        let error = svm
+            .apply_time_travel(Clock {
+                slot: before.1 + 1,
+                unix_timestamp: clock.unix_timestamp + 7,
+                ..clock.clone()
+            })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("landings"), "{error}");
+        assert_eq!(svm.inner.clock(), clock);
+        assert_eq!((svm.updated_at, svm.get_latest_absolute_slot()), before);
     }
 
     /// The blocks Geyser announced, and the slots it rooted, in the order it sent them.

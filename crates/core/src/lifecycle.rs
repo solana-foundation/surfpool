@@ -16,7 +16,7 @@
 //! surfnet shared (normal surfnets coexist, but never with a historical writer). Sandbox and profiling copies live
 //! inside an instance and share its resources; they are never instances of their own.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, atomic::AtomicU64};
 
 use crossbeam_channel::{Receiver, Sender};
 use surfpool_types::{
@@ -44,6 +44,7 @@ pub struct SurfnetInstance {
     simnet_events_tx: SimnetEventsTx,
     startup_status_rx: tokio::sync::watch::Receiver<SurfnetStartupStatus>,
     core_started_rx: tokio::sync::watch::Receiver<bool>,
+    coalesced_slots: Arc<AtomicU64>,
 }
 
 enum Opened {
@@ -159,12 +160,19 @@ impl SurfnetInstance {
                 stored_fork,
             })),
         };
+        let coalesced_slots = match &opened {
+            Opened::Local { locker, .. } => {
+                locker.with_svm_reader(|svm| svm.coalesced_slots.clone())
+            }
+            Opened::Historical(_) => Arc::new(AtomicU64::new(0)),
+        };
         Ok((
             Self {
                 opened,
                 simnet_events_tx,
                 startup_status_rx,
                 core_started_rx,
+                coalesced_slots,
             },
             simnet_events_rx,
         ))
@@ -178,6 +186,11 @@ impl SurfnetInstance {
             Opened::Local { locker, .. } => Some(locker),
             Opened::Historical(_) => None,
         }
+    }
+
+    /// The clock's counter, shared before either execution backend starts.
+    pub fn coalesced_slots_counter(&self) -> Arc<AtomicU64> {
+        self.coalesced_slots.clone()
     }
 
     /// The instance's event sender, for frontend reports before and during the run.
@@ -267,7 +280,7 @@ impl SurfnetInstance {
                     simnet_commands_rx,
                     self.simnet_events_tx.clone(),
                 )?;
-                let svm = session
+                let mut svm = session
                     .attach()
                     .and_then(|fork| {
                         SurfnetSvm::build_with(
@@ -282,6 +295,7 @@ impl SurfnetInstance {
                         self.simnet_events_tx
                             .error(format!("Historical fork failed to start: {error}"))
                     })?;
+                svm.coalesced_slots = self.coalesced_slots.clone();
                 // The historical clock is in place: interfaces waiting for the fork can show it.
                 self.simnet_events_tx
                     .system_clock_updated(svm.inner.clock());

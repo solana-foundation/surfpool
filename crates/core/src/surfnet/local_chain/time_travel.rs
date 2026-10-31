@@ -54,17 +54,21 @@ impl SurfnetSvm {
     /// recorded, nothing changes in memory.
     pub(crate) fn apply_time_travel(&mut self, clock: Clock) -> SurfpoolResult<EpochInfo> {
         self.local_vm()?;
-        let previous = std::mem::replace(&mut self.updated_at, clock.unix_timestamp as u64 * 1_000);
-        if let Err(e) = self.travel_to(clock.slot.max(self.get_latest_absolute_slot())) {
-            self.updated_at = previous;
-            return Err(e);
-        }
+        let slot = clock.slot.max(self.get_latest_absolute_slot());
         let clock = Clock {
-            slot: self.latest_epoch_info.absolute_slot,
-            epoch: self.latest_epoch_info.epoch,
+            slot,
+            epoch: self.inner.epoch_schedule().get_epoch(slot),
             ..clock
         };
+        let previous = std::mem::replace(&mut self.updated_at, clock.unix_timestamp as u64 * 1_000);
+        let previous_clock = self.inner.clock();
+        // Geyser must see the landing's Clock when its bank is announced.
         self.apply_local_clock(&clock)?;
+        if let Err(e) = self.travel_to(slot) {
+            self.updated_at = previous;
+            self.apply_local_clock(&previous_clock)?;
+            return Err(e);
+        }
         self.simnet_events_tx.system_clock_updated(clock);
         Ok(self.latest_epoch_info.clone())
     }

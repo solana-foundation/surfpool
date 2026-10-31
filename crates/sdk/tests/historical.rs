@@ -41,6 +41,54 @@ fn define(surfnet: &Surfnet, pubkey: &Pubkey, lamports: u64) {
         .expect("define a local account");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs a staged SVM Replay backend and cached history (M59_* variables)"]
+async fn historical_payer_funding_respects_cheatcode_locks_and_snapshots() {
+    use std::collections::BTreeMap;
+
+    use surfpool_types::{AccountSnapshot, CheatcodeFilter};
+
+    for restored in [None, Some(1_234_567)] {
+        let payer = Keypair::new();
+        let address = payer.pubkey();
+        let mut builder = Surfnet::builder()
+            .historical(options())
+            .payer(payer)
+            .lock_cheatcodes(CheatcodeFilter::all());
+        if let Some(lamports) = restored {
+            builder = builder.snapshot(BTreeMap::from([(
+                address.to_string(),
+                Some(AccountSnapshot::new(
+                    lamports,
+                    "11111111111111111111111111111111".into(),
+                    false,
+                    0,
+                    String::new(),
+                    None,
+                )),
+            )]));
+        }
+        let mut surfnet = builder
+            .start()
+            .await
+            .expect("startup funding is not an RPC cheatcode");
+        let expected = restored.unwrap_or(10_000_000_000);
+        assert_eq!(surfnet.coalesced_slots(), 0);
+        assert_eq!(
+            surfnet.rpc_client().get_balance(&address).unwrap(),
+            expected
+        );
+        let error = surfnet.cheatcodes().fund_sol(&address, 1).unwrap_err();
+        assert!(
+            error.to_string().contains("is currently disabled"),
+            "{error}"
+        );
+        surfnet
+            .stop()
+            .expect("the owner can still stop a locked surfnet");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs a staged SVM Replay backend and cached history (M59_* variables)"]
 async fn two_historical_surfnets_are_isolated_and_stop_independently() {

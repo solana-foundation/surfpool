@@ -7,20 +7,21 @@
 //! It owns no store, index or event: those stay in `SurfnetSvm`'s workflows.
 
 use agave_feature_set::FeatureSet;
-use solana_clock::Clock;
+use solana_clock::{Clock, Slot};
 use solana_epoch_schedule::EpochSchedule;
+use solana_pubkey::Pubkey;
 use solana_slot_hashes::MAX_ENTRIES as MAX_SLOT_HASHES_ENTRIES;
-use solana_sysvar::last_restart_slot::LastRestartSlot;
+use solana_sysvar::{last_restart_slot::LastRestartSlot, slot_history::SlotHistory};
 
 use super::{
-    BlockIdentifier,
+    BlockIdentifier, GeyserEvent,
     backend::LocalBackend,
     svm::{MAX_RECENT_BLOCKHASHES_STANDARD, SurfnetSvm},
 };
 use crate::{
     error::{SurfpoolError, SurfpoolResult},
     helpers::time_travel::clock_for_slot,
-    types::SyntheticBlockhash,
+    types::{GeyserAccountUpdate, SyntheticBlockhash},
 };
 
 mod time_travel;
@@ -170,6 +171,35 @@ impl SurfnetSvm {
             self.chain_tip.index + 1,
             new_synthetic_blockhash_str.as_str(),
         ))
+    }
+
+    /// Records a closed local slot before Geyser receives the block's metadata.
+    pub(super) fn record_local_slot_history(&mut self, slot: Slot) -> SurfpoolResult<()> {
+        let vm = self.local_vm()?;
+        let mut history = vm.get_sysvar::<SlotHistory>();
+        history.add(slot);
+        vm.set_sysvar(&history);
+        Ok(())
+    }
+
+    /// Streams local sysvar images without reading or mutating a historical fork.
+    pub(super) fn stream_local_sysvars(
+        &mut self,
+        slot: Slot,
+        sysvars: [Pubkey; 2],
+    ) -> SurfpoolResult<()> {
+        for pubkey in sysvars {
+            let Some(account) = self.local_vm()?.get_account_no_db(&pubkey) else {
+                continue;
+            };
+            let write_version = self.increment_write_version();
+            self.geyser_events_tx
+                .send(GeyserEvent::UpdateAccount(
+                    GeyserAccountUpdate::block_update(pubkey, account, slot, write_version),
+                ))
+                .ok();
+        }
+        Ok(())
     }
 
     /// The local VM's own settings (its log limit), from the surfnet's configuration.

@@ -23,6 +23,16 @@ def extract(path: Path, digest: str, destination: Path) -> None:
         archive.extractall(destination, filter="data")
 
 
+def verify_results(listing: str, output: str) -> None:
+    names = {line.removesuffix(": test") for line in listing.splitlines() if line.endswith(": test")}
+    summaries = [line.split("; finished in ", 1)[0] for line in output.splitlines()
+                 if line.startswith("test result:")]
+    expected = (f"test result: ok. {len(names)} passed; 0 failed; 0 ignored; "
+                "0 measured; 0 filtered out")
+    if not names or summaries != [expected]:
+        raise RuntimeError("Expected every declared historical SDK test to execute and pass")
+
+
 def main() -> None:
     # Refuse a normal network namespace: missing input must never fetch mainnet.
     interfaces = {name for _, name in socket.if_nameindex()}
@@ -72,6 +82,10 @@ def main() -> None:
         M59_HISTORICAL_CONFIG=str(fixture / "Surfpool.toml"),
     )
     binary = Path(os.environ["HISTORICAL_TEST_BINARY"]).resolve(strict=True)
+    listing = subprocess.run(
+        [str(binary), "--ignored", "--list", "--format", "terse"],
+        env=env, text=True, capture_output=True, check=True, timeout=60,
+    )
     result = subprocess.run(
         [str(binary), "--ignored", "--test-threads=1", "--nocapture"],
         env=env,
@@ -83,8 +97,7 @@ def main() -> None:
     (root / "tests.log").write_text(result.stdout)
     print(result.stdout, end="", flush=True)
     result.check_returncode()
-    if "4 passed; 0 failed; 0 ignored" not in result.stdout:
-        raise RuntimeError("Expected all four historical SDK tests to execute")
+    verify_results(listing.stdout, result.stdout)
 
 
 if __name__ == "__main__":

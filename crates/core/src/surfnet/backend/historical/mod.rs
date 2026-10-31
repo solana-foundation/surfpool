@@ -720,6 +720,9 @@ mod tests {
     mod slot_stream;
 
     #[cfg(unix)]
+    mod tokens;
+
+    #[cfg(unix)]
     mod security_admission {
         use super::*;
 
@@ -759,7 +762,9 @@ for line in sys.stdin:
     elif isinstance(op, dict) and 'peek' in op:
         result = [{'loaded':False} for _ in op['peek']['pubkeys']]
     elif isinstance(op, dict) and op.get('command', {}).get('method') == 'accounts':
-        if len(keys) == 2 and not blocked:
+        pause = os.path.join(os.path.dirname(log), 'pause-account')
+        selected = os.path.exists(pause) and open(pause).read() in op['command']['params']['pubkeys']
+        if (len(keys) == 2 or selected) and not blocked:
             blocked = True
             open(os.path.join(os.path.dirname(log), 'read-started'), 'x').close()
             release = os.path.join(os.path.dirname(log), 'release-read')
@@ -1157,6 +1162,52 @@ for line in sys.stdin:
                     .filter(|r| r["op"]["command"]["method"] == "overrideAccounts")
                     .count(),
                 2
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn historical_program_upload_holds_one_write_lock() {
+            use crate::{rpc::full::SurfpoolFullRpc, tests::helpers::TestSetup};
+            let setup = TestSetup::new(SurfpoolFullRpc);
+            let (fork, dir) = ipc_fixture(0);
+            setup.context.svm_locker.with_svm_writer(|svm| {
+                svm.inner = crate::surfnet::backend::Backend::historical(fork)
+            });
+            let locker = setup.context.svm_locker.clone();
+            let program = Pubkey::new_unique();
+            let data_address = solana_loader_v3_interface::get_program_data_address(&program);
+            std::fs::write(dir.path().join("pause-account"), data_address.to_string()).unwrap();
+            let upload = tokio::spawn({
+                let locker = locker.clone();
+                async move {
+                    locker
+                        .write_program(
+                            program,
+                            None,
+                            0,
+                            crate::surfnet::noop_program::NOOP_PROGRAM_ELF,
+                            &None,
+                        )
+                        .await
+                }
+            });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+            while !dir.path().join("read-started").exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "authority read did not start"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            let exclusive = locker.0.try_read().is_err();
+            std::fs::write(dir.path().join("release-read"), "release").unwrap();
+            assert_eq!(
+                upload.await.unwrap().unwrap_err().historical_code(),
+                Some("TEST_RUNTIME_REFUSAL")
+            );
+            assert!(
+                exclusive,
+                "another upload must not stage between completion and installation"
             );
         }
 

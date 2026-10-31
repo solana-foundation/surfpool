@@ -842,6 +842,34 @@ impl SurfnetSvmLocker {
             let slot = svm.get_latest_absolute_slot();
 
             for (pubkey, account, fetched_from_remote) in accounts_to_load {
+                // Surfpool maintains LastRestartSlot and refuses account writes
+                // to it, but a snapshot is a datasource like any other: restore
+                // its value, as `initialize` does from a remote. Programs that
+                // check it (Phoenix halts on a mismatch) otherwise read 0 after
+                // an offline restore.
+                if pubkey == solana_sysvar::last_restart_slot::ID
+                    && let Some(local) = svm.inner.local_mut()
+                {
+                    match account.data.get(..8).map(|bytes| {
+                        u64::from_le_bytes(bytes.try_into().expect("8 bytes"))
+                    }) {
+                        Some(last_restart_slot) => {
+                            local.set_sysvar(
+                                &solana_sysvar::last_restart_slot::LastRestartSlot {
+                                    last_restart_slot,
+                                },
+                            );
+                            loaded_count += 1;
+                        }
+                        None => {
+                            let _ = svm.simnet_events_tx.warn(format!(
+                                "Skipping LastRestartSlot in snapshot: {} bytes of data, expected 8",
+                                account.data.len()
+                            ));
+                        }
+                    }
+                    continue;
+                }
                 let load_result = if fetched_from_remote {
                     svm.apply_account_update(
                         GetAccountResult::FoundAccount(
@@ -2343,6 +2371,12 @@ impl SurfnetSvmLocker {
             capture
         };
 
+        if self.is_historical() {
+            self.with_svm_writer(|svm| {
+                svm.index_historical_transaction_tokens(&transaction_accounts)
+            })?;
+        }
+
         let (accounts_before, token_accounts_before, token_programs) =
             self.with_svm_reader(|svm_reader| {
                 let accounts_before = transaction_accounts
@@ -2834,6 +2868,18 @@ impl SurfnetSvmLocker {
                 post_execution_capture.insert(*pubkey, account.clone());
 
                 if let Some(token_account) = token_account {
+                    if svm_writer.inner.is_historical()
+                        && svm_writer
+                            .token_mints
+                            .get(&token_account.mint().to_string())?
+                            .is_none()
+                    {
+                        svm_writer.simnet_events_tx.warn(format!(
+                            "Historical token balance for {pubkey} omitted: mint {} is absent or invalid",
+                            token_account.mint()
+                        ));
+                        continue;
+                    }
                     token_accounts_after.push((i, token_account));
                     post_token_program_ids.push(
                         account
@@ -3825,13 +3871,13 @@ impl SurfnetSvmLocker {
         match tag_map {
             None => Ok(None),
             Some(uuids_or_sigs) => {
+                // Profiles are kept up to `max_profiles`, oldest dropped
+                // first: a tag lists the ones still kept.
                 let mut profiles = Vec::new();
                 for id in uuids_or_sigs {
-                    let profile = self.get_profile_result(id, config)?;
-                    if profile.is_none() {
-                        return Err(SurfpoolError::tag_not_found(&tag));
+                    if let Some(profile) = self.get_profile_result(id, config)? {
+                        profiles.push(profile);
                     }
-                    profiles.push(profile.unwrap());
                 }
                 Ok(Some(profiles))
             }
@@ -5024,9 +5070,7 @@ impl SurfnetSvmLocker {
     ) -> SurfpoolResult<()> {
         program_write_end(offset, data.len())?;
         if self.is_historical() {
-            return self
-                .write_historical_program(program_id, authority, offset, data, remote_ctx)
-                .await;
+            return self.write_historical_program(program_id, authority, offset, data);
         }
         let program_data_address = get_program_data_address(&program_id);
 
@@ -5068,112 +5112,101 @@ impl SurfnetSvmLocker {
     /// pending upload, and once the ELF holds everything its own headers describe, the
     /// program data and program account are written as one atomic change. A program the
     /// runtime refuses leaves the fork, including any program it replaces, unchanged.
-    async fn write_historical_program(
+    fn write_historical_program(
         &self,
         program_id: Pubkey,
         authority: Option<Pubkey>,
         offset: usize,
         data: &[u8],
-        remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
     ) -> SurfpoolResult<()> {
         let end = program_write_end(offset, data.len())?;
         let program_data_address = get_program_data_address(&program_id);
-        let existing = self.get_account(remote_ctx, &program_id, None).await?.inner;
-        if !existing.is_none() {
-            let account = existing.map_account()?;
-            if account.owner != solana_sdk_ids::bpf_loader_upgradeable::id() || !account.executable
-            {
-                return Err(SurfpoolError::invalid_program_account(
-                    &program_id,
-                    "Account is not an executable BPF Upgradeable Loader program",
-                ));
-            }
-        }
-        let elf = self.with_svm_writer(|svm_writer| {
-            let upload = svm_writer.historical_uploads.entry(program_id).or_default();
-            upload.stage(offset, end, data)
-        });
-        let Some(elf) = elf else {
-            self.simnet_events_tx().info(format!(
-                "Staged {} bytes of program {program_id} at offset {offset}; it activates once complete",
-                data.len()
-            ));
-            return Ok(());
-        };
-        // The upgrade authority: the one given, else the existing program data's, else none
-        // (the system program, as local uploads default to).
-        let existing_authority = match self
-            .get_account(remote_ctx, &program_data_address, None)
-            .await?
-            .inner
-        {
-            GetAccountResult::None(_) => None,
-            found => match bincode::deserialize(&found.map_account()?.data) {
-                Ok(solana_loader_v3_interface::state::UpgradeableLoaderState::ProgramData {
-                    upgrade_authority_address,
-                    ..
-                }) => upgrade_authority_address,
-                _ => None,
-            },
-        };
-        let upgrade_authority_address = authority
-            .or(existing_authority)
-            .or(Some(solana_system_interface::program::id()));
-        let serialize = |state| {
-            bincode::serialize(&state).map_err(|e| {
-                SurfpoolError::internal(format!("Failed to serialize program state: {e}"))
-            })
-        };
-        let mut program_data = serialize(
-            solana_loader_v3_interface::state::UpgradeableLoaderState::ProgramData {
-                slot: self.get_latest_absolute_slot(),
-                upgrade_authority_address,
-            },
-        )?;
-        program_data.extend_from_slice(&elf);
-        let program = serialize(
-            solana_loader_v3_interface::state::UpgradeableLoaderState::Program {
-                programdata_address: program_data_address,
-            },
-        )?;
-        let rent = |len: usize| {
-            self.with_svm_reader(|svm_reader| {
-                svm_reader.inner.minimum_balance_for_rent_exemption(len)
-            })
-        };
-        let accounts = vec![
-            (
-                program_data_address,
-                Account {
-                    lamports: rent(program_data.len()),
-                    data: program_data,
-                    owner: solana_sdk_ids::bpf_loader_upgradeable::id(),
-                    executable: false,
-                    rent_epoch: 0,
-                },
-            ),
-            (
-                program_id,
-                Account {
-                    lamports: rent(program.len()),
-                    data: program,
-                    owner: solana_sdk_ids::bpf_loader_upgradeable::id(),
-                    executable: true,
-                    rent_epoch: 0,
-                },
-            ),
-        ];
         let written = self.with_svm_writer(|svm_writer| {
+            if let Some(account) = svm_writer.inner.get_account(&program_id)? {
+                if account.owner != solana_sdk_ids::bpf_loader_upgradeable::id()
+                    || !account.executable
+                {
+                    return Err(SurfpoolError::invalid_program_account(
+                        &program_id,
+                        "Account is not an executable BPF Upgradeable Loader program",
+                    ));
+                }
+            }
+            // The upgrade authority: the one given, else the existing program data's, else none
+            // (the system program, as local uploads default to).
+            let existing_authority = match svm_writer.inner.get_account(&program_data_address)? {
+                None => None,
+                Some(account) => match bincode::deserialize(&account.data) {
+                    Ok(
+                        solana_loader_v3_interface::state::UpgradeableLoaderState::ProgramData {
+                            upgrade_authority_address,
+                            ..
+                        },
+                    ) => upgrade_authority_address,
+                    _ => None,
+                },
+            };
+            let upgrade_authority_address = authority
+                .or(existing_authority)
+                .or(Some(solana_system_interface::program::id()));
+            let upload = svm_writer.historical_uploads.entry(program_id).or_default();
+            let Some(elf) = upload.stage(offset, end, data) else {
+                return Ok(None);
+            };
+            let serialize = |state| {
+                bincode::serialize(&state).map_err(|e| {
+                    SurfpoolError::internal(format!("Failed to serialize program state: {e}"))
+                })
+            };
+            let mut program_data = serialize(
+                solana_loader_v3_interface::state::UpgradeableLoaderState::ProgramData {
+                    slot: svm_writer.get_latest_absolute_slot(),
+                    upgrade_authority_address,
+                },
+            )?;
+            program_data.extend_from_slice(&elf);
+            let program = serialize(
+                solana_loader_v3_interface::state::UpgradeableLoaderState::Program {
+                    programdata_address: program_data_address,
+                },
+            )?;
+            let rent = |len| svm_writer.inner.minimum_balance_for_rent_exemption(len);
+            let accounts = vec![
+                (
+                    program_data_address,
+                    Account {
+                        lamports: rent(program_data.len()),
+                        data: program_data,
+                        owner: solana_sdk_ids::bpf_loader_upgradeable::id(),
+                        executable: false,
+                        rent_epoch: 0,
+                    },
+                ),
+                (
+                    program_id,
+                    Account {
+                        lamports: rent(program.len()),
+                        data: program,
+                        owner: solana_sdk_ids::bpf_loader_upgradeable::id(),
+                        executable: true,
+                        rent_epoch: 0,
+                    },
+                ),
+            ];
             svm_writer.bump_state_revision();
             svm_writer.set_historical_accounts(accounts)?;
             svm_writer.historical_uploads.remove(&program_id);
-            Ok::<_, SurfpoolError>(())
-        });
-        written?;
-        self.simnet_events_tx().info(format!(
-            "Program {program_id} written ({} bytes); callable from the next slot",
-            elf.len()
-        ));
+            Ok::<_, SurfpoolError>(Some(elf.len()))
+        })?;
+        match written {
+            Some(bytes) => self.simnet_events_tx().info(format!(
+                "Program {program_id} written ({bytes} bytes); callable from the next slot"
+            )),
+            None => self.simnet_events_tx().info(format!(
+                "Staged {} bytes of program {program_id} at offset {offset}; it activates once complete",
+                data.len()
+            )),
+        };
         Ok(())
     }
 
