@@ -722,6 +722,7 @@ fn process_runbook_execution_output(
         return false;
     } else {
         let runbook_outputs = runbook.collect_formatted_outputs();
+        let mut output_write_failed = false;
         if !runbook_outputs.is_empty() {
             if let Some(some_output_loc) = output_json {
                 if let Some(output_loc) = some_output_loc {
@@ -743,6 +744,7 @@ fn process_runbook_execution_output(
                         Err(e) => {
                             simnet_events_tx
                                 .warn(format!("Failed to write runbook outputs: {}", e));
+                            output_write_failed = true;
                         }
                     }
                 } else {
@@ -759,6 +761,9 @@ fn process_runbook_execution_output(
                         .unwrap(),
                 );
             }
+        }
+        if output_write_failed {
+            return false;
         }
         write_runbook_state(runbook, runbook_state_location, simnet_events_tx);
         return true;
