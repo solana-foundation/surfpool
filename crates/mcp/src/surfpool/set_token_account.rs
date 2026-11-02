@@ -127,10 +127,50 @@ struct TokenDetails {
     symbol: Option<String>,
     /// The number of decimals of the token
     decimals: u32,
+    token_program_id: Option<String>,
 }
 
 fn scale_token_amount(amount: u64, decimals: u32) -> Option<u64> {
     10u64.checked_pow(decimals)?.checked_mul(amount)
+}
+
+async fn rpc_call(
+    client: &Client,
+    rpc_url: &str,
+    id: u64,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let response = client
+        .post(rpc_url)
+        .json(&JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id,
+            method: method.to_string(),
+            params,
+        })
+        .send()
+        .await
+        .map_err(|_| format!("RPC request failed for {method} (timeout or network error)"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "RPC HTTP error for {method}: {}",
+            response.status()
+        ));
+    }
+    let response = response
+        .json::<JsonRpcResponse<serde_json::Value>>()
+        .await
+        .map_err(|error| format!("Failed to parse {method} response: {error}"))?;
+    if let Some(error) = response.error {
+        return Err(format!(
+            "RPC error for {method} ({}): {}",
+            error.code, error.message
+        ));
+    }
+    response
+        .result
+        .ok_or_else(|| format!("{method} returned no result"))
 }
 
 impl SetTokenAccountsResponse {
@@ -188,6 +228,7 @@ pub async fn run(
             mint_address: SOL_SYMBOL.to_string(),
             symbol: Some(SOL_SYMBOL.to_string()),
             decimals: SOL_DECIMALS,
+            token_program_id: None,
         })
     } else if let Ok(mint_pubkey) = Pubkey::try_from(token_identifier.as_str()) {
         let mint_str = mint_pubkey.to_string();
@@ -201,6 +242,7 @@ pub async fn run(
                 mint_address: mint_str,
                 symbol: Some(symbol),
                 decimals,
+                token_program_id: None,
             })
         } else {
             Ok(TokenDetails {
@@ -208,6 +250,7 @@ pub async fn run(
                 mint_address: mint_str,
                 symbol: None,
                 decimals: 0,
+                token_program_id: None,
             })
         }
     } else if let Some(token_info) = VERIFIED_TOKENS_BY_SYMBOL.get(&token_identifier.to_uppercase())
@@ -217,6 +260,7 @@ pub async fn run(
             mint_address: token_info.address.clone(),
             symbol: Some(token_info.symbol.clone()),
             decimals: token_info.decimals as u32,
+            token_program_id: None,
         })
     } else {
         Err(format!(
@@ -225,10 +269,67 @@ pub async fn run(
         ))
     };
 
-    let token_details = match token_details {
+    let mut token_details = match token_details {
         Ok(details) => details,
         Err(e) => return SetTokenAccountsResponse::error(e),
     };
+
+    if !token_details.is_sol {
+        let mint = token_details.mint_address.clone();
+        let supply: serde_json::Value = match rpc_call(
+            &client,
+            &rpc_url,
+            2,
+            "getTokenSupply",
+            serde_json::json!([mint]),
+        )
+        .await
+        {
+            Ok(value) => value,
+            Err(error) => return SetTokenAccountsResponse::error(error),
+        };
+        let Some(decimals) = supply
+            .get("value")
+            .and_then(|value| value.get("decimals"))
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+        else {
+            return SetTokenAccountsResponse::error(
+                "Mint does not exist or has no token supply".into(),
+            );
+        };
+        let account: serde_json::Value = match rpc_call(
+            &client,
+            &rpc_url,
+            3,
+            "getAccountInfo",
+            serde_json::json!([token_details.mint_address, {"encoding":"base64"}]),
+        )
+        .await
+        {
+            Ok(value) => value,
+            Err(error) => return SetTokenAccountsResponse::error(error),
+        };
+        let Some(program_id) = account
+            .get("value")
+            .and_then(|value| value.get("owner"))
+            .and_then(serde_json::Value::as_str)
+        else {
+            return SetTokenAccountsResponse::error(
+                "Mint does not exist or has no token program owner".into(),
+            );
+        };
+        if token_program_id
+            .as_deref()
+            .is_some_and(|provided| provided != program_id)
+        {
+            return SetTokenAccountsResponse::error(
+                "Provided token program does not own the mint".into(),
+            );
+        }
+        token_details.decimals = decimals;
+        token_details.token_program_id = Some(program_id.to_string());
+    }
 
     let Some(amount_in_smallest_unit) = scale_token_amount(amount_to_set, token_details.decimals)
     else {
@@ -267,7 +368,7 @@ pub async fn run(
             owner_seeded_account.pubkey(),
             token_details.mint_address.clone(),
             update_params,
-            None::<String>,
+            token_details.token_program_id.clone(),
         );
         let params_value = match serde_json::to_value(params_tuple) {
             Ok(v) => v,
@@ -313,7 +414,7 @@ pub async fn run(
                                 let owner_pubkey =
                                     Pubkey::try_from(owner_seeded_account.pubkey().as_str())
                                         .expect("Owner pubkey should be valid");
-                                let token_program_id_pk = match &token_program_id {
+                                let token_program_id_pk = match &token_details.token_program_id {
                                     Some(id_str) => match Pubkey::try_from(id_str.as_str()) {
                                         Ok(pk) => pk,
                                         Err(_) => {
@@ -388,20 +489,39 @@ mod tests {
         assert_eq!(scale_token_amount(1, 20), None);
     }
 
-    fn canned_rpc() -> (String, JoinHandle<()>) {
+    fn canned_rpc(program_id: &'static str, request_count: usize) -> (String, JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind canned rpc");
         let url = format!("http://{}", listener.local_addr().expect("local addr"));
         let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept request");
-            let mut request = [0u8; 16 * 1024];
-            assert_ne!(stream.read(&mut request).expect("read request"), 0);
-            let body = r#"{"jsonrpc":"2.0","result":null,"id":1}"#;
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            )
-            .expect("write response");
+            for _ in 0..request_count {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                let mut request = [0u8; 16 * 1024];
+                let count = stream.read(&mut request).expect("read request");
+                assert_ne!(count, 0);
+                let request = String::from_utf8_lossy(&request[..count]);
+                let body = if request.contains("getTokenSupply") {
+                    r#"{"jsonrpc":"2.0","result":{"value":{"amount":"0","decimals":8}},"id":2}"#
+                        .to_string()
+                } else if request.contains("getAccountInfo") {
+                    format!(
+                        r#"{{"jsonrpc":"2.0","result":{{"value":{{"owner":"{program_id}"}}}},"id":3}}"#
+                    )
+                } else {
+                    if request.contains("surfnet_setTokenAccount") {
+                        assert!(
+                            request.contains(program_id),
+                            "set request omitted inferred token program"
+                        );
+                    }
+                    r#"{"jsonrpc":"2.0","result":null,"id":1}"#.to_string()
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .expect("write response");
+            }
         });
         (url, handle)
     }
@@ -412,7 +532,7 @@ mod tests {
             "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh",
             "5XZw2LKTyrfvfiskJ78AMpackRjPcyCif1WhUsPDuVqQ",
         ] {
-            let (url, server) = canned_rpc();
+            let (url, server) = canned_rpc("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", 3);
             let response = run(
                 url,
                 SeededAccount::new(None),
@@ -441,8 +561,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolves_unknown_mint_decimals_and_token_2022_program_from_rpc() {
+        let token_2022 = "TokenzQdBNbLqP5VEhdkAS6EPF9w4kNf4kF2gN5";
+        let mint = Pubkey::new_unique().to_string();
+        let (url, server) = canned_rpc(token_2022, 3);
+        let response = run(
+            url,
+            SeededAccount::new(None),
+            Some(mint.clone()),
+            Some(1),
+            None,
+            None,
+        )
+        .await;
+        server.join().expect("canned rpc thread");
+
+        let success = response
+            .success
+            .unwrap_or_else(|| panic!("unknown mint {mint}: {:?}", response.error));
+        assert!(matches!(
+            success.as_slice(),
+            [SetAccountSuccess::Token(AccountUpdated {
+                token_amount: 100_000_000,
+                token_mint,
+                ..
+            })] if token_mint == &mint
+        ));
+    }
+
+    #[tokio::test]
     async fn funds_sol_with_default_amount_when_amount_is_omitted() {
-        let (url, server) = canned_rpc();
+        let (url, server) = canned_rpc("", 1);
         let response = run(url, SeededAccount::new(None), None, None, None, None).await;
         server.join().expect("canned rpc thread");
 
