@@ -432,7 +432,10 @@ pub fn start_app(
     Ok(())
 }
 
-fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<()> {
+fn run_app<B: Backend<Error = io::Error>>(
+    terminal: &mut Terminal<B>,
+    mut app: App,
+) -> io::Result<()> {
     let (tx, rx) = unbounded();
     let rpc_api_url = match app.displayed_url {
         DisplayedUrl::Datasource(ref config) => config.rpc_url.clone(),
