@@ -2387,9 +2387,11 @@ impl SurfnetSvm {
     }
 
     /// Records that `pubkey` was written at `slot`, so reads cover the write: see
-    /// [`ReadSlot::covering`].
+    /// [`ReadSlot::covering`]. A write recorded at an older slot, as a scenario override for a
+    /// past slot is, keeps the later one.
     pub(crate) fn record_account_write(&mut self, pubkey: Pubkey, slot: Slot) {
-        self.account_update_slots.insert(pubkey, slot);
+        let recorded = self.account_update_slots.entry(pubkey).or_default();
+        *recorded = (*recorded).max(slot);
         self.latest_account_write_slot = self.latest_account_write_slot.max(slot);
     }
 
@@ -7231,6 +7233,31 @@ mod tests {
             .unwrap();
         assert_eq!(read.covering(&svm, &[pubkey]).slot(), read.slot());
         assert_eq!(read.covering_every_account(&svm).slot(), read.slot());
+    }
+
+    /// A scenario override can record its write at a slot behind the tip, after `set_account`
+    /// recorded the tip: reads keep covering the later write.
+    #[test]
+    fn an_older_write_never_lowers_the_slot_reads_cover() {
+        let (mut svm, _events_rx, _geyser_rx) = TestType::in_memory().initialize_svm();
+        let pubkey = Pubkey::new_unique();
+        svm.travel_to(10_000).unwrap();
+        let tip = svm.get_latest_absolute_slot();
+        svm.set_scenario_override_account(
+            &pubkey,
+            Account {
+                lamports: 1_000_000,
+                ..Account::default()
+            },
+            tip - 100,
+        )
+        .unwrap();
+
+        let read = svm
+            .read_slot(Some(CommitmentConfig::finalized()), None)
+            .unwrap();
+        assert!(read.slot() < tip);
+        assert_eq!(read.covering(&svm, &[pubkey]).slot(), tip);
     }
 
     #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
