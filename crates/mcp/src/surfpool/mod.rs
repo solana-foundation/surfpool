@@ -412,7 +412,7 @@ impl RegisterScenarioResponse {
 
 fn scenario_tool_error(message: String) -> CallToolResult {
     let response = RegisterScenarioResponse::error(message);
-    CallToolResult::success(vec![Content::text(
+    CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string(&response).unwrap_or_default(),
     )])
 }
@@ -523,7 +523,7 @@ impl Surfpool {
                     "Failed to load scenarios at {endpoint}: {error}"
                 ));
                 let json = serde_json::to_string(&response).unwrap_or_default();
-                return Ok(CallToolResult::success(vec![Content::text(json)]));
+                return Ok(CallToolResult::success(vec![ContentBlock::text(json)]));
             }
         };
         let status = response.status();
@@ -534,7 +534,7 @@ impl Surfpool {
                     "Failed to read response text: {error}"
                 ));
                 let json = serde_json::to_string(&response).unwrap_or_default();
-                return Ok(CallToolResult::success(vec![Content::text(json)]));
+                return Ok(CallToolResult::success(vec![ContentBlock::text(json)]));
             }
         };
         let response: serde_json::Value = match serde_json::from_str(&body) {
@@ -544,7 +544,7 @@ impl Surfpool {
                     "Failed to parse JSON response: {error}. Response: {body}"
                 ));
                 let json = serde_json::to_string(&response).unwrap_or_default();
-                return Ok(CallToolResult::success(vec![Content::text(json)]));
+                return Ok(CallToolResult::success(vec![ContentBlock::text(json)]));
             }
         };
         if status == reqwest::StatusCode::CONFLICT {
@@ -553,12 +553,12 @@ impl Surfpool {
                 scenario.id
             ));
             let json = serde_json::to_string(&response).unwrap_or_default();
-            return Ok(CallToolResult::success(vec![Content::text(json)]));
+            return Ok(CallToolResult::success(vec![ContentBlock::text(json)]));
         }
         if let Some(error) = response.get("error") {
             let response = RegisterScenarioResponse::error(format!("RPC error: {error}"));
             let json = serde_json::to_string(&response).unwrap_or_default();
-            return Ok(CallToolResult::success(vec![Content::text(json)]));
+            return Ok(CallToolResult::success(vec![ContentBlock::text(json)]));
         }
 
         let scenario_id = response
@@ -571,7 +571,7 @@ impl Surfpool {
         );
         let response = RegisterScenarioResponse::success(url);
         let json = serde_json::to_string(&response).unwrap_or_default();
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
     }
 }
 
@@ -593,7 +593,7 @@ impl Surfpool {
             Err(e) => {
                 let response = StartSurfnetResponse::error(e);
                 let json_str = serde_json::to_string(&response).unwrap_or_default();
-                return Ok(CallToolResult::success(vec![Content::text(json_str)]));
+                return Ok(CallToolResult::success(vec![ContentBlock::text(json_str)]));
             }
         };
 
@@ -608,7 +608,7 @@ impl Surfpool {
         }
 
         let json_str = serde_json::to_string(&res).unwrap_or_default();
-        Ok(CallToolResult::success(vec![Content::text(json_str)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(json_str)]))
     }
 
     /// Sets token balances for multiple accounts in your local Solana network (surfnet).
@@ -654,7 +654,7 @@ impl Surfpool {
             error,
         };
         let json_str = serde_json::to_string(&response).unwrap_or_default();
-        Ok(CallToolResult::success(vec![Content::text(json_str)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(json_str)]))
     }
 
     /// Starts a new local Solana network and sets token balances on it.
@@ -671,7 +671,7 @@ impl Surfpool {
             Err(e) => {
                 let response = StartSurfnetWithTokenAccountsResponse::error(e);
                 let json_str = serde_json::to_string(&response).unwrap_or_default();
-                return Ok(CallToolResult::success(vec![Content::text(json_str)]));
+                return Ok(CallToolResult::success(vec![ContentBlock::text(json_str)]));
             }
         };
 
@@ -692,7 +692,7 @@ impl Surfpool {
                         .unwrap_or_else(|| "Unknown error starting surfnet".to_string())
                 ));
                 let json_str = serde_json::to_string(&response).unwrap_or_default();
-                return Ok(CallToolResult::success(vec![Content::text(json_str)]));
+                return Ok(CallToolResult::success(vec![ContentBlock::text(json_str)]));
             }
         };
 
@@ -733,7 +733,7 @@ impl Surfpool {
             });
         response.error = error;
         let json_str = serde_json::to_string(&response).unwrap_or_default();
-        Ok(CallToolResult::success(vec![Content::text(json_str)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(json_str)]))
     }
 
     /// Calls any RPC method on a running surfnet instance.
@@ -778,7 +778,7 @@ impl Surfpool {
                     surfnet_endpoint, e
                 ));
                 let json_str = serde_json::to_string(&response).unwrap_or_default();
-                return Ok(CallToolResult::success(vec![Content::text(json_str)]));
+                return Ok(CallToolResult::success(vec![ContentBlock::text(json_str)]));
             }
         };
 
@@ -788,7 +788,7 @@ impl Surfpool {
                 let response =
                     SurfnetRpcCallResponse::error(format!("Failed to read response text: {}", e));
                 let json_str = serde_json::to_string(&response).unwrap_or_default();
-                return Ok(CallToolResult::success(vec![Content::text(json_str)]));
+                return Ok(CallToolResult::success(vec![ContentBlock::text(json_str)]));
             }
         };
 
@@ -800,14 +800,14 @@ impl Surfpool {
                     e, response_text
                 ));
                 let json_str = serde_json::to_string(&response).unwrap_or_default();
-                return Ok(CallToolResult::success(vec![Content::text(json_str)]));
+                return Ok(CallToolResult::success(vec![ContentBlock::text(json_str)]));
             }
         };
 
         if let Some(error) = rpc_response.get("error") {
             let response = SurfnetRpcCallResponse::error(format!("RPC error: {}", error));
             let json_str = serde_json::to_string(&response).unwrap_or_default();
-            return Ok(CallToolResult::success(vec![Content::text(json_str)]));
+            return Ok(CallToolResult::success(vec![ContentBlock::text(json_str)]));
         }
 
         // Extract the result
@@ -818,7 +818,7 @@ impl Surfpool {
 
         let response = SurfnetRpcCallResponse::success(call_params.method, result);
         let json_str = serde_json::to_string(&response).unwrap_or_default();
-        Ok(CallToolResult::success(vec![Content::text(json_str)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(json_str)]))
     }
 
     #[tool(description = r#"
@@ -1094,7 +1094,7 @@ impl Surfpool {
         if let Some(message) = validation_error {
             let response = RegisterScenarioResponse::error(message);
             let json_str = serde_json::to_string(&response).unwrap_or_default();
-            return Ok(CallToolResult::success(vec![Content::text(json_str)]));
+            return Ok(CallToolResult::success(vec![ContentBlock::text(json_str)]));
         }
 
         self.stage_scenario(scenario).await
@@ -1204,7 +1204,7 @@ impl Surfpool {
             ))
             .await
         {
-            Ok(payload) => Ok(CallToolResult::success(vec![Content::text(
+            Ok(payload) => Ok(CallToolResult::success(vec![ContentBlock::text(
                 payload.to_string(),
             )])),
             Err(error) => Ok(scenario_tool_error(error)),
@@ -1258,7 +1258,7 @@ impl Surfpool {
             )
             .await
         {
-            Ok(payload) => Ok(CallToolResult::success(vec![Content::text(
+            Ok(payload) => Ok(CallToolResult::success(vec![ContentBlock::text(
                 payload.to_string(),
             )])),
             Err(error) => Ok(scenario_tool_error(error)),
@@ -1285,7 +1285,7 @@ impl Surfpool {
             .collect();
 
         let json_str = serde_json::to_string(&templates).unwrap_or_default();
-        Ok(CallToolResult::success(vec![Content::text(json_str)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(json_str)]))
     }
 
     #[tool(
@@ -1307,14 +1307,14 @@ impl Surfpool {
         let all_templates = registry.all();
         let Some(template) = all_templates.iter().find(|t| t.id == params.template_id) else {
             let valid_ids: Vec<&String> = all_templates.iter().map(|t| &t.id).collect();
-            return Ok(CallToolResult::error(vec![Content::text(format!(
+            return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                 "Unknown templateId {:?}. Valid IDs are: {:?}",
                 params.template_id, valid_ids
             ))]));
         };
 
         let json_str = serde_json::to_string(&compact_template_json(template)).unwrap_or_default();
-        Ok(CallToolResult::success(vec![Content::text(json_str)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(json_str)]))
     }
 
     #[tool(
@@ -1336,7 +1336,7 @@ impl Surfpool {
         let all_templates = registry.all();
         let Some(template) = all_templates.iter().find(|t| t.id == params.template_id) else {
             let valid_ids: Vec<&String> = all_templates.iter().map(|t| &t.id).collect();
-            return Ok(CallToolResult::error(vec![Content::text(format!(
+            return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                 "Unknown templateId {:?}. Valid IDs are: {:?}",
                 params.template_id, valid_ids
             ))]));
@@ -1345,7 +1345,7 @@ impl Surfpool {
         if let Some(ref wanted) = params.constant {
             if !template.constants.contains_key(wanted) {
                 let available: Vec<&String> = template.constants.keys().collect();
-                return Ok(CallToolResult::error(vec![Content::text(format!(
+                return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                     "Template {:?} has no constant {:?}. Available constants: {:?}",
                     params.template_id, wanted, available
                 ))]));
@@ -1398,7 +1398,7 @@ impl Surfpool {
             "truncated": total_matches > results.len(),
         });
         let json_str = serde_json::to_string(&response).unwrap_or_default();
-        Ok(CallToolResult::success(vec![Content::text(json_str)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(json_str)]))
     }
 
     #[tool(
@@ -1421,72 +1421,56 @@ impl Surfpool {
         };
 
         let json_str = serde_json::to_string(&response).unwrap_or_default();
-        Ok(CallToolResult::success(vec![Content::text(json_str)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(json_str)]))
     }
 }
 
-#[tool_handler]
+#[tool_handler(router = self.tool_router)]
 impl ServerHandler for Surfpool {
     /// Return information about the server, including its capabilities and description.
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            protocol_version: ProtocolVersion::V_2024_11_05,
-            capabilities: ServerCapabilities::builder()
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(
+            ServerCapabilities::builder()
                 .enable_tools()
                 .enable_resources()
                 .build(),
-            server_info: Implementation::from_build_env(),
-            instructions: Some(
-                "Surfpool MCP server, your personal surfnet manager to start surfing on Solana!"
-                    .to_string(),
-            ),
-        }
+        )
+        .with_protocol_version(ProtocolVersion::V_2024_11_05)
+        .with_instructions(
+            "Surfpool MCP server, your personal surfnet manager to start surfing on Solana!",
+        )
+    }
+    fn supported_protocol_versions(&self) -> std::borrow::Cow<'static, [ProtocolVersion]> {
+        std::borrow::Cow::Borrowed(ProtocolVersion::known_up_to(&ProtocolVersion::V_2024_11_05))
     }
     async fn list_resources(
         &self,
-        _request: Option<PaginatedRequestParam>,
+        _request: Option<PaginatedRequestParams>,
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<ListResourcesResult, McpError> {
-        Ok(ListResourcesResult {
-            resources: vec![
-                RawResource {
-                    uri: "str:///rpc_endpoints".to_string(),
-                    name: "List of available RPC endpoints".to_string(),
-                    title: Some("RPC Endpoints".to_string()),
-                    description: Some("A json file containing all the RPC methods and the parameters available for being able to handle any RPC call with the tool call_surfnet_rpc".to_string()),
-                    mime_type: Some("application/json".to_string()),
-                    size: None,
-                    icons: None,
-                }.no_annotation(),
-                RawResource {
-                    uri: "str:///override_templates".to_string(),
-                    name: "List of override templates".to_string(),
-                    title: Some("Override Templates".to_string()),
-                    description: Some("A json file containing all the override templates available for scenario registration with account overrides".to_string()),
-                    mime_type: Some("application/json".to_string()),
-                    size: None,
-                    icons: None,
-                }.no_annotation()
-            ],
-            next_cursor: None,
-        })
+        Ok(ListResourcesResult::with_all_items(vec![
+            Resource::new("str:///rpc_endpoints", "List of available RPC endpoints")
+                .with_title("RPC Endpoints")
+                .with_description("A json file containing all the RPC methods and the parameters available for being able to handle any RPC call with the tool call_surfnet_rpc")
+                .with_mime_type("application/json"),
+            Resource::new("str:///override_templates", "List of override templates")
+                .with_title("Override Templates")
+                .with_description("A json file containing all the override templates available for scenario registration with account overrides")
+                .with_mime_type("application/json"),
+        ]))
     }
     async fn read_resource(
         &self,
-        ReadResourceRequestParam { uri }: ReadResourceRequestParam,
+        ReadResourceRequestParams { uri, .. }: ReadResourceRequestParams,
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
-    ) -> Result<ReadResourceResult, McpError> {
+    ) -> Result<ReadResourceResponse, McpError> {
         match uri.as_str() {
             "str:///rpc_endpoints" => {
                 let rpc_endpoints = include_str!("../../../types/src/rpc_endpoints.json");
-                Ok(ReadResourceResult {
-                    contents: vec![ResourceContents::TextResourceContents {
-                        uri,
-                        mime_type: Some("application/json".to_string()),
-                        text: rpc_endpoints.to_string(),
-                        meta: None,
-                    }],
-                })
+                Ok(ReadResourceResult::new(vec![
+                    ResourceContents::text(rpc_endpoints, uri).with_mime_type("application/json"),
+                ])
+                .into())
             }
             "str:///override_templates" => {
                 let registry = self.template_registry.read().map_err(|_| {
@@ -1513,14 +1497,10 @@ impl ServerHandler for Surfpool {
                     }
                 })?;
 
-                Ok(ReadResourceResult {
-                    contents: vec![ResourceContents::TextResourceContents {
-                        uri,
-                        mime_type: Some("application/json".to_string()),
-                        text: templates_json,
-                        meta: None,
-                    }],
-                })
+                Ok(ReadResourceResult::new(vec![
+                    ResourceContents::text(templates_json, uri).with_mime_type("application/json"),
+                ])
+                .into())
             }
             _ => {
                 use std::borrow::Cow;
@@ -1533,13 +1513,6 @@ impl ServerHandler for Surfpool {
                 })
             }
         }
-    }
-    async fn initialize(
-        &self,
-        _request: InitializeRequestParam,
-        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
-    ) -> Result<InitializeResult, McpError> {
-        Ok(self.get_info())
     }
 }
 
