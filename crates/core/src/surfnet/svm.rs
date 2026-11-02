@@ -437,14 +437,17 @@ impl ReadSlot {
         }
         pubkeys
             .iter()
-            .filter_map(|pubkey| {
+            .map(|pubkey| {
                 // Written at every block, outside `record_account_write`.
                 if *pubkey == solana_sdk_ids::sysvar::slot_history::ID
                     || MANAGED_SYSVARS.iter().any(|(id, _)| id == pubkey)
                 {
-                    Some(tip)
+                    tip
                 } else {
-                    svm.account_update_slots.get(pubkey).copied()
+                    svm.account_update_slots
+                        .get(pubkey)
+                        .copied()
+                        .unwrap_or(svm.recovered_accounts_slot)
                 }
             })
             .fold(self, |read, written| Self(read.0.max(written)))
@@ -644,8 +647,12 @@ pub struct SurfnetSvm {
     startup_status_watch_tx: tokio::sync::watch::Sender<SurfnetStartupStatus>,
     pub account_update_slots: HashMap<Pubkey, Slot>,
     /// The latest slot in `account_update_slots`, so a scan covers every write without walking
-    /// it. Both grow only through [`Self::record_account_write`] and empty on a network reset.
+    /// it. Both grow only through [`Self::record_account_write`], but for a restart seeding the
+    /// watermark with `recovered_accounts_slot`, and empty on a network reset.
     pub latest_account_write_slot: Slot,
+    /// The slot a restart reopened the chain at. Accounts recovered from storage keep their data
+    /// but not the slots they were written at, so reads cover them as written there.
+    pub recovered_accounts_slot: Slot,
     pub streamed_accounts: Box<dyn Storage<String, bool>>,
     pub recent_blockhashes: VecDeque<(SyntheticBlockhash, i64)>,
     pub scheduled_overrides: Box<dyn Storage<u64, Vec<OverrideInstance>>>,
@@ -982,6 +989,7 @@ impl SurfnetSvm {
             startup_status_watch_tx: tokio::sync::watch::channel(self.startup_status.clone()).0,
             account_update_slots: self.account_update_slots.clone(),
             latest_account_write_slot: self.latest_account_write_slot,
+            recovered_accounts_slot: self.recovered_accounts_slot,
             recent_blockhashes: self.recent_blockhashes.clone(),
             offline_accounts: OverlayStorage::wrap(self.offline_accounts.clone_box()),
             genesis_slot: self.genesis_slot,
@@ -1412,6 +1420,7 @@ impl SurfnetSvm {
             startup_status_watch_tx: tokio::sync::watch::channel(SurfnetStartupStatus::default()).0,
             account_update_slots: HashMap::new(),
             latest_account_write_slot: 0,
+            recovered_accounts_slot: 0,
             streamed_accounts: streamed_accounts_db,
             recent_blockhashes: VecDeque::new(),
             scheduled_overrides: scheduled_overrides_db,
@@ -1454,6 +1463,10 @@ impl SurfnetSvm {
                 svm.chain_tip = svm.new_blockhash();
                 svm.store_genesis_anchor()?;
             }
+        }
+        if recovered_slot.is_some() {
+            svm.recovered_accounts_slot = svm.get_latest_absolute_slot();
+            svm.latest_account_write_slot = svm.recovered_accounts_slot;
         }
         svm.register_builtin_template_idls();
         svm.reconstruct_sysvars();
@@ -2644,6 +2657,7 @@ impl SurfnetSvm {
         self.scheduled_overrides.clear()?;
         self.account_update_slots.clear();
         self.latest_account_write_slot = 0;
+        self.recovered_accounts_slot = 0;
 
         let current_time = chrono::Utc::now().timestamp_millis() as u64;
         self.updated_at = current_time;
@@ -6687,6 +6701,68 @@ mod tests {
         assert_eq!(svm.get_latest_absolute_slot(), block_slot + 1);
         assert_eq!(svm.genesis_slot, block_slot + 1);
         assert_eq!(svm.last_checkpoint_slot, block_slot);
+    }
+
+    /// Accounts survive a restart with persistent storage but the slots they were written at do
+    /// not, so reads cover them as written when the chain reopened.
+    #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
+    #[cfg_attr(feature = "postgres", test_case(TestType::postgres(); "with postgres db"))]
+    fn reads_cover_the_accounts_a_restart_recovers(test_type: TestType) {
+        let (database_url, surfnet_id) = match &test_type {
+            TestType::OnDiskSqlite(db_path) => {
+                (db_path.as_str(), "restart-write-slots".to_string())
+            }
+            #[cfg(feature = "postgres")]
+            TestType::Postgres { url, surfnet_id } => (url.as_str(), surfnet_id.clone()),
+            _ => unreachable!("test case must provide persistent database storage"),
+        };
+        let config = SurfnetSvmConfig {
+            surfnet_id,
+            ..SurfnetSvmConfig::default()
+        };
+        let pubkey = Pubkey::new_unique();
+        let write_slot = {
+            let (mut svm, _events_rx, _geyser_rx) =
+                SurfnetSvm::new_with_db(Some(database_url), config.clone()).unwrap();
+            for _ in 0..svm.finalization_slot_threshold() {
+                svm.confirm_current_block().unwrap();
+            }
+            svm.set_account(
+                &pubkey,
+                Account {
+                    lamports: 1_000_000,
+                    ..Account::default()
+                },
+            )
+            .unwrap();
+            let write_slot = svm.get_latest_absolute_slot();
+            svm.confirm_current_block().unwrap();
+            svm.shutdown();
+            write_slot
+        };
+
+        let (mut svm, _events_rx, _geyser_rx) =
+            SurfnetSvm::new_with_db(Some(database_url), config).unwrap();
+        assert!(svm.get_account(&pubkey).unwrap().is_some());
+        let read = svm
+            .read_slot(Some(CommitmentConfig::finalized()), None)
+            .unwrap();
+        assert!(read.slot() < write_slot);
+        assert!(read.covering(&svm, &[pubkey]).slot() >= write_slot);
+        assert!(read.covering_every_account(&svm).slot() >= write_slot);
+
+        // A reset discards the recovered accounts too.
+        let epoch_schedule = SurfnetSvm::default_epoch_schedule();
+        svm.reset_network(
+            SurfnetSvm::default_epoch_info(&epoch_schedule),
+            epoch_schedule,
+        )
+        .unwrap();
+        let read = svm
+            .read_slot(Some(CommitmentConfig::finalized()), None)
+            .unwrap();
+        assert_eq!(read.covering(&svm, &[pubkey]).slot(), read.slot());
+        assert_eq!(read.covering_every_account(&svm).slot(), read.slot());
     }
 
     #[test]
