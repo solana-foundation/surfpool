@@ -12007,7 +12007,6 @@ dependencies = [
  "convert_case 0.8.0",
  "crossbeam",
  "crossbeam-channel",
- "ed25519-dalek 1.0.1",
  "env_logger",
  "hex",
  "hiro-system-kit",
