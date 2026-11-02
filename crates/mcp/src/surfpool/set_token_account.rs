@@ -562,7 +562,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolves_unknown_mint_decimals_and_token_2022_program_from_rpc() {
-        let token_2022 = "TokenzQdBNbLqP5VEhdkAS6EPF9w4kNf4kF2gN5";
+        let token_2022 = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
         let mint = Pubkey::new_unique().to_string();
         let (url, server) = canned_rpc(token_2022, 3);
         let response = run(
