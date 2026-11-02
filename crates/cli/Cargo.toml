@@ -72,7 +72,6 @@ txtx-addon-network-svm = { workspace = true }
 txtx-core = { workspace = true }
 txtx-gql = { workspace = true }
 txtx-supervisor-ui = { workspace = true, optional = true }
-opentelemetry_sdk = "0.31.0"
 self-replace = "1.5.0"
 flate2 = "1.1.9"
 tar = "0.4.45"

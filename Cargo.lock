@@ -5805,28 +5805,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "opentelemetry"
-version = "0.31.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b84bcd6ae87133e903af7ef497404dda70c60d0ea14895fc8a5e6722754fc2a0"
-dependencies = [
- "futures-core",
- "futures-sink",
- "js-sys",
- "pin-project-lite",
- "thiserror 2.0.20",
- "tracing",
-]
-
-[[package]]
 name = "opentelemetry-prometheus"
 version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "765a76ba13ec77043903322f85dc5434d7d01a37e75536d0f871ed7b9b5bbf0d"
 dependencies = [
  "once_cell",
- "opentelemetry 0.28.0",
- "opentelemetry_sdk 0.28.0",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "prometheus",
  "protobuf",
 ]
@@ -5842,25 +5828,10 @@ dependencies = [
  "futures-executor",
  "futures-util",
  "glob",
- "opentelemetry 0.28.0",
+ "opentelemetry",
  "thiserror 2.0.20",
  "tokio",
  "tokio-stream",
-]
-
-[[package]]
-name = "opentelemetry_sdk"
-version = "0.31.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e14ae4f5991976fd48df6d843de219ca6d31b01daaab2dad5af2badeded372bd"
-dependencies = [
- "futures-channel",
- "futures-executor",
- "futures-util",
- "opentelemetry 0.31.0",
- "percent-encoding 2.3.2",
- "rand 0.9.4",
- "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -11994,7 +11965,6 @@ dependencies = [
  "mime_guess",
  "mustache",
  "notify",
- "opentelemetry_sdk 0.31.0",
  "ratatui",
  "reqwest",
  "rmcp",
@@ -12069,9 +12039,9 @@ dependencies = [
  "litesvm",
  "litesvm-token",
  "log 0.4.33",
- "opentelemetry 0.28.0",
+ "opentelemetry",
  "opentelemetry-prometheus",
- "opentelemetry_sdk 0.28.0",
+ "opentelemetry_sdk",
  "p256",
  "phoenix-rise-accounts",
  "prometheus",
