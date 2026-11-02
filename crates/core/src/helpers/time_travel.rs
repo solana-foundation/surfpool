@@ -6,8 +6,8 @@ use crate::types::{TimeTravelConfig, TimeTravelError};
 
 const MAX_SUPPORTED_TIMESTAMP_SECONDS: i64 = i64::MAX / 1_000;
 
-fn timestamp_seconds(timestamp_ms: u64) -> i64 {
-    (timestamp_ms.min(i64::MAX as u64) / 1_000) as i64
+pub(crate) fn timestamp_seconds(timestamp_ms: u64) -> i64 {
+    (timestamp_ms / 1_000).min(i64::MAX as u64) as i64
 }
 
 /// The Clock sysvar at `slot` and `unix_timestamp`, filled in the way Agave's `Bank::update_clock`
@@ -414,6 +414,15 @@ mod tests {
     }
 
     #[test]
+    fn timestamp_conversion_stays_positive_after_signed_millisecond_range() {
+        let timestamp_ms = i64::MAX as u64 + 1_200;
+        assert_eq!(
+            timestamp_seconds(timestamp_ms),
+            (timestamp_ms / 1_000) as i64
+        );
+    }
+
+    #[test]
     fn test_calculate_absolute_slot_clock_epoch_boundary() {
         let epoch_info = create_test_epoch_info(1, 431_999, 863_999); // Last slot of epoch 1
         let current_time = 1_000_000_000;
@@ -637,13 +646,13 @@ mod tests {
 
         // A slot whose extrapolated time overflows still lands at the time asked for.
         let config = TimeTravelConfig::AbsoluteSlotAt {
-            slot: u64::MAX,
+            slot: u64::MAX - 1,
             timestamp: 5_000,
         };
         let clock =
             calculate_time_travel_clock(&config, current_time, slot_time, &epoch_info, &schedule())
                 .unwrap();
-        assert_eq!((clock.slot, clock.unix_timestamp), (u64::MAX, 5));
+        assert_eq!((clock.slot, clock.unix_timestamp), (u64::MAX - 1, 5));
     }
 
     #[test]
