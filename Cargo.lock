@@ -12035,7 +12035,6 @@ dependencies = [
  "agave-feature-set",
  "ansi_term",
  "anyhow",
- "atty",
  "chrono",
  "clap",
  "clap_complete",
