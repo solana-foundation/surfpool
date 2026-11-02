@@ -88,6 +88,11 @@ This is a cumbersome process in most cases.
 Override templates that are registered in the Surfpool repo will automatically be available in Surfpool Studio's drag-and-drop UI for creating scenarios.
 This UI will automatically create the `surfnet_registerScenario` payload for you, eliminating the complexity from the process.
 
+A collection tagged `clock-sensitive` holds accounts with a time or slot the program checks against the Clock, such as a
+Pyth price's `publish_time` or the oracle staleness window of Phoenix markets. Playing such a scenario with the clock paused
+leaves fetched accounts ahead of the surfnet's time, and the program can refuse transactions; Studio warns before pausing for
+them. The tag applies to every template in the collection, including ones without a time check.
+
 ## Creating Native Scenario Support for a Protocol
 Having a protocol being natively supported by Surfpool Scenarios will allow users to easily create scenarios to override account states for that protocol.
 All accounts in a surfnet's account db that are owned by the protocol will include automatic IDL-parsing, and the protocol's account overrides will be available in Surfpool Studio's drag-and-drop UI.
