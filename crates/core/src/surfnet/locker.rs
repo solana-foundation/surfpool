@@ -4095,13 +4095,7 @@ impl SurfnetSvmLocker {
             &epoch_info,
             &epoch_schedule,
         )
-        .map_err(|e| SurfpoolError::internal(e.to_string()))?;
-        // The block at the largest slot could have no block after it.
-        if clock_update.slot == Slot::MAX {
-            return Err(SurfpoolError::internal(
-                "Cannot time travel to the largest slot",
-            ));
-        }
+        .map_err(SurfpoolError::invalid_params)?;
 
         let formated_time = chrono::DateTime::from_timestamp(clock_update.unix_timestamp, 0)
             .unwrap_or_else(|| chrono::DateTime::from_timestamp(0, 0).unwrap())
