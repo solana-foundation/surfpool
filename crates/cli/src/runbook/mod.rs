@@ -321,7 +321,7 @@ pub async fn execute_runbook(
     if cmd.unsupervised {
         simnet_events_tx.runbook_started(runbook_id.clone());
         let res = start_unsupervised_runbook_runloop(&mut runbook, &progress_tx).await;
-        let diags = res
+        let mut diags = res
             .as_ref()
             .map_err(|ds| ds.iter().map(|d| d.message.clone()).collect())
             .err();
@@ -332,6 +332,9 @@ pub async fn execute_runbook(
             &simnet_events_tx,
             cmd.output_json,
         );
+        if !success && diags.is_none() {
+            diags = Some(vec!["Failed to write runbook outputs".to_string()]);
+        }
         simnet_events_tx.runbook_completed(runbook_id, diags);
         if !success {
             return Err("Runbook execution failed".to_string());
@@ -721,8 +724,8 @@ fn process_runbook_execution_output(
         write_runbook_transient_state(runbook, runbook_state_location, simnet_events_tx);
         return false;
     } else {
+        let mut output_error = None;
         let runbook_outputs = runbook.collect_formatted_outputs();
-        let mut output_write_failed = false;
         if !runbook_outputs.is_empty() {
             if let Some(some_output_loc) = output_json {
                 if let Some(output_loc) = some_output_loc {
@@ -742,9 +745,9 @@ fn process_runbook_execution_output(
                                 .info(format!("Outputs written to {}", output_location));
                         }
                         Err(e) => {
-                            simnet_events_tx
-                                .warn(format!("Failed to write runbook outputs: {}", e));
-                            output_write_failed = true;
+                            let message = format!("Failed to write runbook outputs: {}", e);
+                            simnet_events_tx.warn(message.clone());
+                            output_error = Some(message);
                         }
                     }
                 } else {
@@ -762,12 +765,18 @@ fn process_runbook_execution_output(
                 );
             }
         }
-        if output_write_failed {
-            return false;
-        }
-        write_runbook_state(runbook, runbook_state_location, simnet_events_tx);
-        return true;
+        return persist_runbook_state_before_reporting_output_status(output_error, || {
+            write_runbook_state(runbook, runbook_state_location, simnet_events_tx);
+        });
     }
+}
+
+fn persist_runbook_state_before_reporting_output_status(
+    output_error: Option<String>,
+    persist_state: impl FnOnce(),
+) -> bool {
+    persist_state();
+    output_error.is_none()
 }
 
 pub fn persist_log(
@@ -897,5 +906,23 @@ pub fn handle_log_event(
                 );
             }
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::persist_runbook_state_before_reporting_output_status;
+
+    #[test]
+    fn output_failure_is_reported_after_runbook_state_is_persisted() {
+        let mut state_was_persisted = false;
+
+        let success = persist_runbook_state_before_reporting_output_status(
+            Some("output directory is not writable".to_string()),
+            || state_was_persisted = true,
+        );
+
+        assert!(!success);
+        assert!(state_was_persisted);
     }
 }
