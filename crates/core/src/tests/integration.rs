@@ -13,7 +13,6 @@ use base64::Engine;
 use crossbeam_channel::{
     RecvTimeoutError, Sender, bounded, unbounded, unbounded as crossbeam_unbounded,
 };
-use ed25519_dalek::Signer as DalekSigner;
 use jsonrpc_core::{
     Error, Result as JsonRpcResult,
     futures::{
@@ -1284,13 +1283,11 @@ async fn test_transaction_with_ed25519_instruction(test_type: TestType) {
     // Issue #587 previously failed here with:
     // "Transaction simulation failed: Error processing Instruction 2: Unsupported program id".
     let tx = {
-        let payer_dalek =
-            ed25519_dalek::Keypair::from_bytes(&payer.to_bytes()).expect("invalid dalek keypair");
         let message = b"surfpool ed25519 precompile integration test";
-        let signature = payer_dalek.sign(message);
+        let signature = payer.sign_message(message);
         let ed25519_ix = new_ed25519_instruction_with_signature(
             message,
-            &signature.to_bytes(),
+            signature.as_array(),
             payer.pubkey().as_array(),
         );
         let compute_budget_ixs = [
