@@ -237,10 +237,11 @@ pub async fn start_local_surfnet_runloop(
     // Load snapshot accounts if provided
     if !simnet.snapshot.is_empty() {
         match svm_locker
-            .load_snapshot(
+            .load_snapshot_with_options(
                 &simnet.snapshot,
                 remote_rpc_client.as_ref(),
                 CommitmentConfig::confirmed(),
+                simnet.strict_snapshot,
             )
             .await
         {
@@ -253,6 +254,9 @@ pub async fn start_local_surfnet_runloop(
                 });
             }
             Err(e) => {
+                if simnet.strict_snapshot {
+                    return Err(e.into());
+                }
                 let _ = svm_locker.with_svm_reader(|svm| {
                     svm.simnet_events_tx
                         .warn(format!("Error loading snapshot accounts: {}", e))

@@ -173,6 +173,12 @@ pub(crate) enum AccountUpdatePolicy {
     HydrateIfAbsent,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HydrationMode {
+    BestEffort,
+    StrictSnapshot,
+}
+
 impl AccountUpdatePolicy {
     /// Converts account provenance into the non-authoritative policy used when
     /// a result needs to be materialized in LiteSVM.
@@ -2969,14 +2975,37 @@ impl SurfnetSvm {
         account_update: GetAccountResult,
         policy: AccountUpdatePolicy,
     ) -> SurfpoolResult<()> {
+        self.apply_account_update_with_mode(account_update, policy, HydrationMode::BestEffort)
+    }
+
+    /// Snapshot hydration must surface installation failures and never synthesize ProgramData.
+    pub(crate) fn hydrate_snapshot_strict(
+        &mut self,
+        account_update: GetAccountResult,
+    ) -> SurfpoolResult<()> {
+        self.apply_account_update_with_mode(
+            account_update,
+            AccountUpdatePolicy::HydrateIfAbsent,
+            HydrationMode::StrictSnapshot,
+        )
+    }
+
+    fn apply_account_update_with_mode(
+        &mut self,
+        account_update: GetAccountResult,
+        policy: AccountUpdatePolicy,
+        mode: HydrationMode,
+    ) -> SurfpoolResult<()> {
         let account_update = self.account_update_for_policy(account_update, policy)?;
 
         match account_update {
             GetAccountResult::None(_) => {}
             GetAccountResult::FoundAccount(pubkey, account, source) => {
                 if source != AccountSource::Svm {
-                    self.apply_synthetic_programdata(&account)?;
-                    self.apply_account_component(pubkey, account, policy)?;
+                    if mode == HydrationMode::BestEffort {
+                        self.apply_synthetic_programdata(&account)?;
+                    }
+                    self.apply_account_component(pubkey, account, policy, mode)?;
                 }
             }
             GetAccountResult::FoundCoupledAccount(
@@ -2984,31 +3013,33 @@ impl SurfnetSvm {
                 CoupledAccount::ProgramData(_, None),
                 _,
             ) => {
-                self.apply_synthetic_programdata(&account)?;
-                self.apply_account_component(pubkey, account, policy)?;
+                if mode == HydrationMode::BestEffort {
+                    self.apply_synthetic_programdata(&account)?;
+                }
+                self.apply_account_component(pubkey, account, policy, mode)?;
             }
             GetAccountResult::FoundCoupledAccount(
                 (pubkey, account),
                 CoupledAccount::ProgramData(coupled_pubkey, Some(coupled_account)),
                 _,
             ) => {
-                self.apply_account_component(coupled_pubkey, coupled_account, policy)?;
-                self.apply_account_component(pubkey, account, policy)?;
+                self.apply_account_component(coupled_pubkey, coupled_account, policy, mode)?;
+                self.apply_account_component(pubkey, account, policy, mode)?;
             }
             GetAccountResult::FoundCoupledAccount(
                 (pubkey, account),
                 CoupledAccount::Mint(coupled_pubkey, Some(coupled_account)),
                 _,
             ) => {
-                self.apply_account_component(coupled_pubkey, coupled_account, policy)?;
-                self.apply_account_component(pubkey, account, policy)?;
+                self.apply_account_component(coupled_pubkey, coupled_account, policy, mode)?;
+                self.apply_account_component(pubkey, account, policy, mode)?;
             }
             GetAccountResult::FoundCoupledAccount(
                 (pubkey, account),
                 CoupledAccount::Mint(_, None),
                 _,
             ) => {
-                self.apply_account_component(pubkey, account, policy)?;
+                self.apply_account_component(pubkey, account, policy, mode)?;
             }
         }
 
@@ -3054,6 +3085,7 @@ impl SurfnetSvm {
         pubkey: Pubkey,
         account: Account,
         policy: AccountUpdatePolicy,
+        mode: HydrationMode,
     ) -> SurfpoolResult<()> {
         let account = if policy == AccountUpdatePolicy::HydrateIfAbsent {
             match self.inner.get_account_result(&pubkey)? {
@@ -3077,6 +3109,9 @@ impl SurfnetSvm {
         // returned to the caller, with the insertion failure emitted as an
         // event for observability.
         if let Err(error) = self.set_account(&pubkey, account) {
+            if mode == HydrationMode::StrictSnapshot {
+                return Err(error);
+            }
             let _ = self.simnet_events_tx.error(error.to_string());
         }
         Ok(())
@@ -3115,6 +3150,7 @@ impl SurfnetSvm {
                 rent_epoch: 0,
             },
             AccountUpdatePolicy::HydrateIfAbsent,
+            HydrationMode::BestEffort,
         )
     }
 

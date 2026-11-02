@@ -130,6 +130,17 @@ surfpool start --help
 
 Is documenting all the options available.
 
+To fail startup when a declared snapshot account cannot be loaded, use:
+
+```console
+surfpool start --snapshot dependencies.json --strict-snapshot
+```
+
+The flag requires `--snapshot` and preserves its JSON format (`null` fetches upstream).
+Failures, including missing required program data, abort before RPC startup; default
+loading remains best effort. Strict loading neither discovers protocol dependencies
+nor rolls back partial database writes.
+
 ## Crypto Infrastructure as Code: A New Standard in Web3
 
 Infrastructure as code (IaC) transforms how teams deploy and operate Solana programs:
