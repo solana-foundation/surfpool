@@ -212,9 +212,9 @@ pub async fn execute_runbook(
         runbook_state_location,
     )
     .await;
-    let errors = result.as_ref().err().map(|error| vec![error.clone()]);
+    let errors = result.as_ref().err().cloned();
     simnet_events_tx.runbook_completed(runbook_id, errors);
-    result
+    result.map_err(|errors| errors.join("\n"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -228,7 +228,7 @@ async fn execute_runbook_inner(
     mut runbook: Runbook,
     runbook_sources: RunbookSources,
     runbook_state_location: Option<RunbookStateLocation>,
-) -> Result<(), String> {
+) -> Result<(), Vec<String>> {
     let top_level_inputs_map = manifest
         .get_runbook_inputs(&cmd.environment, &cmd.inputs, None)
         .unwrap_or_else(|_| RunbookTopLevelInputsMap::new());
@@ -245,7 +245,8 @@ async fn execute_runbook_inner(
             &runbook_id,
             &cmd.log_level,
             false,
-        )?;
+        )
+        .map_err(|error| vec![error])?;
     }
 
     let cloud_svc_context = CloudServiceContext::new();
@@ -283,7 +284,10 @@ async fn execute_runbook_inner(
         let ctx = RunbookSnapshotContext::new();
 
         let execution_context_backups = runbook.backup_execution_contexts();
-        let new = runbook.simulate_and_snapshot_flows(&old).await?;
+        let new = runbook
+            .simulate_and_snapshot_flows(&old)
+            .await
+            .map_err(|error| vec![error.to_string()])?;
 
         for flow_context in runbook.flow_contexts.iter() {
             if old.flows.get(&flow_context.name).is_none() {
@@ -298,7 +302,13 @@ async fn execute_runbook_inner(
             handle_snapshot_diff_result(ctx.diff(old, new), &simnet_events_tx)?;
 
         let Some(consolidated_changes) = display_snapshot_diffing(consolidated_changes) else {
-            return Ok(());
+            return process_runbook_execution_output(
+                Ok(()),
+                &mut runbook,
+                runbook_state_location,
+                &simnet_events_tx,
+                cmd.output_json,
+            );
         };
 
         runbook.prepare_flows_for_new_plans(
@@ -342,26 +352,18 @@ async fn execute_runbook_inner(
 
     if cmd.unsupervised {
         let res = start_unsupervised_runbook_runloop(&mut runbook, &progress_tx).await;
-        let diags = res
-            .as_ref()
-            .map_err(|ds| ds.iter().map(|d| d.message.clone()).collect())
-            .err();
-        let success = process_runbook_execution_output(
+        process_runbook_execution_output(
             res,
             &mut runbook,
             runbook_state_location,
             &simnet_events_tx,
             cmd.output_json,
-        );
-        if !success {
-            return Err(diags
-                .and_then(|errors| errors.into_iter().next())
-                .unwrap_or_else(|| "Runbook execution failed".to_string()));
-        }
+        )?;
     } else {
         let (kill_supervised_execution_tx, block_store_handle, execution_result_rx) =
             configure_supervised_execution(runbook, runbook_state_location, &cmd, simnet_events_tx)
-                .await?;
+                .await
+                .map_err(|error| vec![error])?;
 
         ctrlc::set_handler(move || {
             kill_supervised_execution_tx.send(true).unwrap();
@@ -369,12 +371,9 @@ async fn execute_runbook_inner(
         .expect("Error setting Ctrl-C handler");
 
         let _ = tokio::join!(block_store_handle);
-        if !execution_result_rx
+        execution_result_rx
             .await
-            .map_err(|_| "Supervised runbook execution stopped unexpectedly".to_string())?
-        {
-            return Err("Runbook execution failed".to_string());
-        }
+            .map_err(|_| vec!["Supervised runbook execution stopped unexpectedly".to_string()])??;
     };
 
     Ok(())
@@ -389,7 +388,7 @@ pub async fn configure_supervised_execution(
     (
         Sender<bool>,
         JoinHandle<()>,
-        tokio::sync::oneshot::Receiver<bool>,
+        tokio::sync::oneshot::Receiver<Result<(), Vec<String>>>,
     ),
     String,
 > {
@@ -442,7 +441,7 @@ pub async fn configure_supervised_execution(
         let runloop_future =
             start_supervised_runbook_runloop(&mut runbook, moved_block_tx, action_item_events_rx);
 
-        let success = process_runbook_execution_output(
+        let result = process_runbook_execution_output(
             hiro_system_kit::nestable_block_on(runloop_future),
             &mut runbook,
             moved_runbook_state,
@@ -451,7 +450,7 @@ pub async fn configure_supervised_execution(
         );
 
         let _ = moved_kill_loops_tx.send(true);
-        let _ = execution_result_tx.send(success);
+        let _ = execution_result_tx.send(result);
     });
 
     let moved_kill_loops_tx = kill_loops_tx.clone();
@@ -685,12 +684,13 @@ fn log_diagnostic_lines(diags: Vec<Diagnostic>, simnet_events_tx: &SimnetEventsT
 fn handle_context_build_result(
     result: Result<bool, Vec<Diagnostic>>,
     simnet_events_tx: &SimnetEventsTx,
-) -> Result<(), String> {
+) -> Result<(), Vec<String>> {
     match result {
         Ok(_) => Ok(()),
         Err(diags) => {
+            let errors = diags.iter().map(|diag| diag.message.clone()).collect();
             log_diagnostic_lines(diags, simnet_events_tx);
-            Err("Failed to build runbook execution contexts".to_string())
+            Err(errors)
         }
     }
 }
@@ -698,13 +698,16 @@ fn handle_context_build_result(
 fn handle_snapshot_diff_result<T, E: std::fmt::Display>(
     result: Result<T, E>,
     simnet_events_tx: &SimnetEventsTx,
-) -> Result<T, String> {
+) -> Result<T, Vec<String>> {
     match result {
         Ok(changes) => Ok(changes),
         Err(error) => {
             let _ = simnet_events_tx.warn("Failed to process runbook snapshot");
             simnet_events_tx.warn(error.to_string());
-            Err("Failed to process runbook snapshot".to_string())
+            Err(vec![
+                "Failed to process runbook snapshot".to_string(),
+                error.to_string(),
+            ])
         }
     }
 }
@@ -771,12 +774,13 @@ fn process_runbook_execution_output(
     runbook_state_location: Option<RunbookStateLocation>,
     simnet_events_tx: &SimnetEventsTx,
     output_json: Option<Option<String>>,
-) -> bool {
+) -> Result<(), Vec<String>> {
     if let Err(diags) = execution_result {
         simnet_events_tx.warn("Runbook execution aborted");
+        let errors = diags.iter().map(|diag| diag.message.clone()).collect();
         log_diagnostic_lines(diags, simnet_events_tx);
         write_runbook_transient_state(runbook, runbook_state_location, simnet_events_tx);
-        return false;
+        return Err(errors);
     } else {
         let mut output_error = None;
         let runbook_outputs = runbook.collect_formatted_outputs();
@@ -820,7 +824,10 @@ fn process_runbook_execution_output(
             }
         }
         write_runbook_state(runbook, runbook_state_location, simnet_events_tx);
-        return output_error.is_none();
+        match output_error {
+            Some(error) => Err(vec![error]),
+            None => Ok(()),
+        }
     }
 }
 
@@ -996,7 +1003,9 @@ mod tests {
         assert!(events.iter().any(|event| matches!(
             event,
             SimnetEvent::RunbookCompleted(id, Some(errors))
-                if id == runbook_id && !errors.is_empty()
+                if id == runbook_id
+                    && !errors.is_empty()
+                    && matches!(&result, Err(message) if message == &errors.join("\n"))
         )));
     }
 }
