@@ -2709,6 +2709,7 @@ impl SurfnetSvm {
         self.remove_from_indexes(pubkey, account)?;
 
         self.inner.delete_account(pubkey)?;
+        self.record_account_write(*pubkey, self.get_latest_absolute_slot());
 
         Ok(())
     }
@@ -7258,6 +7259,34 @@ mod tests {
             .unwrap();
         assert!(read.slot() < tip);
         assert_eq!(read.covering(&svm, &[pubkey]).slot(), tip);
+    }
+
+    /// Resetting an account deletes it, a write that reads cover like any other.
+    #[test]
+    fn an_account_reset_is_a_write_reads_cover() {
+        let (mut svm, _events_rx, _geyser_rx) = TestType::in_memory().initialize_svm();
+        let pubkey = Pubkey::new_unique();
+        svm.set_account(
+            &pubkey,
+            Account {
+                lamports: 1_000_000,
+                ..Account::default()
+            },
+        )
+        .unwrap();
+        for _ in 0..=svm.finalization_slot_threshold() {
+            svm.confirm_current_block().unwrap();
+        }
+        let read = svm
+            .read_slot(Some(CommitmentConfig::finalized()), None)
+            .unwrap();
+        assert_eq!(read.covering(&svm, &[pubkey]).slot(), read.slot());
+
+        svm.reset_account(&pubkey, false).unwrap();
+
+        let tip = svm.get_latest_absolute_slot();
+        assert_eq!(read.covering(&svm, &[pubkey]).slot(), tip);
+        assert_eq!(read.covering_every_account(&svm).slot(), tip);
     }
 
     #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
