@@ -102,8 +102,8 @@ ratatui = { version = "0.29.0", features = [
     "crossterm",
 ], default-features = false }
 reqwest = { version = "0.12.23", default-features = false }
-rmcp = "0.9.0"
-rmcp-actix-web = "=0.8.17"
+rmcp = "3.8.0"
+rmcp-actix-web = "=0.13.1"
 rust-embed = "8.2.0"
 schemars = { version = "1.0.4" }
 schemars_derive = { version = "1.0.4" }
