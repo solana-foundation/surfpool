@@ -2855,13 +2855,26 @@ impl SurfnetSvmLocker {
         self.with_svm_reader(Self::offline_account_owners)
     }
 
-    /// Registers a scenario for execution
+    /// Schedules a scenario's overrides from `slot`, or from the next slot when omitted.
+    /// A base slot that is already produced is rejected: nothing would ever apply it.
     pub fn register_scenario(
         &self,
         scenario: surfpool_types::Scenario,
         slot: Option<Slot>,
     ) -> SurfpoolResult<()> {
-        self.with_svm_writer(move |svm_writer| svm_writer.register_scenario(scenario, slot))
+        self.with_svm_writer(move |svm_writer| {
+            let current_slot = svm_writer.get_latest_absolute_slot();
+            let next_slot = current_slot
+                .checked_add(1)
+                .ok_or_else(|| SurfpoolError::internal("the slot counter overflowed"))?;
+            let base_slot = slot.unwrap_or(next_slot);
+            if base_slot <= current_slot {
+                return Err(SurfpoolError::invalid_params(format!(
+                    "base slot {base_slot} is already produced; the next slot is {next_slot}"
+                )));
+            }
+            svm_writer.register_scenario(scenario, Some(base_slot))
+        })
     }
 
     /// Materializes overrides for a specific slot (not necessarily the current slot)

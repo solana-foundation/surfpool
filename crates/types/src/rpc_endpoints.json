@@ -857,7 +857,7 @@
                       "id": "String (A unique identifier for this override instance)",
                       "templateId": "String (The identifier of the template this instance is based on)",
                       "values": "HashMap<String, serde_json::Value> (A hash map of field paths to override values. The field paths are a flat map to the account key being updated, from the IDL, using dot-notation to provide the path to the key. For example, to override a field 'amount' in an account 'myAccount', the path would be 'myAccount.amount'.)",
-                      "scenarioRelativeSlot": "u64 (Relative slot when this override should be applied (relative to scenario registration slot))",
+                      "scenarioRelativeSlot": "u64 (Slot offset from the base slot at which this override is applied)",
                       "label": "Option<String> (An optional label for this override instance)",
                       "enabled": "bool (Indicates whether this override instance is enabled)",
                       "fetchBeforeUse": "bool (Indicates whether to fetch the latest on-chain account data before applying overrides)",
@@ -870,7 +870,7 @@
             {
               "name": "slot",
               "type": "Option<u64>",
-              "description": "The base slot from which relative slot offsets are calculated. If omitted, uses the current slot."
+              "description": "The base slot from which relative slot offsets are calculated. If omitted, the next slot the surfnet produces; a base slot that is already produced is rejected. Overrides are applied when the surfnet produces their slot; nothing is applied during this call. Wait for that slot (getSlot with commitment processed above the response context slot) before reading the overridden accounts."
             }
           ],
           "returns": "A `RpcResponse<()>` indicating whether the write was successful."

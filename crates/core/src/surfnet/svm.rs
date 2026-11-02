@@ -4996,17 +4996,22 @@ impl SurfnetSvm {
             base_slot
         );
 
-        // Schedule overrides by adding base slot to their scenario-relative slots
+        // Every slot is checked before anything is stored, so a bad override leaves no partial plan.
+        let mut scheduled = Vec::with_capacity(scenario.overrides.len());
         for override_instance in scenario.overrides {
             let scenario_relative_slot = override_instance.scenario_relative_slot;
             // Both operands are caller-supplied, so the sum has to be checked.
             let absolute_slot = base_slot.checked_add(scenario_relative_slot).ok_or_else(|| {
-                SurfpoolError::internal(format!(
+                SurfpoolError::invalid_params(format!(
                     "Override {} cannot be scheduled: base slot {} plus relative slot {} overflows",
                     override_instance.id, base_slot, scenario_relative_slot
                 ))
             })?;
+            scheduled.push((absolute_slot, override_instance));
+        }
 
+        for (absolute_slot, override_instance) in scheduled {
+            let scenario_relative_slot = override_instance.scenario_relative_slot;
             debug!(
                 "Scheduling override at absolute slot {} (base {} + relative {})",
                 absolute_slot, base_slot, scenario_relative_slot
@@ -5053,7 +5058,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        storage::tests::TestType, surfnet::locker::SurfnetSvmLocker, tests::helpers::canned_rpc,
+        storage::tests::TestType,
+        surfnet::locker::SurfnetSvmLocker,
+        tests::helpers::{UNHEALTHY_OFFSET, canned_rpc, scheduled_override_fixture},
     };
 
     #[test]
@@ -8646,62 +8653,10 @@ mod tests {
         assert_eq!(restored_account.lamports, 1_000_000);
     }
 
-    /// `Obligation.unhealthy_borrow_value_sf` (u128), counting the discriminator.
-    const UNHEALTHY_OFFSET: usize = 2256;
-
-    /// A zeroed Kamino `Obligation` owned by klend. `SurfnetSvm::default()` already registers
-    /// the bundled template IDLs, so klend's is resolvable by owner program.
-    fn scheduled_override_fixture() -> (
-        SurfnetSvm,
-        Pubkey,
-        surfpool_types::OverrideInstance,
-        Receiver<GeyserEvent>,
-    ) {
-        let (mut surfnet_svm, _simnet_events_rx, geyser_events_rx) = SurfnetSvm::default();
-
-        let klend = Pubkey::from_str_const("KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD");
-        let idl: Idl = serde_json::from_str(crate::scenarios::registry::KAMINO_V1_IDL_CONTENT)
-            .expect("kamino idl");
-        let obligation_disc = &idl
-            .accounts
-            .iter()
-            .find(|a| a.name == "Obligation")
-            .expect("Obligation account")
-            .discriminator;
-
-        let mut data = vec![0u8; 3344];
-        data[..8].copy_from_slice(obligation_disc);
-
-        let account_pubkey = Pubkey::new_unique();
-        surfnet_svm
-            .inner
-            .set_account(
-                account_pubkey,
-                Account {
-                    lamports: 1_000_000,
-                    data,
-                    owner: klend,
-                    executable: false,
-                    rent_epoch: 0,
-                },
-            )
-            .expect("set obligation account");
-
-        let instance = surfpool_types::OverrideInstance::new(
-            "kamino-obligation-health".to_string(),
-            0,
-            surfpool_types::AccountAddress::Pubkey(account_pubkey.to_string()),
-        )
-        .with_values(HashMap::from([(
-            "unhealthy_borrow_value_sf".to_string(),
-            serde_json::json!(1_234u64),
-        )]));
-        (surfnet_svm, account_pubkey, instance, geyser_events_rx)
-    }
-
     #[tokio::test]
     async fn test_scenario_relative_slot_overflow_is_an_error_not_a_wrap() {
-        let (mut svm, account_pubkey, _instance, _geyser_events_rx) = scheduled_override_fixture();
+        let (mut svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+        let (account_pubkey, _instance) = scheduled_override_fixture(&mut svm);
 
         let mut far = surfpool_types::OverrideInstance::new(
             "kamino-obligation-health".to_string(),
@@ -8726,7 +8681,8 @@ mod tests {
     #[tokio::test]
     async fn forged_scenario_override_notifies_subscribers_and_geyser_once() {
         const SLOT: u64 = 500;
-        let (mut svm, account_pubkey, instance, geyser_events_rx) = scheduled_override_fixture();
+        let (mut svm, _simnet_events_rx, geyser_events_rx) = SurfnetSvm::default();
+        let (account_pubkey, instance) = scheduled_override_fixture(&mut svm);
         let account_updates = svm.subscribe_for_account_updates(&account_pubkey, None);
         let program_updates = svm.subscribe_for_program_updates(
             &Pubkey::from_str_const("KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD"),
@@ -8786,7 +8742,8 @@ mod tests {
         // immediately precedes unhealthy_borrow_value_sf in the Obligation layout
         const ALLOWED_OFFSET: usize = UNHEALTHY_OFFSET - 16;
 
-        let (mut svm, account_pubkey, first, _geyser_events_rx) = scheduled_override_fixture();
+        let (mut svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+        let (account_pubkey, first) = scheduled_override_fixture(&mut svm);
         let mut first = first;
         first.fetch_before_use = true;
 
@@ -9130,7 +9087,8 @@ mod tests {
     #[tokio::test]
     async fn an_idl_override_notifies_account_subscribers() {
         const SLOT: u64 = 500;
-        let (mut svm, account_pubkey, instance, _geyser_events_rx) = scheduled_override_fixture();
+        let (mut svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+        let (account_pubkey, instance) = scheduled_override_fixture(&mut svm);
         let updates =
             svm.subscribe_for_account_updates(&account_pubkey, Some(UiAccountEncoding::Base64));
         svm.scheduled_overrides.store(SLOT, vec![instance]).unwrap();

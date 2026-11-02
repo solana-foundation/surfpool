@@ -36,8 +36,11 @@ whole struct or array) also works, but it must be **complete** - every field of 
 padding included - because the account is re-encoded with Borsh. An out-of-range index or a
 non-numeric segment on an array is a hard error, never a silent write elsewhere.
 
-An override is applied once. Its resulting account state remains in later slots until a transaction
-or another override writes that account again.
+An override is applied once, when the surfnet produces its slot; nothing is applied during the
+registration call. Its resulting account state remains in later slots until a transaction or another
+override writes that account again.
+`surfnet_timeTravel` produces only the next slot before it jumps, so overrides scheduled in the slots
+it skips are never applied; step one slot at a time to play a scenario under a paused clock.
 
 ### Kamino integration tests
 
