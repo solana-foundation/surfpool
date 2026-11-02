@@ -439,7 +439,9 @@ impl ReadSlot {
             .iter()
             .filter_map(|pubkey| {
                 // Written at every block, outside `record_account_write`.
-                if MANAGED_SYSVARS.iter().any(|(id, _)| id == pubkey) {
+                if *pubkey == solana_sdk_ids::sysvar::slot_history::ID
+                    || MANAGED_SYSVARS.iter().any(|(id, _)| id == pubkey)
+                {
                     Some(tip)
                 } else {
                     svm.account_update_slots.get(pubkey).copied()

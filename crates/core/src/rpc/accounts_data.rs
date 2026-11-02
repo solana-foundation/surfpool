@@ -1936,6 +1936,45 @@ mod tests {
         }
     }
 
+    /// Surfpool records each block in SlotHistory as the block freezes, outside the recorded
+    /// writes, so a read of it answers for the tip: never for a slot before the newest block it
+    /// records.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn slot_history_reads_never_answer_for_a_slot_older_than_the_history() {
+        let setup = TestSetup::new(SurfpoolAccountsDataRpc);
+        setup
+            .context
+            .svm_locker
+            .confirm_current_block(&None)
+            .await
+            .unwrap();
+
+        for commitment in [CommitmentConfig::confirmed(), CommitmentConfig::finalized()] {
+            let read = setup
+                .rpc
+                .get_account_info(
+                    Some(setup.context.clone()),
+                    solana_sdk_ids::sysvar::slot_history::ID.to_string(),
+                    Some(RpcAccountInfoConfig {
+                        commitment: Some(commitment),
+                        encoding: Some(solana_account_decoder::UiAccountEncoding::Base64),
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap();
+            let data = read.value.unwrap().data.decode().unwrap();
+            let history: solana_sysvar::slot_history::SlotHistory =
+                bincode::deserialize(&data).unwrap();
+            assert!(
+                read.context.slot >= history.next_slot - 1,
+                "{commitment:?}: context slot {} predates slot {} in SlotHistory",
+                read.context.slot,
+                history.next_slot - 1
+            );
+        }
+    }
+
     /// A transaction's writes are covered as soon as it is processed, before its block confirms.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_processed_transfer_is_never_read_at_an_older_slot() {
