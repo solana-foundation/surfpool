@@ -1,6 +1,11 @@
-use std::io::Write;
+use std::{
+    io::Write,
+    sync::{Arc, Mutex},
+};
 
+use agave_geyser_plugin_interface::geyser_plugin_interface::GeyserPlugin;
 use crossbeam_channel::unbounded;
+use libloading::Library;
 use tempfile::NamedTempFile;
 
 use crate::{
@@ -97,6 +102,79 @@ fn test_unload_plugin_not_found() {
         err.contains("not found"),
         "expected not found error, got: {err}"
     );
+}
+
+// ── Teardown tests (in-process plugin, no dylib needed) ─────────────────
+
+/// Plugin that records its `on_unload` call and its own destruction, so tests
+/// can check teardown order.
+#[derive(Debug)]
+struct RecordingPlugin {
+    events: Arc<Mutex<Vec<&'static str>>>,
+}
+
+impl GeyserPlugin for RecordingPlugin {
+    fn name(&self) -> &'static str {
+        "recording-plugin"
+    }
+
+    fn on_unload(&mut self) {
+        self.events.lock().unwrap().push("on_unload");
+    }
+}
+
+impl Drop for RecordingPlugin {
+    fn drop(&mut self) {
+        self.events.lock().unwrap().push("drop");
+    }
+}
+
+/// Returns a handle to the running test binary, standing in for a plugin
+/// library since `RecordingPlugin` is compiled into the host.
+fn current_process_library() -> Library {
+    #[cfg(unix)]
+    let library = libloading::os::unix::Library::this();
+    #[cfg(windows)]
+    let library = libloading::os::windows::Library::this().unwrap();
+    library.into()
+}
+
+fn recording_managed_plugin() -> (ManagedPlugin, Arc<Mutex<Vec<&'static str>>>) {
+    let events = Arc::new(Mutex::new(vec![]));
+    let plugin = RecordingPlugin {
+        events: events.clone(),
+    };
+    let managed = ManagedPlugin {
+        uuid: crate::Uuid::new_v4(),
+        name: plugin.name().to_string(),
+        plugin: Box::new(plugin),
+        _library: current_process_library(),
+        config_path: "recording-plugin.json".to_string(),
+    };
+    (managed, events)
+}
+
+#[test]
+fn test_dropping_loaded_plugins_calls_on_unload_once() {
+    // The geyser runloop drops its plugin list when it exits; plugins must still
+    // get `on_unload` so they can stop workers before their library unloads.
+    let (managed, events) = recording_managed_plugin();
+    let managed_plugins = vec![managed];
+
+    drop(managed_plugins);
+
+    assert_eq!(*events.lock().unwrap(), vec!["on_unload", "drop"]);
+}
+
+#[test]
+fn test_unload_plugin_by_name_calls_on_unload_once() {
+    let (managed, events) = recording_managed_plugin();
+    let mut managed_plugins = vec![managed];
+
+    unload_plugin_by_name("recording-plugin", &mut managed_plugins).unwrap();
+
+    assert!(managed_plugins.is_empty());
+    assert_eq!(*events.lock().unwrap(), vec!["on_unload", "drop"]);
 }
 
 // ── Happy path tests (require pre-built hello-geyser dylib) ─────────────
