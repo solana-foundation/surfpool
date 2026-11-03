@@ -196,6 +196,8 @@ pub trait SurfnetCheatcodes {
     ///
     /// This method allows developers to re-enable cheatcode methods that were previously disabled.
     /// Each cheatcode name must match a valid `surfnet_*` RPC method (e.g. `surfnet_setAccount`, `surfnet_timeTravel`).
+    /// Methods locked with `surfnet_disableCheatcode` and `{"lockout": true}`
+    /// (or at startup with `--lock-cheatcodes`) cannot be re-enabled; `"all"` re-enables everything else.
     ///
     /// ## Parameters
     /// - `cheatcodes`: A list of cheatcode method names to enable, as strings (e.g. `["surfnet_setAccount", "surfnet_timeTravel"]`).
@@ -234,14 +236,24 @@ pub trait SurfnetCheatcodes {
         cheatcodes_filter: CheatcodeFilter,
     ) -> Result<RpcResponse<()>>;
 
-    /// Disables one or more Surfpool cheatcode RPC methods for the current session.
+    /// Disables Surfpool cheatcode RPC methods, optionally for good.
     ///
-    /// This method allows developers to turn off specific cheatcode methods so they are no longer callable.
-    /// Each cheatcode name must match a valid `surfnet_*` RPC method. When lockout is not enabled,
-    /// `surfnet_enableCheatcode` and `surfnet_disableCheatcode` cannot be disabled.
+    /// Each name must be a `surfnet_*` method; `"all"` disables every one of them.
+    ///
+    /// With `{"lockout": true}`, the disabled methods are **locked**: they stay disabled for the
+    /// life of the surfnet, and `surfnet_enableCheatcode` refuses to turn them back on, by name or
+    /// with `"all"`. `"all"` with lockout locks the whole surfnet: `surfnet_enableCheatcode`, this
+    /// method, `requestAirdrop`, the `snapshotSubscribe` WebSocket import, and the admin methods that stop it or load plugins (`exit`,
+    /// `loadPlugin`, `reloadPlugin`, `unloadPlugin`), so it behaves like a plain validator RPC
+    /// from then on. Stop a locked surfnet through its process, not `surfpool stop`.
+    /// Without lockout, `surfnet_enableCheatcode` and `surfnet_disableCheatcode` cannot be disabled.
+    ///
+    /// To lock cheatcodes before any client connects, start the surfnet with
+    /// `surfpool start --lock-cheatcodes` or `SurfnetBuilder::lock_cheatcodes`.
     ///
     /// ## Parameters
-    /// - `cheatcodes`: A list of cheatcode method names to disable, as strings (e.g. `["surfnet_setAccount"]`).
+    /// - `cheatcodes`: `"all"`, or a list of method names (e.g. `["surfnet_setAccount"]`).
+    /// - `config` (optional): `{"lockout": true}` to lock the methods.
     ///
     /// ## Returns
     /// A `RpcResponse<()>` indicating whether the disable operation was successful.
@@ -252,7 +264,7 @@ pub trait SurfnetCheatcodes {
     ///   "jsonrpc": "2.0",
     ///   "id": 1,
     ///   "method": "surfnet_disableCheatcode",
-    ///   "params": [["surfnet_setAccount", "surfnet_timeTravel"]]
+    ///   "params": ["all", { "lockout": true }]
     /// }
     /// ```
     ///
@@ -265,11 +277,8 @@ pub trait SurfnetCheatcodes {
     /// }
     /// ```
     ///
-    /// # Notes
-    /// Call `surfnet_lockout` first if you need to disable `surfnet_enableCheatcode` or `surfnet_disableCheatcode`.
-    ///
     /// # See Also
-    /// - `surfnet_enableCheatcode`, `surfnet_disableAllCheatcodes`, `surfnet_lockout`
+    /// - `surfnet_enableCheatcode`
     #[rpc(meta, name = "surfnet_disableCheatcode")]
     fn disable_cheatcode(
         &self,
@@ -1674,10 +1683,16 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
                             .into());
                         }
                     }
-                    // Apply all after validation passes
-                    for cheatcode in cheatcodes {
-                        if let Err(e) = cheatcode_ctx.disable_cheatcode(&cheatcode) {
-                            return Err(SurfpoolError::disable_cheatcode(e).into());
+                    // Apply all after validation passes. With lockout, the
+                    // methods are locked: disabled for good, already-disabled
+                    // ones included.
+                    if lockout {
+                        cheatcode_ctx.lock_methods(&cheatcodes);
+                    } else {
+                        for cheatcode in cheatcodes {
+                            if let Err(e) = cheatcode_ctx.disable_cheatcode(&cheatcode) {
+                                return Err(SurfpoolError::disable_cheatcode(e).into());
+                            }
                         }
                     }
                 }
@@ -1712,8 +1727,10 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
                         .into());
                     }
 
-                    // we probably don't need to check whether lockout == true because surfnet_enableCheatcode won't be called if it's disabled
-                    cheatcode_ctx.filter = CheatcodeFilter::List(vec![]);
+                    // Locked methods stay disabled.
+                    if let Err(e) = cheatcode_ctx.enable_all() {
+                        return Err(SurfpoolError::enable_cheatcode(e).into());
+                    }
                 }
                 CheatcodeFilter::List(cheatcodes) => {
                     for ref cheatcode in cheatcodes {

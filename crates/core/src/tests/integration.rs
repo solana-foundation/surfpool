@@ -1069,8 +1069,10 @@ async fn assert_precompile_transaction_succeeds<F>(
     }
 }
 
+#[test_case(false; "best effort")]
+#[test_case(true; "strict")]
 #[tokio::test(flavor = "multi_thread")]
-async fn test_load_snapshot_program_is_invokable() {
+async fn test_load_snapshot_program_is_invokable(strict_snapshot: bool) {
     let snapshot: std::collections::BTreeMap<String, Option<AccountSnapshot>> =
         serde_json::from_str(include_str!("assets/program_snapshot.json"))
             .expect("program snapshot fixture should deserialize");
@@ -1089,6 +1091,7 @@ async fn test_load_snapshot_program_is_invokable() {
             block_production_mode: BlockProductionMode::Manual,
             offline_mode: true,
             snapshot,
+            strict_snapshot,
             ..SimnetConfig::default()
         }],
         rpc: RpcConfig {
@@ -1791,7 +1794,7 @@ fn test_enable_and_disable_cheatcodes(test_type: TestType) {
     );
 
     assert_eq!(
-        runloop_context.cheatcode_config.lock().unwrap().filter,
+        runloop_context.cheatcode_config.lock().unwrap().filter(),
         CheatcodeConfig::filter_all_list(false, available_methods.clone()),
         "The disabled cheatcodes list doesn't match the expected one"
     );
@@ -1889,7 +1892,7 @@ fn test_enable_and_disable_cheatcodes(test_type: TestType) {
     );
 
     assert_eq!(
-        runloop_context.cheatcode_config.lock().unwrap().filter,
+        runloop_context.cheatcode_config.lock().unwrap().filter(),
         CheatcodeFilter::List(vec![]),
         "Expected all the cheatcodes to be enabled"
     );
@@ -1908,7 +1911,7 @@ fn test_enable_and_disable_cheatcodes(test_type: TestType) {
     );
 
     assert_eq!(
-        runloop_context.cheatcode_config.lock().unwrap().filter,
+        runloop_context.cheatcode_config.lock().unwrap().filter(),
         CheatcodeConfig::filter_all_list(true, vec![]),
         "Expected all the features to be disabled"
     );
@@ -2909,6 +2912,49 @@ async fn test_profile_transaction_multi_instruction_basic(test_type: TestType) {
             }
         }
     }
+}
+
+/// With `max_profiles` reached, the oldest simulated profile is dropped, and
+/// a tag lists the profiles still kept instead of failing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tag_skips_profiles_dropped_by_max_profiles() {
+    let (svm_instance, _simnet_events_rx, _geyser_events_rx) =
+        SurfnetSvm::new(crate::surfnet::svm::SurfnetSvmConfig {
+            max_profiles: 1,
+            ..Default::default()
+        })
+        .unwrap();
+    let svm_locker = SurfnetSvmLocker::new(svm_instance);
+    let payer = Keypair::new();
+    svm_locker
+        .with_svm_writer(|svm| svm.airdrop(&payer.pubkey(), 10_000_000))
+        .unwrap()
+        .unwrap();
+    let latest_blockhash = svm_locker.with_svm_reader(|svm| svm.latest_blockhash());
+    let tag = "evicted".to_string();
+
+    let mut uuids = vec![];
+    for _ in 0..2 {
+        let instruction = transfer(&payer.pubkey(), &Pubkey::new_unique(), 1_000_000);
+        let message =
+            Message::new_with_blockhash(&[instruction], Some(&payer.pubkey()), &latest_blockhash);
+        let transaction =
+            VersionedTransaction::try_new(VersionedMessage::Legacy(message), &[&payer]).unwrap();
+        uuids.push(
+            svm_locker
+                .profile_transaction(&None, transaction, Some(tag.clone()))
+                .await
+                .unwrap()
+                .inner,
+        );
+    }
+
+    let tagged = svm_locker
+        .get_profile_results_by_tag(tag, &RpcProfileResultConfig::default())
+        .unwrap()
+        .expect("the tag still exists");
+    assert_eq!(tagged.len(), 1);
+    assert_eq!(tagged[0].key, UuidOrSignature::Uuid(uuids[1]));
 }
 
 #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
@@ -4614,6 +4660,7 @@ fn boot_simnet_with_features(
             gossip_port: 0,
             tpu_port: 0,
             tpu_quic_port: 0,
+            ..RpcConfig::default()
         },
         subgraph: SubgraphConfig::default(),
         ..SurfpoolConfig::default()
