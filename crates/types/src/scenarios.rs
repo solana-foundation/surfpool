@@ -566,10 +566,10 @@ pub struct OverrideInstance {
     )]
     #[cfg_attr(feature = "ts-bindings", ts(type = "Record<string, unknown>"))]
     pub values: HashMap<String, serde_json::Value>,
-    /// Relative slot when this override should be applied (1 = one slot after registration;
-    /// a slot lasts the surfnet's configured slot time, 250ms by default)
+    /// Slot offset from the scenario's base slot (0 = the base slot itself, by default the next
+    /// slot the surfnet produces; a slot lasts the surfnet's configured slot time, 250ms by default)
     #[schemars(
-        description = "Slot offset from scenario registration (integer, e.g., 1, 2, 3). Each slot lasts the surfnet's configured slot time (250ms by default)."
+        description = "Slot offset from the scenario's base slot (integer, e.g., 1, 2, 3). Each slot lasts the surfnet's configured slot time (250ms by default)."
     )]
     #[cfg_attr(feature = "ts-bindings", ts(type = "number | bigint"))]
     pub scenario_relative_slot: Slot,

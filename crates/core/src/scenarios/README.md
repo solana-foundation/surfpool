@@ -36,8 +36,11 @@ whole struct or array) also works, but it must be **complete** - every field of 
 padding included - because the account is re-encoded with Borsh. An out-of-range index or a
 non-numeric segment on an array is a hard error, never a silent write elsewhere.
 
-An override is applied once. Its resulting account state remains in later slots until a transaction
-or another override writes that account again.
+An override is applied once, when the surfnet produces its slot; nothing is applied during the
+registration call. Its resulting account state remains in later slots until a transaction or another
+override writes that account again.
+`surfnet_timeTravel` produces only the next slot before it jumps, so overrides scheduled in the slots
+it skips are never applied; step one slot at a time to play a scenario under a paused clock.
 
 ### Kamino integration tests
 
@@ -84,6 +87,11 @@ Directly using the `surfnet_registerScenario` endpoint requires building out a m
 This is a cumbersome process in most cases.
 Override templates that are registered in the Surfpool repo will automatically be available in Surfpool Studio's drag-and-drop UI for creating scenarios.
 This UI will automatically create the `surfnet_registerScenario` payload for you, eliminating the complexity from the process.
+
+A collection tagged `clock-sensitive` holds accounts with a time or slot the program checks against the Clock, such as a
+Pyth price's `publish_time` or the oracle staleness window of Phoenix markets. Playing such a scenario with the clock paused
+leaves fetched accounts ahead of the surfnet's time, and the program can refuse transactions; Studio warns before pausing for
+them. The tag applies to every template in the collection, including ones without a time check.
 
 ## Creating Native Scenario Support for a Protocol
 Having a protocol being natively supported by Surfpool Scenarios will allow users to easily create scenarios to override account states for that protocol.

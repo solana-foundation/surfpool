@@ -1,11 +1,16 @@
 #![allow(dead_code)]
-use std::net::TcpListener;
+use std::{collections::HashMap, net::TcpListener};
 
 use crossbeam_channel::{Receiver, Sender};
+use solana_account::Account;
 use solana_clock::Clock;
 use solana_epoch_info::EpochInfo;
+use solana_pubkey::Pubkey;
 use solana_transaction::versioned::VersionedTransaction;
-use surfpool_types::{CheatcodeConfig, RpcConfig, SimnetCommand, SimnetEvent, SvmFeatureConfig};
+use surfpool_types::{
+    AccountAddress, CheatcodeConfig, Idl, OverrideInstance, RpcConfig, SimnetCommand, SimnetEvent,
+    SvmFeatureConfig,
+};
 
 use crate::{
     rpc::RunloopContext,
@@ -56,6 +61,53 @@ pub async fn canned_rpc(result_json: impl Into<String>) -> String {
     });
 
     format!("http://{addr}")
+}
+
+/// `Obligation.unhealthy_borrow_value_sf` (u128), counting the discriminator.
+pub const UNHEALTHY_OFFSET: usize = 2256;
+
+/// Writes a zeroed Kamino `Obligation` owned by klend and returns an override that sets its
+/// `unhealthy_borrow_value_sf`. `SurfnetSvm::default()` already registers the bundled template
+/// IDLs, so klend's is resolvable by owner program.
+pub fn scheduled_override_fixture(surfnet_svm: &mut SurfnetSvm) -> (Pubkey, OverrideInstance) {
+    let klend = Pubkey::from_str_const("KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD");
+    let idl: Idl = serde_json::from_str(crate::scenarios::registry::KAMINO_V1_IDL_CONTENT)
+        .expect("kamino idl");
+    let obligation_disc = &idl
+        .accounts
+        .iter()
+        .find(|a| a.name == "Obligation")
+        .expect("Obligation account")
+        .discriminator;
+
+    let mut data = vec![0u8; 3344];
+    data[..8].copy_from_slice(obligation_disc);
+
+    let account_pubkey = Pubkey::new_unique();
+    surfnet_svm
+        .inner
+        .set_account(
+            account_pubkey,
+            Account {
+                lamports: 1_000_000,
+                data,
+                owner: klend,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .expect("set obligation account");
+
+    let instance = OverrideInstance::new(
+        "kamino-obligation-health".to_string(),
+        0,
+        AccountAddress::Pubkey(account_pubkey.to_string()),
+    )
+    .with_values(HashMap::from([(
+        "unhealthy_borrow_value_sf".to_string(),
+        serde_json::json!(1_234u64),
+    )]));
+    (account_pubkey, instance)
 }
 
 #[derive(Clone)]
