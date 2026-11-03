@@ -144,17 +144,17 @@ $ surfpool profile <SIGNATURE>
 │  ├─ System                 —
 │  ├─ SPL Token          37 CU
 │  └─ SPL Token         229 CU
-├─ Jupiter v6        60,370 CU   75.3%
-│  ├─ Pump AMM       53,546 CU
+├─ jupiter           60,370 CU   75.3%
+│  ├─ pump_amm       53,546 CU
 │  │  ├─ Token-2022   2,977 CU
 │  │  ├─ SPL Token      112 CU
 │  │  ├─ SPL Token      112 CU
-│  │  └─ Pump AMM     2,116 CU
-│  └─ Jupiter v6         91 CU
+│  │  └─ pump_amm     2,116 CU
+│  └─ jupiter            91 CU
 ├─ SPL Token            118 CU    0.1%
 └─ Token-2022         1,466 CU    1.8%
 
-300 CU went to builtin programs, which log no cost of their own.
+300 CU unattributed: no program's logs account for them.
 ```
 
 It reads the transaction from the local surfnet by default, or from any RPC with `--rpc-url`. Programs with an IDL registered on the surfnet are shown by name. `--folded cu.txt` also writes a flame graph for [speedscope](https://www.speedscope.app), and `--json` prints the tree for scripts.

@@ -4,10 +4,13 @@ use ansi_term::Colour;
 use serde::Serialize;
 use serde_json::{Value, json};
 use solana_pubkey::Pubkey;
+use surfpool_core::solana_rpc_client::{
+    api::request::RpcRequest, nonblocking::rpc_client::RpcClient,
+};
 
-use crate::cli::{ProfileCommand, rpc_request};
+use crate::cli::ProfileCommand;
 
-/// Programs named in the tree without asking the RPC for an IDL.
+/// Native and SPL programs, named without asking the RPC for an IDL.
 const KNOWN_PROGRAMS: &[(&str, &str)] = &[
     ("11111111111111111111111111111111", "System"),
     (
@@ -29,36 +32,6 @@ const KNOWN_PROGRAMS: &[(&str, &str)] = &[
         "Associated Token",
     ),
     ("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr", "Memo"),
-    (
-        "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s",
-        "Metaplex Token Metadata",
-    ),
-    ("JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4", "Jupiter v6"),
-    (
-        "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",
-        "Orca Whirlpool",
-    ),
-    (
-        "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",
-        "Raydium AMM v4",
-    ),
-    (
-        "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK",
-        "Raydium CLMM",
-    ),
-    (
-        "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C",
-        "Raydium CPMM",
-    ),
-    (
-        "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",
-        "Meteora DLMM",
-    ),
-    ("PhoeNiXZ8ByJGLkxNfZRnkUfjvmuYqLR89jjFHGqdXY", "Phoenix"),
-    ("KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD", "Kamino Lend"),
-    ("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P", "Pump"),
-    ("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA", "Pump AMM"),
-    ("pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ", "Pump Fees"),
 ];
 
 /// A transaction's compute units, broken down by the program invocations its logs record.
@@ -69,7 +42,7 @@ pub struct TransactionProfile {
     pub slot: u64,
     pub err: Value,
     pub compute_units_consumed: Option<u64>,
-    /// The runtime cut the logs short, so invocations after the cut are missing.
+    /// The runtime cut the logs short, so compute units after the cut are unknown.
     pub logs_truncated: bool,
     pub invocations: Vec<Invocation>,
 }
@@ -80,7 +53,8 @@ pub struct TransactionProfile {
 pub struct Invocation {
     pub program_id: String,
     pub name: Option<String>,
-    /// Compute units consumed, CPIs included. Builtin programs log none.
+    /// Compute units consumed, CPIs included. Builtin programs log none, and neither does an
+    /// invocation after the logs are cut.
     pub consumed: Option<u64>,
     pub error: Option<String>,
     /// The logs end before this invocation does.
@@ -140,11 +114,7 @@ pub fn parse_invocations(logs: &[String]) -> (Vec<Invocation>, bool) {
         };
 
         if event.starts_with("invoke [") {
-            open.push(Invocation {
-                program_id: program_id.to_string(),
-                name: known_program_name(program_id),
-                ..Default::default()
-            });
+            open.push(invocation(program_id));
         } else if let Some(units) = event.strip_prefix("consumed ") {
             if let Some(invocation) = open.last_mut() {
                 invocation.consumed = units.split(' ').next().and_then(|n| n.parse().ok());
@@ -171,11 +141,101 @@ fn attach(invocation: Invocation, open: &mut [Invocation], top_level: &mut Vec<I
     }
 }
 
-fn known_program_name(program_id: &str) -> Option<String> {
-    KNOWN_PROGRAMS
+fn invocation(program_id: &str) -> Invocation {
+    Invocation {
+        program_id: program_id.to_string(),
+        name: KNOWN_PROGRAMS
+            .iter()
+            .find(|(id, _)| *id == program_id)
+            .map(|(_, name)| name.to_string()),
+        ..Default::default()
+    }
+}
+
+/// Builds the invocation tree from the message's instructions and the CPIs
+/// `meta.innerInstructions` records under them, nested by `stackHeight`. Unlike the logs, these
+/// aren't truncated. `None` when the RPC doesn't record them, or not with their stack heights.
+fn instruction_tree(transaction: &Value) -> Option<Vec<Invocation>> {
+    let message = &transaction["transaction"]["message"];
+    let meta = &transaction["meta"];
+    // Instructions index the static account keys, then those loaded from lookup tables.
+    let keys = message["accountKeys"]
+        .as_array()?
         .iter()
-        .find(|(id, _)| *id == program_id)
-        .map(|(_, name)| name.to_string())
+        .chain(
+            meta["loadedAddresses"]["writable"]
+                .as_array()
+                .into_iter()
+                .flatten(),
+        )
+        .chain(
+            meta["loadedAddresses"]["readonly"]
+                .as_array()
+                .into_iter()
+                .flatten(),
+        )
+        .map(Value::as_str)
+        .collect::<Option<Vec<_>>>()?;
+    let program = |instruction: &Value| {
+        let index = instruction["programIdIndex"].as_u64()?;
+        keys.get(index as usize)
+            .map(|program_id| invocation(program_id))
+    };
+
+    let mut top_level = message["instructions"]
+        .as_array()?
+        .iter()
+        .map(program)
+        .collect::<Option<Vec<_>>>()?;
+    for inner in meta["innerInstructions"].as_array()? {
+        let index = inner["index"].as_u64()? as usize;
+        let mut open = vec![std::mem::take(top_level.get_mut(index)?)];
+        for instruction in inner["instructions"].as_array()? {
+            // The top-level instruction is at height 1, its CPIs at 2, and so on.
+            let height = instruction["stackHeight"].as_u64()? as usize;
+            while open.len() >= height {
+                let done = open.pop()?;
+                open.last_mut()?.invocations.push(done);
+            }
+            open.push(program(instruction)?);
+        }
+        while open.len() > 1 {
+            let done = open.pop()?;
+            open.last_mut()?.invocations.push(done);
+        }
+        top_level[index] = open.pop()?;
+    }
+
+    // The instructions after the one that failed never ran.
+    if let Some(failed) = meta["err"]["InstructionError"][0].as_u64() {
+        top_level.truncate(failed as usize + 1);
+    }
+    Some(top_level)
+}
+
+/// Copies the compute units, errors and cut-off frames the logs record onto the instruction
+/// tree. Both list invocations in the order they ran, so the n-th `invoke` line is the n-th
+/// instruction. One the logs don't open, a precompile's or one after the cut, gets nothing.
+fn take_compute_units_from_logs(tree: &mut [Invocation], mut logged: Vec<Invocation>) {
+    let mut frames = vec![];
+    for_each_invocation(&mut logged, &mut |frame| {
+        frames.push((
+            std::mem::take(&mut frame.program_id),
+            frame.consumed,
+            frame.error.take(),
+            frame.unfinished,
+        ));
+    });
+    let mut frames = frames.into_iter().peekable();
+    for_each_invocation(tree, &mut |invocation| {
+        if let Some((_, consumed, error, unfinished)) =
+            frames.next_if(|(program_id, ..)| *program_id == invocation.program_id)
+        {
+            invocation.consumed = consumed;
+            invocation.error = error;
+            invocation.unfinished = unfinished;
+        }
+    });
 }
 
 fn for_each_invocation(invocations: &mut [Invocation], f: &mut impl FnMut(&mut Invocation)) {
@@ -194,7 +254,14 @@ impl TransactionProfile {
         let meta = &transaction["meta"];
         let logs: Vec<String> = serde_json::from_value(meta["logMessages"].clone())
             .map_err(|_| format!("the RPC returned no log messages for {signature}"))?;
-        let (invocations, logs_truncated) = parse_invocations(&logs);
+        let (logged, logs_truncated) = parse_invocations(&logs);
+        let invocations = match instruction_tree(transaction) {
+            Some(mut tree) => {
+                take_compute_units_from_logs(&mut tree, logged);
+                tree
+            }
+            None => logged,
+        };
         Ok(Self {
             signature: signature.to_string(),
             slot: transaction["slot"].as_u64().unwrap_or_default(),
@@ -205,8 +272,9 @@ impl TransactionProfile {
         })
     }
 
-    /// Compute units the logs don't attribute to any top-level invocation: builtin programs,
-    /// and anything cut from truncated logs.
+    /// Compute units no `consumed` line charges to a top-level invocation: builtin programs',
+    /// those after a log cut, and those a failed transaction's runtime drains after the last
+    /// `consumed` line.
     fn unattributed(&self) -> u64 {
         let attributed: u64 = self.invocations.iter().map(Invocation::attributed).sum();
         self.compute_units_consumed
@@ -273,7 +341,7 @@ impl TransactionProfile {
                 "\n{}",
                 paint(
                     Colour::Yellow,
-                    "The runtime truncated these logs: invocations after the cut are missing."
+                    "The runtime truncated these logs: compute units after the cut are unknown."
                 )
             );
         }
@@ -281,13 +349,8 @@ impl TransactionProfile {
         if unattributed > 0 {
             let _ = writeln!(
                 out,
-                "\n{} CU went to builtin programs{}, which log no cost of their own.",
-                thousands(unattributed),
-                if self.logs_truncated {
-                    " or to invocations cut from the logs"
-                } else {
-                    ""
-                }
+                "\n{} CU unattributed: no program's logs account for them.",
+                thousands(unattributed)
             );
         }
         out
@@ -313,7 +376,7 @@ impl TransactionProfile {
         walk(&self.invocations, "", &mut out);
         let unattributed = self.unattributed();
         if unattributed > 0 {
-            let _ = writeln!(out, "builtin programs {unattributed}");
+            let _ = writeln!(out, "unattributed {unattributed}");
         }
         out
     }
@@ -374,9 +437,9 @@ fn thousands(n: u64) -> String {
 }
 
 /// Names programs the built-in list doesn't know from the IDLs registered with the surfnet.
-/// Best effort: an RPC without `surfnet_getActiveIdl`, or a program without an IDL, keeps its
-/// address.
-async fn name_programs_from_idls(rpc_url: &str, invocations: &mut [Invocation]) {
+/// Best effort: a program without an IDL keeps its address, and so does every program on an RPC
+/// that isn't a surfnet.
+async fn name_programs_from_idls(client: &RpcClient, invocations: &mut [Invocation]) {
     let mut unnamed = BTreeSet::new();
     for_each_invocation(invocations, &mut |invocation| {
         if invocation.name.is_none() {
@@ -386,9 +449,13 @@ async fn name_programs_from_idls(rpc_url: &str, invocations: &mut [Invocation]) 
 
     let mut names = vec![];
     for program_id in unnamed {
-        let Ok(idl) = rpc_request(rpc_url, "surfnet_getActiveIdl", json!([program_id])).await
-        else {
-            continue;
+        let request = RpcRequest::Custom {
+            method: "surfnet_getActiveIdl",
+        };
+        // Stop at the first error, such as a "method not found" from an RPC that isn't a
+        // surfnet, rather than asking once per program.
+        let Ok(idl) = client.send::<Value>(request, json!([program_id])).await else {
+            break;
         };
         if let Some(name) = idl["value"]["metadata"]["name"].as_str() {
             names.push((program_id, name.to_string()));
@@ -404,21 +471,23 @@ async fn name_programs_from_idls(rpc_url: &str, invocations: &mut [Invocation]) 
 
 pub async fn handle_profile_command(cmd: ProfileCommand) -> Result<(), String> {
     let rpc_url = cmd.get_rpc_url();
-    let transaction = rpc_request(
-        &rpc_url,
-        "getTransaction",
-        json!([
-            cmd.signature,
-            {
-                "encoding": "json",
-                "maxSupportedTransactionVersion": 0,
-                "commitment": "confirmed",
-            }
-        ]),
-    )
-    .await?;
+    let client = RpcClient::new(rpc_url.clone());
+    let transaction = client
+        .send::<Value>(
+            RpcRequest::GetTransaction,
+            json!([
+                cmd.signature,
+                {
+                    "encoding": "json",
+                    "maxSupportedTransactionVersion": 1,
+                    "commitment": "confirmed",
+                }
+            ]),
+        )
+        .await
+        .map_err(|e| format!("failed to read {} from {rpc_url}: {e}", cmd.signature))?;
     let mut profile = TransactionProfile::from_rpc(&cmd.signature, &transaction)?;
-    name_programs_from_idls(&rpc_url, &mut profile.invocations).await;
+    name_programs_from_idls(&client, &mut profile.invocations).await;
 
     if let Some(path) = &cmd.folded {
         std::fs::write(path, profile.folded())
@@ -449,6 +518,8 @@ mod tests {
     const TOKEN: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
     const SYSTEM: &str = "11111111111111111111111111111111";
     const UNKNOWN: &str = "L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95";
+    const COMPUTE_BUDGET: &str = "ComputeBudget111111111111111111111111111111";
+    const ED25519: &str = "Ed25519SigVerify111111111111111111111111111";
 
     fn logs(lines: &[&str]) -> Vec<String> {
         lines.iter().map(|line| line.to_string()).collect()
@@ -487,10 +558,29 @@ mod tests {
     fn create_associated_token_account() -> Value {
         json!({
             "slot": 463407496,
+            "transaction": {
+                "message": {
+                    "accountKeys": [UNKNOWN, COMPUTE_BUDGET, ATA, TOKEN, SYSTEM],
+                    "instructions": [
+                        {"programIdIndex": 1},
+                        {"programIdIndex": 1},
+                        {"programIdIndex": 2},
+                    ],
+                },
+            },
             "meta": {
                 "err": null,
                 "computeUnitsConsumed": 18213,
                 "logMessages": create_associated_token_account_logs(),
+                "innerInstructions": [{
+                    "index": 2,
+                    "instructions": [
+                        {"programIdIndex": 3, "stackHeight": 2},
+                        {"programIdIndex": 4, "stackHeight": 2},
+                        {"programIdIndex": 3, "stackHeight": 2},
+                        {"programIdIndex": 3, "stackHeight": 2},
+                    ],
+                }],
             },
         })
     }
@@ -568,6 +658,105 @@ mod tests {
     }
 
     #[test]
+    fn truncated_logs_keep_every_call_the_metadata_records() {
+        // An Ed25519 precompile, which logs nothing, then a program whose logs are cut inside it.
+        // Its CPIs go to programs loaded from a lookup table.
+        let profile = TransactionProfile::from_rpc(
+            "sig",
+            &json!({
+                "slot": 1,
+                "transaction": {
+                    "message": {
+                        "accountKeys": [UNKNOWN, ED25519],
+                        "instructions": [{"programIdIndex": 1}, {"programIdIndex": 0}],
+                    },
+                },
+                "meta": {
+                    "err": null,
+                    "computeUnitsConsumed": 5000,
+                    "loadedAddresses": {"writable": [], "readonly": [TOKEN, SYSTEM]},
+                    "innerInstructions": [{
+                        "index": 1,
+                        "instructions": [
+                            {"programIdIndex": 2, "stackHeight": 2},
+                            {"programIdIndex": 3, "stackHeight": 3},
+                            {"programIdIndex": 2, "stackHeight": 2},
+                        ],
+                    }],
+                    "logMessages": [
+                        "Program L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95 invoke [1]",
+                        "Program TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA invoke [2]",
+                        "Program 11111111111111111111111111111111 invoke [3]",
+                        "Program 11111111111111111111111111111111 success",
+                        "Program TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA consumed 300 of 199000 compute units",
+                        "Program TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA success",
+                        "Log truncated",
+                    ],
+                },
+            }),
+        )
+        .unwrap();
+
+        assert!(profile.logs_truncated);
+        let [precompile, caller] = &profile.invocations[..] else {
+            panic!("{:?}", profile.invocations);
+        };
+        assert_eq!(
+            (precompile.program_id.as_str(), precompile.consumed),
+            (ED25519, None)
+        );
+        assert_eq!(
+            (caller.program_id.as_str(), caller.consumed),
+            (UNKNOWN, None)
+        );
+        assert!(caller.unfinished);
+        let cpis = caller
+            .invocations
+            .iter()
+            .map(|cpi| (cpi.program_id.as_str(), cpi.consumed))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            cpis,
+            [(TOKEN, Some(300)), (TOKEN, None)],
+            "the CPI after the cut stays"
+        );
+        assert_eq!(caller.invocations[0].invocations[0].program_id, SYSTEM);
+        assert_eq!(profile.unattributed(), 4700);
+    }
+
+    #[test]
+    fn instructions_after_the_failed_one_are_left_out() {
+        let profile = TransactionProfile::from_rpc(
+            "sig",
+            &json!({
+                "slot": 1,
+                "transaction": {
+                    "message": {
+                        "accountKeys": [UNKNOWN, TOKEN],
+                        "instructions": [{"programIdIndex": 0}, {"programIdIndex": 1}],
+                    },
+                },
+                "meta": {
+                    "err": {"InstructionError": [0, {"Custom": 1}]},
+                    "computeUnitsConsumed": 100,
+                    "innerInstructions": [],
+                    "logMessages": [
+                        "Program L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95 invoke [1]",
+                        "Program L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95 consumed 100 of 200000 compute units",
+                        "Program L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95 failed: custom program error: 0x1",
+                    ],
+                },
+            }),
+        )
+        .unwrap();
+
+        let [failed] = &profile.invocations[..] else {
+            panic!("{:?}", profile.invocations);
+        };
+        assert_eq!(failed.error.as_deref(), Some("custom program error: 0x1"));
+    }
+
+    #[test]
     fn a_programs_own_log_lines_cannot_pass_for_the_runtimes() {
         let (top_level, _) = parse_invocations(&logs(&[
             "Program L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95 invoke [1]",
@@ -608,7 +797,7 @@ mod tests {
         assert_eq!(profile.unattributed(), 800);
         assert_eq!(
             profile.folded(),
-            format!("{UNKNOWN};SPL Token 200\nbuiltin programs 800\n")
+            format!("{UNKNOWN};SPL Token 200\nunattributed 800\n")
         );
     }
 
@@ -647,7 +836,7 @@ mod tests {
              Associated Token;SPL Token 179\n\
              Associated Token;SPL Token 37\n\
              Associated Token;SPL Token 229\n\
-             builtin programs 300\n"
+             unattributed 300\n"
         );
         let total: u64 = folded
             .lines()
@@ -673,7 +862,7 @@ mod tests {
             "   ├─ SPL Token          37 CU",
             "   └─ SPL Token         229 CU",
             "",
-            "300 CU went to builtin programs, which log no cost of their own.",
+            "300 CU unattributed: no program's logs account for them.",
             "",
         ];
         assert_eq!(profile.render(false), expected.join("\n"));
