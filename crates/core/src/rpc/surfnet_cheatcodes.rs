@@ -1774,7 +1774,8 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
             Err(e) => return e.into(),
         };
 
-        let is_native_mint = mint == spl_token_interface::native_mint::id();
+        let is_native_mint = mint == spl_token_interface::native_mint::id()
+            || mint == spl_token_2022_interface::native_mint::id();
         let token_amount = update.amount.unwrap_or(0);
 
         let token_program_id = match some_token_program_str {
@@ -5516,6 +5517,113 @@ mod tests {
         assert_eq!(state.base.amount, 42);
         assert_eq!(state.base.is_native, COption::Some(extended_rent));
         assert!(state.get_extension::<ImmutableOwner>().is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_set_token_2022_native_mint_amount_is_backed_by_lamports() {
+        use spl_token_2022_interface::{
+            extension::StateWithExtensions,
+            instruction::close_account,
+            state::{Account as Token2022Account, Mint as Token2022Mint},
+        };
+
+        let client = TestSetup::new(SurfnetCheatcodesRpc::empty());
+        let owner = Keypair::new();
+        let recipient = Pubkey::new_unique();
+        let mint = spl_token_2022_interface::native_mint::id();
+        let token_program = spl_token_2022_interface::id();
+        let wrapped = 1_000_000_000;
+
+        let mut mint_data = vec![0; Token2022Mint::LEN];
+        Token2022Mint {
+            decimals: spl_token_2022_interface::native_mint::DECIMALS,
+            is_initialized: true,
+            ..Default::default()
+        }
+        .pack_into_slice(&mut mint_data);
+        let mint_rent = client.context.svm_locker.with_svm_reader(|svm| {
+            svm.inner
+                .minimum_balance_for_rent_exemption(mint_data.len())
+        });
+        set_account(
+            &client,
+            &mint,
+            &Account {
+                lamports: mint_rent,
+                data: mint_data,
+                owner: token_program,
+                executable: false,
+                rent_epoch: 0,
+            },
+        );
+        client
+            .context
+            .svm_locker
+            .airdrop(&owner.pubkey(), 1_000_000_000)
+            .unwrap()
+            .unwrap();
+
+        client
+            .rpc
+            .set_token_account(
+                Some(client.context.clone()),
+                owner.pubkey().to_string(),
+                mint.to_string(),
+                TokenAccountUpdate {
+                    amount: Some(wrapped),
+                    ..Default::default()
+                },
+                Some(token_program.to_string()),
+            )
+            .await
+            .unwrap();
+
+        let ata =
+            get_associated_token_address_with_program_id(&owner.pubkey(), &mint, &token_program);
+        let account = client
+            .context
+            .svm_locker
+            .with_svm_reader(|svm| svm.inner.get_account(&ata).unwrap().unwrap());
+        let state = StateWithExtensions::<Token2022Account>::unpack(&account.data).unwrap();
+        let rent = client.context.svm_locker.with_svm_reader(|svm| {
+            svm.inner
+                .minimum_balance_for_rent_exemption(account.data.len())
+        });
+        assert_eq!(state.base.amount, wrapped);
+        assert_eq!(state.base.is_native, COption::Some(rent));
+        assert_eq!(account.lamports, rent + wrapped);
+
+        let instruction = close_account(
+            &token_program,
+            &ata,
+            &recipient,
+            &owner.pubkey(),
+            &[&owner.pubkey()],
+        )
+        .unwrap();
+        let blockhash = client
+            .context
+            .svm_locker
+            .with_svm_reader(|svm| svm.latest_blockhash());
+        let transaction = Transaction::new_signed_with_payer(
+            &[instruction],
+            Some(&owner.pubkey()),
+            &[&owner],
+            blockhash,
+        );
+        let close_result = client
+            .context
+            .svm_locker
+            .with_svm_writer(|svm| svm.send_transaction(transaction.into(), false, false));
+        assert!(
+            close_result.is_ok(),
+            "a funded Token-2022 wrapped SOL ATA should unwrap: {close_result:?}"
+        );
+        let received = client
+            .context
+            .svm_locker
+            .with_svm_reader(|svm| svm.inner.get_account(&recipient).unwrap().unwrap().lamports);
+        assert_eq!(received, rent + wrapped);
     }
 
     #[tokio::test(flavor = "multi_thread")]
