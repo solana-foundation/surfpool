@@ -57,7 +57,9 @@ impl StorageBackend {
             + std::hash::Hash,
         V: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static + Clone,
     {
-        self.open_store_with_default(table_name, || Box::new(StorageHashMap::new()))
+        self.open_store_with_default(table_name, || {
+            Box::new(std::sync::Arc::new(StorageHashMap::new()))
+        })
     }
 
     /// Opens the kv store for `table_name`, using `default_storage_constructor`

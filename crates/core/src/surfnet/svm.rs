@@ -110,7 +110,7 @@ use crate::{
         },
         template_registry,
     },
-    storage::{OverlayStorage, Storage, StorageBackend},
+    storage::{OverlayStorage, ProfileFifoMap, Storage, StorageBackend},
     surfnet::{
         BlockSubscriptionData, LogsSubscriptionData, locker::is_supported_token_program,
         surfnet_lite_svm::SurfnetLiteSvm,
@@ -548,6 +548,9 @@ pub struct SurfnetSvm {
     pub logs_subscriptions: Vec<LogsSubscriptionData>,
     pub block_subscriptions: Vec<BlockSubscriptionData>,
     pub snapshot_subscriptions: Vec<super::SnapshotSubscriptionData>,
+    /// Signalled after subscription notifications are sent, so WebSocket tasks can wait for
+    /// them instead of polling their channels.
+    pub(crate) subscription_wake: Arc<tokio::sync::Notify>,
     pub updated_at: u64,
     pub slot_time: u64,
     pub start_time: SystemTime,
@@ -669,11 +672,14 @@ fn add_pubkey_to_index(
     key: String,
     pubkey_str: &str,
 ) -> SurfpoolResult<()> {
-    let mut accounts = index.get(&key).ok().flatten().unwrap_or_default();
-    if !accounts.iter().any(|pk| pk == pubkey_str) {
+    index.modify(key, &mut |accounts| {
+        let accounts = accounts.get_or_insert_with(Vec::new);
+        if accounts.iter().any(|pk| pk == pubkey_str) {
+            return false;
+        }
         accounts.push(pubkey_str.to_string());
-        index.store(key, accounts)?;
-    }
+        true
+    })?;
     Ok(())
 }
 
@@ -685,15 +691,16 @@ fn remove_pubkey_from_index(
     key: &str,
     pubkey_str: &str,
 ) -> SurfpoolResult<()> {
-    let key_owned = key.to_string();
-    if let Some(mut accounts) = index.get(&key_owned).ok().flatten() {
+    index.modify(key.to_string(), &mut |entry| {
+        let Some(accounts) = entry else {
+            return false;
+        };
         accounts.retain(|pk| pk != pubkey_str);
         if accounts.is_empty() {
-            index.take(&key_owned)?;
-        } else {
-            index.store(key_owned, accounts)?;
+            *entry = None;
         }
-    }
+        true
+    })?;
     Ok(())
 }
 
@@ -907,6 +914,7 @@ impl SurfnetSvm {
             logs_subscriptions: Vec::new(),
             block_subscriptions: Vec::new(),
             snapshot_subscriptions: Vec::new(),
+            subscription_wake: Arc::default(),
 
             updated_at: self.updated_at,
             slot_time: self.slot_time,
@@ -970,9 +978,29 @@ impl SurfnetSvm {
         for (_, template) in registry.templates.into_iter() {
             // Templates for programs with no IDL have nothing to register; they write through
             // `raw_layout` instead.
-            if let Some(idl) = template.idl {
-                let _ = self.register_idl(idl, None);
+            let Some(idl) = template.idl else {
+                continue;
+            };
+            // Templates of one program share its IDL, and a persistent store keeps the IDLs of
+            // earlier starts. Skip the IDL when it is already the one every lookup resolves to
+            // now: the versions sharing the newest slot not after the current one.
+            let slot = self.latest_epoch_info.absolute_slot;
+            let versions = self
+                .registered_idls
+                .get(&Pubkey::from_str_const(&idl.address).to_string())
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            let mut effective = versions.iter().skip_while(|v| v.0 > slot).peekable();
+            let newest = effective.peek().map(|v| v.0);
+            if newest.is_some()
+                && effective
+                    .take_while(|v| Some(v.0) == newest)
+                    .all(|v| v.1 == idl)
+            {
+                continue;
             }
+            let _ = self.register_idl(idl, None);
         }
     }
 
@@ -1270,17 +1298,18 @@ impl SurfnetSvm {
             storage_backend.open_store("profile_tag_map")?;
         // Ensure max_profiles is at least 1 to avoid creating a zero-capacity FifoMap
         let max_profiles = max(1, config.max_profiles);
-        // Use FifoMap for both profile stores to maintain FIFO eviction behavior
-        // (when no on-disk DB is provided)
+        // Without an on-disk DB, both profile stores are FIFO maps capped at max_profiles.
+        // ProfileFifoMap behind an Arc lets profiling sandboxes share the map, and a
+        // copy-on-write keeps the cap.
         let simulated_transaction_profiles_db: Box<dyn Storage<String, KeyedProfileResult>> =
             storage_backend
                 .open_store_with_default("simulated_transaction_profiles", move || {
-                    Box::new(FifoMap::<String, KeyedProfileResult>::new(max_profiles))
+                    Box::new(Arc::new(ProfileFifoMap(FifoMap::new(max_profiles))))
                 })?;
         let executed_transaction_profiles_db: Box<dyn Storage<String, KeyedProfileResult>> =
             storage_backend
                 .open_store_with_default("executed_transaction_profiles", move || {
-                    Box::new(FifoMap::<String, KeyedProfileResult>::new(max_profiles))
+                    Box::new(Arc::new(ProfileFifoMap(FifoMap::new(max_profiles))))
                 })?;
         let epoch_schedule = Self::default_epoch_schedule();
         let epoch_info = Self::default_epoch_info(&epoch_schedule);
@@ -1333,6 +1362,7 @@ impl SurfnetSvm {
             logs_subscriptions: Vec::new(),
             block_subscriptions: Vec::new(),
             snapshot_subscriptions: Vec::new(),
+            subscription_wake: Arc::default(),
             updated_at,
             slot_time: config.slot_time,
             start_time: SystemTime::now(),
@@ -4043,6 +4073,7 @@ impl SurfnetSvm {
             if !remaining.is_empty() {
                 self.signature_subscriptions.insert(*signature, remaining);
             }
+            self.subscription_wake.notify_waiters();
         }
     }
 
@@ -4073,6 +4104,7 @@ impl SurfnetSvm {
                 self.account_subscriptions
                     .insert(*account_updated_pubkey, remaining);
             }
+            self.subscription_wake.notify_waiters();
         }
     }
 
@@ -4107,6 +4139,7 @@ impl SurfnetSvm {
             if !remaining.is_empty() {
                 self.program_subscriptions.insert(program_id, remaining);
             }
+            self.subscription_wake.notify_waiters();
         }
     }
 
@@ -4399,8 +4432,12 @@ impl SurfnetSvm {
     }
 
     pub fn notify_slot_subscribers(&mut self, slot: Slot, parent: Slot, root: Slot) {
+        if self.slot_subscriptions.is_empty() {
+            return;
+        }
         self.slot_subscriptions
             .retain(|tx| tx.send(SlotInfo { slot, parent, root }).is_ok());
+        self.subscription_wake.notify_waiters();
     }
 
     /// Registers a new sender for `slotsUpdatesSubscribe` notifications and
@@ -4428,6 +4465,7 @@ impl SurfnetSvm {
         let arc = Arc::new(update);
         self.slots_updates_subscriptions
             .retain(|tx| tx.send(arc.clone()).is_ok());
+        self.subscription_wake.notify_waiters();
     }
 
     /// Sends a slot status to Geyser plugins and mirrors it to `slotsUpdatesSubscribe`, so the
@@ -4602,6 +4640,7 @@ impl SurfnetSvm {
                     logs: logs.clone(),
                 };
                 let _ = tx.send((self.get_latest_absolute_slot(), message));
+                self.subscription_wake.notify_waiters();
             }
         }
     }
@@ -4683,6 +4722,7 @@ impl SurfnetSvm {
                 tx.send(update).is_ok()
             })
             .collect();
+        self.subscription_wake.notify_waiters();
     }
 
     /// Registers a snapshot subscription and returns a sender and receiver for notifications.
@@ -6607,6 +6647,27 @@ mod tests {
         assert!(svm.get_block_or_reconstruct(blocks[0] + 1).is_err());
         svm.confirm_current_block().unwrap();
         assert_eq!(read(&svm, &[open])[0].0, height + 1);
+    }
+
+    #[test]
+    fn test_builtin_idls_are_registered_once_across_restarts() {
+        let test_type = TestType::sqlite();
+        let TestType::OnDiskSqlite(database_url) = &test_type else {
+            unreachable!()
+        };
+        let config = SurfnetSvmConfig {
+            surfnet_id: "builtin-idls".to_string(),
+            ..SurfnetSvmConfig::default()
+        };
+        for _ in 0..2 {
+            let (mut svm, _events_rx, _geyser_rx) =
+                SurfnetSvm::new_with_db(Some(database_url), config.clone()).unwrap();
+            svm.confirm_current_block().unwrap();
+            for (program_id, versions) in svm.registered_idls.into_iter().unwrap() {
+                assert_eq!(versions.len(), 1, "{program_id}");
+            }
+            svm.shutdown();
+        }
     }
 
     #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
