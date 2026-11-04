@@ -3,7 +3,7 @@ use std::{collections::HashSet, vec};
 use base64::{Engine, prelude::BASE64_STANDARD};
 use bytemuck::{Pod, Zeroable, bytes_of, from_bytes};
 use chrono::Utc;
-use litesvm::types::TransactionMetadata;
+use litesvm::types::{TokenBalance, TransactionBalances, TransactionMetadata};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use solana_account::Account;
 use solana_account_decoder::{
@@ -449,73 +449,60 @@ impl TransactionWithStatusMeta {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// Builds the stored status of a transaction that reached LiteSVM.
+    ///
+    /// The balances are the ones LiteSVM recorded around execution. If it recorded none,
+    /// because it rejected the transaction before execution, the native balances are read
+    /// from `accounts_before` and `accounts_after` and no token balances are reported.
     pub fn new(
         slot: u64,
         transaction: VersionedTransaction,
+        status: Result<(), TransactionError>,
         transaction_meta: TransactionMetadata,
         accounts_before: &[Option<Account>],
         accounts_after: &[Option<Account>],
-        pre_token_accounts_with_indexes: &[(usize, TokenAccount)],
-        post_token_accounts_with_indexes: &[(usize, TokenAccount)],
-        pre_token_mints: Vec<Option<MintAccount>>,
-        post_token_mints: Vec<MintAccount>,
-        pre_token_program_ids: &[Pubkey],
-        post_token_program_ids: &[Pubkey],
         loaded_addresses: LoadedAddresses,
     ) -> Self {
+        let lamports = |accounts: &[Option<Account>]| {
+            accounts
+                .iter()
+                .map(|a| a.as_ref().map_or(0, |a| a.lamports))
+                .collect()
+        };
+        let TransactionBalances {
+            pre_balances,
+            post_balances,
+            pre_token_balances,
+            post_token_balances,
+        } = transaction_meta
+            .balances
+            .unwrap_or_else(|| TransactionBalances {
+                pre_balances: lamports(accounts_before),
+                post_balances: lamports(accounts_after),
+                ..Default::default()
+            });
         Self {
             slot,
             transaction,
             meta: TransactionStatusMeta {
-                status: Ok(()),
+                status,
                 fee: transaction_meta.fee,
-                pre_balances: accounts_before
-                    .iter()
-                    .map(|a| a.clone().map(|a| a.lamports).unwrap_or(0))
-                    .collect(),
-                post_balances: accounts_after
-                    .iter()
-                    .map(|a| a.clone().map(|a| a.lamports).unwrap_or(0))
-                    .collect(),
+                pre_balances,
+                post_balances,
                 inner_instructions: Some(
                     map_inner_instructions(transaction_meta.inner_instructions).collect(),
                 ),
                 log_messages: Some(transaction_meta.logs),
                 pre_token_balances: Some(
-                    pre_token_accounts_with_indexes
-                        .iter()
-                        .zip(pre_token_mints)
-                        .zip(pre_token_program_ids)
-                        .filter_map(|(((i, a), mint), token_program)| {
-                            Some(TransactionTokenBalance {
-                                account_index: *i as u8,
-                                mint: a.mint().to_string(),
-                                ui_token_amount: token_amount_to_ui_amount_v3(
-                                    a.amount(),
-                                    &SplTokenAdditionalDataV2::with_decimals(mint?.decimals()),
-                                ),
-                                owner: a.owner().to_string(),
-                                program_id: token_program.to_string(),
-                            })
-                        })
+                    pre_token_balances
+                        .into_iter()
+                        .map(transaction_token_balance)
                         .collect(),
                 ),
                 post_token_balances: Some(
-                    post_token_accounts_with_indexes
-                        .iter()
-                        .zip(post_token_mints)
-                        .zip(post_token_program_ids)
-                        .map(|(((i, a), mint), token_program)| TransactionTokenBalance {
-                            account_index: *i as u8,
-                            mint: a.mint().to_string(),
-                            ui_token_amount: token_amount_to_ui_amount_v3(
-                                a.amount(),
-                                &SplTokenAdditionalDataV2::with_decimals(mint.decimals()),
-                            ),
-                            owner: a.owner().to_string(),
-                            program_id: token_program.to_string(),
-                        })
+                    post_token_balances
+                        .into_iter()
+                        .map(transaction_token_balance)
                         .collect(),
                 ),
                 rewards: Some(vec![]),
@@ -526,70 +513,20 @@ impl TransactionWithStatusMeta {
             },
         }
     }
+}
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn from_failure(
-        slot: u64,
-        transaction: VersionedTransaction,
-        failure: &litesvm::types::FailedTransactionMetadata,
-        accounts_before: &[Option<Account>],
-        accounts_after: &[Option<Account>],
-        pre_token_accounts_with_indexes: &[(usize, TokenAccount)],
-        token_mints: Vec<Option<MintAccount>>,
-        token_program_ids: &[Pubkey],
-        loaded_addresses: LoadedAddresses,
-    ) -> Self {
-        let pre_balances: Vec<u64> = accounts_before
-            .iter()
-            .map(|a| a.as_ref().map(|a| a.lamports).unwrap_or(0))
-            .collect();
-
-        let fee = failure.meta.fee;
-
-        let post_balances: Vec<u64> = accounts_after
-            .iter()
-            .map(|a| a.clone().map(|a| a.lamports).unwrap_or(0))
-            .collect();
-
-        let balances: Vec<TransactionTokenBalance> = pre_token_accounts_with_indexes
-            .iter()
-            .zip(token_mints)
-            .zip(token_program_ids)
-            .filter_map(|(((i, a), mint), token_program)| {
-                Some(TransactionTokenBalance {
-                    account_index: *i as u8,
-                    mint: a.mint().to_string(),
-                    ui_token_amount: token_amount_to_ui_amount_v3(
-                        a.amount(),
-                        &SplTokenAdditionalDataV2::with_decimals(mint?.decimals()),
-                    ),
-                    owner: a.owner().to_string(),
-                    program_id: token_program.to_string(),
-                })
-            })
-            .collect();
-
-        Self {
-            slot,
-            transaction,
-            meta: TransactionStatusMeta {
-                status: Err(failure.err.clone()),
-                fee,
-                pre_balances,
-                post_balances,
-                inner_instructions: Some(
-                    map_inner_instructions(failure.meta.inner_instructions.clone()).collect(),
-                ),
-                log_messages: Some(failure.meta.logs.clone()),
-                pre_token_balances: Some(balances.clone()),
-                post_token_balances: Some(balances),
-                rewards: Some(vec![]),
-                loaded_addresses,
-                return_data: Some(failure.meta.return_data.clone()).filter(|d| !d.data.is_empty()),
-                compute_units_consumed: Some(failure.meta.compute_units_consumed),
-                cost_units: None,
-            },
-        }
+/// Converts a raw token balance recorded by LiteSVM to its status-meta form, with the UI
+/// amount computed from the decimals only, as Agave's ledger does.
+fn transaction_token_balance(balance: TokenBalance) -> TransactionTokenBalance {
+    TransactionTokenBalance {
+        account_index: balance.account_index,
+        mint: balance.mint.to_string(),
+        ui_token_amount: token_amount_to_ui_amount_v3(
+            balance.amount,
+            &SplTokenAdditionalDataV2::with_decimals(balance.decimals),
+        ),
+        owner: balance.owner.to_string(),
+        program_id: balance.program_id.to_string(),
     }
 }
 
@@ -604,6 +541,7 @@ pub fn surfpool_tx_metadata_to_litesvm_tx_metadata(
         signature: metadata.signature,
         fee: metadata.fee,
         loaded_accounts_data_size: metadata.loaded_accounts_data_size,
+        balances: None,
     }
 }
 

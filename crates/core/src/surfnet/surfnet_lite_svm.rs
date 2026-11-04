@@ -100,6 +100,7 @@ impl SurfnetLiteSvm {
             .with_precompiles()
             .with_blockhash_check(false)
             .with_sigverify(false)
+            .with_transaction_balance_recording(true)
     }
 
     pub fn reset(&mut self, feature_set: FeatureSet) -> SurfpoolResult<()> {
