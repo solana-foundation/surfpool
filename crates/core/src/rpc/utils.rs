@@ -16,6 +16,9 @@ use solana_message::v1::{MAX_TRANSACTION_SIZE, V1_PREFIX};
 use solana_packet::PACKET_DATA_SIZE;
 use solana_pubkey::{ParsePubkeyError, Pubkey};
 use solana_signature::Signature;
+use solana_transaction::versioned::{
+    VersionedTransaction, sanitized::SanitizedVersionedTransaction,
+};
 use solana_transaction_status::{TransactionBinaryEncoding, UiTransactionEncoding};
 
 use crate::error::{SurfpoolError, SurfpoolResult};
@@ -196,27 +199,53 @@ where
 }
 
 /// Decode the RPC `data` parameter of `sendTransaction` and
-/// `simulateTransaction` into a `solana_transaction::VersionedTransaction`.
+/// `simulateTransaction` with [`decode_transaction`].
 ///
 /// Both methods accept a `UiTransactionEncoding` on their config that defaults
-/// to `Base58`, map it to the internal `TransactionBinaryEncoding`, and feed
-/// the result into `decode_and_deserialize`. The mapping can fail (the RPC
-/// only accepts base58 and base64), which is reported back as an
-/// `Error::invalid_params` listing the supported encodings.
+/// to `Base58` and map it to the internal `TransactionBinaryEncoding`. The
+/// mapping can fail (the RPC only accepts base58 and base64), which is reported
+/// back as an `Error::invalid_params` listing the supported encodings.
 pub fn decode_rpc_versioned_transaction(
     data: String,
     encoding: Option<UiTransactionEncoding>,
-) -> Result<solana_transaction::versioned::VersionedTransaction> {
+) -> Result<SanitizedVersionedTransaction> {
     let tx_encoding = encoding.unwrap_or(UiTransactionEncoding::Base58);
     let binary_encoding = tx_encoding.into_binary_encoding().ok_or_else(|| {
         Error::invalid_params(format!(
             "unsupported encoding: {tx_encoding}. Supported encodings: base58, base64"
         ))
     })?;
-    let (_, unsanitized_tx) = decode_and_deserialize::<
-        solana_transaction::versioned::VersionedTransaction,
-    >(data, binary_encoding)?;
-    Ok(unsanitized_tx)
+    decode_transaction(data, binary_encoding)
+}
+
+/// Decode a transaction sent to an RPC method and sanitize it, refusing one
+/// whose signatures, header and account indexes don't add up with the error
+/// Agave's `sanitize_transaction` returns.
+///
+/// Surfpool reads a transaction before LiteSVM sanitizes it: the runloop takes
+/// its first signature and instruction profiling indexes its accounts. Handing
+/// on the sanitized type means nothing past the RPC layer can see a
+/// transaction that would panic the thread reading it.
+pub fn decode_transaction(
+    encoded: String,
+    encoding: TransactionBinaryEncoding,
+) -> Result<SanitizedVersionedTransaction> {
+    let (_, tx) = decode_and_deserialize::<VersionedTransaction>(encoded, encoding)?;
+    SanitizedVersionedTransaction::try_new(tx).map_err(|e| {
+        Error::invalid_params(format!(
+            "invalid transaction: {}",
+            solana_transaction_error::TransactionError::from(e)
+        ))
+    })
+}
+
+/// The transaction behind a sanitized one, for LiteSVM, without a copy.
+pub fn into_versioned_transaction(tx: SanitizedVersionedTransaction) -> VersionedTransaction {
+    let (signatures, message) = tx.destruct();
+    VersionedTransaction {
+        signatures,
+        message: message.message,
+    }
 }
 
 /// Substrings that, when present in a lowercased error message, indicate the

@@ -567,6 +567,7 @@ pub async fn start_block_production_runloop(
                         continue
                     }
                     SimnetCommand::ProcessTransaction(_key, transaction, status_tx, skip_preflight, skip_sig_verify_override) => {
+                       let transaction = rpc::utils::into_versioned_transaction(transaction);
                        let skip_sig_verify = skip_sig_verify_override.unwrap_or(global_skip_sig_verify);
                        let sigverify = !skip_sig_verify;
                        let signature = transaction.signatures[0];
