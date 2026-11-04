@@ -30,6 +30,9 @@ env:
   CARGO_TERM_COLOR: always
   SURFPOOL_WEB_UI_VERSION: 0.2.0-alpha.0
 
+permissions:
+  contents: read
+
 jobs:
   kit_types_fresh:
     name: Generated kit RPC types are up to date
