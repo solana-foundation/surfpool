@@ -1938,6 +1938,26 @@ impl SurfnetSvmLocker {
     }
 }
 
+/// Why [`SurfnetSvmLocker::preflight_transaction`] refused a transaction.
+#[derive(Debug)]
+pub enum PreflightFailure {
+    /// The simulation failed, or the transaction loads an account twice.
+    Simulation(TransactionError, surfpool_types::TransactionMetadata),
+    /// The transaction's accounts could not be loaded.
+    AccountLoad(String),
+}
+
+impl From<PreflightFailure> for TransactionStatusEvent {
+    fn from(failure: PreflightFailure) -> Self {
+        match failure {
+            PreflightFailure::Simulation(err, meta) => {
+                TransactionStatusEvent::SimulationFailure((err, meta))
+            }
+            PreflightFailure::AccountLoad(err) => TransactionStatusEvent::VerificationFailure(err),
+        }
+    }
+}
+
 /// Functions for simulating and processing transactions in the underlying SurfnetSvm instance
 impl SurfnetSvmLocker {
     /// Simulates a transaction on the SVM, returning detailed info or failure metadata.
@@ -1983,23 +2003,10 @@ impl SurfnetSvmLocker {
         {
             Ok(result) => result,
             Err(e) => {
-                // Ensure the status channel always receives a response to prevent
-                // the RPC handler from hanging on recv() when errors occur during
-                // account fetching, ALT resolution, or other pre-processing steps.
-                // This is critical for issue #454 where program close stops block production.
-                //
-                // AccountLoadedTwice errors should go through SimulationFailure to produce
-                // Agave-compatible JSON-RPC error format with structured `err` and `data` fields.
-                let err_str = e.to_string();
-                if err_str.contains("Account loaded twice") {
-                    let _ = status_tx.try_send(TransactionStatusEvent::SimulationFailure((
-                        TransactionError::AccountLoadedTwice,
-                        surfpool_types::TransactionMetadata::default(),
-                    )));
-                } else {
-                    let _ =
-                        status_tx.try_send(TransactionStatusEvent::VerificationFailure(err_str));
-                }
+                // Errors during account fetching, ALT resolution, or other pre-processing
+                // steps must still reach the status channel, so a caller awaiting it
+                // (the Jito bundle path) does not hang. See issue #454.
+                let _ = status_tx.try_send(Self::account_load_failure(&e).into());
                 return Err(e);
             }
         };
@@ -2009,6 +2016,112 @@ impl SurfnetSvmLocker {
         })?;
 
         Ok(())
+    }
+
+    /// Runs the preflight `sendTransaction` performs before enqueueing a transaction: loads
+    /// every account the transaction references (lookup tables resolved, accounts missing
+    /// locally fetched from `remote_ctx` and written into the SVM), then simulates it under
+    /// the read lock without committing anything.
+    ///
+    /// Signatures are verified when `sigverify` is set, as the simulation does.
+    ///
+    /// # Returns
+    /// `Ok(())` when the transaction may be enqueued, otherwise why it was refused.
+    pub async fn preflight_transaction(
+        &self,
+        remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
+        transaction: VersionedTransaction,
+        sigverify: bool,
+    ) -> Result<(), PreflightFailure> {
+        self.load_transaction_accounts(remote_ctx, &transaction)
+            .await
+            .map_err(|e| Self::account_load_failure(&e))?;
+        self.simulate_transaction(transaction, sigverify)
+            .map(drop)
+            .map_err(|FailedTransactionMetadata { err, meta }| {
+                PreflightFailure::Simulation(
+                    err,
+                    convert_transaction_metadata_from_canonical(&meta),
+                )
+            })
+    }
+
+    /// Classifies a failure to load a transaction's accounts. `AccountLoadedTwice` is a
+    /// simulation failure, so the RPC answers it with Agave's structured preflight error.
+    fn account_load_failure(e: &SurfpoolError) -> PreflightFailure {
+        let err_str = e.to_string();
+        if err_str.contains("Account loaded twice") {
+            PreflightFailure::Simulation(
+                TransactionError::AccountLoadedTwice,
+                surfpool_types::TransactionMetadata::default(),
+            )
+        } else {
+            PreflightFailure::AccountLoad(err_str)
+        }
+    }
+
+    /// Loads the accounts `transaction` references into the SVM: resolves its lookup tables,
+    /// then fetches every message account and lookup table account missing locally from
+    /// `remote_ctx`.
+    ///
+    /// # Returns
+    /// The resolved lookup table addresses, the transaction's account keys (static keys plus
+    /// the addresses loaded from lookup tables, without the tables themselves), and those
+    /// accounts as loaded. Fails with `AccountLoadedTwice` when a lookup table address is also
+    /// a static key, as Agave rejects such transactions before execution.
+    async fn load_transaction_accounts(
+        &self,
+        remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
+        transaction: &VersionedTransaction,
+    ) -> SurfpoolResult<(
+        Option<TransactionLoadedAddresses>,
+        Vec<Pubkey>,
+        Vec<GetAccountResult>,
+    )> {
+        let tx_loaded_addresses = self
+            .get_loaded_addresses(remote_ctx, &transaction.message)
+            .await?;
+
+        if let Some(ref loaded) = tx_loaded_addresses {
+            let static_keys: HashSet<&Pubkey> =
+                transaction.message.static_account_keys().iter().collect();
+            for loaded_key in loaded.all_loaded_addresses() {
+                if static_keys.contains(loaded_key) {
+                    return Err(TransactionError::AccountLoadedTwice.into());
+                }
+            }
+        }
+
+        let transaction_accounts = self.get_pubkeys_from_message(
+            &transaction.message,
+            tx_loaded_addresses
+                .as_ref()
+                .map(|l| l.all_loaded_addresses()),
+        );
+        debug!(
+            "Transaction {} accounts inputs: {}",
+            transaction.get_signature(),
+            transaction_accounts.iter().join(", ")
+        );
+
+        let account_updates = self
+            .get_multiple_accounts(remote_ctx, &transaction_accounts, None)
+            .await?
+            .inner;
+
+        // The lookup tables are not transaction accounts, but execution resolves them, so they
+        // must be local too.
+        self.get_multiple_accounts(
+            remote_ctx,
+            &tx_loaded_addresses
+                .as_ref()
+                .map(|l| l.alt_addresses())
+                .unwrap_or_default(),
+            None,
+        )
+        .await?;
+
+        Ok((tx_loaded_addresses, transaction_accounts, account_updates))
     }
 
     pub async fn profile_transaction(
@@ -2078,53 +2191,9 @@ impl SurfnetSvmLocker {
             latest_absolute_slot
         });
 
-        // find accounts that are needed for this transaction but are missing from the local
-        // svm cache, fetch them from the RPC, and insert them locally
-        let tx_loaded_addresses = self
-            .get_loaded_addresses(remote_ctx, &transaction.message)
+        let (tx_loaded_addresses, transaction_accounts, account_updates) = self
+            .load_transaction_accounts(remote_ctx, &transaction)
             .await?;
-
-        // Check for duplicate accounts between static keys and ALT-loaded addresses.
-        // Agave rejects such transactions pre-execution with AccountLoadedTwice.
-        if let Some(ref loaded) = tx_loaded_addresses {
-            let static_keys: HashSet<&Pubkey> =
-                transaction.message.static_account_keys().iter().collect();
-            for loaded_key in loaded.all_loaded_addresses() {
-                if static_keys.contains(loaded_key) {
-                    return Err(TransactionError::AccountLoadedTwice.into());
-                }
-            }
-        }
-
-        // we don't want the pubkeys of the address lookup tables to be included in the transaction accounts,
-        // but we do want the pubkeys of the accounts _loaded_ by the ALT to be in the transaction accounts.
-        let transaction_accounts = self.get_pubkeys_from_message(
-            &transaction.message,
-            tx_loaded_addresses
-                .as_ref()
-                .map(|l| l.all_loaded_addresses()),
-        );
-        debug!(
-            "Transaction {} accounts inputs: {}",
-            transaction.get_signature(),
-            transaction_accounts.iter().join(", ")
-        );
-
-        let account_updates = self
-            .get_multiple_accounts(remote_ctx, &transaction_accounts, None)
-            .await?
-            .inner;
-
-        // We also need the pubkeys of the ALTs to be pulled from the remote, so we'll do a fetch for them
-        self.get_multiple_accounts(
-            remote_ctx,
-            &tx_loaded_addresses
-                .as_ref()
-                .map(|l| l.alt_addresses())
-                .unwrap_or_default(),
-            None,
-        )
-        .await?;
 
         let readonly_account_states = transaction_accounts
             .iter()
@@ -2416,7 +2485,9 @@ impl SurfnetSvmLocker {
         let cus = meta.compute_units_consumed;
         let log_messages = meta.logs.clone();
         let err_string = err.to_string();
-        let signature = meta.signature;
+        // The client polls the signature it signed with; metadata from a pre-execution
+        // rejection must not decide where the failure is recorded.
+        let signature = transaction.signatures[0];
 
         let accounts_after = pubkeys_from_message
             .iter()

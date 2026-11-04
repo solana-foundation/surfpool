@@ -12450,6 +12450,18 @@ async fn test_send_transaction_resend_of_processed_transaction(test_type: TestTy
     };
     let skip_preflight = send_config(true, None, None);
     let processed_preflight = send_config(false, Some(CommitmentLevel::Processed), None);
+    // sendTransaction returns once the transaction is queued; the runloop executes it after.
+    let wait_until_executed = async |signature: &solana_signature::Signature| {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while svm_locker
+                .with_svm_reader(|svm_reader| svm_reader.is_transaction_pending(signature))
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the runloop should execute the queued transaction");
+    };
     let tx = transfer(LAMPORTS_PER_SOL / 10);
     let signature = tx.signatures[0].to_string();
     let data = encode(&tx);
@@ -12458,6 +12470,7 @@ async fn test_send_transaction_resend_of_processed_transaction(test_type: TestTy
         .send_transaction(data.clone(), None)
         .await
         .expect("the first send should succeed");
+    wait_until_executed(&tx.signatures[0]).await;
     let observed_state = async || {
         let payer = minimal_client.get_balance(payer.pubkey().to_string(), None);
         let recipient = minimal_client.get_balance(recipient.to_string(), None);
@@ -12519,6 +12532,7 @@ async fn test_send_transaction_resend_of_processed_transaction(test_type: TestTy
         .send_transaction(reusing_data.clone(), send_config(true, None, Some(true)))
         .await
         .expect("a send without signature verification should succeed");
+    wait_until_executed(&reusing_signature.signatures[0]).await;
     assert_eq!(
         observed_state().await.1,
         state_after_first_send.1 + LAMPORTS_PER_SOL / 20,
@@ -12581,6 +12595,7 @@ async fn test_send_transaction_resend_of_processed_transaction(test_type: TestTy
         ),
         (in_flight_signature.clone(), in_flight_signature)
     );
+    wait_until_executed(&in_flight.signatures[0]).await;
     assert_eq!(
         observed_state().await.1,
         balance_before_in_flight + LAMPORTS_PER_SOL / 40,

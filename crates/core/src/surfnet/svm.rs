@@ -37,7 +37,7 @@ use solana_client::{
         RpcLogsResponse, RpcPerfSample, RpcResponseContext,
     },
 };
-use solana_clock::{Clock, Slot};
+use solana_clock::{Clock, MAX_PROCESSING_AGE, Slot};
 use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_epoch_info::EpochInfo;
 use solana_epoch_schedule::EpochSchedule;
@@ -2181,6 +2181,13 @@ impl SurfnetSvm {
             .map(|age| age as u64)
     }
 
+    /// Whether a transaction carrying `blockhash` may still be processed, as Agave's `check_age`
+    /// decides it: the blockhash is recent and at most `MAX_PROCESSING_AGE` blocks old.
+    pub fn is_blockhash_valid_for_processing(&self, blockhash: &Hash) -> bool {
+        self.blockhash_age(blockhash)
+            .is_some_and(|age| age <= MAX_PROCESSING_AGE as u64)
+    }
+
     /// Returns `false` when `blockhash` is a recent blockhash too new for `commitment`.
     pub fn is_blockhash_visible_at(&self, blockhash: &Hash, commitment: &CommitmentConfig) -> bool {
         if self.skip_blockhash_check {
@@ -2244,8 +2251,8 @@ impl SurfnetSvm {
         self.inner.svm.get_fee_structure().lamports_per_signature
     }
 
-    /// Validates a transaction's lifetime as Agave's `check_transactions` does: a recent blockhash,
-    /// or else a durable nonce.
+    /// Validates a transaction's lifetime as Agave's `check_transactions` does: a blockhash no
+    /// older than `MAX_PROCESSING_AGE`, or else a durable nonce.
     ///
     /// # Arguments
     /// * `tx` - The transaction to validate.
@@ -2254,7 +2261,7 @@ impl SurfnetSvm {
     /// `true` if the transaction blockhash is valid, `false` otherwise.
     pub fn validate_transaction_blockhash(&self, tx: &VersionedTransaction) -> bool {
         self.skip_blockhash_check
-            || self.check_blockhash_is_recent(tx.message.recent_blockhash())
+            || self.is_blockhash_valid_for_processing(tx.message.recent_blockhash())
             || self.check_durable_nonce(&tx.message)
     }
 
@@ -2300,18 +2307,29 @@ impl SurfnetSvm {
     /// So, if the user is trying to skip signature verification for a simulation, we'd need to unset and set this value,
     /// requiring a mutable reference to the SVM, which we don't have/want in the simulation path.
     /// Additionally, having this function internally lets us do this check before we start fetching accounts from mainnet.
+    /// Metadata for a transaction rejected before it ran: no logs or compute units, but the
+    /// transaction's own signature, so the failure is recorded and announced under the
+    /// signature the client holds. An unsigned transaction, which simulation accepts when
+    /// signature verification is off, gets the default signature.
+    fn rejected_transaction_metadata(tx: &VersionedTransaction) -> TransactionMetadata {
+        TransactionMetadata {
+            signature: tx.signatures.first().copied().unwrap_or_default(),
+            ..TransactionMetadata::default()
+        }
+    }
+
     pub fn sigverify(&self, tx: &VersionedTransaction) -> Result<(), FailedTransactionMetadata> {
         if tx.verify_with_results().iter().any(|valid| !*valid) {
             return Err(FailedTransactionMetadata {
                 err: TransactionError::SignatureFailure,
-                meta: TransactionMetadata::default(),
+                meta: Self::rejected_transaction_metadata(tx),
             });
         }
 
         if self.processed_slot(tx).is_some() {
             return Err(FailedTransactionMetadata {
                 err: TransactionError::AlreadyProcessed,
-                meta: TransactionMetadata::default(),
+                meta: Self::rejected_transaction_metadata(tx),
             });
         }
         Ok(())
@@ -2808,7 +2826,7 @@ impl SurfnetSvm {
         self.transactions_processed += 1;
 
         if !self.validate_transaction_blockhash(&tx) {
-            let meta = TransactionMetadata::default();
+            let meta = Self::rejected_transaction_metadata(&tx);
             let err = solana_transaction_error::TransactionError::BlockhashNotFound;
 
             let transaction_meta = convert_transaction_metadata_from_canonical(&meta);
@@ -2889,7 +2907,7 @@ impl SurfnetSvm {
         }
 
         if !self.validate_transaction_blockhash(&tx) {
-            let meta = TransactionMetadata::default();
+            let meta = Self::rejected_transaction_metadata(&tx);
             let err = TransactionError::BlockhashNotFound;
 
             return Err(FailedTransactionMetadata { err, meta });
@@ -7085,6 +7103,30 @@ mod tests {
         assert!(!svm.is_blockhash_visible_at(&fresh_blockhash, &finalized));
         confirm_blocks(&mut svm, 1);
         assert!(svm.is_blockhash_visible_at(&fresh_blockhash, &finalized));
+    }
+
+    /// simulateTransaction with sigVerify off accepts a transaction carrying no signatures;
+    /// rejecting its unknown blockhash must not index into the empty signature list.
+    #[test]
+    fn test_unsigned_simulation_with_unknown_blockhash_is_rejected_without_panicking() {
+        let (svm, _events_rx, _geyser_rx) = TestType::no_db().initialize_svm();
+        let payer = Pubkey::new_unique();
+        let message = solana_message::Message::new_with_blockhash(
+            &[system_instruction::transfer(
+                &payer,
+                &Pubkey::new_unique(),
+                1,
+            )],
+            Some(&payer),
+            &Hash::new_unique(),
+        );
+        let tx = VersionedTransaction {
+            signatures: vec![],
+            message: VersionedMessage::Legacy(message),
+        };
+
+        let err = svm.simulate_transaction(tx, false).err().map(|e| e.err);
+        assert_eq!(err, Some(TransactionError::BlockhashNotFound));
     }
 
     #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
