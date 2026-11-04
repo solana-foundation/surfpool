@@ -2521,7 +2521,9 @@ impl SurfnetSvmLocker {
         let cus = meta.compute_units_consumed;
         let log_messages = meta.logs.clone();
         let err_string = err.to_string();
-        let signature = meta.signature;
+        // The client polls the signature it signed with; metadata from a pre-execution
+        // rejection must not decide where the failure is recorded.
+        let signature = transaction.signatures[0];
 
         let accounts_after = pubkeys_from_message
             .iter()

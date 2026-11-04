@@ -2300,18 +2300,28 @@ impl SurfnetSvm {
     /// So, if the user is trying to skip signature verification for a simulation, we'd need to unset and set this value,
     /// requiring a mutable reference to the SVM, which we don't have/want in the simulation path.
     /// Additionally, having this function internally lets us do this check before we start fetching accounts from mainnet.
+    /// Metadata for a transaction rejected before it ran: no logs or compute units, but the
+    /// transaction's own signature, so the failure is recorded and announced under the
+    /// signature the client holds.
+    fn rejected_transaction_metadata(tx: &VersionedTransaction) -> TransactionMetadata {
+        TransactionMetadata {
+            signature: tx.signatures[0],
+            ..TransactionMetadata::default()
+        }
+    }
+
     pub fn sigverify(&self, tx: &VersionedTransaction) -> Result<(), FailedTransactionMetadata> {
         if tx.verify_with_results().iter().any(|valid| !*valid) {
             return Err(FailedTransactionMetadata {
                 err: TransactionError::SignatureFailure,
-                meta: TransactionMetadata::default(),
+                meta: Self::rejected_transaction_metadata(tx),
             });
         }
 
         if self.processed_slot(tx).is_some() {
             return Err(FailedTransactionMetadata {
                 err: TransactionError::AlreadyProcessed,
-                meta: TransactionMetadata::default(),
+                meta: Self::rejected_transaction_metadata(tx),
             });
         }
         Ok(())
@@ -2807,7 +2817,7 @@ impl SurfnetSvm {
         self.transactions_processed += 1;
 
         if !self.validate_transaction_blockhash(&tx) {
-            let meta = TransactionMetadata::default();
+            let meta = Self::rejected_transaction_metadata(&tx);
             let err = solana_transaction_error::TransactionError::BlockhashNotFound;
 
             let transaction_meta = convert_transaction_metadata_from_canonical(&meta);
@@ -2888,7 +2898,7 @@ impl SurfnetSvm {
         }
 
         if !self.validate_transaction_blockhash(&tx) {
-            let meta = TransactionMetadata::default();
+            let meta = Self::rejected_transaction_metadata(&tx);
             let err = TransactionError::BlockhashNotFound;
 
             return Err(FailedTransactionMetadata { err, meta });

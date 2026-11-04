@@ -3691,6 +3691,25 @@ mod tests {
             ))) => {}
             other => panic!("expected an expired blockhash to fail execution, got {other:?}"),
         }
+
+        // The client only holds the signature it sent, so the failure must be recorded under
+        // it rather than under the empty signature of the pre-execution rejection's metadata.
+        confirm_blocks(&setup, 1);
+        let statuses = setup
+            .rpc
+            .get_signature_statuses(
+                Some(setup.context.clone()),
+                vec![tx.signatures[0].to_string()],
+                None,
+            )
+            .await
+            .unwrap()
+            .value;
+        assert_eq!(
+            statuses[0].as_ref().and_then(|status| status.err.clone()),
+            Some(TransactionError::BlockhashNotFound),
+            "the expired transaction's failure should be visible at its own signature"
+        );
     }
 
     /// A durable-nonce transaction is validated against its nonce account at execution: it
