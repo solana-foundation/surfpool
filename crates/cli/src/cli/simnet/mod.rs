@@ -31,7 +31,8 @@ mod endpoints;
 mod startup;
 use endpoints::resolve_endpoints;
 use startup::{
-    StartupPlan, dispatch_startup_plan, plan_startup, seal_startup_plan, spawn_startup_watchdog,
+    SealFailure, StartupPlan, dispatch_startup_plan, plan_startup, seal_startup_plan,
+    spawn_startup_watchdog,
 };
 
 #[cfg(feature = "version_check")]
@@ -522,12 +523,20 @@ fn spawn_startup_dispatch(
             if runloop_terminator.load(Ordering::Acquire) {
                 return Ok(());
             }
+            // A seal failure ends the session, so stop the surfnet too: the
+            // frontend returns on `Aborted`, and the caller then joins the
+            // simnet thread, which would otherwise keep running after a
+            // timed-out seal is eventually answered.
+            let abort_startup = |failure: SealFailure| {
+                let _ = simnet_commands_tx.send(SimnetCommand::Terminate(None));
+                simnet_events_tx.aborted(format!("Failed to seal startup plan: {failure}"));
+            };
             match startup_plan {
                 Some(Ok(plan)) => {
                     if let Err(failure) =
                         dispatch_startup_plan(&cmd, plan, &simnet_events_tx, &simnet_commands_tx)
                     {
-                        simnet_events_tx.aborted(format!("Failed to seal startup plan: {failure}"));
+                        abort_startup(failure);
                     }
                 }
                 Some(Err(e)) => {
@@ -538,7 +547,7 @@ fn spawn_startup_dispatch(
                 // ourselves; the surfnet cannot reach `Ready` without a sealed plan.
                 None => {
                     if let Err(failure) = seal_startup_plan(&simnet_commands_tx, vec![]) {
-                        simnet_events_tx.aborted(format!("Failed to seal startup plan: {failure}"));
+                        abort_startup(failure);
                     }
                 }
             }

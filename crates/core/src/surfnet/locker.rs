@@ -267,16 +267,15 @@ impl SurfnetSvmLocker {
         };
 
         // The four reads are independent; issue them together so startup pays one
-        // round trip instead of four.
-        let (epoch_info, epoch_schedule, some_genesis_hash, last_restart_slot) = tokio::join!(
+        // round trip instead of four. A failed required read returns at once rather
+        // than waiting on the others; the genesis hash and last restart slot are
+        // optional, so their failures are folded into the value.
+        let (mut epoch_info, epoch_schedule, some_genesis_hash, last_restart_slot) = tokio::try_join!(
             remote_client.get_epoch_info(),
             remote_client.get_epoch_schedule(),
-            remote_client.get_genesis_hash(),
-            remote_client.get_last_restart_slot(),
-        );
-        let mut epoch_info = epoch_info?;
-        let epoch_schedule = epoch_schedule?;
-        let some_genesis_hash = some_genesis_hash.ok();
+            async { Ok(remote_client.get_genesis_hash().await.ok()) },
+            async { Ok(remote_client.get_last_restart_slot().await) },
+        )?;
         epoch_info.transaction_count = None;
 
         self.with_svm_writer(move |svm_writer| {
