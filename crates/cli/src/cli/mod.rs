@@ -34,6 +34,7 @@ use txtx_core::manifest::WorkspaceManifest;
 use txtx_gql::kit::{helpers::fs::FileLocation, types::frontend::LogLevel};
 
 use crate::{cli::update::handle_update_command, runbook::handle_execute_runbook_command};
+mod cu;
 mod simnet;
 mod update;
 
@@ -121,6 +122,9 @@ enum Command {
     /// Stop a running Surfpool instance
     #[clap(name = "stop", bin_name = "stop")]
     Stop(StopCommand),
+    /// Show where a transaction's compute units went, CPI by CPI
+    #[clap(name = "cu", bin_name = "cu")]
+    Cu(CuCommand),
     /// Generate shell completion scripts
     #[clap(name = "completions", bin_name = "completions", aliases = &["completion"])]
     Completions(Completions),
@@ -226,6 +230,33 @@ impl StopCommand {
             .port
             .expect("--port is required when --rpc-url is absent");
         format!("http://{host}:{port}")
+    }
+}
+
+#[derive(Parser, PartialEq, Clone, Debug)]
+pub struct CuCommand {
+    /// Signature of the transaction.
+    #[arg(value_name = "SIGNATURE")]
+    pub signature: String,
+    /// RPC URL to read the transaction from: a running Surfpool instance or any Solana RPC.
+    /// Defaults to the local Surfpool instance.
+    #[arg(long = "rpc-url", short = 'u', value_name = "RPC_URL")]
+    pub rpc_url: Option<String>,
+    /// Also write the compute units as collapsed stacks to this file, for a flame graph in
+    /// speedscope.app or inferno-flamegraph.
+    #[arg(long = "folded", value_name = "PATH")]
+    pub folded: Option<PathBuf>,
+    /// Print the invocation tree as JSON.
+    #[arg(long = "json")]
+    pub json: bool,
+}
+
+impl CuCommand {
+    fn get_rpc_url(&self) -> String {
+        self.rpc_url
+            .as_deref()
+            .map(|rpc_url| rpc_url.trim_end_matches('/').to_string())
+            .unwrap_or_else(|| format!("http://{DEFAULT_NETWORK_HOST}:{DEFAULT_RPC_PORT}"))
     }
 }
 
@@ -1045,6 +1076,7 @@ fn handle_command(opts: Opts, ctx: &Context) -> Result<(), String> {
             hiro_system_kit::nestable_block_on(simnet::handle_start_local_surfnet_command(cmd, ctx))
         }
         Command::Stop(cmd) => hiro_system_kit::nestable_block_on(handle_stop_command(cmd)),
+        Command::Cu(cmd) => hiro_system_kit::nestable_block_on(cu::handle_cu_command(cmd)),
         Command::Completions(cmd) => {
             hiro_system_kit::nestable_block_on(generate_completion_helpers(cmd))
         }
