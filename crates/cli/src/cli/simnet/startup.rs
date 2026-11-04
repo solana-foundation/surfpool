@@ -136,23 +136,10 @@ pub(super) fn watch_startup_until_completion(
 
 /// Bounded wait for the seal round-trip. Generous rather than tight: the
 /// runloop emits `SimnetEvent::CoreStarted` immediately before entering the
-/// command loop on the same task, and the CLI waits for Ready before
-/// planning, so the loop is provably alive at every call site. A timeout
+/// command loop on the same task, and the CLI waits for that event before
+/// sealing, so the loop is provably alive at every call site. A timeout
 /// here means the loop is dead or wedged, not merely slow.
 const SEAL_STARTUP_PLAN_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// How startup planning failed, split at the seal boundary because the two
-/// halves demand different responses from the caller.
-pub(super) enum StartupPlanFailure {
-    /// Planning failed before the plan was sealed. The startup state
-    /// machine (`SurfnetStartupStatus`) is reachable and still in
-    /// Planning-unsealed, so the caller can (and must) drive it to Failed;
-    /// the watchdog policy then decides fatality.
-    Planning(String),
-    /// The seal did not take. Which half failed decides what is knowable
-    /// afterwards, so the two arrive separately.
-    Sealing(SealFailure),
-}
 
 /// The two ways sealing fails, which differ in what they leave known.
 pub(super) enum SealFailure {
@@ -192,9 +179,10 @@ pub(super) fn seal_startup_plan(
 /// Everything the planner learned about the project before sealing: the task
 /// list to seal, the work to dispatch, and the context the artifact watcher
 /// needs to re-execute runbooks later.
-struct StartupPlan {
+pub(super) struct StartupPlan {
     progress_tx: Sender<BlockEvent>,
-    progress_rx: Receiver<BlockEvent>,
+    /// Progress of the startup runbooks, for the frontend to display.
+    pub(super) progress_rx: Receiver<BlockEvent>,
     futures: RunbookExecutionFutures,
     clone_pubkeys: Vec<Pubkey>,
     startup_tasks: Vec<SurfnetStartupTask>,
@@ -208,7 +196,7 @@ struct StartupPlan {
 /// Inspects the project, scaffolds runbooks as the execution mode requires,
 /// and assembles the startup plan. Never touches the startup machine: a
 /// failure leaves it in Planning-unsealed for the caller to fail explicitly.
-async fn plan_startup(
+pub(super) async fn plan_startup(
     cmd: &StartSimnet,
     simnet_events_tx: &SimnetEventsTx,
 ) -> Result<StartupPlan, String> {
@@ -339,14 +327,21 @@ async fn plan_startup(
 /// executing txtx runbooks) now lives in [`plan_startup`] and the
 /// runbook-execution futures; this function's job is the startup
 /// choreography around them.
-pub(super) async fn plan_and_dispatch_startup(
+/// Seals the plan and dispatches its work: account cloning to the surfnet,
+/// runbook executions to a worker thread, and the artifact watcher when
+/// requested. Must run after `SimnetEvent::CoreStarted`, since the seal is
+/// a bounded round trip with the surfnet's command loop. A sealing failure
+/// is fatal to the session; everything past the seal reports through the
+/// startup state machine instead.
+pub(super) fn dispatch_startup_plan(
     cmd: &StartSimnet,
+    plan: StartupPlan,
     simnet_events_tx: &SimnetEventsTx,
     simnet_commands_tx: &Sender<SimnetCommand>,
-) -> Result<Receiver<BlockEvent>, StartupPlanFailure> {
+) -> Result<(), SealFailure> {
     let StartupPlan {
         progress_tx,
-        progress_rx,
+        progress_rx: _,
         futures,
         clone_pubkeys,
         startup_tasks,
@@ -355,13 +350,11 @@ pub(super) async fn plan_and_dispatch_startup(
         in_memory_runbook_data,
         runbook_input,
         dev_skill_install,
-    } = plan_startup(cmd, simnet_events_tx)
-        .await
-        .map_err(StartupPlanFailure::Planning)?;
+    } = plan;
 
     // Seal before dispatching anything: from here on, only the registered
     // tasks' transitions can move readiness.
-    seal_startup_plan(simnet_commands_tx, startup_tasks).map_err(StartupPlanFailure::Sealing)?;
+    seal_startup_plan(simnet_commands_tx, startup_tasks)?;
 
     // One choreography for all startup tasks: the submitter sends
     // StartStartupTask before dispatching the work, and the worker reports
@@ -459,7 +452,7 @@ pub(super) async fn plan_and_dispatch_startup(
         }
     }
 
-    Ok(progress_rx)
+    Ok(())
 }
 
 fn report_dev_skill_install(outcome: DevSkillInstallOutcome, events_tx: &SimnetEventsTx) {

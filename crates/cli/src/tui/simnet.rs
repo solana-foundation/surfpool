@@ -269,6 +269,7 @@ struct App {
     blink_state: bool,
     last_blink: Instant,
     selected_tab: usize,
+    core_started_tx: Sender<()>,
 }
 
 impl App {
@@ -279,25 +280,17 @@ impl App {
         runbook_progress_rx: Vec<Receiver<BlockEvent>>,
         displayed_url: DisplayedUrl,
         breaker: Option<Keypair>,
-        initial_transactions: u64,
+        core_started_tx: Sender<()>,
     ) -> App {
         let theme = Theme::detect();
         let palette = theme.palette();
 
-        let mut events = vec![];
-        let (rpc_url, ws_url, datasource) = match &displayed_url {
-            DisplayedUrl::Datasource(config) | DisplayedUrl::Studio(config) => (
-                config.rpc_url.clone(),
-                config.ws_url.clone(),
-                config.rpc_datasource_url.clone(),
-            ),
+        let datasource = match &displayed_url {
+            DisplayedUrl::Datasource(config) | DisplayedUrl::Studio(config) => {
+                config.rpc_datasource_url.clone()
+            }
         };
-        events.push((
-            EventType::Success,
-            Local::now(),
-            format!("Surfnet up and running, emulating local Solana validator (RPC: {rpc_url}, WS: {ws_url})"),
-        ));
-        events.push((
+        let events = vec![(
             EventType::Info,
             Local::now(),
             match &datasource {
@@ -306,7 +299,7 @@ impl App {
                 }
                 None => "No datasource configured, working in offline mode".to_string(),
             },
-        ));
+        )];
 
         App {
             state: TableState::default().with_offset(0),
@@ -323,7 +316,7 @@ impl App {
                 block_height: 0,
                 transaction_count: None,
             },
-            successful_transactions: initial_transactions as u32,
+            successful_transactions: 0,
             events,
             transactions: vec![],
             include_debug_logs,
@@ -335,6 +328,7 @@ impl App {
             blink_state: false,
             last_blink: Instant::now(),
             selected_tab: 0,
+            core_started_tx,
         }
     }
 
@@ -400,8 +394,8 @@ pub fn start_app(
     runbook_progress_rx: Vec<Receiver<BlockEvent>>,
     displayed_url: DisplayedUrl,
     breaker: Option<Keypair>,
-    initial_transactions: u64,
     should_exit: Arc<AtomicBool>,
+    core_started_tx: Sender<()>,
 ) -> Result<(), Box<dyn Error>> {
     // setup terminal
     enable_raw_mode()?;
@@ -418,7 +412,7 @@ pub fn start_app(
         runbook_progress_rx,
         displayed_url,
         breaker,
-        initial_transactions,
+        core_started_tx,
     );
     let res = run_app(&mut terminal, app, should_exit);
 
@@ -427,10 +421,9 @@ pub fn start_app(
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
-    if let Err(err) = res {
-        println!("{err:?}");
-    }
-
+    // Surfaced only after the terminal is restored, so an aborted startup
+    // reaches stderr instead of the alternate screen.
+    res?;
     Ok(())
 }
 
@@ -565,10 +558,29 @@ fn run_app<B: Backend<Error = io::Error>>(
                                     app.successful_transactions += 1;
                                 }
                             }
-                            SimnetEvent::Aborted(_error) => {
-                                break;
+                            SimnetEvent::Aborted(error) => {
+                                return Err(io::Error::other(error.clone()));
                             }
-                            SimnetEvent::CoreStarted(_) => {}
+                            // The surfnet is serving: the replayed transactions
+                            // count toward the total, and the startup dispatcher
+                            // may now seal the plan.
+                            SimnetEvent::CoreStarted(replayed_transactions) => {
+                                app.successful_transactions += *replayed_transactions as u32;
+                                let (rpc_url, ws_url) = match &app.displayed_url {
+                                    DisplayedUrl::Datasource(config)
+                                    | DisplayedUrl::Studio(config) => {
+                                        (config.rpc_url.clone(), config.ws_url.clone())
+                                    }
+                                };
+                                new_events.push((
+                                    EventType::Success,
+                                    Local::now(),
+                                    format!(
+                                        "Surfnet up and running, emulating local Solana validator (RPC: {rpc_url}, WS: {ws_url})"
+                                    ),
+                                ));
+                                let _ = app.core_started_tx.try_send(());
+                            }
                             SimnetEvent::Connected(_) => {}
                             SimnetEvent::Shutdown => {
                                 return Ok(());
