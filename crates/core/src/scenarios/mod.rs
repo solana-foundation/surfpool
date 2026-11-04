@@ -1,3 +1,4 @@
+pub mod keep_alive;
 pub mod protocols;
 pub mod registry;
 

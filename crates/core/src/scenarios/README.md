@@ -118,8 +118,8 @@ time; other values are written as given.
 
 Keep-alive starts in the slot the importing override plays and rewrites its fields every slot, after
 that slot's overrides, until the network is reset. An override of one of those fields therefore
-never takes effect. An account not yet in the surfnet is fetched from the remote first, unless it is
-marked offline. Keep-alive is kept in memory only: after a restart on a persistent database it stops
+never takes effect. An account not yet in the surfnet is fetched from the remote first, unless it,
+or its owner with its owned accounts, is marked offline. Keep-alive is kept in memory only: after a restart on a persistent database it stops
 until an importing override plays again.
 
 ### Override Templates

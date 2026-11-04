@@ -184,7 +184,7 @@ impl TemplateRegistry {
             for import in &template.keep_alive {
                 let fail = |reason: String| {
                     Err(format!(
-                        "template '{}' imports keep-alive '{}': {reason}",
+                        "template '{}' failed to import keep-alive '{}': {reason}",
                         template.id, import.template
                     ))
                 };
@@ -994,7 +994,7 @@ templates:
                 "template: example-fresh\n    address",
                 "template: nowhere\n    address",
             ),
-            "imports keep-alive 'nowhere': no keep-alive file defines it",
+            "failed to import keep-alive 'nowhere': no keep-alive file defines it",
         );
         refused(
             KEEP_ALIVE_OVERRIDES.replace("values: { slot: $slot }", "values: { size: 1 }"),

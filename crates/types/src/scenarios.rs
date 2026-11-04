@@ -1616,8 +1616,8 @@ pub enum KeepAliveAddress {
 }
 
 impl KeepAliveImport {
-    /// The account to write, given the account the importing override wrote and its values.
-    pub fn account(
+    /// The address to write, given the address the importing override wrote and its values.
+    pub fn address(
         &self,
         written: Pubkey,
         values: &HashMap<String, serde_json::Value>,
@@ -1965,7 +1965,7 @@ mod tests {
             keep_alive(&format!(
                 "template: t\naddress: {address}\nvalues: {{ slot: $slot }}\n"
             ))
-            .account(written, &values)
+            .address(written, &values)
         };
         assert_eq!(at("{ type: override }"), Some(written));
         assert_eq!(at("{ type: input, value: oracle }"), Some(oracle));

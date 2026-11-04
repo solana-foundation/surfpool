@@ -287,23 +287,6 @@ impl SurfnetSvmLocker {
 
 /// Functions for getting accounts from the underlying SurfnetSvm instance or remote client
 impl SurfnetSvmLocker {
-    /// Filters the downloaded account result to remove accounts owned by offline owners.
-    fn filter_downloaded_account_result(
-        requested_pubkey: &Pubkey,
-        result: GetAccountResult,
-        offline_owners: &[Pubkey],
-    ) -> GetAccountResult {
-        match result {
-            GetAccountResult::FoundAccount(_, account, _)
-            | GetAccountResult::FoundCoupledAccount((_, account), _, _)
-                if offline_owners.contains(&account.owner) =>
-            {
-                GetAccountResult::None(*requested_pubkey)
-            }
-            other => other,
-        }
-    }
-
     /// Re-checks local state after an asynchronous fetch, returning the local
     /// account when another writer won the race.
     fn resolve_account_after_fetch(
@@ -379,9 +362,9 @@ impl SurfnetSvmLocker {
             return Ok(GetAccountResult::None(pubkey));
         };
 
-        let offline_owners = Self::offline_account_owners(svm_writer);
+        let offline_owners = svm_writer.offline_account_owners();
         let fetched_account =
-            Self::filter_downloaded_account_result(&pubkey, fetched_account, &offline_owners);
+            SurfnetSvm::filter_downloaded_account_result(&pubkey, fetched_account, &offline_owners);
 
         if !fetched_account.is_none() {
             svm_writer.apply_account_update(
@@ -431,25 +414,6 @@ impl SurfnetSvmLocker {
             coupled,
             source,
         ))
-    }
-
-    fn offline_account_owners(svm_writer: &SurfnetSvm) -> Vec<Pubkey> {
-        svm_writer
-            .offline_accounts
-            .into_iter()
-            .unwrap_or_else(|e| {
-                warn!("Failed to iterate offline_accounts: {}", e);
-                Box::new(std::iter::empty())
-            })
-            .filter(|(_, config)| config.include_owned_accounts)
-            .filter_map(|(key, _)| match key.parse() {
-                Ok(pubkey) => Some(pubkey),
-                Err(e) => {
-                    warn!("Invalid pubkey in offline_accounts: {}: {}", key, e);
-                    None
-                }
-            })
-            .collect()
     }
 
     /// Retrieves a local account from the SVM cache, returning a contextualized result.
@@ -2852,7 +2816,7 @@ impl SurfnetSvmLocker {
 
     /// Gets all owners whose accounts are marked offline.
     pub fn get_offline_account_owners(&self) -> Vec<Pubkey> {
-        self.with_svm_reader(Self::offline_account_owners)
+        self.with_svm_reader(SurfnetSvm::offline_account_owners)
     }
 
     /// Registers a scenario for execution

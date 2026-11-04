@@ -104,6 +104,7 @@ use crate::{
     rpc::utils::convert_transaction_metadata_from_canonical,
     scenarios::{
         TemplateRegistry, account_data_values,
+        keep_alive::{KeepAliveBinding, KeepAliveSource},
         protocols::phoenix_eternal::v1::state_builder::{
             prepare_phoenix_override, write_all_or_none,
         },
@@ -111,9 +112,7 @@ use crate::{
     },
     storage::{OverlayStorage, Storage, StorageBackend},
     surfnet::{
-        BlockSubscriptionData, LogsSubscriptionData,
-        keep_alive::{KeepAliveBinding, KeepAliveSource},
-        locker::is_supported_token_program,
+        BlockSubscriptionData, LogsSubscriptionData, locker::is_supported_token_program,
         surfnet_lite_svm::SurfnetLiteSvm,
     },
     types::{
@@ -3345,7 +3344,7 @@ impl SurfnetSvm {
                 let touched = self
                     .apply_overrides(remote_ctx, target_slot, overrides, true)
                     .await?;
-                self.enrol_keep_alive(touched);
+                self.enroll_keep_alive(touched);
             }
             Ok::<_, SurfpoolError>(())
         }
@@ -3439,7 +3438,7 @@ impl SurfnetSvm {
             {
                 keep_alive_source = Some(KeepAliveSource {
                     template: template.id.clone(),
-                    account: account_pubkey,
+                    address: account_pubkey,
                     values: override_instance.values.clone(),
                 });
             }
@@ -3459,10 +3458,22 @@ impl SurfnetSvm {
                         account_pubkey
                     );
 
-                    let fetched = match client
+                    let result = client
                         .get_account(&account_pubkey, CommitmentConfig::confirmed())
                         .await
-                    {
+                        .map(|result| {
+                            if scheduled {
+                                return result;
+                            }
+                            // Keep-alive fetches its target unasked, so it honours an owner marked
+                            // offline with its owned accounts, as an ordinary read does.
+                            Self::filter_downloaded_account_result(
+                                &account_pubkey,
+                                result,
+                                &self.offline_account_owners(),
+                            )
+                        });
+                    let fetched = match result {
                         Ok(GetAccountResult::FoundAccount(_pubkey, remote_account, _)) => {
                             Some((remote_account, None))
                         }
@@ -3546,6 +3557,8 @@ impl SurfnetSvm {
                 Ok(account) => account,
                 Err(e) => {
                     restore_unprocessed(self, index);
+                    // The overrides before this one wrote their accounts, so they still join.
+                    self.enroll_keep_alive(std::mem::take(&mut keep_alive_touched));
                     return Err(e);
                 }
             };
@@ -3694,6 +3707,8 @@ impl SurfnetSvm {
                             target_slot,
                         ) {
                             restore_unprocessed(self, index);
+                            // The overrides before this one wrote their accounts, so they still join.
+                            self.enroll_keep_alive(std::mem::take(&mut keep_alive_touched));
                             return Err(e);
                         }
                         keep_alive_touched.extend(keep_alive_source.take());
@@ -3803,28 +3818,28 @@ impl SurfnetSvm {
     }
 
     /// Adds the accounts that `touched` makes keep-alive imports rewrite.
-    fn enrol_keep_alive(&mut self, touched: Vec<KeepAliveSource>) {
+    fn enroll_keep_alive(&mut self, touched: Vec<KeepAliveSource>) {
         for source in touched {
             let Some(template) = template_registry().get(&source.template) else {
                 continue;
             };
             for (index, import) in template.keep_alive.iter().enumerate() {
-                let Some(account) = import.account(source.account, &source.values) else {
+                let Some(address) = import.address(source.address, &source.values) else {
                     warn!(
                         "Keep-alive '{}' of override template '{}' has no address for {}",
-                        import.template, template.id, source.account
+                        import.template, template.id, source.address
                     );
                     continue;
                 };
                 let binding = KeepAliveBinding {
                     template: template.id.clone(),
                     import: index,
-                    account,
+                    address,
                 };
                 if self.keep_alive_bindings.insert(binding) {
                     info!(
                         "Keep-alive '{}' rewrites {} every slot",
-                        import.template, account
+                        import.template, address
                     );
                 }
             }
@@ -3834,13 +3849,12 @@ impl SurfnetSvm {
     /// The keep-alive overrides for every binding at `slot`. A missing account is fetched first when
     /// `can_fetch` and not offline, otherwise skipped.
     fn keep_alive_overrides(&self, slot: Slot, can_fetch: bool) -> Vec<OverrideInstance> {
-        // The time the slot's Clock sysvar is set from, which under Alpenglow is a slot earlier than
-        // the block's time.
+        // The time the open slot's Clock sysvar holds. The Clock advances by each slot's own
+        // interval, so recomputing it from the slot would apply a changed slot interval to every
+        // slot since the last time travel or restart.
         let clock = KeepAliveClock {
             slot,
-            unix_time_ms: self
-                .calculate_block_time_for_slot(slot)
-                .saturating_sub(self.block_time_lag()),
+            unix_time_ms: self.updated_at,
         };
         let mut instances = Vec::new();
         for binding in &self.keep_alive_bindings {
@@ -3850,23 +3864,23 @@ impl SurfnetSvm {
             else {
                 continue;
             };
-            let missing = match self.get_account(&binding.account) {
+            let missing = match self.get_account(&binding.address) {
                 Ok(Some(_)) => false,
                 Ok(None)
                     if can_fetch
                         && !self
                             .offline_accounts
-                            .contains_key(&binding.account.to_string())
+                            .contains_key(&binding.address.to_string())
                             .unwrap_or(false) =>
                 {
                     true
                 }
                 Ok(None) => {
-                    debug!("Keep-alive skips {}: not in this surfnet", binding.account);
+                    debug!("Keep-alive skips {}: not in this surfnet", binding.address);
                     continue;
                 }
                 Err(e) => {
-                    warn!("Keep-alive cannot read {}: {}", binding.account, e);
+                    warn!("Keep-alive cannot read {}: {}", binding.address, e);
                     continue;
                 }
             };
@@ -3875,7 +3889,7 @@ impl SurfnetSvm {
                 Err(e) => {
                     warn!(
                         "Keep-alive '{}' skips {}: {}",
-                        import.template, binding.account, e
+                        import.template, binding.address, e
                     );
                     continue;
                 }
@@ -3883,15 +3897,51 @@ impl SurfnetSvm {
             let mut instance = OverrideInstance::new(
                 import.template.clone(),
                 0,
-                surfpool_types::AccountAddress::Pubkey(binding.account.to_string()),
+                surfpool_types::AccountAddress::Pubkey(binding.address.to_string()),
             )
             .with_values(values)
             .with_label(format!("keep-alive {}", import.template));
-            instance.id = format!("keep-alive:{}:{}", import.template, binding.account);
+            instance.id = format!("keep-alive:{}:{}", import.template, binding.address);
             instance.fetch_before_use = missing;
             instances.push(instance);
         }
         instances
+    }
+
+    /// Filters the downloaded account result to remove accounts owned by offline owners.
+    pub(crate) fn filter_downloaded_account_result(
+        requested_pubkey: &Pubkey,
+        result: GetAccountResult,
+        offline_owners: &[Pubkey],
+    ) -> GetAccountResult {
+        match result {
+            GetAccountResult::FoundAccount(_, account, _)
+            | GetAccountResult::FoundCoupledAccount((_, account), _, _)
+                if offline_owners.contains(&account.owner) =>
+            {
+                GetAccountResult::None(*requested_pubkey)
+            }
+            other => other,
+        }
+    }
+
+    /// The owners marked offline with their owned accounts, whose accounts are never downloaded.
+    pub(crate) fn offline_account_owners(&self) -> Vec<Pubkey> {
+        self.offline_accounts
+            .into_iter()
+            .unwrap_or_else(|e| {
+                warn!("Failed to iterate offline_accounts: {}", e);
+                Box::new(std::iter::empty())
+            })
+            .filter(|(_, config)| config.include_owned_accounts)
+            .filter_map(|(key, _)| match key.parse() {
+                Ok(pubkey) => Some(pubkey),
+                Err(e) => {
+                    warn!("Invalid pubkey in offline_accounts: {}: {}", key, e);
+                    None
+                }
+            })
+            .collect()
     }
 
     /// Forges account data by applying overrides to existing account data
@@ -5335,6 +5385,34 @@ mod tests {
     use crate::{
         storage::tests::TestType, surfnet::locker::SurfnetSvmLocker, tests::helpers::canned_rpc,
     };
+
+    /// Keep-alive stamps the open slot with the time its Clock holds. After the slot interval
+    /// changes, a time recomputed from the slot applies the new interval to every slot since the
+    /// last time anchor and runs ahead of that Clock.
+    #[test]
+    fn keep_alive_stamps_the_clock_time_after_the_slot_interval_changes() {
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        for _ in 0..10 {
+            svm.confirm_current_block().unwrap();
+        }
+        svm.slot_time *= 3;
+        for _ in 0..10 {
+            svm.confirm_current_block().unwrap();
+        }
+
+        let slot = svm.get_latest_absolute_slot();
+        let clock = svm.inner.get_sysvar::<Clock>();
+        assert_eq!(svm.updated_at / 1_000, clock.unix_timestamp as u64);
+        let recomputed = svm
+            .calculate_block_time_for_slot(slot)
+            .saturating_sub(svm.block_time_lag())
+            / 1_000;
+        assert!(
+            recomputed > clock.unix_timestamp as u64,
+            "the slot-based time {recomputed} should run ahead of the Clock {}",
+            clock.unix_timestamp
+        );
+    }
 
     #[test]
     fn startup_status_subscription_tracks_accepted_transitions() {

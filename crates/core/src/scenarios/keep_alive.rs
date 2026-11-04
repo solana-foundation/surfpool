@@ -11,7 +11,8 @@ use solana_pubkey::Pubkey;
 #[derive(Clone, Debug)]
 pub struct KeepAliveSource {
     pub template: String,
-    pub account: Pubkey,
+    /// The address the override wrote.
+    pub address: Pubkey,
     /// The override's values, which input and PDA addresses resolve against.
     pub values: HashMap<String, serde_json::Value>,
 }
@@ -24,5 +25,6 @@ pub struct KeepAliveBinding {
     pub template: String,
     /// The import's index in that template's `keep_alive` list.
     pub import: usize,
-    pub account: Pubkey,
+    /// The address the import rewrites.
+    pub address: Pubkey,
 }
