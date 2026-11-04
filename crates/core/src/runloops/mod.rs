@@ -40,7 +40,11 @@ use surfpool_types::{
     SimnetCommand, SimnetConfig, SimnetEvent, SimnetEventsTx, StartupPlanner, SurfnetStartupTask,
     SurfpoolConfig, TransactionConfirmationStatus, TransactionStatusEvent,
 };
-type PluginConstructor = unsafe fn() -> *mut dyn GeyserPlugin;
+// Matches the `extern "C"` export every geyser plugin provides. The trait-object
+// pointer is not FFI-safe, so host and plugin must be built with compatible
+// toolchains and interface versions.
+#[allow(improper_ctypes_definitions)]
+type PluginConstructor = unsafe extern "C" fn() -> *mut dyn GeyserPlugin;
 use txtx_addon_kit::helpers::fs::FileLocation;
 
 use crate::{
@@ -93,6 +97,15 @@ pub(crate) struct ManagedPlugin {
     pub(crate) plugin: Box<dyn GeyserPlugin>,
     pub(crate) _library: Library,
     pub(crate) config_path: String,
+}
+
+impl Drop for ManagedPlugin {
+    /// Calls the plugin's `on_unload` before the plugin and its library are
+    /// dropped, so plugin-owned workers can stop while the library's code is
+    /// still mapped.
+    fn drop(&mut self) {
+        self.plugin.on_unload();
+    }
 }
 
 pub(crate) fn load_plugin_from_config(
@@ -160,9 +173,7 @@ pub(crate) fn unload_plugin_by_name(
         .position(|p| p.name == name)
         .ok_or_else(|| format!("Plugin '{}' not found", name))?;
 
-    let mut plugin = managed_plugins.remove(idx);
-    plugin.plugin.on_unload();
-    // plugin and _library are dropped here in correct order
+    managed_plugins.remove(idx);
     Ok(())
 }
 
