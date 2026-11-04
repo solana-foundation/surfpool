@@ -526,10 +526,12 @@ fn spawn_startup_dispatch(
             // A seal failure ends the session, so stop the surfnet too: the
             // frontend returns on `Aborted`, and the caller then joins the
             // simnet thread, which would otherwise keep running after a
-            // timed-out seal is eventually answered.
+            // timed-out seal is eventually answered. `Aborted` goes first so
+            // it is queued ahead of the `Shutdown` that `Terminate` produces;
+            // both frontends treat `Shutdown` as a clean exit.
             let abort_startup = |failure: SealFailure| {
-                let _ = simnet_commands_tx.send(SimnetCommand::Terminate(None));
                 simnet_events_tx.aborted(format!("Failed to seal startup plan: {failure}"));
+                let _ = simnet_commands_tx.send(SimnetCommand::Terminate(None));
             };
             match startup_plan {
                 Some(Ok(plan)) => {
