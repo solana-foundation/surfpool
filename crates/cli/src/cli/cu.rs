@@ -8,7 +8,7 @@ use surfpool_core::solana_rpc_client::{
     api::request::RpcRequest, nonblocking::rpc_client::RpcClient,
 };
 
-use crate::cli::ProfileCommand;
+use crate::cli::CuCommand;
 
 /// Native and SPL programs, named without asking the RPC for an IDL.
 const KNOWN_PROGRAMS: &[(&str, &str)] = &[
@@ -469,7 +469,7 @@ async fn name_programs_from_idls(client: &RpcClient, invocations: &mut [Invocati
     });
 }
 
-pub async fn handle_profile_command(cmd: ProfileCommand) -> Result<(), String> {
+pub async fn handle_cu_command(cmd: CuCommand) -> Result<(), String> {
     let rpc_url = cmd.get_rpc_url();
     let client = RpcClient::new(rpc_url.clone());
     let transaction = client

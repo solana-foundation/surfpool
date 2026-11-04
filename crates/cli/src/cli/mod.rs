@@ -34,7 +34,7 @@ use txtx_core::manifest::WorkspaceManifest;
 use txtx_gql::kit::{helpers::fs::FileLocation, types::frontend::LogLevel};
 
 use crate::{cli::update::handle_update_command, runbook::handle_execute_runbook_command};
-mod profile;
+mod cu;
 mod simnet;
 mod update;
 
@@ -123,8 +123,8 @@ enum Command {
     #[clap(name = "stop", bin_name = "stop")]
     Stop(StopCommand),
     /// Show where a transaction's compute units went, CPI by CPI
-    #[clap(name = "profile", bin_name = "profile")]
-    Profile(ProfileCommand),
+    #[clap(name = "cu", bin_name = "cu")]
+    Cu(CuCommand),
     /// Generate shell completion scripts
     #[clap(name = "completions", bin_name = "completions", aliases = &["completion"])]
     Completions(Completions),
@@ -234,8 +234,8 @@ impl StopCommand {
 }
 
 #[derive(Parser, PartialEq, Clone, Debug)]
-pub struct ProfileCommand {
-    /// Signature of the transaction to profile.
+pub struct CuCommand {
+    /// Signature of the transaction.
     #[arg(value_name = "SIGNATURE")]
     pub signature: String,
     /// RPC URL to read the transaction from: a running Surfpool instance or any Solana RPC.
@@ -251,7 +251,7 @@ pub struct ProfileCommand {
     pub json: bool,
 }
 
-impl ProfileCommand {
+impl CuCommand {
     fn get_rpc_url(&self) -> String {
         self.rpc_url
             .as_deref()
@@ -1076,9 +1076,7 @@ fn handle_command(opts: Opts, ctx: &Context) -> Result<(), String> {
             hiro_system_kit::nestable_block_on(simnet::handle_start_local_surfnet_command(cmd, ctx))
         }
         Command::Stop(cmd) => hiro_system_kit::nestable_block_on(handle_stop_command(cmd)),
-        Command::Profile(cmd) => {
-            hiro_system_kit::nestable_block_on(profile::handle_profile_command(cmd))
-        }
+        Command::Cu(cmd) => hiro_system_kit::nestable_block_on(cu::handle_cu_command(cmd)),
         Command::Completions(cmd) => {
             hiro_system_kit::nestable_block_on(generate_completion_helpers(cmd))
         }

@@ -144,7 +144,7 @@ nor rolls back partial database writes.
 See where a transaction's compute units went, CPI by CPI:
 
 ```console
-$ surfpool profile <SIGNATURE>
+$ surfpool cu <SIGNATURE>
 3axDtsg6…EfGAZg
 ✓ succeeded in slot 463,409,289 · 80,167 CU
 
