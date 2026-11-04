@@ -2302,10 +2302,11 @@ impl SurfnetSvm {
     /// Additionally, having this function internally lets us do this check before we start fetching accounts from mainnet.
     /// Metadata for a transaction rejected before it ran: no logs or compute units, but the
     /// transaction's own signature, so the failure is recorded and announced under the
-    /// signature the client holds.
+    /// signature the client holds. An unsigned transaction, which simulation accepts when
+    /// signature verification is off, gets the default signature.
     fn rejected_transaction_metadata(tx: &VersionedTransaction) -> TransactionMetadata {
         TransactionMetadata {
-            signature: tx.signatures[0],
+            signature: tx.signatures.first().copied().unwrap_or_default(),
             ..TransactionMetadata::default()
         }
     }
@@ -6857,6 +6858,30 @@ mod tests {
         assert!(!svm.is_blockhash_visible_at(&fresh_blockhash, &finalized));
         confirm_blocks(&mut svm, 1);
         assert!(svm.is_blockhash_visible_at(&fresh_blockhash, &finalized));
+    }
+
+    /// simulateTransaction with sigVerify off accepts a transaction carrying no signatures;
+    /// rejecting its unknown blockhash must not index into the empty signature list.
+    #[test]
+    fn test_unsigned_simulation_with_unknown_blockhash_is_rejected_without_panicking() {
+        let (svm, _events_rx, _geyser_rx) = TestType::no_db().initialize_svm();
+        let payer = Pubkey::new_unique();
+        let message = solana_message::Message::new_with_blockhash(
+            &[system_instruction::transfer(
+                &payer,
+                &Pubkey::new_unique(),
+                1,
+            )],
+            Some(&payer),
+            &Hash::new_unique(),
+        );
+        let tx = VersionedTransaction {
+            signatures: vec![],
+            message: VersionedMessage::Legacy(message),
+        };
+
+        let err = svm.simulate_transaction(tx, false).err().map(|e| e.err);
+        assert_eq!(err, Some(TransactionError::BlockhashNotFound));
     }
 
     #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
