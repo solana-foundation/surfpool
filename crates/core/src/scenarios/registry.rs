@@ -1053,6 +1053,30 @@ templates: []
     }
 
     #[test]
+    fn test_clock_sensitive_tag_marks_pyth_and_every_phoenix_template() {
+        let registry = TemplateRegistry::new();
+        let tagged: Vec<&str> = registry
+            .by_tags(&["clock-sensitive".to_string()])
+            .iter()
+            .map(|template| template.id.as_str())
+            .collect();
+
+        let phoenix = registry.by_protocol("Phoenix Eternal");
+        assert!(
+            !phoenix.is_empty(),
+            "the Phoenix Eternal templates are registered"
+        );
+        for template in std::iter::once("pyth-price-feed-v2")
+            .chain(phoenix.iter().map(|template| template.id.as_str()))
+        {
+            assert!(
+                tagged.contains(&template),
+                "{template} must be clock-sensitive"
+            );
+        }
+    }
+
+    #[test]
     fn test_jupiter_idl_has_token_ledger_account() {
         let registry = TemplateRegistry::new();
         let jupiter_template = registry.get("jupiter-token-ledger-override").unwrap();
