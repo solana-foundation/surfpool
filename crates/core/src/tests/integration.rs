@@ -66,7 +66,10 @@ use solana_signer::Signer;
 use solana_system_interface::{
     instruction as system_instruction, instruction::transfer, program as system_program,
 };
-use solana_transaction::{Transaction, versioned::VersionedTransaction};
+use solana_transaction::{
+    Transaction,
+    versioned::{VersionedTransaction, sanitized::SanitizedVersionedTransaction},
+};
 use spl_token_2022_interface::{
     extension::{
         BaseStateWithExtensions, ExtensionType, StateWithExtensions, pausable::PausableConfig,
@@ -4704,7 +4707,7 @@ async fn transaction_mode_processes_queued_transactions_before_finalization() {
         .commands
         .send(SimnetCommand::ProcessTransaction(
             None,
-            VersionedTransaction::from(first),
+            SanitizedVersionedTransaction::try_new(VersionedTransaction::from(first)).unwrap(),
             first_status_tx,
             false,
             None,
@@ -4714,7 +4717,7 @@ async fn transaction_mode_processes_queued_transactions_before_finalization() {
         .commands
         .send(SimnetCommand::ProcessTransaction(
             None,
-            VersionedTransaction::from(second),
+            SanitizedVersionedTransaction::try_new(VersionedTransaction::from(second)).unwrap(),
             second_status_tx,
             false,
             None,

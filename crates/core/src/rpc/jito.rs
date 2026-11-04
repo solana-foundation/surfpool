@@ -10,7 +10,9 @@ use solana_message::VersionedMessage;
 use solana_pubkey::Pubkey;
 use solana_rpc_client_api::response::{Response as RpcResponse, RpcBlockhash};
 use solana_signature::Signature;
-use solana_transaction::versioned::VersionedTransaction;
+use solana_transaction::versioned::{
+    VersionedTransaction, sanitized::SanitizedVersionedTransaction,
+};
 use solana_transaction_status::{TransactionConfirmationStatus, UiTransactionEncoding};
 use surfpool_types::{
     JitoBundleStatus, RpcBundleExecutionError, RpcBundleRequest, RpcBundleSimulationSummary,
@@ -20,7 +22,7 @@ use surfpool_types::{
 
 use super::{
     RunloopContext,
-    utils::{decode_and_deserialize, sanitize_transaction},
+    utils::{decode_transaction, into_versioned_transaction},
 };
 use crate::{
     error::SurfpoolResult,
@@ -303,22 +305,18 @@ impl Jito for SurfpoolJitoRpc {
                 ))
             })?;
 
-            let mut decoded_txs: Vec<VersionedTransaction> = Vec::with_capacity(transactions.len());
+            let mut decoded_txs = Vec::with_capacity(transactions.len());
             for (idx, tx_data) in transactions.iter().enumerate() {
-                let tx = decode_and_deserialize::<VersionedTransaction>(
-                    tx_data.clone(),
-                    binary_encoding,
-                )
-                .and_then(|(_, tx)| sanitize_transaction(tx))
-                .map_err(|e| Error {
-                    code: e.code,
-                    message: format!(
-                        "Failed to decode bundle transaction {}: {}",
-                        idx + 1,
-                        e.message
-                    ),
-                    data: e.data,
-                })?;
+                let tx =
+                    decode_transaction(tx_data.clone(), binary_encoding).map_err(|e| Error {
+                        code: e.code,
+                        message: format!(
+                            "Failed to decode bundle transaction {}: {}",
+                            idx + 1,
+                            e.message
+                        ),
+                        data: e.data,
+                    })?;
                 decoded_txs.push(tx);
             }
 
@@ -544,43 +542,17 @@ impl Jito for SurfpoolJitoRpc {
             // we spend cycles cloning the SVM.
             let mut decoded_txs: Vec<VersionedTransaction> = Vec::with_capacity(bundle_len);
             for (idx, tx_data) in rpc_bundle_request.encoded_transactions.iter().enumerate() {
-                let (_, tx) = decode_and_deserialize::<VersionedTransaction>(
-                    tx_data.clone(),
-                    binary_encoding,
-                )
-                .map_err(|e| Error {
-                    code: e.code,
-                    message: format!(
-                        "Failed to decode bundle transaction {}: {}",
-                        idx + 1,
-                        e.message
-                    ),
-                    data: e.data,
-                })?;
-                // Reject transactions without signatures up front. A versioned
-                // transaction is required to carry at least one signature
-                // (the fee-payer's); the validator rejects sig-less txs at
-                // ingest, so a bundle entry with empty `signatures` is not a
-                // valid Solana transaction. Rejecting here avoids having to
-                // synthesize a zero-byte placeholder Signature into the
-                // RpcBundleExecutionError::TransactionFailure(Signature, _)
-                // wire variant downstream — that would mislead clients
-                // keying off the sig inside `error`.
-                if tx.signatures.is_empty() {
-                    return Err(Error::invalid_params(format!(
-                        "Bundle transaction {} has no signatures",
-                        idx + 1
-                    )));
-                }
-                let tx = sanitize_transaction(tx).map_err(|e| Error {
-                    message: format!(
-                        "Failed to decode bundle transaction {}: {}",
-                        idx + 1,
-                        e.message
-                    ),
-                    ..e
-                })?;
-                decoded_txs.push(tx);
+                let tx =
+                    decode_transaction(tx_data.clone(), binary_encoding).map_err(|e| Error {
+                        code: e.code,
+                        message: format!(
+                            "Failed to decode bundle transaction {}: {}",
+                            idx + 1,
+                            e.message
+                        ),
+                        data: e.data,
+                    })?;
+                decoded_txs.push(into_versioned_transaction(tx));
             }
 
             // Pre-resolve the pre/post pubkey lists per tx. Done once before the loop
@@ -871,8 +843,12 @@ impl Jito for SurfpoolJitoRpc {
 pub(crate) async fn process_bundle(
     svm_locker: &SurfnetSvmLocker,
     remote_ctx: &Option<(SurfnetRemoteClient, CommitmentConfig)>,
-    decoded_txs: Vec<VersionedTransaction>,
+    transactions: Vec<SanitizedVersionedTransaction>,
 ) -> std::result::Result<String, String> {
+    let decoded_txs: Vec<VersionedTransaction> = transactions
+        .into_iter()
+        .map(into_versioned_transaction)
+        .collect();
     prefetch_bundle_accounts(svm_locker, remote_ctx, &decoded_txs)
         .await
         .map_err(|error| error.to_string())?;
@@ -1423,7 +1399,7 @@ mod tests {
             panic!("sendBundle must enqueue ProcessBundle");
         };
         assert_eq!(transactions.len(), 1);
-        assert_eq!(transactions[0].signatures[0], expected_signature);
+        assert_eq!(transactions[0].signatures()[0], expected_signature);
         reply_tx
             .send(Ok("bundle-id-from-runloop".to_string()))
             .expect("sendBundle must still be waiting for the runloop reply");
@@ -1549,7 +1525,7 @@ mod tests {
             .simnet_commands_tx
             .send(SimnetCommand::ProcessTransaction(
                 None,
-                regular_tx,
+                SanitizedVersionedTransaction::try_new(regular_tx).unwrap(),
                 status_tx,
                 true,
                 Some(false),
@@ -3035,11 +3011,10 @@ mod tests {
             result.is_err(),
             "sig-less tx must be rejected at decode time"
         );
-        let err = result.unwrap_err();
-        assert!(
-            err.message.contains("has no signatures"),
-            "expected explicit no-signatures rejection (got {})",
-            err.message,
+        // Sanitization requires the fee payer's signature.
+        assert_eq!(
+            result.unwrap_err().message,
+            format!("Failed to decode bundle transaction 1: {UNSANITARY_TRANSACTION_ERROR}")
         );
     }
 

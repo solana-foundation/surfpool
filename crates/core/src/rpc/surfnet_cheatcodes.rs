@@ -13,7 +13,6 @@ use solana_epoch_info::EpochInfo;
 use solana_program_option::COption;
 use solana_rpc_client_api::response::Response as RpcResponse;
 use solana_system_interface::program as system_program;
-use solana_transaction::versioned::VersionedTransaction;
 use spl_associated_token_account_interface::address::get_associated_token_address_with_program_id;
 use surfpool_types::{
     AccountSnapshot, CheatcodeControlConfig, CheatcodeFilter, ClockCommand, ExportSnapshotConfig,
@@ -32,7 +31,7 @@ use crate::{
     error::SurfpoolError,
     rpc::{
         State,
-        utils::{decode_and_deserialize, sanitize_transaction, verify_pubkey, verify_pubkeys},
+        utils::{decode_transaction, into_versioned_transaction, verify_pubkey, verify_pubkeys},
     },
     surfnet::{
         AccountSource, GetAccountResult, locker::SvmAccessContext,
@@ -1951,11 +1950,10 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
         config: Option<RpcProfileResultConfig>,
     ) -> BoxFuture<Result<RpcResponse<UiKeyedProfileResult>>> {
         Box::pin(async move {
-            let (_, transaction) = decode_and_deserialize::<VersionedTransaction>(
+            let transaction = into_versioned_transaction(decode_transaction(
                 transaction_data_b64,
                 solana_transaction_status::TransactionBinaryEncoding::Base64,
-            )?;
-            let transaction = sanitize_transaction(transaction)?;
+            )?);
 
             let SurfnetRpcContext {
                 svm_locker,
