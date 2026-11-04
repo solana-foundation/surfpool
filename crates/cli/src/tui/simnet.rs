@@ -457,6 +457,7 @@ fn run_app<B: Backend<Error = io::Error>>(
         let mut selector = Select::new();
         let mut handles = vec![];
         let mut new_events = vec![];
+        let mut aborted = None;
 
         {
             selector.recv(&app.simnet_events_rx);
@@ -559,7 +560,8 @@ fn run_app<B: Backend<Error = io::Error>>(
                                 }
                             }
                             SimnetEvent::Aborted(error) => {
-                                return Err(io::Error::other(error.clone()));
+                                aborted = Some(error.clone());
+                                break;
                             }
                             // The surfnet is serving: the replayed transactions
                             // count toward the total, and the startup dispatcher
@@ -727,6 +729,14 @@ fn run_app<B: Backend<Error = io::Error>>(
             app.tail();
         }
 
+        if let Some(error) = aborted {
+            app.events
+                .push((EventType::Failure, Local::now(), error.clone()));
+            app.tail();
+            show_fatal_error(terminal, &mut app, &error, &should_exit)?;
+            return Err(io::Error::other(error));
+        }
+
         app.update_blink_state();
         terminal.draw(|f| ui(f, &mut app))?;
 
@@ -791,6 +801,70 @@ fn run_app<B: Backend<Error = io::Error>>(
             }
         }
     }
+}
+
+/// Keeps the TUI on screen with `error` shown over the normal layout until the
+/// user presses a key or the process is asked to exit, so a failed startup is
+/// read in place instead of flashing past as the terminal is restored.
+fn show_fatal_error<B: Backend<Error = io::Error>>(
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+    error: &str,
+    should_exit: &AtomicBool,
+) -> io::Result<()> {
+    loop {
+        terminal.draw(|f| {
+            ui(f, app);
+            render_fatal_error(f, app, error);
+        })?;
+        if should_exit.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(());
+        }
+        if event::poll(Duration::from_millis(100))?
+            && matches!(event::read()?, Event::Key(key) if key.kind == KeyEventKind::Press)
+        {
+            return Ok(());
+        }
+    }
+}
+
+fn render_fatal_error(f: &mut Frame, app: &App, error: &str) {
+    let area = f.area();
+    let width = area.width.saturating_sub(4).clamp(20, 100);
+    let inner_width = width.saturating_sub(4) as usize;
+    // Approximates the paragraph's wrapping: each source line fills ceil(len / width) rows.
+    let message_lines = error
+        .lines()
+        .map(|line| line.chars().count().div_ceil(inner_width.max(1)).max(1) as u16)
+        .sum::<u16>();
+    // Message, blank line, prompt, plus borders and one line of vertical padding each side.
+    let height = (message_lines + 2 + 4).min(area.height);
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(Line::from(" Startup failed ").alignment(Alignment::Center))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Red))
+        .style(Style::new().bg(app.colors.background))
+        .padding(Padding::new(1, 1, 1, 1));
+    let text = Text::from(vec![
+        Line::from(error.to_string()),
+        Line::from(""),
+        Line::from("Press any key to exit").style(Style::default().fg(app.colors.light_gray)),
+    ]);
+    f.render_widget(
+        Paragraph::new(text)
+            .block(block)
+            .wrap(Wrap { trim: false })
+            .alignment(Alignment::Left),
+        popup,
+    );
 }
 
 fn ui(f: &mut Frame, app: &mut App) {
