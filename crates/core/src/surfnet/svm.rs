@@ -104,7 +104,7 @@ use crate::{
     helpers::time_travel::clock_for_slot,
     rpc::utils::convert_transaction_metadata_from_canonical,
     scenarios::{
-        TemplateRegistry, account_data_values,
+        account_data_values,
         keep_alive::{KeepAliveBinding, KeepAliveSource},
         protocols::phoenix_eternal::v1::state_builder::{
             prepare_phoenix_override, write_all_or_none,
@@ -979,12 +979,13 @@ impl SurfnetSvm {
     }
 
     fn register_builtin_template_idls(&mut self) {
-        let registry = TemplateRegistry::new();
-        let templates = registry.templates.into_values();
-        for template in templates.chain(registry.keep_alive_templates.into_values()) {
+        // The bundled registry is parsed once per process; the HTTP server shares it.
+        let registry = template_registry();
+        let templates = registry.templates.values();
+        for template in templates.chain(registry.keep_alive_templates.values()) {
             // Templates for programs with no IDL have nothing to register; they write through
             // `raw_layout` instead.
-            let Some(idl) = template.idl else {
+            let Some(idl) = &template.idl else {
                 continue;
             };
             // Templates of one program share its IDL, and a persistent store keeps the IDLs of
@@ -1002,11 +1003,11 @@ impl SurfnetSvm {
             if newest.is_some()
                 && effective
                     .take_while(|v| Some(v.0) == newest)
-                    .all(|v| v.1 == idl)
+                    .all(|v| &v.1 == idl)
             {
                 continue;
             }
-            let _ = self.register_idl(idl, None);
+            let _ = self.register_idl(idl.clone(), None);
         }
     }
 
@@ -6996,7 +6997,7 @@ mod tests {
         let epoch_schedule = svm.inner.get_sysvar::<EpochSchedule>();
         assert!(!epoch_schedule.warmup);
 
-        let registry = TemplateRegistry::new();
+        let registry = crate::scenarios::TemplateRegistry::new();
         let mut checked = 0usize;
         for (_, template) in registry.templates {
             // Templates for programs that publish no IDL have nothing to register.

@@ -266,13 +266,17 @@ impl SurfnetSvmLocker {
             return Ok(());
         };
 
-        let (mut epoch_info, epoch_schedule, some_genesis_hash) = {
-            let epoch_info = remote_client.get_epoch_info().await?;
-            let epoch_schedule = remote_client.get_epoch_schedule().await?;
-            let some_genesis_hash = remote_client.get_genesis_hash().await.ok();
-            (epoch_info, epoch_schedule, some_genesis_hash)
-        };
-        let last_restart_slot = remote_client.get_last_restart_slot().await;
+        // The four reads are independent; issue them together so startup pays one
+        // round trip instead of four.
+        let (epoch_info, epoch_schedule, some_genesis_hash, last_restart_slot) = tokio::join!(
+            remote_client.get_epoch_info(),
+            remote_client.get_epoch_schedule(),
+            remote_client.get_genesis_hash(),
+            remote_client.get_last_restart_slot(),
+        );
+        let mut epoch_info = epoch_info?;
+        let epoch_schedule = epoch_schedule?;
+        let some_genesis_hash = some_genesis_hash.ok();
         epoch_info.transaction_count = None;
 
         self.with_svm_writer(move |svm_writer| {

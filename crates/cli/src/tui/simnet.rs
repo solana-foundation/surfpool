@@ -715,6 +715,9 @@ fn run_app<B: Backend<Error = io::Error>>(
             app.tail();
         }
 
+        app.update_blink_state();
+        terminal.draw(|f| ui(f, &mut app))?;
+
         if event::poll(Duration::from_millis(50))? {
             if let Event::Key(key_event) = event::read()? {
                 if key_event.kind == KeyEventKind::Press {
@@ -775,9 +778,6 @@ fn run_app<B: Backend<Error = io::Error>>(
                 }
             }
         }
-
-        app.update_blink_state();
-        terminal.draw(|f| ui(f, &mut app))?;
     }
 }
 
