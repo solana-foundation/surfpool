@@ -58,6 +58,7 @@ use solana_sdk_ids::{bpf_loader, system_program};
 use solana_signature::Signature;
 use solana_slot_hashes::{MAX_ENTRIES as MAX_SLOT_HASHES_ENTRIES, SlotHashes};
 use solana_system_interface::instruction as system_instruction;
+use solana_sysvar::slot_history::SlotHistory;
 use solana_transaction::versioned::VersionedTransaction;
 use solana_transaction_error::TransactionError;
 use solana_transaction_status::{
@@ -171,6 +172,12 @@ pub(crate) enum AccountUpdatePolicy {
     /// Keep any live LiteSVM state and rehydrate database-only state instead
     /// of replacing it with a fetched result.
     HydrateIfAbsent,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HydrationMode {
+    BestEffort,
+    StrictSnapshot,
 }
 
 impl AccountUpdatePolicy {
@@ -545,6 +552,15 @@ pub struct SurfnetSvm {
     pub updated_at: u64,
     pub slot_time: u64,
     pub start_time: SystemTime,
+    /// Clock-mode ticks the clock dropped because block production was
+    /// behind: each is a slot that came later than `slot_time` promised,
+    /// instead of arriving in a burst. Shared with the clock thread.
+    pub coalesced_slots: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Whether blocks are produced in `BlockProductionMode::Clock`, so a
+    /// dropped tick is a late slot. Set by block production, read by the
+    /// clock thread: ticks dropped in other modes produce no block and
+    /// aren't counted in `coalesced_slots`.
+    pub clock_driven: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub accounts_by_owner: Box<dyn Storage<String, Vec<String>>>,
     pub account_associated_data: Box<dyn Storage<String, SerializableAccountAdditionalData>>,
     pub token_accounts: Box<dyn Storage<String, TokenAccount>>,
@@ -900,6 +916,8 @@ impl SurfnetSvm {
             updated_at: self.updated_at,
             slot_time: self.slot_time,
             start_time: self.start_time,
+            coalesced_slots: self.coalesced_slots.clone(),
+            clock_driven: self.clock_driven.clone(),
 
             total_supply: self.total_supply,
             circulating_supply: self.circulating_supply,
@@ -1256,18 +1274,20 @@ impl SurfnetSvm {
             storage_backend.open_store("registered_idls")?;
         let profile_tag_map_db: Box<dyn Storage<String, Vec<UuidOrSignature>>> =
             storage_backend.open_store("profile_tag_map")?;
+        // Ensure max_profiles is at least 1 to avoid creating a zero-capacity FifoMap
+        let max_profiles = max(1, config.max_profiles);
+        // Use FifoMap for both profile stores to maintain FIFO eviction behavior
+        // (when no on-disk DB is provided)
         let simulated_transaction_profiles_db: Box<dyn Storage<String, KeyedProfileResult>> =
-            storage_backend.open_store("simulated_transaction_profiles")?;
-        let executed_transaction_profiles_db: Box<dyn Storage<String, KeyedProfileResult>> = {
-            // Ensure max_profiles is at least 1 to avoid creating a zero-capacity FifoMap
-            let max_profiles = max(1, config.max_profiles);
-            storage_backend.open_store_with_default(
-                "executed_transaction_profiles",
-                // Use FifoMap for executed_transaction_profiles to maintain FIFO eviction behavior
-                // (when no on-disk DB is provided)
-                move || Box::new(FifoMap::<String, KeyedProfileResult>::new(max_profiles)),
-            )?
-        };
+            storage_backend
+                .open_store_with_default("simulated_transaction_profiles", move || {
+                    Box::new(FifoMap::<String, KeyedProfileResult>::new(max_profiles))
+                })?;
+        let executed_transaction_profiles_db: Box<dyn Storage<String, KeyedProfileResult>> =
+            storage_backend
+                .open_store_with_default("executed_transaction_profiles", move || {
+                    Box::new(FifoMap::<String, KeyedProfileResult>::new(max_profiles))
+                })?;
         let epoch_schedule = Self::default_epoch_schedule();
         let epoch_info = Self::default_epoch_info(&epoch_schedule);
         let default_genesis_slot = epoch_info.absolute_slot;
@@ -1322,6 +1342,8 @@ impl SurfnetSvm {
             updated_at,
             slot_time: config.slot_time,
             start_time: SystemTime::now(),
+            coalesced_slots: Default::default(),
+            clock_driven: Default::default(),
             accounts_by_owner: accounts_by_owner_db,
             account_associated_data: account_associated_data_db,
             token_accounts: token_accounts_db,
@@ -1749,17 +1771,21 @@ impl SurfnetSvm {
     /// is by now, lands on the open slot: only its time changes. If the landing can't be
     /// recorded, nothing changes in memory.
     pub(crate) fn apply_time_travel(&mut self, clock: Clock) -> SurfpoolResult<EpochInfo> {
-        let previous = std::mem::replace(&mut self.updated_at, clock.unix_timestamp as u64 * 1_000);
-        if let Err(e) = self.travel_to(clock.slot.max(self.get_latest_absolute_slot())) {
-            self.updated_at = previous;
-            return Err(e);
-        }
+        let slot = clock.slot.max(self.get_latest_absolute_slot());
         let clock = Clock {
-            slot: self.latest_epoch_info.absolute_slot,
-            epoch: self.latest_epoch_info.epoch,
+            slot,
+            epoch: self.inner.get_sysvar::<EpochSchedule>().get_epoch(slot),
             ..clock
         };
+        let previous = std::mem::replace(&mut self.updated_at, clock.unix_timestamp as u64 * 1_000);
+        let previous_clock = self.inner.get_sysvar::<Clock>();
+        // The Clock is set before the landing is announced, so Geyser streams the landing's.
         self.inner.set_sysvar(&clock);
+        if let Err(e) = self.travel_to(slot) {
+            self.updated_at = previous;
+            self.inner.set_sysvar(&previous_clock);
+            return Err(e);
+        }
         self.simnet_events_tx.system_clock_updated(clock);
         Ok(self.latest_epoch_info.clone())
     }
@@ -2957,14 +2983,37 @@ impl SurfnetSvm {
         account_update: GetAccountResult,
         policy: AccountUpdatePolicy,
     ) -> SurfpoolResult<()> {
+        self.apply_account_update_with_mode(account_update, policy, HydrationMode::BestEffort)
+    }
+
+    /// Snapshot hydration must surface installation failures and never synthesize ProgramData.
+    pub(crate) fn hydrate_snapshot_strict(
+        &mut self,
+        account_update: GetAccountResult,
+    ) -> SurfpoolResult<()> {
+        self.apply_account_update_with_mode(
+            account_update,
+            AccountUpdatePolicy::HydrateIfAbsent,
+            HydrationMode::StrictSnapshot,
+        )
+    }
+
+    fn apply_account_update_with_mode(
+        &mut self,
+        account_update: GetAccountResult,
+        policy: AccountUpdatePolicy,
+        mode: HydrationMode,
+    ) -> SurfpoolResult<()> {
         let account_update = self.account_update_for_policy(account_update, policy)?;
 
         match account_update {
             GetAccountResult::None(_) => {}
             GetAccountResult::FoundAccount(pubkey, account, source) => {
                 if source != AccountSource::Svm {
-                    self.apply_synthetic_programdata(&account)?;
-                    self.apply_account_component(pubkey, account, policy)?;
+                    if mode == HydrationMode::BestEffort {
+                        self.apply_synthetic_programdata(&account)?;
+                    }
+                    self.apply_account_component(pubkey, account, policy, mode)?;
                 }
             }
             GetAccountResult::FoundCoupledAccount(
@@ -2972,31 +3021,33 @@ impl SurfnetSvm {
                 CoupledAccount::ProgramData(_, None),
                 _,
             ) => {
-                self.apply_synthetic_programdata(&account)?;
-                self.apply_account_component(pubkey, account, policy)?;
+                if mode == HydrationMode::BestEffort {
+                    self.apply_synthetic_programdata(&account)?;
+                }
+                self.apply_account_component(pubkey, account, policy, mode)?;
             }
             GetAccountResult::FoundCoupledAccount(
                 (pubkey, account),
                 CoupledAccount::ProgramData(coupled_pubkey, Some(coupled_account)),
                 _,
             ) => {
-                self.apply_account_component(coupled_pubkey, coupled_account, policy)?;
-                self.apply_account_component(pubkey, account, policy)?;
+                self.apply_account_component(coupled_pubkey, coupled_account, policy, mode)?;
+                self.apply_account_component(pubkey, account, policy, mode)?;
             }
             GetAccountResult::FoundCoupledAccount(
                 (pubkey, account),
                 CoupledAccount::Mint(coupled_pubkey, Some(coupled_account)),
                 _,
             ) => {
-                self.apply_account_component(coupled_pubkey, coupled_account, policy)?;
-                self.apply_account_component(pubkey, account, policy)?;
+                self.apply_account_component(coupled_pubkey, coupled_account, policy, mode)?;
+                self.apply_account_component(pubkey, account, policy, mode)?;
             }
             GetAccountResult::FoundCoupledAccount(
                 (pubkey, account),
                 CoupledAccount::Mint(_, None),
                 _,
             ) => {
-                self.apply_account_component(pubkey, account, policy)?;
+                self.apply_account_component(pubkey, account, policy, mode)?;
             }
         }
 
@@ -3042,6 +3093,7 @@ impl SurfnetSvm {
         pubkey: Pubkey,
         account: Account,
         policy: AccountUpdatePolicy,
+        mode: HydrationMode,
     ) -> SurfpoolResult<()> {
         let account = if policy == AccountUpdatePolicy::HydrateIfAbsent {
             match self.inner.get_account_result(&pubkey)? {
@@ -3065,6 +3117,9 @@ impl SurfnetSvm {
         // returned to the caller, with the insertion failure emitted as an
         // event for observability.
         if let Err(error) = self.set_account(&pubkey, account) {
+            if mode == HydrationMode::StrictSnapshot {
+                return Err(error);
+            }
             let _ = self.simnet_events_tx.error(error.to_string());
         }
         Ok(())
@@ -3103,6 +3158,7 @@ impl SurfnetSvm {
                 rent_epoch: 0,
             },
             AccountUpdatePolicy::HydrateIfAbsent,
+            HydrationMode::BestEffort,
         )
     }
 
@@ -3201,6 +3257,19 @@ impl SurfnetSvm {
                 max_transactions_per_entry: num_transactions,
             },
         });
+
+        // Agave writes SlotHistory and RecentBlockhashes as it freezes a block. Yellowstone
+        // publishes a block only once it has seen them, along with the slot's Clock and SlotHashes.
+        let mut slot_history = self.inner.get_sysvar::<SlotHistory>();
+        slot_history.add(slot);
+        self.inner.set_sysvar(&slot_history);
+        self.stream_sysvars(
+            slot,
+            [
+                solana_sdk_ids::sysvar::slot_history::ID,
+                solana_sdk_ids::sysvar::recent_blockhashes::ID,
+            ],
+        );
 
         // The block's entry goes before its metadata: Yellowstone drops the metadata of an empty
         // block whose entry arrives after it.
@@ -4613,14 +4682,37 @@ impl SurfnetSvm {
 
     /// Announces the open slot on its parent block, as Agave does when it creates the slot's
     /// bank: at startup, after each block, after a time travel and a reset. A skipped slot gets
-    /// none.
+    /// none. Geyser first receives the Clock and SlotHashes sysvars as the open slot's account
+    /// writes, as Agave writes them while it creates the bank.
     pub fn announce_open_slot(&mut self) {
         let slot = self.get_latest_absolute_slot();
         let parent = self.parent_slot(slot);
         let root = self.slot_for_commitment(&CommitmentConfig::finalized());
         self.notify_slot_subscribers(slot, parent, root);
+        self.stream_sysvars(
+            slot,
+            [
+                solana_sdk_ids::sysvar::clock::ID,
+                solana_sdk_ids::sysvar::slot_hashes::ID,
+            ],
+        );
         let timestamp = Utc::now().timestamp_millis().max(0) as u64;
         self.emit_slot_status(slot, Some(parent), GeyserSlotStatus::CreatedBank, timestamp);
+    }
+
+    /// Sends the current accounts of `sysvars` to Geyser plugins as account writes in `slot`.
+    fn stream_sysvars(&mut self, slot: Slot, sysvars: [Pubkey; 2]) {
+        for pubkey in sysvars {
+            let Some(account) = self.inner.get_account_no_db(&pubkey) else {
+                continue;
+            };
+            let write_version = self.increment_write_version();
+            self.geyser_events_tx
+                .send(GeyserEvent::UpdateAccount(
+                    GeyserAccountUpdate::block_update(pubkey, account, slot, write_version),
+                ))
+                .ok();
+        }
     }
 
     pub fn write_simulated_profile_result(
@@ -5326,17 +5418,22 @@ impl SurfnetSvm {
             base_slot
         );
 
-        // Schedule overrides by adding base slot to their scenario-relative slots
+        // Every slot is checked before anything is stored, so a bad override leaves no partial plan.
+        let mut scheduled = Vec::with_capacity(scenario.overrides.len());
         for override_instance in scenario.overrides {
             let scenario_relative_slot = override_instance.scenario_relative_slot;
             // Both operands are caller-supplied, so the sum has to be checked.
             let absolute_slot = base_slot.checked_add(scenario_relative_slot).ok_or_else(|| {
-                SurfpoolError::internal(format!(
+                SurfpoolError::invalid_params(format!(
                     "Override {} cannot be scheduled: base slot {} plus relative slot {} overflows",
                     override_instance.id, base_slot, scenario_relative_slot
                 ))
             })?;
+            scheduled.push((absolute_slot, override_instance));
+        }
 
+        for (absolute_slot, override_instance) in scheduled {
+            let scenario_relative_slot = override_instance.scenario_relative_slot;
             debug!(
                 "Scheduling override at absolute slot {} (base {} + relative {})",
                 absolute_slot, base_slot, scenario_relative_slot
@@ -5383,7 +5480,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        storage::tests::TestType, surfnet::locker::SurfnetSvmLocker, tests::helpers::canned_rpc,
+        storage::tests::TestType,
+        surfnet::locker::SurfnetSvmLocker,
+        tests::helpers::{UNHEALTHY_OFFSET, canned_rpc, scheduled_override_fixture},
     };
 
     /// Keep-alive stamps the open slot with the time its Clock holds. After the slot interval
@@ -7312,6 +7411,23 @@ mod tests {
         );
     }
 
+    /// Garbage collection rebuilds LiteSVM as a block closes, just before the block records its
+    /// slot in SlotHistory, so the blocks recorded before it must survive the rebuild.
+    #[test]
+    fn slot_history_survives_garbage_collection() {
+        let (mut svm, _events_rx, _geyser_rx) = TestType::in_memory().initialize_svm();
+        let gc_slot = svm.garbage_collection_interval_slots();
+        svm.latest_epoch_info.absolute_slot = gc_slot - 1;
+        svm.latest_epoch_info.slot_index = gc_slot - 1;
+        svm.confirm_current_block().unwrap();
+        let mut expected = svm.inner.get_sysvar::<SlotHistory>();
+        expected.add(gc_slot);
+
+        svm.confirm_current_block().unwrap();
+
+        assert!(svm.inner.get_sysvar::<SlotHistory>() == expected);
+    }
+
     #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
     #[test_case(TestType::in_memory(); "with in-memory sqlite db")]
     #[test_case(TestType::no_db(); "with no db")]
@@ -7666,6 +7782,58 @@ mod tests {
         let streamed: Vec<_> = blocks.iter().map(|block| block.block_time).collect();
         assert_eq!(streamed, expected);
         assert_blocks_read_as_streamed(&svm, &blocks);
+    }
+
+    /// Yellowstone gRPC v16 publishes a block only once Geyser has written its Clock,
+    /// SlotHashes, SlotHistory and RecentBlockhashes in that slot; without them its slot, block
+    /// and confirmed streams stay empty. A time travel's landing gets its own Clock.
+    #[test]
+    fn geyser_writes_the_sysvars_of_each_block() {
+        use solana_sdk_ids::sysvar::{clock, recent_blockhashes, slot_hashes, slot_history};
+        let sysvar_writes = |events: &[GeyserEvent], slot: Slot| -> Vec<(Pubkey, Account)> {
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    GeyserEvent::UpdateAccount(update) if update.slot == slot => {
+                        Some((update.pubkey, update.account.clone()))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let (mut svm, _events_rx, geyser_rx) = SurfnetSvm::default();
+        svm.announce_open_slot();
+        let slot = svm.get_latest_absolute_slot();
+        svm.confirm_current_block().unwrap();
+
+        let events: Vec<_> = geyser_rx.try_iter().collect();
+        let written: Vec<Pubkey> = sysvar_writes(&events, slot)
+            .into_iter()
+            .map(|(pubkey, _)| pubkey)
+            .collect();
+        assert_eq!(
+            written,
+            [
+                clock::ID,
+                slot_hashes::ID,
+                slot_history::ID,
+                recent_blockhashes::ID
+            ]
+        );
+        assert_eq!(svm.inner.get_sysvar::<SlotHistory>().next_slot, slot + 1);
+
+        let landing = svm.get_latest_absolute_slot() + 100;
+        let clock = svm.inner.get_sysvar::<Clock>();
+        svm.apply_time_travel(Clock {
+            slot: landing,
+            ..clock
+        })
+        .unwrap();
+        let events: Vec<_> = geyser_rx.try_iter().collect();
+        let (pubkey, account) = &sysvar_writes(&events, landing)[0];
+        assert_eq!(*pubkey, clock::ID);
+        let streamed: Clock = bincode::deserialize(&account.data).unwrap();
+        assert_eq!(streamed.slot, landing);
     }
 
     /// A forward time travel skips the slots it jumps, as a leader's missed slots are: the
@@ -9055,62 +9223,10 @@ mod tests {
         assert_eq!(restored_account.lamports, 1_000_000);
     }
 
-    /// `Obligation.unhealthy_borrow_value_sf` (u128), counting the discriminator.
-    const UNHEALTHY_OFFSET: usize = 2256;
-
-    /// A zeroed Kamino `Obligation` owned by klend. `SurfnetSvm::default()` already registers
-    /// the bundled template IDLs, so klend's is resolvable by owner program.
-    fn scheduled_override_fixture() -> (
-        SurfnetSvm,
-        Pubkey,
-        surfpool_types::OverrideInstance,
-        Receiver<GeyserEvent>,
-    ) {
-        let (mut surfnet_svm, _simnet_events_rx, geyser_events_rx) = SurfnetSvm::default();
-
-        let klend = Pubkey::from_str_const("KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD");
-        let idl: Idl = serde_json::from_str(crate::scenarios::registry::KAMINO_V1_IDL_CONTENT)
-            .expect("kamino idl");
-        let obligation_disc = &idl
-            .accounts
-            .iter()
-            .find(|a| a.name == "Obligation")
-            .expect("Obligation account")
-            .discriminator;
-
-        let mut data = vec![0u8; 3344];
-        data[..8].copy_from_slice(obligation_disc);
-
-        let account_pubkey = Pubkey::new_unique();
-        surfnet_svm
-            .inner
-            .set_account(
-                account_pubkey,
-                Account {
-                    lamports: 1_000_000,
-                    data,
-                    owner: klend,
-                    executable: false,
-                    rent_epoch: 0,
-                },
-            )
-            .expect("set obligation account");
-
-        let instance = surfpool_types::OverrideInstance::new(
-            "kamino-obligation-health".to_string(),
-            0,
-            surfpool_types::AccountAddress::Pubkey(account_pubkey.to_string()),
-        )
-        .with_values(HashMap::from([(
-            "unhealthy_borrow_value_sf".to_string(),
-            serde_json::json!(1_234u64),
-        )]));
-        (surfnet_svm, account_pubkey, instance, geyser_events_rx)
-    }
-
     #[tokio::test]
     async fn test_scenario_relative_slot_overflow_is_an_error_not_a_wrap() {
-        let (mut svm, account_pubkey, _instance, _geyser_events_rx) = scheduled_override_fixture();
+        let (mut svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+        let (account_pubkey, _instance) = scheduled_override_fixture(&mut svm);
 
         let mut far = surfpool_types::OverrideInstance::new(
             "kamino-obligation-health".to_string(),
@@ -9135,7 +9251,8 @@ mod tests {
     #[tokio::test]
     async fn forged_scenario_override_notifies_subscribers_and_geyser_once() {
         const SLOT: u64 = 500;
-        let (mut svm, account_pubkey, instance, geyser_events_rx) = scheduled_override_fixture();
+        let (mut svm, _simnet_events_rx, geyser_events_rx) = SurfnetSvm::default();
+        let (account_pubkey, instance) = scheduled_override_fixture(&mut svm);
         let account_updates = svm.subscribe_for_account_updates(&account_pubkey, None);
         let program_updates = svm.subscribe_for_program_updates(
             &Pubkey::from_str_const("KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD"),
@@ -9195,7 +9312,8 @@ mod tests {
         // immediately precedes unhealthy_borrow_value_sf in the Obligation layout
         const ALLOWED_OFFSET: usize = UNHEALTHY_OFFSET - 16;
 
-        let (mut svm, account_pubkey, first, _geyser_events_rx) = scheduled_override_fixture();
+        let (mut svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+        let (account_pubkey, first) = scheduled_override_fixture(&mut svm);
         let mut first = first;
         first.fetch_before_use = true;
 
@@ -9539,7 +9657,8 @@ mod tests {
     #[tokio::test]
     async fn an_idl_override_notifies_account_subscribers() {
         const SLOT: u64 = 500;
-        let (mut svm, account_pubkey, instance, _geyser_events_rx) = scheduled_override_fixture();
+        let (mut svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+        let (account_pubkey, instance) = scheduled_override_fixture(&mut svm);
         let updates =
             svm.subscribe_for_account_updates(&account_pubkey, Some(UiAccountEncoding::Base64));
         svm.scheduled_overrides.store(SLOT, vec![instance]).unwrap();

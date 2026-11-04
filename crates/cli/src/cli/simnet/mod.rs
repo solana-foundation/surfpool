@@ -76,6 +76,17 @@ pub async fn handle_start_local_surfnet_command(
         }
     }
     let (simnet_commands_tx, simnet_commands_rx) = crossbeam::channel::unbounded();
+    let runloop_terminator = Arc::new(AtomicBool::new(false));
+    let signal_terminator = runloop_terminator.clone();
+    let signal_commands_tx = simnet_commands_tx.clone();
+    // Own process signals before starting HTTP; both frontends share this handler.
+    ctrlc::set_handler(move || {
+        signal_terminator.store(true, Ordering::Release);
+        if let Err(error) = signal_commands_tx.send(SimnetCommand::Terminate(None)) {
+            warn!("Unable to request surfnet shutdown: {error}");
+        }
+    })
+    .map_err(|error| format!("Failed to install shutdown signal handler: {error}"))?;
     let (subgraph_events_tx, subgraph_events_rx) = crossbeam::channel::unbounded();
     let simnet_events_tx = surfnet_svm.simnet_events_tx.clone();
     // Subscribe before the SVM moves into the simnet thread; the receiver
@@ -207,7 +218,7 @@ pub async fn handle_start_local_surfnet_command(
 
     let simnet_commands_tx_copy = simnet_commands_tx.clone();
     let mut runbook_progress_rx = vec![];
-    if !cmd.project.no_deploy {
+    if !cmd.project.no_deploy && !runloop_terminator.load(Ordering::Acquire) {
         match plan_and_dispatch_startup(&cmd, &simnet_events_tx, &simnet_commands_tx_copy).await {
             Ok(rx) => runbook_progress_rx.push(rx),
             // Planning failed before the plan was sealed. Drive the startup
@@ -230,7 +241,7 @@ pub async fn handle_start_local_surfnet_command(
                 return Err(format!("Startup plan refused: {error}"));
             }
         }
-    } else {
+    } else if !runloop_terminator.load(Ordering::Acquire) {
         // There are no startup tasks to execute, so seal the empty plan
         // ourselves; the surfnet cannot reach `Ready` without a sealed plan.
         // An unreachable command loop is fatal here too, same as the
@@ -271,8 +282,6 @@ pub async fn handle_start_local_surfnet_command(
     let cmd_cc = cmd.clone();
     let ctx_cc = ctx.clone();
 
-    let runloop_terminator = Arc::new(AtomicBool::new(false));
-
     // service_result carries the Aborted event for startup failures, so the
     // caller can exit nonzero accordingly.
     let service_result = start_service(
@@ -285,7 +294,7 @@ pub async fn handle_start_local_surfnet_command(
         sanitized_config,
         explorer_handle,
         ctx_cc,
-        Some(runloop_terminator),
+        runloop_terminator,
         initial_transactions,
     )
     .await;
@@ -326,7 +335,7 @@ async fn start_service(
     sanitized_config: SanitizedConfig,
     explorer_handle: Option<ServerHandle>,
     _ctx: Context,
-    runloop_terminator: Option<Arc<AtomicBool>>,
+    runloop_terminator: Arc<AtomicBool>,
     initial_transactions: u64,
 ) -> Result<(), String> {
     let displayed_url = if cmd.runtime.no_studio {
@@ -344,7 +353,7 @@ async fn start_service(
             include_debug_logs,
             runbook_progress_rx,
             simnet_commands_tx,
-            runloop_terminator.unwrap(),
+            runloop_terminator,
         )?;
     } else {
         tui::simnet::start_app(
@@ -355,6 +364,7 @@ async fn start_service(
             displayed_url,
             breaker,
             initial_transactions,
+            runloop_terminator,
         )
         .map_err(|e| format!("{}", e))?;
     }
@@ -374,14 +384,6 @@ fn log_events(
     runloop_terminator: Arc<AtomicBool>,
 ) -> Result<(), String> {
     let mut deployment_completed = false;
-    let do_stop_loop = runloop_terminator.clone();
-    let terminate_tx = simnet_commands_tx.clone();
-    ctrlc::set_handler(move || {
-        do_stop_loop.store(true, Ordering::Relaxed);
-        // Send terminate command to allow graceful shutdown (Drop to run)
-        let _ = terminate_tx.send(SimnetCommand::Terminate(None));
-    })
-    .expect("Error setting Ctrl-C handler");
 
     let log_filter = if include_debug_logs {
         LogLevel::Debug
@@ -392,7 +394,7 @@ fn log_events(
     let mut multi_progress = MultiProgress::new();
 
     loop {
-        if runloop_terminator.load(Ordering::Relaxed) {
+        if runloop_terminator.load(Ordering::Acquire) {
             break;
         }
         let mut selector = Select::new();

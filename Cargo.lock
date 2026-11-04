@@ -12163,6 +12163,7 @@ dependencies = [
 name = "surfpool-sdk"
 version = "1.7.0"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
  "crossbeam-channel",
  "hex",

@@ -858,7 +858,7 @@ async fn test_pump_token2022_graduation_lifecycle() {
     let fixture = GraduationFixture::new(user.pubkey(), mint, &curve_account.data, &global_data);
 
     locker
-        .register_scenario(preparation.scenario, Some(0))
+        .with_svm_writer(|svm| svm.register_scenario(preparation.scenario, Some(0)))
         .unwrap();
     locker
         .materialize_overrides_for_slot(&None, 1)
@@ -1092,7 +1092,9 @@ async fn price_shock_changes_a_live_pool_swap() {
     );
     price_shock.tags = vec!["pumpswap".to_string(), "price-shock".to_string()];
     price_shock.add_override(pool_override);
-    locker.register_scenario(price_shock, Some(100)).unwrap();
+    locker
+        .with_svm_writer(|svm| svm.register_scenario(price_shock, Some(100)))
+        .unwrap();
     locker
         .materialize_overrides_for_slot(&None, 100)
         .await

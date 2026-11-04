@@ -24,10 +24,11 @@ use surfpool_core::surfnet::svm::SurfnetSvmConfig;
 use surfpool_mcp::McpOptions;
 use surfpool_types::{
     AccountSnapshot, BlockProductionMode, CHANGE_TO_DEFAULT_STUDIO_PORT_ONCE_SUPERVISOR_MERGED,
-    DEFAULT_DEVNET_RPC_URL, DEFAULT_GOSSIP_PORT, DEFAULT_MAINNET_RPC_URL, DEFAULT_NETWORK_HOST,
-    DEFAULT_RPC_PORT, DEFAULT_SLOT_TIME_MS, DEFAULT_TESTNET_RPC_URL, DEFAULT_TPU_PORT,
-    DEFAULT_TPU_QUIC_PORT, DEFAULT_WS_PORT, RpcConfig, SimnetConfig, SimnetEvent, StartupPlanner,
-    StudioConfig, SubgraphConfig, SurfpoolConfig, SvmFeatureConfig, parse_feature_pubkey,
+    CheatcodeFilter, DEFAULT_DEVNET_RPC_URL, DEFAULT_GOSSIP_PORT, DEFAULT_MAINNET_RPC_URL,
+    DEFAULT_NETWORK_HOST, DEFAULT_RPC_PORT, DEFAULT_SLOT_TIME_MS, DEFAULT_TESTNET_RPC_URL,
+    DEFAULT_TPU_PORT, DEFAULT_TPU_QUIC_PORT, DEFAULT_WS_PORT, RpcConfig, SURFNET_CHEATCODE_METHODS,
+    SimnetConfig, SimnetEvent, StartupPlanner, StudioConfig, SubgraphConfig, SurfpoolConfig,
+    SvmFeatureConfig, parse_feature_pubkey,
 };
 use txtx_core::manifest::WorkspaceManifest;
 use txtx_gql::kit::{helpers::fs::FileLocation, types::frontend::LogLevel};
@@ -381,6 +382,9 @@ pub struct StartAccountOptions {
         long_help = "JSON account snapshot to preload. Can be specified multiple times.\n\nThe snapshot format matches the surfnet_exportSnapshot RPC output. Account values can be null to fetch the account from the remote RPC. Later files override earlier files for duplicate keys.\n\nExample: surfpool start --snapshot ./snapshot1.json --snapshot ./snapshot2.json"
     )]
     pub snapshot: Vec<String>,
+    /// Fail startup if any snapshot account cannot be loaded.
+    #[arg(long = "strict-snapshot", requires = "snapshot")]
+    pub strict_snapshot: bool,
     /// Database connection URL for persistent Surfnet state.
     #[arg(
         long = "db",
@@ -476,6 +480,39 @@ pub struct StartSvmOptions {
     /// Skip transaction blockhash validation.
     #[clap(long = "skip-blockhash-check", action=ArgAction::SetTrue, default_value = "false")]
     pub skip_blockhash_check: bool,
+    /// Lock cheatcodes for the life of the surfnet.
+    #[arg(
+        long = "lock-cheatcodes",
+        value_name = "METHODS",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "all",
+        value_delimiter = ',',
+        value_parser = parse_lockable_method,
+        long_help = "Lock cheatcodes before the RPC server accepts its first request. Locked methods are refused for the life of the surfnet: nothing, including surfnet_enableCheatcode, turns them back on.\n\nWithout a value, locks the whole surfnet: every surfnet_* method, requestAirdrop, the snapshotSubscribe WebSocket import, and the admin methods exit, loadPlugin, reloadPlugin and unloadPlugin. Stop it with Ctrl-C or a signal, since `surfpool stop` relies on exit. With a comma-separated list, locks only those surfnet_* methods.\n\nExample: surfpool start --lock-cheatcodes\nExample: surfpool start --lock-cheatcodes=surfnet_setAccount,surfnet_timeTravel"
+    )]
+    pub lock_cheatcodes: Option<Vec<String>>,
+}
+
+impl StartSvmOptions {
+    pub fn cheatcode_lock(&self) -> Option<CheatcodeFilter> {
+        let methods = self.lock_cheatcodes.as_ref()?;
+        Some(if methods.iter().any(|m| m == "all") {
+            CheatcodeFilter::all()
+        } else {
+            CheatcodeFilter::List(methods.clone())
+        })
+    }
+}
+
+fn parse_lockable_method(method: &str) -> Result<String, String> {
+    if method == "all" || SURFNET_CHEATCODE_METHODS.contains(&method) {
+        Ok(method.to_string())
+    } else {
+        Err(format!(
+            "{method} is not a cheatcode; expected `all` or a surfnet_* method"
+        ))
+    }
 }
 
 #[derive(Args, PartialEq, Clone, Debug)]
@@ -615,6 +652,7 @@ impl StartSimnet {
             gossip_port: DEFAULT_GOSSIP_PORT,
             tpu_port: DEFAULT_TPU_PORT,
             tpu_quic_port: DEFAULT_TPU_QUIC_PORT,
+            cheatcode_lock: self.svm.cheatcode_lock(),
         }
     }
 
@@ -697,6 +735,7 @@ impl StartSimnet {
             skip_blockhash_check: self.svm.skip_blockhash_check,
             surfnet_id: self.accounts.surfnet_id.clone(),
             snapshot,
+            strict_snapshot: self.accounts.strict_snapshot,
             genesis_hash: self.network.genesis_hash,
         }
     }
@@ -1058,6 +1097,11 @@ fn parse_stop_response(body: &str) -> Result<(), String> {
 
     if let Some(error) = value.get("error").filter(|error| !error.is_null()) {
         if let Some(message) = error.get("message").and_then(|message| message.as_str()) {
+            if message.contains("is currently disabled") {
+                return Err(format!(
+                    "Surfpool RPC returned error: {message}. The surfnet's cheatcodes are locked; stop it with Ctrl-C or by signalling its process"
+                ));
+            }
             return Err(format!("Surfpool RPC returned error: {message}"));
         }
         return Err(format!("Surfpool RPC returned error: {error}"));
@@ -1360,6 +1404,28 @@ mod tests {
             ]
         );
         assert_eq!(cmd.project.runbooks, vec!["deploy", "seed"]);
+    }
+
+    #[test]
+    fn strict_snapshot_requires_snapshot_and_reaches_config() {
+        let err = Opts::try_parse_from(["surfpool", "start", "--strict-snapshot"])
+            .expect_err("strict snapshot requires a snapshot file");
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+
+        let default_cmd = parse_start(&["surfpool", "start"]);
+        assert!(
+            !default_cmd
+                .simnet_config(vec![], BTreeMap::new())
+                .strict_snapshot
+        );
+        let cmd = parse_start(&[
+            "surfpool",
+            "start",
+            "--snapshot",
+            "snapshot.json",
+            "--strict-snapshot",
+        ]);
+        assert!(cmd.simnet_config(vec![], BTreeMap::new()).strict_snapshot);
     }
 
     #[test]
