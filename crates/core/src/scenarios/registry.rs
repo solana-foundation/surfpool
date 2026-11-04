@@ -23,6 +23,11 @@ pub const RAYDIUM_AMM_V4_OVERRIDES_CONTENT: &str =
 pub const METEORA_DLMM_IDL_CONTENT: &str = include_str!("./protocols/meteora/dlmm/v1/idl.json");
 pub const METEORA_DLMM_OVERRIDES_CONTENT: &str =
     include_str!("./protocols/meteora/dlmm/v1/overrides.yaml");
+
+pub const METEORA_DBC_IDL_CONTENT: &str = include_str!("./protocols/meteora/dbc/v1/idl.json");
+pub const METEORA_DBC_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/meteora/dbc/v1/overrides.yaml");
+
 pub const KAMINO_V1_IDL_CONTENT: &str = include_str!("./protocols/kamino/v1/idl.json");
 pub const KAMINO_V1_OVERRIDES_CONTENT: &str = include_str!("./protocols/kamino/v1/overrides.yaml");
 
@@ -137,6 +142,11 @@ impl TemplateRegistry {
             METEORA_DLMM_IDL_CONTENT,
             METEORA_DLMM_OVERRIDES_CONTENT,
             "meteora",
+        );
+        self.load_protocol_overrides(
+            METEORA_DBC_IDL_CONTENT,
+            METEORA_DBC_OVERRIDES_CONTENT,
+            "meteora-dbc",
         );
     }
 
@@ -358,6 +368,50 @@ mod tests {
     use surfpool_types::{AccountAddress, PdaSeed};
 
     use super::*;
+
+    #[test]
+    fn meteora_dbc_templates_take_the_account_address_and_cover_graduation() {
+        let registry = TemplateRegistry::new();
+
+        let pool = registry
+            .get("meteora-dbc-pool-custom")
+            .expect("the DBC pool template");
+        assert_eq!(pool.account_type, "VirtualPool");
+        assert!(
+            matches!(pool.address, AccountAddress::Pubkey(_)),
+            "the pool address cannot be derived from seeds (max/min of the mints), so the caller passes it"
+        );
+        let paths: BTreeSet<&str> = pool.properties.iter().map(|p| p.path.as_str()).collect();
+        for path in [
+            "quote_reserve",
+            "base_reserve",
+            "sqrt_price",
+            "is_migrated",
+            "migration_progress",
+        ] {
+            assert!(paths.contains(path), "pool template lacks {path}");
+        }
+
+        let config = registry
+            .get("meteora-dbc-config-custom")
+            .expect("the DBC config template");
+        assert_eq!(config.account_type, "PoolConfig");
+        assert!(
+            config
+                .properties
+                .iter()
+                .any(|p| p.path == "migration_quote_threshold"),
+            "the config template moves the graduation point"
+        );
+
+        let meteora: BTreeSet<&str> = registry
+            .by_protocol("meteora")
+            .into_iter()
+            .map(|t| t.id.as_str())
+            .collect();
+        assert!(meteora.contains("meteora-dbc-pool-custom"));
+        assert!(meteora.contains("meteora-dbc-config-custom"));
+    }
 
     #[test]
     fn account_data_values_exclude_constant_ref_selectors() {
