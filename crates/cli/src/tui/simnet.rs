@@ -434,7 +434,7 @@ pub fn start_app(
     Ok(())
 }
 
-fn run_app<B: Backend>(
+fn run_app<B: Backend<Error = io::Error>>(
     terminal: &mut Terminal<B>,
     mut app: App,
     should_exit: Arc<AtomicBool>,

@@ -350,7 +350,6 @@ fn create_native_mint(svm: &mut SurfnetLiteSvm) {
 }
 #[cfg(test)]
 mod tests {
-    use ed25519_dalek::Signer as DalekSigner;
     use solana_compute_budget_interface::ComputeBudgetInstruction;
     use solana_ed25519_program::new_ed25519_instruction_with_signature;
     use solana_keypair::Keypair;
@@ -364,13 +363,11 @@ mod tests {
         payer: &Keypair,
         blockhash: solana_hash::Hash,
     ) -> VersionedTransaction {
-        let payer_dalek = ed25519_dalek::Keypair::from_bytes(&payer.to_bytes())
-            .expect("failed to create dalek keypair");
         let message = b"surfpool ed25519 precompile regression";
-        let signature = payer_dalek.sign(message);
+        let signature = payer.sign_message(message);
         let ed25519_ix = new_ed25519_instruction_with_signature(
             message,
-            &signature.to_bytes(),
+            signature.as_array(),
             payer.pubkey().as_array(),
         );
         let compute_budget_ixs = [

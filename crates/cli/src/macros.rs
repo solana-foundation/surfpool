@@ -3,9 +3,8 @@
 macro_rules! green {
     ($($arg:tt)*) => (
         {
-            use atty::Stream;
             use ansi_term::Colour;
-            if atty::is(Stream::Stdout) {
+            if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
                 let colour = Colour::Green.bold();
                 format!(
                     "{}",
@@ -26,9 +25,8 @@ macro_rules! green {
 macro_rules! red {
     ($($arg:tt)*) => (
         {
-            use atty::Stream;
             use ansi_term::Colour;
-            if atty::is(Stream::Stdout) {
+            if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
                 let colour = Colour::Red.bold();
                 format!(
                     "{}",
@@ -49,9 +47,8 @@ macro_rules! red {
 macro_rules! yellow {
     ($($arg:tt)*) => (
         {
-            use atty::Stream;
             use ansi_term::Colour;
-            if atty::is(Stream::Stdout) {
+            if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
                 let colour = Colour::Yellow.bold();
                 format!(
                     "{}",
@@ -72,9 +69,8 @@ macro_rules! yellow {
 macro_rules! blue {
     ($($arg:tt)*) => (
         {
-            use atty::Stream;
             use ansi_term::Colour;
-            if atty::is(Stream::Stdout) {
+            if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
                 let colour = Colour::Cyan.bold();
                 format!(
                     "{}",
@@ -95,9 +91,8 @@ macro_rules! blue {
 macro_rules! purple {
     ($($arg:tt)*) => (
         {
-            use atty::Stream;
             use ansi_term::Colour;
-            if atty::is(Stream::Stdout) {
+            if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
                 let colour = Colour::Purple.bold();
                 format!(
                     "{}",
@@ -118,9 +113,8 @@ macro_rules! purple {
 macro_rules! black {
     ($($arg:tt)*) => (
         {
-            use atty::Stream;
             use ansi_term::Colour;
-            if atty::is(Stream::Stdout) {
+            if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
                 let colour = Colour::Fixed(244);
                 format!(
                     "{}",

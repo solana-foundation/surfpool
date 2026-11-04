@@ -36,7 +36,6 @@ anchor-lang-idl = "0.1.2"
 ansi_term = "0.12.1"
 anyhow = { version = "1.0.95", default-features = false }
 async-trait = "0.1.89"
-atty = "0.2.13"
 base58 = "0.2.0"
 base64 = { version = "0.22.1", default-features = false }
 bincode = "1.3.3"
@@ -52,7 +51,7 @@ clap_complete = { version = "4.5.48", default-features = false }
 convert_case = "0.8.0"
 crossbeam = "0.8.4"
 crossbeam-channel = { version = "0.5.15", default-features = false }
-crossterm = { version = "0.28.1", default-features = false }
+crossterm = { version = "0.29.0", default-features = false }
 ctrlc = {version = "3.4.5", features = ["termination"]}
 dialoguer = { version = "0.11.0", default-features = false }
 diesel = { version = "2.2.11", default-features = false }
@@ -98,12 +97,12 @@ notify = { version = "8.0.0", default-features = false }
 npm_rs = "1.0.0"
 once_cell = { version = "1.19.0", default-features = false }
 phoenix-rise-accounts = "0.6.15"
-ratatui = { version = "0.29.0", features = [
+ratatui = { version = "0.30.2", features = [
     "crossterm",
 ], default-features = false }
 reqwest = { version = "0.12.23", default-features = false }
-rmcp = "0.9.0"
-rmcp-actix-web = "=0.8.17"
+rmcp = "3.8.0"
+rmcp-actix-web = "=0.13.1"
 rust-embed = "8.2.0"
 schemars = { version = "1.0.4" }
 schemars_derive = { version = "1.0.4" }
@@ -180,7 +179,7 @@ tracing = { version = "0.1.41", default-features = false }
 url = { version = "1.7.2", default-features = false }
 uuid = "1.15.1"
 wincode = "0.6"
-zip = { version = "0.6", features = ["deflate"], default-features = false }
+zip = { version = "9.0.5", features = ["deflate-flate2-zlib-rs"], default-features = false }
 sha2 = { version = "0.10" }
 
 surfpool-core = { path = "crates/core", default-features = false, version = "1.7.0"}

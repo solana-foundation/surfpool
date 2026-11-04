@@ -17,7 +17,7 @@ bs58 = { workspace = true }
 crossbeam-channel = { workspace = true }
 hiro-system-kit = { workspace = true }
 reqwest = { workspace = true }
-rmcp = { workspace = true, features = ["transport-io", "transport-sse-server", "server", "schemars"] }
+rmcp = { workspace = true, features = ["transport-io", "server", "schemars"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = "0.9"
