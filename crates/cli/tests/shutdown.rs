@@ -97,10 +97,12 @@ impl Surfpool {
                 let size = stream.read(&mut response)?;
                 Ok(String::from_utf8_lossy(&response[..size]).contains("200 OK"))
             });
-            let logging_started = self.log().contains("Genesis airdrop successful");
+            // The RPC server binds after the snapshot is decoded, so a listening
+            // RPC port means startup completed.
+            let rpc_listening = TcpStream::connect(("127.0.0.1", self.ports[0])).is_ok();
             match ready {
-                Ok(true) if !fully_started || logging_started => {
-                    return logging_started == fully_started;
+                Ok(true) if !fully_started || rpc_listening => {
+                    return rpc_listening == fully_started;
                 }
                 Err(error) if Instant::now() >= deadline => {
                     panic!("Studio readiness failed: {error}; {}", self.log());

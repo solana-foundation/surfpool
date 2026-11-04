@@ -82,7 +82,7 @@ pub struct TemplateRegistry {
 }
 
 /// The bundled template registry, parsed once and reused by scenario execution.
-pub(crate) fn template_registry() -> &'static TemplateRegistry {
+pub fn template_registry() -> &'static TemplateRegistry {
     static REGISTRY: OnceLock<TemplateRegistry> = OnceLock::new();
     REGISTRY.get_or_init(TemplateRegistry::new)
 }

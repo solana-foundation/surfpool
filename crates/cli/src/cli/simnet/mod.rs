@@ -31,7 +31,7 @@ mod endpoints;
 mod startup;
 use endpoints::resolve_endpoints;
 use startup::{
-    SealFailure, StartupPlanFailure, plan_and_dispatch_startup, seal_startup_plan,
+    SealFailure, StartupPlan, dispatch_startup_plan, plan_startup, seal_startup_plan,
     spawn_startup_watchdog,
 };
 
@@ -49,8 +49,8 @@ pub async fn handle_start_local_surfnet_command(
     // Local plugin loading is handled directly by `surfpool-core`.
 
     // We start the simnet as soon as possible. Startup work (account
-    // cloning, runbook executions) is planned, sealed, and dispatched only
-    // after the simnet's `Ready` event arrives below.
+    // cloning, runbook executions) is planned while the simnet comes up and
+    // sealed and dispatched once its `CoreStarted` event arrives.
     let (surfnet_svm, simnet_events_rx, geyser_events_rx) =
         SurfnetSvm::new_with_db(cmd.accounts.db.as_deref(), cmd.svm_config())
             .map_err(|e| format!("Failed to initialize Surfnet SVM: {}", e))?;
@@ -198,57 +198,32 @@ pub async fn handle_start_local_surfnet_command(
         })
         .map_err(|e| format!("{}", e))?;
 
-    // Collect events that occur before Ready so we can re-send them to the TUI
-    let mut early_events = Vec::new();
-    let initial_transactions = loop {
-        match simnet_events_rx.recv() {
-            Ok(SimnetEvent::Aborted(error)) => {
-                eprintln!("Error: {}", error);
-                return Err(error);
+    // Plan on this thread, before the frontend takes the terminal: scaffolding
+    // may prompt the user on stdin. The plan is not sealed until the surfnet's
+    // command loop is alive, which the frontend signals on `CoreStarted`.
+    let mut runbook_progress_rx = vec![];
+    let startup_plan = if !cmd.project.no_deploy && !runloop_terminator.load(Ordering::Acquire) {
+        match plan_startup(&cmd, &simnet_events_tx).await {
+            Ok(plan) => {
+                runbook_progress_rx.push(plan.progress_rx.clone());
+                Some(Ok(plan))
             }
-            Ok(SimnetEvent::Shutdown) => return Ok(()),
-            Ok(SimnetEvent::CoreStarted(initial_transactions)) => break initial_transactions,
-            Ok(other) => early_events.push(other),
-            Err(_) => continue,
+            Err(e) => Some(Err(e)),
         }
+    } else {
+        None
     };
 
-    // Re-send early events (like snapshot loading messages) so the TUI receives them
-    replay_early_events(&simnet_events_tx, early_events, airdrop_events);
-
-    let simnet_commands_tx_copy = simnet_commands_tx.clone();
-    let mut runbook_progress_rx = vec![];
-    if !cmd.project.no_deploy && !runloop_terminator.load(Ordering::Acquire) {
-        match plan_and_dispatch_startup(&cmd, &simnet_events_tx, &simnet_commands_tx_copy).await {
-            Ok(rx) => runbook_progress_rx.push(rx),
-            // Planning failed before the plan was sealed. Drive the startup
-            // state machine to Failed (from Planning-unsealed this always
-            // applies) and keep going: whether a failed startup is fatal is
-            // the watchdog's decision.
-            Err(StartupPlanFailure::Planning(e)) => {
-                let _ = simnet_commands_tx_copy.send(SimnetCommand::FailStartupPlanning(e.clone()));
-                simnet_events_tx.warn(format!("Startup planning failed: {e}"));
-            }
-            // The command loop is dead or wedged, so the startup state machine
-            // is unreachable and no session can ever become ready.
-            // Nothing left to display; exit.
-            Err(StartupPlanFailure::Sealing(SealFailure::Unreachable(e))) => return Err(e),
-            // The startup state machine refused the seal. The command loop is
-            // alive and the state is known, but the CLI cannot dispatch work
-            // against an unsealed plan, so this is fatal too; the reason names
-            // which rule declined.
-            Err(StartupPlanFailure::Sealing(SealFailure::Refused(error))) => {
-                return Err(format!("Startup plan refused: {error}"));
-            }
-        }
-    } else if !runloop_terminator.load(Ordering::Acquire) {
-        // There are no startup tasks to execute, so seal the empty plan
-        // ourselves; the surfnet cannot reach `Ready` without a sealed plan.
-        // An unreachable command loop is fatal here too, same as the
-        // Sealing arm above.
-        seal_startup_plan(&simnet_commands_tx_copy, vec![])
-            .map_err(|failure| failure.to_string())?;
-    }
+    let (core_started_tx, core_started_rx) = crossbeam::channel::bounded(1);
+    spawn_startup_dispatch(
+        cmd.clone(),
+        startup_plan,
+        airdrop_events,
+        core_started_rx,
+        simnet_events_tx.clone(),
+        simnet_commands_tx.clone(),
+        runloop_terminator.clone(),
+    )?;
 
     let is_headless = cmd.runtime.daemon || cmd.runtime.no_tui;
     spawn_startup_watchdog(
@@ -257,27 +232,6 @@ pub async fn handle_start_local_surfnet_command(
         simnet_events_tx.clone(),
         simnet_commands_tx.clone(),
     )?;
-
-    // Non blocking check for new versions
-    #[cfg(feature = "version_check")]
-    {
-        let mut local_version = env!("CARGO_PKG_VERSION").to_string();
-        if cmd.runtime.ci {
-            local_version = format!("{}-ci", local_version);
-        }
-        let response = txtx_gql::kit::reqwest::get(format!(
-            "https://cloud.txtx.run/api/versions?v=/{}",
-            local_version
-        ))
-        .await;
-        if let Ok(response) = response {
-            if let Ok(body) = response.json::<CheckVersionResponse>().await {
-                if let Some(deprecation_notice) = body.deprecation_notice {
-                    let _ = simnet_events_tx.warn(deprecation_notice.to_string());
-                }
-            }
-        }
-    }
 
     let cmd_cc = cmd.clone();
     let ctx_cc = ctx.clone();
@@ -295,7 +249,7 @@ pub async fn handle_start_local_surfnet_command(
         explorer_handle,
         ctx_cc,
         runloop_terminator,
-        initial_transactions,
+        core_started_tx,
     )
     .await;
 
@@ -336,7 +290,7 @@ async fn start_service(
     explorer_handle: Option<ServerHandle>,
     _ctx: Context,
     runloop_terminator: Arc<AtomicBool>,
-    initial_transactions: u64,
+    core_started_tx: Sender<()>,
 ) -> Result<(), String> {
     let displayed_url = if cmd.runtime.no_studio {
         DisplayedUrl::Datasource(sanitized_config)
@@ -354,6 +308,7 @@ async fn start_service(
             runbook_progress_rx,
             simnet_commands_tx,
             runloop_terminator,
+            core_started_tx,
         )?;
     } else {
         tui::simnet::start_app(
@@ -363,8 +318,8 @@ async fn start_service(
             runbook_progress_rx,
             displayed_url,
             breaker,
-            initial_transactions,
             runloop_terminator,
+            core_started_tx,
         )
         .map_err(|e| format!("{}", e))?;
     }
@@ -382,6 +337,7 @@ fn log_events(
     runbook_progress_rx: Vec<Receiver<BlockEvent>>,
     simnet_commands_tx: Sender<SimnetCommand>,
     runloop_terminator: Arc<AtomicBool>,
+    core_started_tx: Sender<()>,
 ) -> Result<(), String> {
     let mut deployment_completed = false;
 
@@ -461,7 +417,9 @@ fn log_events(
                         error!("{}", error);
                         return Err(error);
                     }
-                    SimnetEvent::CoreStarted(_) => {}
+                    SimnetEvent::CoreStarted(_) => {
+                        let _ = core_started_tx.try_send(());
+                    }
                     SimnetEvent::Connected(_rpc_url) => {}
                     SimnetEvent::Shutdown => {
                         break;
@@ -537,79 +495,90 @@ fn log_events(
     Ok(())
 }
 
-/// Re-send events buffered before `CoreStarted` (and the airdrop
-/// announcements) so the frontend consumer receives them.
-pub(crate) fn replay_early_events(
-    simnet_events_tx: &SimnetEventsTx,
-    early_events: Vec<SimnetEvent>,
+/// Finishes startup off the frontend's thread once the surfnet signals
+/// `CoreStarted`: announces the airdrops, then seals the plan and dispatches
+/// its work. A planning failure drives the startup state machine to Failed
+/// and leaves fatality to the watchdog policy; a sealing failure leaves no
+/// way for the session to become ready, so it aborts the session through
+/// the event channel. If the frontend exits before `CoreStarted`, there is
+/// nothing left to dispatch and the thread ends.
+#[allow(clippy::too_many_arguments)]
+fn spawn_startup_dispatch(
+    cmd: StartSimnet,
+    startup_plan: Option<Result<StartupPlan, String>>,
     airdrop_events: Vec<SimnetEvent>,
-) {
-    // On a separate thread: the caller owns the only receiver and does not
-    // drain again until the frontend consumer starts, so a blocking emit on
-    // the caller's thread wedges startup once the buffer fills (a warm
-    // start can buffer a full channel of replayed transactions before
-    // CoreStarted). The replay thread blocks until the consumer drains,
-    // intentionally.
-    let tx = simnet_events_tx.clone();
-    let _ = hiro_system_kit::thread_named("early-event-replay").spawn(move || {
-        for event in early_events.into_iter().chain(airdrop_events) {
-            tx.forward(event);
-        }
-        Ok::<(), String>(())
-    });
-}
+    core_started_rx: Receiver<()>,
+    simnet_events_tx: SimnetEventsTx,
+    simnet_commands_tx: Sender<SimnetCommand>,
+    runloop_terminator: Arc<AtomicBool>,
+) -> Result<(), String> {
+    hiro_system_kit::thread_named("startup-dispatch")
+        .spawn(move || {
+            if core_started_rx.recv().is_err() {
+                return Ok(());
+            }
+            for event in airdrop_events {
+                simnet_events_tx.forward(event);
+            }
+            if runloop_terminator.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            // A seal failure ends the session, so stop the surfnet too: the
+            // frontend returns on `Aborted`, and the caller then joins the
+            // simnet thread, which would otherwise keep running after a
+            // timed-out seal is eventually answered. `Aborted` goes first so
+            // it is queued ahead of the `Shutdown` that `Terminate` produces;
+            // both frontends treat `Shutdown` as a clean exit.
+            let abort_startup = |failure: SealFailure| {
+                simnet_events_tx.aborted(format!("Failed to seal startup plan: {failure}"));
+                let _ = simnet_commands_tx.send(SimnetCommand::Terminate(None));
+            };
+            match startup_plan {
+                Some(Ok(plan)) => {
+                    if let Err(failure) =
+                        dispatch_startup_plan(&cmd, plan, &simnet_events_tx, &simnet_commands_tx)
+                    {
+                        abort_startup(failure);
+                    }
+                }
+                Some(Err(e)) => {
+                    let _ = simnet_commands_tx.send(SimnetCommand::FailStartupPlanning(e.clone()));
+                    simnet_events_tx.warn(format!("Startup planning failed: {e}"));
+                }
+                // There are no startup tasks to execute, so seal the empty plan
+                // ourselves; the surfnet cannot reach `Ready` without a sealed plan.
+                None => {
+                    if let Err(failure) = seal_startup_plan(&simnet_commands_tx, vec![]) {
+                        abort_startup(failure);
+                    }
+                }
+            }
 
-#[cfg(test)]
-mod replay_tests {
-    use std::{thread, time::Duration};
-
-    use surfpool_types::SimnetEventsTx;
-
-    use super::*;
-
-    /// Startup calls the replay on the thread that owns the only receiver,
-    /// and concurrent producers may already have refilled the buffer, so
-    /// the call must return without waiting on a drain. Buffered events
-    /// route by class: lifecycle events arrive once the consumer drains;
-    /// telemetry may drop, telemetry's standing contract. Small capacity
-    /// for speed; the mechanism is capacity-independent.
-    #[test]
-    fn replay_returns_before_the_consumer_drains() {
-        let (tx, rx) = SimnetEventsTx::channel(4);
-        for i in 0..4 {
-            tx.info(format!("producer {i}"));
-        }
-
-        let replay_tx = tx.clone();
-        let replayer = thread::spawn(move || {
-            replay_early_events(
-                &replay_tx,
-                vec![
-                    SimnetEvent::info("telemetry, droppable"),
-                    SimnetEvent::RunbookStarted("lifecycle, must arrive".to_string()),
-                ],
-                vec![],
-            );
-        });
-
-        thread::sleep(Duration::from_millis(300));
-        assert!(
-            replayer.is_finished(),
-            "replay must not block the receiver-owning thread on a full buffer"
-        );
-
-        // The consumer drains, as log_events/start_app do. The four producer
-        // events and the lifecycle event arrive; the telemetry line found
-        // the buffer full and dropped.
-        let received: Vec<SimnetEvent> = (0..5)
-            .map(|_| {
-                rx.recv_timeout(Duration::from_secs(5))
-                    .expect("every surviving event arrives once the consumer drains")
-            })
-            .collect();
-        assert!(
-            matches!(&received[4], SimnetEvent::RunbookStarted(msg) if msg == "lifecycle, must arrive")
-        );
-        assert!(rx.try_recv().is_err(), "nothing else was queued");
-    }
+            // Non blocking check for new versions
+            #[cfg(feature = "version_check")]
+            {
+                let mut local_version = env!("CARGO_PKG_VERSION").to_string();
+                if cmd.runtime.ci {
+                    local_version = format!("{}-ci", local_version);
+                }
+                let response = hiro_system_kit::nestable_block_on(async {
+                    match txtx_gql::kit::reqwest::get(format!(
+                        "https://cloud.txtx.run/api/versions?v=/{}",
+                        local_version
+                    ))
+                    .await
+                    {
+                        Ok(response) => response.json::<CheckVersionResponse>().await.ok(),
+                        Err(_) => None,
+                    }
+                });
+                if let Some(deprecation_notice) = response.and_then(|body| body.deprecation_notice)
+                {
+                    simnet_events_tx.warn(deprecation_notice.to_string());
+                }
+            }
+            Ok::<(), String>(())
+        })
+        .map(|_| ())
+        .map_err(|e| format!("Thread to dispatch startup exited: {e}"))
 }
