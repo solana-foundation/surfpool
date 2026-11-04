@@ -1257,6 +1257,20 @@ fn start_rpc_servers_runloop(
     Ok((rpc_handle, ws_handle, shutdown_rpc_servers))
 }
 
+/// The answer to a request on any path but the surfnet's secret one: the
+/// same 404 a server with nothing there gives.
+fn not_found_action() -> jsonrpc_http_server::RequestMiddlewareAction {
+    jsonrpc_http_server::RequestMiddlewareAction::Respond {
+        should_validate_hosts: false,
+        response: Box::pin(async {
+            Ok(jsonrpc_http_server::hyper::Response::builder()
+                .status(404)
+                .body(jsonrpc_http_server::hyper::Body::empty())
+                .expect("a static response"))
+        }),
+    }
+}
+
 fn start_http_rpc_server_runloop(
     config: &SurfpoolConfig,
     middleware: SurfpoolMiddleware,
@@ -1294,8 +1308,26 @@ fn start_http_rpc_server_runloop(
     io.extend_with(rpc::bank_data::SurfpoolBankDataRpc.to_delegate());
     io.extend_with(rpc::admin::SurfpoolAdminRpc.to_delegate());
 
+    let secret_path = config
+        .rpc
+        .secret_path
+        .clone()
+        .map(|secret| format!("/{secret}"));
     spawn_rpc_server_thread("HTTP RPC", simnet_events_tx, move || {
         ServerBuilder::new(io)
+            .request_middleware(
+                move |request: jsonrpc_http_server::hyper::Request<
+                    jsonrpc_http_server::hyper::Body,
+                >| {
+                    match &secret_path {
+                        Some(path) if request.uri().path() != path => not_found_action(),
+                        _ => jsonrpc_http_server::RequestMiddlewareAction::Proceed {
+                            should_continue_on_invalid_cors: false,
+                            request,
+                        },
+                    }
+                },
+            )
             .cors(DomainsValidation::Disabled)
             .threads(6)
             .max_request_body_size(15 * 1024 * 1024)
@@ -1313,6 +1345,11 @@ fn start_ws_rpc_server_runloop(
         .get_ws_base_url()
         .parse::<SocketAddr>()
         .map_err(|e| e.to_string())?;
+    let secret_path = config
+        .rpc
+        .secret_path
+        .clone()
+        .map(|secret| format!("/{secret}"));
 
     spawn_rpc_server_thread("WebSocket RPC", simnet_events_tx, move || {
         // The pubsub handler runs async tasks, so the server carries its
@@ -1343,7 +1380,16 @@ fn start_ws_rpc_server_runloop(
 
         let sessions = WsSessions::default();
         let tracked_sessions = sessions.clone();
+        let secret_path = secret_path.clone();
         let server = WsServerBuilder::new(rpc_io)
+            .request_middleware(
+                move |request: &jsonrpc_ws_server::ws::Request| match &secret_path {
+                    Some(path) if request.resource() != path => Some(
+                        jsonrpc_ws_server::ws::Response::new(404, "Not Found", vec![]),
+                    ),
+                    _ => None,
+                },
+            )
             .session_meta_extractor(move |ctx: &RequestContext| {
                 let out = ctx.out.clone();
                 tracked_sessions.0.lock().unwrap().insert(
