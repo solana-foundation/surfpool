@@ -32,9 +32,7 @@ use solana_transaction_status::{
     TransactionBinaryEncoding, TransactionConfirmationStatus, TransactionStatus, UiConfirmedBlock,
     UiTransactionEncoding, map_inner_instructions, parse_ui_inner_instructions,
 };
-use surfpool_types::{
-    SerialVmMutationResult, SerialVmMutationTask, SimnetCommand, TransactionStatusEvent,
-};
+use surfpool_types::{SerialVmMutationResult, SerialVmMutationTask, SimnetCommand};
 
 use super::{
     RunloopContext, State, SurfnetRpcContext,
@@ -47,7 +45,7 @@ use crate::{
     SURFPOOL_IDENTITY_PUBKEY,
     error::{SurfpoolError, SurfpoolResult},
     rpc::utils::{adjust_default_transaction_config, get_default_transaction_config},
-    surfnet::GetTransactionResult,
+    surfnet::{GetTransactionResult, locker::PreflightFailure},
     types::{SurfnetTransactionStatus, surfpool_tx_metadata_to_litesvm_tx_metadata},
 };
 
@@ -1781,34 +1779,35 @@ impl Full for SurfpoolFullRpc {
                 // Agave verifies the signatures, then simulates at the preflight bank: lifetime
                 // (blockhash or durable nonce) first, then a status cache that holds only the
                 // slots up to the bank's own. A duplicate that bank cannot see yet passes, and the
-                // runloop drops it. A transaction's full lifetime check (its nonce account may
-                // still be on the datasource) runs in the runloop after its accounts load; here it
-                // only decides a duplicate, whose accounts are local since it ran.
-                let preflight_error = ctx.svm_locker.with_svm_reader(|svm_reader| {
-                    let sigverify = !config
-                        .skip_sig_verify
-                        .unwrap_or(svm_reader.skip_signature_verification);
-                    let duplicate =
-                        svm_reader
-                            .processed_slot(&unsanitized_tx)
-                            .is_some_and(|slot| {
-                                slot <= svm_reader.slot_for_commitment(&preflight_commitment)
-                            });
-                    if sigverify && unsanitized_tx.verify_with_results().contains(&false) {
-                        Some(TransactionError::SignatureFailure)
-                    } else if !svm_reader.is_blockhash_visible_at(
-                        tx_message.recent_blockhash(),
-                        &preflight_commitment,
-                    ) || (duplicate
-                        && !svm_reader.validate_transaction_blockhash(&unsanitized_tx))
-                    {
-                        Some(TransactionError::BlockhashNotFound)
-                    } else if duplicate {
-                        Some(TransactionError::AlreadyProcessed)
-                    } else {
-                        None
-                    }
-                });
+                // runloop drops it. The lifetime check here only decides a duplicate, whose
+                // accounts are local since it ran; the simulation below runs it in full once the
+                // transaction's accounts (its nonce account may still be on the datasource) load.
+                let (sigverify, preflight_error, already_processed) =
+                    ctx.svm_locker.with_svm_reader(|svm_reader| {
+                        let sigverify = !config
+                            .skip_sig_verify
+                            .unwrap_or(svm_reader.skip_signature_verification);
+                        let processed_slot = svm_reader.processed_slot(&unsanitized_tx);
+                        let duplicate = processed_slot.is_some_and(|slot| {
+                            slot <= svm_reader.slot_for_commitment(&preflight_commitment)
+                        });
+                        let error =
+                            if sigverify && unsanitized_tx.verify_with_results().contains(&false) {
+                                Some(TransactionError::SignatureFailure)
+                            } else if !svm_reader.is_blockhash_visible_at(
+                                tx_message.recent_blockhash(),
+                                &preflight_commitment,
+                            ) || (duplicate
+                                && !svm_reader.validate_transaction_blockhash(&unsanitized_tx))
+                            {
+                                Some(TransactionError::BlockhashNotFound)
+                            } else if duplicate {
+                                Some(TransactionError::AlreadyProcessed)
+                            } else {
+                                None
+                            };
+                        (sigverify, error, processed_slot.is_some())
+                    });
                 if let Some(error) = preflight_error {
                     return Err(Error {
                         data: Some(
@@ -1832,17 +1831,89 @@ impl Full for SurfpoolFullRpc {
                         code: jsonrpc_core::ErrorCode::ServerError(-32002),
                     });
                 }
+
+                // A duplicate the preflight bank cannot see yet is not simulated: Agave would
+                // run it against that bank's state, which Surfpool does not keep, and the
+                // runloop drops it either way.
+                if !already_processed {
+                    let remote_ctx = ctx
+                        .remote_rpc_client
+                        .as_ref()
+                        .map(|remote_client| (remote_client.clone(), preflight_commitment));
+                    if let Err(failure) = ctx
+                        .svm_locker
+                        .preflight_transaction(&remote_ctx, unsanitized_tx.clone(), sigverify)
+                        .await
+                    {
+                        #[cfg(feature = "prometheus")]
+                        if let Some(m) = crate::telemetry::metrics() {
+                            m.record_transaction(false, rpc_start.elapsed().as_millis() as u64);
+                            m.record_rpc_request(
+                                "sendTransaction",
+                                rpc_start.elapsed().as_millis() as u64,
+                            );
+                        }
+                        return Err(match failure {
+                            PreflightFailure::Simulation(error, metadata) => Error {
+                                data: Some(
+                                    serde_json::to_value(get_simulate_transaction_result(
+                                        surfpool_tx_metadata_to_litesvm_tx_metadata(&metadata),
+                                        None,
+                                        Some(error.clone()),
+                                        None,
+                                        false,
+                                        &tx_message,
+                                        None, // No loaded addresses available in error reporting context
+                                        Some(metadata.loaded_accounts_data_size),
+                                    ))
+                                    .map_err(|e| {
+                                        Error::invalid_params(format!(
+                                            "Failed to serialize simulation result: {e}"
+                                        ))
+                                    })?,
+                                ),
+                                message: format!(
+                                    "Transaction simulation failed: {}{}",
+                                    error,
+                                    if metadata.logs.is_empty() {
+                                        String::new()
+                                    } else {
+                                        format!(
+                                            ": {} log messages:\n{}",
+                                            metadata.logs.len(),
+                                            metadata.logs.iter().map(|l| l.to_string()).join("\n")
+                                        )
+                                    }
+                                ),
+                                code: jsonrpc_core::ErrorCode::ServerError(-32002),
+                            },
+                            PreflightFailure::AccountLoad(error) => Error {
+                                data: None,
+                                message: format!(
+                                    "Transaction verification failed for transaction {error}"
+                                ),
+                                code: jsonrpc_core::ErrorCode::ServerError(-32002),
+                            },
+                        });
+                    }
+                }
             }
 
-            let (status_update_tx, status_update_rx) = crossbeam_channel::bounded(1);
+            // As on an Agave node, the signature is returned once the transaction is queued;
+            // clients learn the outcome from getSignatureStatuses. The status receiver is
+            // dropped here, and every sender on the channel tolerates that.
+            let (status_update_tx, _) = crossbeam_channel::bounded(1);
             ctx.svm_locker.mark_transaction_pending(signature);
+            // The preflight simulation already ran (or the client skipped it), so the runloop
+            // must not repeat it before executing.
+            let skip_preflight = true;
             if ctx
                 .simnet_commands_tx
                 .send(SimnetCommand::ProcessTransaction(
                     ctx.id,
                     unsanitized_tx,
                     status_update_tx,
-                    config.base.skip_preflight,
+                    skip_preflight,
                     config.skip_sig_verify,
                 ))
                 .is_err()
@@ -1854,106 +1925,11 @@ impl Full for SurfpoolFullRpc {
                 .into());
             }
 
-            let status_update = tokio::task::spawn_blocking(move || status_update_rx.recv())
-                .await
-                .map_err(|e| Error {
-                    data: None,
-                    message: format!("Failed to process transaction: {e}"),
-                    code: jsonrpc_core::ErrorCode::ServerError(-32002),
-                })?;
-
-            match status_update {
-                Ok(TransactionStatusEvent::SimulationFailure((error, metadata))) => {
-                    #[cfg(feature = "prometheus")]
-                    if let Some(m) = crate::telemetry::metrics() {
-                        m.record_transaction(false, rpc_start.elapsed().as_millis() as u64);
-                        m.record_rpc_request(
-                            "sendTransaction",
-                            rpc_start.elapsed().as_millis() as u64,
-                        );
-                    }
-                    return Err(Error {
-                        data: Some(
-                            serde_json::to_value(get_simulate_transaction_result(
-                                surfpool_tx_metadata_to_litesvm_tx_metadata(&metadata),
-                                None,
-                                Some(error.clone()),
-                                None,
-                                false,
-                                &tx_message,
-                                None, // No loaded addresses available in error reporting context
-                                Some(metadata.loaded_accounts_data_size),
-                            ))
-                            .map_err(|e| {
-                                Error::invalid_params(format!(
-                                    "Failed to serialize simulation result: {e}"
-                                ))
-                            })?,
-                        ),
-                        message: format!(
-                            "Transaction simulation failed: {}{}",
-                            error,
-                            if metadata.logs.is_empty() {
-                                String::new()
-                            } else {
-                                format!(
-                                    ": {} log messages:\n{}",
-                                    metadata.logs.len(),
-                                    metadata.logs.iter().map(|l| l.to_string()).join("\n")
-                                )
-                            }
-                        ),
-                        code: jsonrpc_core::ErrorCode::ServerError(-32002),
-                    });
-                }
-                Ok(TransactionStatusEvent::ExecutionFailure(_)) => {
-                    #[cfg(feature = "prometheus")]
-                    if let Some(m) = crate::telemetry::metrics() {
-                        m.record_transaction(false, rpc_start.elapsed().as_millis() as u64);
-                    }
-                }
-                Ok(TransactionStatusEvent::VerificationFailure(signature)) => {
-                    #[cfg(feature = "prometheus")]
-                    if let Some(m) = crate::telemetry::metrics() {
-                        m.record_transaction(false, rpc_start.elapsed().as_millis() as u64);
-                        m.record_rpc_request(
-                            "sendTransaction",
-                            rpc_start.elapsed().as_millis() as u64,
-                        );
-                    }
-                    return Err(Error {
-                        data: None,
-                        message: format!(
-                            "Transaction verification failed for transaction {signature}"
-                        ),
-                        code: jsonrpc_core::ErrorCode::ServerError(-32002),
-                    });
-                }
-                Err(e) => {
-                    #[cfg(feature = "prometheus")]
-                    if let Some(m) = crate::telemetry::metrics() {
-                        m.record_transaction(false, rpc_start.elapsed().as_millis() as u64);
-                        m.record_rpc_request(
-                            "sendTransaction",
-                            rpc_start.elapsed().as_millis() as u64,
-                        );
-                    }
-                    return Err(Error {
-                        data: None,
-                        message: format!("Failed to process transaction: {e}"),
-                        code: jsonrpc_core::ErrorCode::ServerError(-32002),
-                    });
-                }
-                Ok(TransactionStatusEvent::Success(_)) => {
-                    #[cfg(feature = "prometheus")]
-                    if let Some(m) = crate::telemetry::metrics() {
-                        m.record_transaction(true, rpc_start.elapsed().as_millis() as u64);
-                    }
-                }
-            }
-
             #[cfg(feature = "prometheus")]
             if let Some(m) = crate::telemetry::metrics() {
+                // A "success" here is a transaction accepted into the queue; its execution
+                // outcome is reported by the runloop, not by this handler.
+                m.record_transaction(true, rpc_start.elapsed().as_millis() as u64);
                 m.record_rpc_request("sendTransaction", rpc_start.elapsed().as_millis() as u64);
             }
             Ok(signature.to_string())
@@ -2523,7 +2499,7 @@ impl Full for SurfpoolFullRpc {
             let read = svm_reader.read_slot(config.commitment, config.min_context_slot)?;
             // Agave checks the blockhash queue of the bank at the commitment.
             Ok(read.respond(
-                svm_reader.check_blockhash_is_recent(&hash)
+                svm_reader.is_blockhash_valid_for_processing(&hash)
                     && svm_reader
                         .is_blockhash_visible_at(&hash, &config.commitment.unwrap_or_default()),
             ))
@@ -2752,6 +2728,7 @@ mod tests {
         rpc_request::RpcRequest,
         rpc_sender::{RpcSender, RpcTransportStats},
     };
+    use solana_clock::MAX_PROCESSING_AGE;
     use solana_commitment_config::CommitmentConfig;
     use solana_hash::Hash;
     use solana_instruction::{AccountMeta, Instruction};
@@ -2783,7 +2760,7 @@ mod tests {
     use solana_transaction_status_client_types::UiTransactionConfig;
     use surfpool_types::{
         BlockProductionMode, ClockCommand, ClockEvent, SimnetCommand, SimnetConfig,
-        TransactionConfirmationStatus,
+        TransactionStatusEvent,
     };
     use test_case::test_case;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2972,11 +2949,6 @@ mod tests {
                                 mutated_accounts,
                             ),
                         )
-                        .unwrap();
-                    status_tx
-                        .send(TransactionStatusEvent::Success(
-                            TransactionConfirmationStatus::Confirmed,
-                        ))
                         .unwrap();
                     drop(writer);
                     setup.context.svm_locker.mark_transaction_complete(&sig);
@@ -3535,14 +3507,306 @@ mod tests {
             build_legacy_transaction(&payer.pubkey(), &[&payer], &[], &recent_blockhash);
         let signature = transaction.signatures[0];
 
+        // Skip the preflight so the send reaches the mempool instead of failing simulation.
         let result = hiro_system_kit::nestable_block_on(setup.rpc.send_transaction(
             Some(setup.context.clone()),
             bs58::encode(bincode::serialize(&transaction).unwrap()).into_string(),
-            None,
+            Some(SurfpoolRpcSendTransactionConfig {
+                base: RpcSendTransactionConfig {
+                    skip_preflight: true,
+                    ..Default::default()
+                },
+                skip_sig_verify: None,
+            }),
         ));
 
         assert!(result.is_err());
         assert!(!setup.context.svm_locker.is_transaction_pending(&signature));
+    }
+
+    /// A funded payer, the latest blockhash, and a transfer of `lamports` encoded for
+    /// `sendTransaction`.
+    fn funded_transfer(
+        setup: &TestSetup<SurfpoolFullRpc>,
+        lamports: u64,
+    ) -> (VersionedTransaction, String) {
+        let payer = Keypair::new();
+        setup
+            .context
+            .svm_locker
+            .airdrop(&payer.pubkey(), 2 * LAMPORTS_PER_SOL)
+            .unwrap()
+            .unwrap();
+        let recent_blockhash = setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm_reader| svm_reader.latest_blockhash());
+        let tx = build_legacy_transaction(
+            &payer.pubkey(),
+            &[&payer],
+            &[transfer(&payer.pubkey(), &Pubkey::new_unique(), lamports)],
+            &recent_blockhash,
+        );
+        let encoded = bs58::encode(bincode::serialize(&tx).unwrap()).into_string();
+        (tx, encoded)
+    }
+
+    /// `sendTransaction` answers with the signature once the transaction is queued, as Agave's
+    /// RPC does, and the signature stays pending until the runloop executes it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_send_transaction_returns_before_the_runloop_executes() {
+        let (mempool_tx, mempool_rx) = crossbeam_channel::unbounded();
+        let setup = TestSetup::new_with_mempool(SurfpoolFullRpc, mempool_tx);
+        let (tx, encoded) = funded_transfer(&setup, LAMPORTS_PER_SOL);
+        let signature = tx.signatures[0];
+
+        let result = setup
+            .rpc
+            .send_transaction(Some(setup.context.clone()), encoded, None)
+            .await
+            .unwrap();
+        assert_eq!(result, signature.to_string());
+
+        // Nothing consumed the mempool, so the transaction is queued and not yet executed.
+        let Ok(SimnetCommand::ProcessTransaction(_, queued, status_tx, skip_preflight, _)) =
+            mempool_rx.try_recv()
+        else {
+            panic!("the transaction should be queued when sendTransaction returns");
+        };
+        assert_eq!(queued.signatures[0], signature);
+        assert!(
+            skip_preflight,
+            "the preflight simulation must not run twice"
+        );
+        assert!(setup.context.svm_locker.is_transaction_pending(&signature));
+        assert!(
+            setup
+                .context
+                .svm_locker
+                .with_svm_reader(|svm_reader| svm_reader.get_transaction(&signature).unwrap())
+                .is_none()
+        );
+
+        setup
+            .context
+            .svm_locker
+            .process_transaction(&None, queued, status_tx, skip_preflight, true)
+            .await
+            .unwrap();
+        setup
+            .context
+            .svm_locker
+            .mark_transaction_complete(&signature);
+        assert!(!setup.context.svm_locker.is_transaction_pending(&signature));
+        assert!(
+            setup
+                .context
+                .svm_locker
+                .with_svm_reader(|svm_reader| svm_reader.get_transaction(&signature).unwrap())
+                .is_some()
+        );
+    }
+
+    /// A transaction failing the preflight simulation is rejected with Agave's preflight
+    /// error and never reaches the runloop.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_send_transaction_preflight_failure_is_not_enqueued() {
+        let (mempool_tx, mempool_rx) = crossbeam_channel::unbounded();
+        let setup = TestSetup::new_with_mempool(SurfpoolFullRpc, mempool_tx);
+        let (tx, encoded) = funded_transfer(&setup, 3 * LAMPORTS_PER_SOL);
+
+        let err = setup
+            .rpc
+            .send_transaction(Some(setup.context.clone()), encoded, None)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code, jsonrpc_core::ErrorCode::ServerError(-32002));
+        assert!(
+            err.message
+                .starts_with("Transaction simulation failed: Error processing Instruction 0"),
+            "unexpected message: {}",
+            err.message
+        );
+        assert!(err.message.contains("log messages:"));
+        let data = err
+            .data
+            .expect("the error should carry the simulation result");
+        assert!(!data["err"].is_null());
+        assert!(!data["logs"].as_array().unwrap().is_empty());
+        assert!(
+            mempool_rx.try_recv().is_err(),
+            "a transaction failing preflight must not be enqueued"
+        );
+        assert!(
+            !setup
+                .context
+                .svm_locker
+                .is_transaction_pending(&tx.signatures[0])
+        );
+    }
+
+    /// A transaction admitted with a valid blockhash fails at execution with
+    /// `BlockhashNotFound` when more than `MAX_PROCESSING_AGE` blocks pass while it is queued,
+    /// as Agave's banking stage rejects it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_queued_transaction_fails_at_execution_once_its_blockhash_expires() {
+        let (mempool_tx, mempool_rx) = crossbeam_channel::unbounded();
+        let setup = TestSetup::new_with_mempool(SurfpoolFullRpc, mempool_tx);
+        let (tx, encoded) = funded_transfer(&setup, LAMPORTS_PER_SOL);
+        let blockhash = *tx.message.recent_blockhash();
+
+        setup
+            .rpc
+            .send_transaction(Some(setup.context.clone()), encoded, None)
+            .await
+            .expect("a transaction with a fresh blockhash should be admitted");
+        let Ok(SimnetCommand::ProcessTransaction(_, queued, _, skip_preflight, _)) =
+            mempool_rx.try_recv()
+        else {
+            panic!("the transaction should be queued");
+        };
+
+        confirm_blocks(&setup, MAX_PROCESSING_AGE as u64 + 1);
+        assert!(
+            !setup
+                .rpc
+                .is_blockhash_valid(Some(setup.context.clone()), blockhash.to_string(), None)
+                .unwrap()
+                .value,
+            "the blockhash should have aged out"
+        );
+
+        let (status_tx, status_rx) = crossbeam_channel::bounded(1);
+        setup
+            .context
+            .svm_locker
+            .process_transaction(&None, queued, status_tx, skip_preflight, true)
+            .await
+            .unwrap();
+        match status_rx.try_recv() {
+            Ok(TransactionStatusEvent::ExecutionFailure((
+                TransactionError::BlockhashNotFound,
+                _,
+            ))) => {}
+            other => panic!("expected an expired blockhash to fail execution, got {other:?}"),
+        }
+    }
+
+    /// A durable-nonce transaction is validated against its nonce account at execution: it
+    /// still runs once the blockhash window has moved on, and a transaction reusing the
+    /// consumed nonce fails with `BlockhashNotFound`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_queued_nonce_transaction_is_validated_against_the_nonce_account() {
+        let (mempool_tx, mempool_rx) = crossbeam_channel::unbounded();
+        let setup = TestSetup::new_with_mempool(SurfpoolFullRpc, mempool_tx);
+        let payer = Keypair::new();
+        let nonce_account = Keypair::new();
+        setup
+            .context
+            .svm_locker
+            .airdrop(&payer.pubkey(), 5 * LAMPORTS_PER_SOL)
+            .unwrap()
+            .unwrap();
+        let (nonce_rent, recent_blockhash) =
+            setup.context.svm_locker.with_svm_reader(|svm_reader| {
+                (
+                    svm_reader
+                        .inner
+                        .minimum_balance_for_rent_exemption(solana_nonce::state::State::size()),
+                    svm_reader.latest_blockhash(),
+                )
+            });
+        let create_nonce_tx = build_legacy_transaction(
+            &payer.pubkey(),
+            &[&payer, &nonce_account],
+            &system_instruction::create_nonce_account(
+                &payer.pubkey(),
+                &nonce_account.pubkey(),
+                &payer.pubkey(),
+                nonce_rent,
+            ),
+            &recent_blockhash,
+        );
+        setup
+            .context
+            .svm_locker
+            .with_svm_writer(|svm_writer| svm_writer.send_transaction(create_nonce_tx, false, true))
+            .expect("the nonce account should be created");
+        let nonce_hash = {
+            let account = setup
+                .context
+                .svm_locker
+                .get_account_local(&nonce_account.pubkey())
+                .inner
+                .map_account()
+                .unwrap();
+            let versions: solana_nonce::versions::Versions =
+                bincode::deserialize(&account.data).unwrap();
+            match versions.state() {
+                solana_nonce::state::State::Initialized(data) => data.blockhash(),
+                _ => panic!("the nonce account should be initialized"),
+            }
+        };
+
+        let nonce_transfer = |lamports| {
+            let mut msg = LegacyMessage::new_with_nonce(
+                vec![transfer(&payer.pubkey(), &Pubkey::new_unique(), lamports)],
+                Some(&payer.pubkey()),
+                &nonce_account.pubkey(),
+                &payer.pubkey(),
+            );
+            msg.recent_blockhash = nonce_hash;
+            VersionedTransaction::try_new(VersionedMessage::Legacy(msg), &[&payer]).unwrap()
+        };
+        let first = nonce_transfer(LAMPORTS_PER_SOL);
+        let second = nonce_transfer(LAMPORTS_PER_SOL / 2);
+        for tx in [&first, &second] {
+            setup
+                .rpc
+                .send_transaction(
+                    Some(setup.context.clone()),
+                    bs58::encode(bincode::serialize(tx).unwrap()).into_string(),
+                    None,
+                )
+                .await
+                .expect("a nonce transaction should pass preflight");
+        }
+
+        confirm_blocks(&setup, MAX_PROCESSING_AGE as u64 + 1);
+
+        let mut outcomes = vec![];
+        for _ in 0..2 {
+            let Ok(SimnetCommand::ProcessTransaction(_, queued, _, skip_preflight, _)) =
+                mempool_rx.try_recv()
+            else {
+                panic!("both nonce transactions should be queued");
+            };
+            let (status_tx, status_rx) = crossbeam_channel::bounded(1);
+            setup
+                .context
+                .svm_locker
+                .process_transaction(&None, queued, status_tx, skip_preflight, true)
+                .await
+                .unwrap();
+            outcomes.push(status_rx.try_recv());
+        }
+        assert!(
+            matches!(outcomes[0], Ok(TransactionStatusEvent::Success(_))),
+            "the nonce should outlive the blockhash window, got {:?}",
+            outcomes[0]
+        );
+        assert!(
+            matches!(
+                outcomes[1],
+                Ok(TransactionStatusEvent::ExecutionFailure((
+                    TransactionError::BlockhashNotFound,
+                    _
+                )))
+            ),
+            "the consumed nonce should be rejected at execution, got {:?}",
+            outcomes[1]
+        );
     }
 
     #[test]
@@ -4688,6 +4952,12 @@ mod tests {
         );
         setup.context.simnet_commands_tx = mempool_tx;
         confirm_blocks(&setup, LEGACY_FINALIZATION_SLOT_THRESHOLD);
+        setup
+            .context
+            .svm_locker
+            .airdrop(&payer.pubkey(), 2 * LAMPORTS_PER_SOL)
+            .unwrap()
+            .unwrap();
 
         let confirmed_blockhash = setup
             .rpc
@@ -4762,14 +5032,9 @@ mod tests {
                 ))
             })
             .unwrap();
-        let Ok(SimnetCommand::ProcessTransaction(_, _, status_tx, _, _)) = mempool_rx.recv() else {
+        let Ok(SimnetCommand::ProcessTransaction(_, _, _, _, _)) = mempool_rx.recv() else {
             panic!("the transaction should be enqueued");
         };
-        status_tx
-            .send(TransactionStatusEvent::Success(
-                TransactionConfirmationStatus::Processed,
-            ))
-            .unwrap();
         assert_eq!(
             handle.join().unwrap().unwrap(),
             tx.signatures[0].to_string()
@@ -6314,11 +6579,6 @@ mod tests {
                                     mutated_accounts,
                                 ),
                             )
-                            .unwrap();
-                        status_tx
-                            .send(TransactionStatusEvent::Success(
-                                TransactionConfirmationStatus::Processed,
-                            ))
                             .unwrap();
                         break;
                     }

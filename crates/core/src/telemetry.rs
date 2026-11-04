@@ -64,7 +64,8 @@ mod instrumented {
             }
         }
 
-        /// Called in send_transaction() — records success or failure + latency
+        /// Called in send_transaction() — records whether the transaction was accepted into
+        /// the queue (not its execution outcome) + latency
         pub fn record_transaction(&self, success: bool, latency_ms: u64) {
             let status = if success { "success" } else { "failure" };
             self.tx_count.add(1, &[KeyValue::new("status", status)]);

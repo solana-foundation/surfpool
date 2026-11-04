@@ -37,7 +37,7 @@ use solana_client::{
         RpcLogsResponse, RpcPerfSample, RpcResponseContext,
     },
 };
-use solana_clock::{Clock, Slot};
+use solana_clock::{Clock, MAX_PROCESSING_AGE, Slot};
 use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_epoch_info::EpochInfo;
 use solana_epoch_schedule::EpochSchedule;
@@ -2174,6 +2174,13 @@ impl SurfnetSvm {
             .map(|age| age as u64)
     }
 
+    /// Whether a transaction carrying `blockhash` may still be processed, as Agave's `check_age`
+    /// decides it: the blockhash is recent and at most `MAX_PROCESSING_AGE` blocks old.
+    pub fn is_blockhash_valid_for_processing(&self, blockhash: &Hash) -> bool {
+        self.blockhash_age(blockhash)
+            .is_some_and(|age| age <= MAX_PROCESSING_AGE as u64)
+    }
+
     /// Returns `false` when `blockhash` is a recent blockhash too new for `commitment`.
     pub fn is_blockhash_visible_at(&self, blockhash: &Hash, commitment: &CommitmentConfig) -> bool {
         if self.skip_blockhash_check {
@@ -2237,8 +2244,8 @@ impl SurfnetSvm {
         self.inner.svm.get_fee_structure().lamports_per_signature
     }
 
-    /// Validates a transaction's lifetime as Agave's `check_transactions` does: a recent blockhash,
-    /// or else a durable nonce.
+    /// Validates a transaction's lifetime as Agave's `check_transactions` does: a blockhash no
+    /// older than `MAX_PROCESSING_AGE`, or else a durable nonce.
     ///
     /// # Arguments
     /// * `tx` - The transaction to validate.
@@ -2247,7 +2254,7 @@ impl SurfnetSvm {
     /// `true` if the transaction blockhash is valid, `false` otherwise.
     pub fn validate_transaction_blockhash(&self, tx: &VersionedTransaction) -> bool {
         self.skip_blockhash_check
-            || self.check_blockhash_is_recent(tx.message.recent_blockhash())
+            || self.is_blockhash_valid_for_processing(tx.message.recent_blockhash())
             || self.check_durable_nonce(&tx.message)
     }
 
