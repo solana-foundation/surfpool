@@ -14,7 +14,10 @@ use spl_token_2022_interface::extension::StateWithExtensions;
 use super::{RunloopContext, SurfnetRpcContext};
 use crate::{
     error::{SurfpoolError, SurfpoolResult},
-    rpc::{State, utils::verify_pubkey},
+    rpc::{
+        State,
+        utils::{MAX_MULTIPLE_ACCOUNTS, verify_input_count, verify_pubkey},
+    },
     surfnet::{
         locker::{SvmAccessContext, is_supported_token_program},
         svm::spl_token_additional_data,
@@ -407,6 +410,9 @@ impl AccountsData for SurfpoolAccountsDataRpc {
         pubkeys_str: Vec<String>,
         config: Option<RpcAccountInfoConfig>,
     ) -> BoxFuture<Result<RpcResponse<Vec<Option<UiAccount>>>>> {
+        if let Err(e) = verify_input_count(pubkeys_str.len(), MAX_MULTIPLE_ACCOUNTS) {
+            return e.into();
+        }
         let config = config.unwrap_or_default();
         let pubkeys = match pubkeys_str
             .iter()
@@ -1646,6 +1652,31 @@ mod tests {
         } else {
             panic!("destination account data was not in json parsed format");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_multiple_accounts_rejects_too_many_inputs() {
+        let setup = TestSetup::new(SurfpoolAccountsDataRpc);
+
+        let err = setup
+            .rpc
+            .get_multiple_accounts(
+                Some(setup.context.clone()),
+                vec!["invalid".to_string(); 101],
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, jsonrpc_core::ErrorCode::InvalidParams);
+        assert_eq!(err.message, "Too many inputs provided; max 100");
+
+        let pubkeys = (0..100).map(|_| Pubkey::new_unique().to_string()).collect();
+        let result = setup
+            .rpc
+            .get_multiple_accounts(Some(setup.context), pubkeys, None)
+            .await
+            .unwrap();
+        assert_eq!(result.value.len(), 100);
     }
 
     #[ignore = "requires-network"]

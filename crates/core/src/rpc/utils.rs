@@ -3,6 +3,10 @@ use std::any::type_name;
 use base64::prelude::*;
 use jsonrpc_core::{Error, Result};
 use litesvm::types::TransactionMetadata;
+pub(crate) use solana_client::rpc_request::{
+    MAX_GET_INFLATION_REWARD_ADDRESSES, MAX_GET_SIGNATURE_STATUSES_QUERY_ITEMS,
+    MAX_MULTIPLE_ACCOUNTS,
+};
 use solana_client::{
     rpc_config::{RpcTokenAccountsFilter, RpcTransactionConfig},
     rpc_filter::RpcFilterType,
@@ -53,6 +57,17 @@ pub(crate) fn verify_filters(filters: &[RpcFilterType]) -> Result<()> {
     }
     for filter in filters {
         verify_filter(filter)?;
+    }
+    Ok(())
+}
+
+pub(crate) const MAX_PRIORITIZATION_FEE_ACCOUNTS: usize = 128;
+
+pub(crate) fn verify_input_count(len: usize, max: usize) -> SurfpoolResult<()> {
+    if len > max {
+        return Err(SurfpoolError::invalid_params(format!(
+            "Too many inputs provided; max {max}"
+        )));
     }
     Ok(())
 }

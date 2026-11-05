@@ -39,8 +39,9 @@ use surfpool_types::{
 use super::{
     RunloopContext, State, SurfnetRpcContext,
     utils::{
-        decode_and_deserialize, decode_rpc_versioned_transaction,
-        verify_and_parse_signatures_for_address_params, verify_pubkey,
+        MAX_GET_INFLATION_REWARD_ADDRESSES, MAX_GET_SIGNATURE_STATUSES_QUERY_ITEMS,
+        MAX_PRIORITIZATION_FEE_ACCOUNTS, decode_and_deserialize, decode_rpc_versioned_transaction,
+        verify_and_parse_signatures_for_address_params, verify_input_count, verify_pubkey,
     },
 };
 use crate::{
@@ -1530,6 +1531,7 @@ impl Full for SurfpoolFullRpc {
         config: Option<RpcEpochConfig>,
     ) -> BoxFuture<Result<Vec<Option<RpcInflationReward>>>> {
         Box::pin(async move {
+            verify_input_count(address_strs.len(), MAX_GET_INFLATION_REWARD_ADDRESSES)?;
             let svm_locker = meta.get_svm_locker()?;
 
             let current_epoch = svm_locker.get_epoch_info().epoch;
@@ -1633,6 +1635,11 @@ impl Full for SurfpoolFullRpc {
         signature_strs: Vec<String>,
         config: Option<RpcSignatureStatusConfig>,
     ) -> BoxFuture<Result<RpcResponse<Vec<Option<TransactionStatus>>>>> {
+        if let Err(e) =
+            verify_input_count(signature_strs.len(), MAX_GET_SIGNATURE_STATUSES_QUERY_ITEMS)
+        {
+            return e.into();
+        }
         let search_transaction_history = config
             .map(|config| config.search_transaction_history)
             .unwrap_or(false);
@@ -2568,6 +2575,11 @@ impl Full for SurfpoolFullRpc {
         meta: Self::Metadata,
         pubkey_strs: Option<Vec<String>>,
     ) -> BoxFuture<Result<Vec<RpcPrioritizationFee>>> {
+        if let Some(strs) = &pubkey_strs
+            && let Err(e) = verify_input_count(strs.len(), MAX_PRIORITIZATION_FEE_ACCOUNTS)
+        {
+            return e.into();
+        }
         let pubkeys_filter = match pubkey_strs
             .map(|strs| {
                 strs.iter()
@@ -6219,6 +6231,67 @@ mod tests {
                 commission_bps: None,
             })
         )
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_full_rpc_rejects_too_many_inputs() {
+        let setup = TestSetup::new(SurfpoolFullRpc);
+        let invalid = |n| vec!["invalid".to_string(); n];
+        let pubkeys = |n| {
+            (0..n)
+                .map(|_| Pubkey::new_unique().to_string())
+                .collect::<Vec<_>>()
+        };
+        let assert_too_many = |err: Error, max: usize| {
+            assert_eq!(err.code, jsonrpc_core::ErrorCode::InvalidParams);
+            assert_eq!(err.message, format!("Too many inputs provided; max {max}"));
+        };
+
+        let err = setup
+            .rpc
+            .get_signature_statuses(Some(setup.context.clone()), invalid(257), None)
+            .await
+            .unwrap_err();
+        assert_too_many(err, 256);
+        let signatures = (0..256)
+            .map(|_| Signature::new_unique().to_string())
+            .collect();
+        let statuses = setup
+            .rpc
+            .get_signature_statuses(Some(setup.context.clone()), signatures, None)
+            .await
+            .unwrap();
+        assert_eq!(statuses.value.len(), 256);
+
+        let err = setup
+            .rpc
+            .get_inflation_reward(Some(setup.context.clone()), invalid(33), None)
+            .await
+            .unwrap_err();
+        assert_too_many(err, 32);
+        let rewards = setup
+            .rpc
+            .get_inflation_reward(Some(setup.context.clone()), pubkeys(32), None)
+            .await
+            .unwrap();
+        assert_eq!(rewards.len(), 32);
+
+        let err = setup
+            .rpc
+            .get_recent_prioritization_fees(Some(setup.context.clone()), Some(invalid(129)))
+            .await
+            .unwrap_err();
+        assert_too_many(err, 128);
+        setup
+            .rpc
+            .get_recent_prioritization_fees(Some(setup.context.clone()), Some(pubkeys(128)))
+            .await
+            .unwrap();
+        setup
+            .rpc
+            .get_recent_prioritization_fees(Some(setup.context), None)
+            .await
+            .unwrap();
     }
 
     /// tests for skip_sig_verify feature
