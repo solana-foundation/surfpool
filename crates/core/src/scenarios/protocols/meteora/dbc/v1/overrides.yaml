@@ -1,0 +1,103 @@
+protocol: Meteora
+version: v1
+account_type: VirtualPool
+idl_file_path: idl.json
+
+tags:
+  - launchpad
+  - bonding-curve
+  - defi
+
+templates:
+  - id: meteora-dbc-pool-custom
+    name: Override Launch Pool (Custom)
+    description: |
+      Override a Meteora Dynamic Bonding Curve (DBC) virtual pool by specifying its address: its
+      reserves, its price and its migration state. The pool graduates when quote_reserve reaches
+      the migration_quote_threshold of its PoolConfig; from then on every swap against it fails
+      with PoolIsCompleted and the token trades on the DAMM pool its liquidity migrates to.
+    idl_account_name: VirtualPool
+    properties:
+      - path: quote_reserve
+        label: Quote Reserve
+        description: Quote raised so far (raw units, lamports for SOL-quoted pools); the pool graduates when this reaches the config's migration_quote_threshold
+      - path: base_reserve
+        label: Base Reserve
+        description: Launched tokens still held by the curve (raw units); falls with every buy
+      - path: sqrt_price
+        label: Sqrt Price
+        description: Current price as a Q64.64 square root (u128); rises with every buy, from the config's sqrt_start_price toward its migration_sqrt_price
+      - path: is_migrated
+        label: Is Migrated
+        description: 1 once the migration instruction has moved the liquidity to the DAMM pool, 0 before
+      - path: migration_progress
+        label: Migration Progress
+        description: 0 PreBondingCurve (trading), 1 PostBondingCurve (graduated, vesting to lock), 2 LockedVesting, 3 CreatedPool (DAMM pool exists)
+      - path: activation_point
+        label: Activation Point
+        description: Slot or timestamp (per the config's activation_type) from which the pool accepts swaps
+    llm_context: |
+      Pass the pool's own address: it is the `pool` account of the swap and swap2 instructions,
+      and the address the program derives as PDA ["pool", config, max(base_mint, quote_mint),
+      min(base_mint, quote_mint)] with max/min by byte order, which is why this template derives
+      nothing. Set fetchBeforeUse: true so the fields you do not override keep their live values.
+      Values are JSON numbers; sqrt_price is a u128 above 2^53, so pass it as a decimal string.
+
+      FAILURE MODES THIS REPRODUCES (each is a distinct program error):
+      - "pool already graduated": set quote_reserve to the config's migration_quote_threshold (read it
+        from the pool's PoolConfig account, field migration_quote_threshold). Every swap now fails with
+        PoolIsCompleted (6013) before any token moves. Add is_migrated: 1 and migration_progress: 3 to
+        model the state after the DAMM pool was created.
+      - "pool nearly full": set sqrt_price just under the config's migration_sqrt_price (the end of the
+        curve) and quote_reserve just under migration_quote_threshold. The swap math walks the curve by
+        sqrt_price; quote_reserve is bookkeeping, and moving it alone near the threshold leaves a buy
+        valid (measured). An exact-in buy larger than the room left fails with InsufficientLiquidity
+        (6033); a partial-fill swap2 takes the room and returns the rest.
+      - "stale quote": move sqrt_price up, keeping it under migration_sqrt_price, and quote_reserve up
+        with it, keeping it under the threshold, as if a buy had landed. A swap built on the old price,
+        with its minimum_amount_out computed from it, fails with ExceededSlippage (6002). A pool near
+        graduation has little price left before the curve ends, so take at most half the distance.
+
+      INVARIANTS: a buy raises quote_reserve and sqrt_price and lowers base_reserve; a sell does the
+      reverse. Keep the three consistent, or the program's own checks fail before the one you meant
+      to reproduce (quote_reserve at or above the threshold reads as graduated; sqrt_price at or above
+      migration_sqrt_price reads as out of curve). This template writes the pool account only: the base and quote vaults (token
+      accounts named by the pool) keep their live balances, so a raised quote_reserve is not backed
+      by quote in the vault. That is fine for swap failures, which the program refuses before moving
+      tokens; to play a full migration, also set the vault balances with the SPL token template.
+    address:
+      type: pubkey
+
+  - id: meteora-dbc-config-custom
+    name: Override Pool Config (Custom)
+    description: |
+      Override a Meteora DBC PoolConfig by specifying its address: the graduation thresholds that
+      every pool created from this config graduates at. Lowering migration_quote_threshold to just
+      above a live pool's quote_reserve lets the next buy graduate that pool on the surfnet.
+    idl_account_name: PoolConfig
+    properties:
+      - path: migration_quote_threshold
+        label: Migration Quote Threshold
+        description: Quote reserve (raw units) at which pools created from this config graduate and stop trading
+      - path: migration_base_threshold
+        label: Migration Base Threshold
+        description: Base tokens (raw units) the pool must still hold at graduation to seed the DAMM pool
+      - path: migration_sqrt_price
+        label: Migration Sqrt Price
+        description: Q64.64 square-root price (u128) at which the curve ends and the DAMM pool opens
+    llm_context: |
+      Pass the config's own address: it is the `config` account of the pool's swap instructions and
+      the `config` field of the VirtualPool account. A config is shared by every pool a launchpad
+      partner created from it, so the override moves the graduation point of all of them at once.
+      Set fetchBeforeUse: true so the other fields keep their live values. Values are JSON numbers;
+      migration_sqrt_price is a u128 above 2^53, so pass it as a decimal string.
+
+      TO GRADUATE A LIVE POOL ON THE SURFNET: read the pool's quote_reserve, set
+      migration_quote_threshold a little above it, then send a buy of at least the difference. The
+      swap completes the curve; the pool records finish_curve_timestamp and moves migration_progress
+      forward, and the next swap fails with PoolIsCompleted (6013). The migration instructions that
+      follow also check the base vault against migration_base_threshold plus fees and vesting
+      (InsufficientLiquidityForMigration, 6029), so keep migration_base_threshold at a value the vault
+      can cover.
+    address:
+      type: pubkey
