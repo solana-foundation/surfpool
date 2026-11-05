@@ -738,6 +738,61 @@
           }
         },
         {
+          "method": "surfnet_setMint",
+          "description": "A 'cheat code' method for developers to create or update a token mint in Surfpool. It sets decimals, mint authority and supply, and for Token-2022 can write the confidential-transfer mint extension (authority, auditor ElGamal key, auto-approve) via the `update.confidential` field without the real initialization instruction. Other extensions already on the mint are kept.",
+          "params": [
+            {
+              "name": "mint",
+              "type": "string",
+              "description": "The base-58 encoded public key of the token mint."
+            },
+            {
+              "name": "update",
+              "type": "object",
+              "description": "The `MintUpdate` struct containing the fields to set on the mint.",
+              "schema": {
+                "decimals": "Option<u8>",
+                "mintAuthority": "Option (base58 public key; omit to keep the current authority, or use the literal string \"null\" to clear it. JSON null does not clear it.)",
+                "supply": "Option<u64>",
+                "confidential": "Option<ConfidentialTransferMintUpdate> (Token-2022 only; writes the confidential-transfer mint extension. Fields: authority (Option<string | null>, base58; null removes it), auditorElgamalPubkey (Option<string | null>, 32 bytes base58/base64; null removes it), autoApproveNewAccounts (Option<bool>, default true). An omitted field keeps its current value.)"
+              }
+            },
+            {
+              "name": "token_program",
+              "type": "string",
+              "description": "Optional: The base-58 encoded address of the token program. Taken from the mint's owner when the mint exists; defaults to SPL Token program otherwise."
+            }
+          ],
+          "returns": "A `RpcResponse<()>` indicating whether the mint update was successful.",
+          "example": {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "surfnet_setMint",
+            "params": [
+              "mint_pubkey",
+              {
+                "decimals": 6,
+                "supply": 1000000000
+              }
+            ]
+          },
+          "confidentialExample": {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "surfnet_setMint",
+            "params": [
+              "mint_pubkey",
+              {
+                "confidential": {
+                  "auditorElgamalPubkey": "<base58, 32 bytes>",
+                  "autoApproveNewAccounts": true
+                }
+              },
+              "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+            ]
+          }
+        },
+        {
           "method": "surfnet_cloneProgramAccount",
           "description": "Clones a program account from a source to a destination program ID. Since a program account points to a program data account (a PDA), this method clones the program data account as well. It gets the source program and data accounts, calculates the destination program data address, points the destination program account to it, and copies the data.",
           "params": [
