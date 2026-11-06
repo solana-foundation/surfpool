@@ -7,7 +7,7 @@ use crate::types::{TimeTravelConfig, TimeTravelError};
 const MAX_SUPPORTED_TIMESTAMP_SECONDS: i64 = i64::MAX / 1_000;
 
 pub(crate) fn timestamp_seconds(timestamp_ms: u64) -> i64 {
-    (timestamp_ms / 1_000).min(i64::MAX as u64) as i64
+    (timestamp_ms / 1_000) as i64
 }
 
 /// The Clock sysvar at `slot` and `unix_timestamp`, filled in the way Agave's `Bank::update_clock`
@@ -197,7 +197,7 @@ pub fn calculate_time_travel_clock(
     slot_time: u64,
     epoch_info: &EpochInfo,
     epoch_schedule: &EpochSchedule,
-) -> Result<Clock, String> {
+) -> Result<Clock, TimeTravelError> {
     let mut clock = match config {
         TimeTravelConfig::AbsoluteTimestamp(timestamp_target) => {
             calculate_absolute_timestamp_clock(
@@ -220,8 +220,7 @@ pub fn calculate_time_travel_clock(
                 return Err(TimeTravelError::PastSlot {
                     target: *slot,
                     current: epoch_info.absolute_slot,
-                }
-                .to_string());
+                });
             }
             let timestamp_seconds = timestamp_seconds(*timestamp);
             Ok(clock_for_slot(
@@ -236,8 +235,7 @@ pub fn calculate_time_travel_clock(
                 return Err(TimeTravelError::PastEpoch {
                     target: *new_epoch,
                     current: epoch_info.epoch,
-                }
-                .to_string());
+                });
             }
             let target_slot = epoch_schedule
                 .get_first_slot_in_epoch(*new_epoch)
@@ -250,11 +248,10 @@ pub fn calculate_time_travel_clock(
                 epoch_schedule,
             )
         }
-    }
-    .map_err(|error| error.to_string())?;
+    }?;
 
     if clock.slot == Slot::MAX {
-        return Err("Cannot time travel to the largest slot".to_string());
+        return Err(TimeTravelError::LargestSlot);
     }
 
     clock.unix_timestamp = clock.unix_timestamp.min(MAX_SUPPORTED_TIMESTAMP_SECONDS);
@@ -311,18 +308,18 @@ mod tests {
     fn time_travel_rejects_the_largest_slot() {
         let epoch_info = create_test_epoch_info(1, 1000, 433_000);
 
-        let result = calculate_time_travel_clock(
-            &TimeTravelConfig::AbsoluteSlot(u64::MAX),
-            1_000_000_000,
-            400,
-            &epoch_info,
-            &schedule(),
-        );
+        for config in [
+            TimeTravelConfig::AbsoluteSlot(u64::MAX),
+            TimeTravelConfig::AbsoluteSlotAt {
+                slot: u64::MAX,
+                timestamp: 5_000,
+            },
+        ] {
+            let result =
+                calculate_time_travel_clock(&config, 1_000_000_000, 400, &epoch_info, &schedule());
 
-        assert_eq!(
-            result.unwrap_err(),
-            "Cannot time travel to the largest slot"
-        );
+            assert!(matches!(result, Err(TimeTravelError::LargestSlot)));
+        }
     }
 
     #[test]

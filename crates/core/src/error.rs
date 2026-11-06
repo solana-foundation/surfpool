@@ -15,7 +15,7 @@ use solana_signature::Signature;
 use solana_transaction::TransactionError;
 use solana_transaction_status::EncodeError;
 
-use crate::storage::StorageError;
+use crate::{storage::StorageError, types::TimeTravelError};
 
 pub type SurfpoolResult<T> = std::result::Result<T, SurfpoolError>;
 
@@ -84,6 +84,12 @@ impl<T> From<TrySendError<T>> for SurfpoolError {
 impl From<solana_client::client_error::ClientError> for SurfpoolError {
     fn from(e: solana_client::client_error::ClientError) -> Self {
         SurfpoolError::client_error(e)
+    }
+}
+
+impl From<TimeTravelError> for SurfpoolError {
+    fn from(error: TimeTravelError) -> Self {
+        Self(Error::invalid_params(error.to_string()))
     }
 }
 
@@ -597,6 +603,19 @@ impl From<AirdropError> for SurfpoolError {
 impl From<AirdropError> for Error {
     fn from(e: AirdropError) -> Self {
         SurfpoolError::from(e).into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SurfpoolError;
+    use crate::types::TimeTravelError;
+
+    #[test]
+    fn time_travel_errors_become_invalid_params() {
+        let error = SurfpoolError::from(TimeTravelError::LargestSlot);
+
+        assert_eq!(error.0.code, jsonrpc_core::ErrorCode::InvalidParams);
     }
 }
 

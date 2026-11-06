@@ -4094,8 +4094,7 @@ impl SurfnetSvmLocker {
             slot_time,
             &epoch_info,
             &epoch_schedule,
-        )
-        .map_err(SurfpoolError::invalid_params)?;
+        )?;
 
         let formated_time = chrono::DateTime::from_timestamp(clock_update.unix_timestamp, 0)
             .unwrap_or_else(|| chrono::DateTime::from_timestamp(0, 0).unwrap())
