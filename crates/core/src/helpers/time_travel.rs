@@ -179,6 +179,28 @@ pub fn calculate_absolute_epoch_clock(
     ))
 }
 
+fn calculate_absolute_slot_at_clock(
+    slot: u64,
+    timestamp: u64,
+    current_absolute_slot: u64,
+    epoch_schedule: &EpochSchedule,
+) -> Result<Clock, TimeTravelError> {
+    if slot < current_absolute_slot {
+        return Err(TimeTravelError::PastSlot {
+            target: slot,
+            current: current_absolute_slot,
+        });
+    }
+
+    let timestamp_seconds = timestamp_seconds(timestamp);
+    Ok(clock_for_slot(
+        slot,
+        timestamp_seconds,
+        None,
+        epoch_schedule,
+    ))
+}
+
 /// Calculates the new clock state based on a time travel configuration.
 ///
 /// # Arguments
@@ -215,21 +237,12 @@ pub fn calculate_time_travel_clock(
             slot_time,
             epoch_schedule,
         ),
-        TimeTravelConfig::AbsoluteSlotAt { slot, timestamp } => {
-            if *slot < epoch_info.absolute_slot {
-                return Err(TimeTravelError::PastSlot {
-                    target: *slot,
-                    current: epoch_info.absolute_slot,
-                });
-            }
-            let timestamp_seconds = timestamp_seconds(*timestamp);
-            Ok(clock_for_slot(
-                *slot,
-                timestamp_seconds,
-                None,
-                epoch_schedule,
-            ))
-        }
+        TimeTravelConfig::AbsoluteSlotAt { slot, timestamp } => calculate_absolute_slot_at_clock(
+            *slot,
+            *timestamp,
+            epoch_info.absolute_slot,
+            epoch_schedule,
+        ),
         TimeTravelConfig::AbsoluteEpoch(new_epoch) => calculate_absolute_epoch_clock(
             *new_epoch,
             epoch_info.epoch,
