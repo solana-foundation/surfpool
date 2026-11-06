@@ -1,0 +1,695 @@
+{
+  "address": "HEvSKofvBgfaexv23kMabbYqxasxU3mQ4ibBMEmJWHny",
+  "metadata": {
+    "name": "store",
+    "version": "1.0.0",
+    "spec": "0.1.0"
+  },
+  "instructions": [
+    {
+      "name": "create_feed",
+      "discriminator": [
+        173,
+        86,
+        95,
+        94,
+        13,
+        193,
+        67,
+        180
+      ],
+      "accounts": [
+        {
+          "name": "feed",
+          "writable": true
+        },
+        {
+          "name": "authority",
+          "signer": true
+        }
+      ],
+      "args": [
+        {
+          "name": "description",
+          "type": "string"
+        },
+        {
+          "name": "decimals",
+          "type": "u8"
+        },
+        {
+          "name": "granularity",
+          "type": "u8"
+        },
+        {
+          "name": "live_length",
+          "type": "u32"
+        }
+      ]
+    },
+    {
+      "name": "close_feed",
+      "discriminator": [
+        153,
+        14,
+        92,
+        89,
+        19,
+        78,
+        211,
+        46
+      ],
+      "accounts": [
+        {
+          "name": "feed",
+          "writable": true
+        },
+        {
+          "name": "owner"
+        },
+        {
+          "name": "receiver",
+          "writable": true
+        },
+        {
+          "name": "authority",
+          "signer": true
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "transfer_feed_ownership",
+      "discriminator": [
+        181,
+        58,
+        251,
+        37,
+        147,
+        180,
+        70,
+        227
+      ],
+      "accounts": [
+        {
+          "name": "feed",
+          "writable": true
+        },
+        {
+          "name": "owner"
+        },
+        {
+          "name": "authority",
+          "signer": true
+        }
+      ],
+      "args": [
+        {
+          "name": "proposed_owner",
+          "type": "pubkey"
+        }
+      ]
+    },
+    {
+      "name": "accept_feed_ownership",
+      "discriminator": [
+        211,
+        161,
+        86,
+        113,
+        101,
+        175,
+        245,
+        136
+      ],
+      "accounts": [
+        {
+          "name": "feed",
+          "writable": true
+        },
+        {
+          "name": "proposed_owner"
+        },
+        {
+          "name": "authority",
+          "signer": true
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "set_validator_config",
+      "discriminator": [
+        87,
+        248,
+        224,
+        193,
+        17,
+        41,
+        80,
+        250
+      ],
+      "accounts": [
+        {
+          "name": "feed",
+          "writable": true
+        },
+        {
+          "name": "owner"
+        },
+        {
+          "name": "authority",
+          "signer": true
+        }
+      ],
+      "args": [
+        {
+          "name": "flagging_threshold",
+          "type": "u32"
+        }
+      ]
+    },
+    {
+      "name": "set_writer",
+      "discriminator": [
+        174,
+        36,
+        177,
+        122,
+        86,
+        142,
+        32,
+        109
+      ],
+      "accounts": [
+        {
+          "name": "feed",
+          "writable": true
+        },
+        {
+          "name": "owner"
+        },
+        {
+          "name": "authority",
+          "signer": true
+        }
+      ],
+      "args": [
+        {
+          "name": "writer",
+          "type": "pubkey"
+        }
+      ]
+    },
+    {
+      "name": "lower_flag",
+      "discriminator": [
+        253,
+        79,
+        240,
+        163,
+        36,
+        124,
+        157,
+        111
+      ],
+      "accounts": [
+        {
+          "name": "feed",
+          "writable": true
+        },
+        {
+          "name": "owner"
+        },
+        {
+          "name": "authority",
+          "signer": true
+        },
+        {
+          "name": "access_controller"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "submit",
+      "discriminator": [
+        88,
+        166,
+        102,
+        181,
+        162,
+        127,
+        170,
+        48
+      ],
+      "accounts": [
+        {
+          "name": "feed",
+          "writable": true
+        },
+        {
+          "name": "authority",
+          "signer": true
+        }
+      ],
+      "args": [
+        {
+          "name": "round",
+          "type": {
+            "defined": {
+              "name": "NewTransmission"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "initialize",
+      "discriminator": [
+        175,
+        175,
+        109,
+        31,
+        13,
+        152,
+        155,
+        237
+      ],
+      "accounts": [
+        {
+          "name": "store",
+          "writable": true
+        },
+        {
+          "name": "owner",
+          "signer": true
+        },
+        {
+          "name": "lowering_access_controller"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "transfer_store_ownership",
+      "discriminator": [
+        186,
+        90,
+        25,
+        87,
+        17,
+        175,
+        57,
+        109
+      ],
+      "accounts": [
+        {
+          "name": "store",
+          "writable": true
+        },
+        {
+          "name": "authority",
+          "signer": true
+        }
+      ],
+      "args": [
+        {
+          "name": "proposed_owner",
+          "type": "pubkey"
+        }
+      ]
+    },
+    {
+      "name": "accept_store_ownership",
+      "discriminator": [
+        239,
+        190,
+        50,
+        245,
+        242,
+        158,
+        249,
+        230
+      ],
+      "accounts": [
+        {
+          "name": "store",
+          "writable": true
+        },
+        {
+          "name": "authority",
+          "signer": true
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "set_lowering_access_controller",
+      "discriminator": [
+        207,
+        68,
+        147,
+        34,
+        164,
+        94,
+        189,
+        113
+      ],
+      "accounts": [
+        {
+          "name": "store",
+          "writable": true
+        },
+        {
+          "name": "authority",
+          "signer": true
+        },
+        {
+          "name": "access_controller"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "query",
+      "discriminator": [
+        39,
+        251,
+        130,
+        159,
+        46,
+        136,
+        164,
+        169
+      ],
+      "accounts": [
+        {
+          "name": "feed"
+        }
+      ],
+      "args": [
+        {
+          "name": "scope",
+          "type": {
+            "defined": {
+              "name": "Scope"
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "accounts": [
+    {
+      "name": "Store",
+      "discriminator": [
+        130,
+        48,
+        247,
+        244,
+        182,
+        191,
+        30,
+        26
+      ]
+    },
+    {
+      "name": "Transmissions",
+      "discriminator": [
+        96,
+        179,
+        69,
+        66,
+        128,
+        129,
+        73,
+        117
+      ]
+    }
+  ],
+  "errors": [
+    {
+      "code": 6000,
+      "name": "Unauthorized",
+      "msg": "Unauthorized"
+    },
+    {
+      "code": 6001,
+      "name": "InvalidInput",
+      "msg": "Invalid input"
+    },
+    {
+      "code": 6002,
+      "name": "NotFound"
+    },
+    {
+      "code": 6003,
+      "name": "InvalidVersion",
+      "msg": "Invalid version"
+    },
+    {
+      "code": 6004,
+      "name": "InsufficientSize",
+      "msg": "Insufficient or invalid feed account size, has to be `8 + HEADER_SIZE + n * size_of::<Transmission>()`"
+    }
+  ],
+  "types": [
+    {
+      "name": "NewTransmission",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "timestamp",
+            "type": "u64"
+          },
+          {
+            "name": "answer",
+            "type": "i128"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Round",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "round_id",
+            "type": "u32"
+          },
+          {
+            "name": "slot",
+            "type": "u64"
+          },
+          {
+            "name": "timestamp",
+            "type": "u32"
+          },
+          {
+            "name": "answer",
+            "type": "i128"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Scope",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "Version"
+          },
+          {
+            "name": "Decimals"
+          },
+          {
+            "name": "Description"
+          },
+          {
+            "name": "RoundData",
+            "fields": [
+              {
+                "name": "round_id",
+                "type": "u32"
+              }
+            ]
+          },
+          {
+            "name": "LatestRoundData"
+          },
+          {
+            "name": "Aggregator"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Store",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "owner",
+            "type": "pubkey"
+          },
+          {
+            "name": "proposed_owner",
+            "type": "pubkey"
+          },
+          {
+            "name": "lowering_access_controller",
+            "type": "pubkey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Transmission",
+      "docs": [
+        "One round, laid out as chainlink_solana's repr(C) Transmission (48 bytes)."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "slot",
+            "docs": [
+              "Slot the round was written at."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "timestamp",
+            "docs": [
+              "Unix seconds the round reports."
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "_padding0",
+            "type": "u32"
+          },
+          {
+            "name": "answer",
+            "docs": [
+              "Feed value scaled by 10^decimals."
+            ],
+            "type": "i128"
+          },
+          {
+            "name": "_padding1",
+            "type": "u64"
+          },
+          {
+            "name": "_padding2",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Transmissions",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "version",
+            "type": "u8"
+          },
+          {
+            "name": "state",
+            "type": "u8"
+          },
+          {
+            "name": "owner",
+            "type": "pubkey"
+          },
+          {
+            "name": "proposed_owner",
+            "type": "pubkey"
+          },
+          {
+            "name": "writer",
+            "type": "pubkey"
+          },
+          {
+            "name": "description",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "decimals",
+            "type": "u8"
+          },
+          {
+            "name": "flagging_threshold",
+            "type": "u32"
+          },
+          {
+            "name": "latest_round_id",
+            "type": "u32"
+          },
+          {
+            "name": "granularity",
+            "type": "u8"
+          },
+          {
+            "name": "live_length",
+            "type": "u32"
+          },
+          {
+            "name": "live_cursor",
+            "type": "u32"
+          },
+          {
+            "name": "historical_cursor",
+            "type": "u32"
+          },
+          {
+            "name": "_header_padding",
+            "docs": [
+              "Unused bytes up to the 192-byte feed header (HEADER_SIZE)."
+            ],
+            "type": {
+              "array": [
+                "u8",
+                40
+              ]
+            }
+          },
+          {
+            "name": "live",
+            "docs": [
+              "The feed's single live round. Chainlink's Solana SDK (chainlink_solana::v2::read_feed_v2)",
+              "reads it here and rejects feeds whose live_length is not 1."
+            ],
+            "type": {
+              "defined": {
+                "name": "Transmission"
+              }
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "constants": [
+    {
+      "name": "HEADER_SIZE",
+      "type": {
+        "defined": {
+          "name": "usize"
+        }
+      },
+      "value": "192"
+    }
+  ]
+}
