@@ -2001,11 +2001,14 @@ impl Full for SurfpoolFullRpc {
             // Convert TransactionLoadedAddresses to LoadedAddresses before it gets consumed
             let loaded_addresses_data = loaded_addresses.as_ref().map(|la| la.loaded_addresses());
 
-            // Like Agave's simulation bank: the context slot, the replacement blockhash and the
-            // simulated state come from one guard, taken once the accounts are loaded.
-            let (read, replacement_blockhash, tx_message, simulation) = svm_locker
+            // Surfpool simulates against tip state, so the response must report the
+            // tip slot. Validate minContextSlot against the requested commitment,
+            // and capture the simulation state and replacement blockhash under
+            // the same SVM reader guard.
+            let (read, simulated_slot, replacement_blockhash, tx_message, simulation) = svm_locker
                 .with_svm_reader(|svm_reader| {
                     let read = svm_reader.read_slot(config.commitment, config.min_context_slot)?;
+                    let simulated_slot = svm_reader.get_latest_absolute_slot();
                     let replacement_blockhash = config.replace_recent_blockhash.then(|| {
                         let (blockhash, last_valid_block_height) =
                             svm_reader.latest_blockhash_at(&config.commitment.unwrap_or_default());
@@ -2021,6 +2024,7 @@ impl Full for SurfpoolFullRpc {
                         svm_reader.simulate_transaction(unsanitized_tx, config.sig_verify);
                     Ok::<_, jsonrpc_core::Error>((
                         read,
+                        simulated_slot,
                         replacement_blockhash,
                         tx_message,
                         simulation,
@@ -2078,7 +2082,9 @@ impl Full for SurfpoolFullRpc {
                 ),
             };
 
-            Ok(read.respond(value))
+            let mut response = read.respond(value);
+            response.context.slot = simulated_slot;
+            Ok(response)
         })
     }
 
@@ -6523,6 +6529,113 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_simulate_transaction_reports_actual_state_slot() {
+        let setup = TestSetup::new_with_serial_vm_executor(SurfpoolFullRpc);
+
+        let payer = Keypair::new();
+        let recipient = Pubkey::new_unique();
+
+        let recent_blockhash = setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm| svm.latest_blockhash());
+
+        // Fund the payer in the current SVM state.
+        setup
+            .rpc
+            .request_airdrop(
+                Some(setup.context.clone()),
+                payer.pubkey().to_string(),
+                2 * LAMPORTS_PER_SOL,
+                None,
+            )
+            .unwrap();
+
+        let tip_slot = setup.context.svm_locker.get_latest_absolute_slot();
+        let confirmed_slot = setup
+            .context
+            .svm_locker
+            .get_slot_for_commitment(&CommitmentConfig::confirmed());
+
+        // Ensure the test has a meaningful commitment lag.
+        assert!(tip_slot > confirmed_slot);
+
+        let tx = build_legacy_transaction(
+            &payer.pubkey(),
+            &[&payer],
+            &[system_instruction::transfer(
+                &payer.pubkey(),
+                &recipient,
+                LAMPORTS_PER_SOL,
+            )],
+            &recent_blockhash,
+        );
+
+        let encoded = bs58::encode(wincode::serialize(&tx).unwrap()).into_string();
+
+        for commitment in [
+            CommitmentConfig::processed(),
+            CommitmentConfig::confirmed(),
+            CommitmentConfig::finalized(),
+        ] {
+            let commitment_slot = setup
+                .context
+                .svm_locker
+                .get_slot_for_commitment(&commitment);
+
+            let result = setup
+                .rpc
+                .simulate_transaction(
+                    Some(setup.context.clone()),
+                    encoded.clone(),
+                    Some(RpcSimulateTransactionConfig {
+                        commitment: Some(commitment),
+                        sig_verify: true,
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap();
+
+            // The simulation succeeds using the payer's current balance.
+            assert_eq!(result.value.err, None);
+
+            // Its context must identify the SVM state actually used.
+            assert_eq!(
+                result.context.slot, tip_slot,
+                "simulation must report the tip slot, not the older commitment slot"
+            );
+
+            // minContextSlot must still be checked against commitment,
+            // not the newer tip slot.
+            if commitment_slot < tip_slot {
+                let error = setup
+                    .rpc
+                    .simulate_transaction(
+                        Some(setup.context.clone()),
+                        encoded.clone(),
+                        Some(RpcSimulateTransactionConfig {
+                            commitment: Some(commitment),
+                            min_context_slot: Some(commitment_slot + 1),
+                            sig_verify: true,
+                            ..Default::default()
+                        }),
+                    )
+                    .await
+                    .unwrap_err();
+
+                assert_eq!(
+                    error,
+                    RpcCustomError::MinContextSlotNotReached {
+                        context_slot: commitment_slot,
+                    }
+                    .into()
+                );
+            }
+        }
+    }
+
     /// A validator reads the blockhash and the context slot from one bank, so the context slot
     /// and `lastValidBlockHeight` keep one offset while blocks are produced.
     #[tokio::test(flavor = "multi_thread")]
@@ -6560,8 +6673,10 @@ mod tests {
         assert_eq!(offsets, [expected].into());
     }
 
-    /// A validator answers these from the bank its commitment selects (`get_bank_with_config`),
-    /// so the value and the context slot are the finalized bank's, not the tip's.
+    /// Commitment-based RPC reads report their selected slot.
+    /// Simulations are different: Surfpool executes against the tip SVM state,
+    /// so their context reports the tip while replacement blockhash selection
+    /// still follows the requested commitment.
     #[tokio::test(flavor = "multi_thread")]
     async fn reads_answer_from_the_slot_their_commitment_names() {
         use crate::rpc::{
@@ -6615,6 +6730,7 @@ mod tests {
                 ctx(),
                 BASE64_STANDARD.encode(bincode::serialize(&tx).unwrap()),
                 Some(RpcSimulateTransactionConfig {
+                    commitment: Some(CommitmentConfig::finalized()),
                     replace_recent_blockhash: true,
                     encoding: Some(UiTransactionEncoding::Base64),
                     ..Default::default()
@@ -6623,13 +6739,15 @@ mod tests {
             .await
             .unwrap();
         let latest = setup.rpc.get_latest_blockhash(ctx(), finalized).unwrap();
-        assert_eq!(
-            (
-                simulated.context.slot,
-                simulated.value.replacement_blockhash
-            ),
-            (finalized_slot, Some(latest.value))
-        );
+        let tip_slot = locker.get_latest_absolute_slot();
+
+        assert!(tip_slot > finalized_slot);
+
+        // Simulation runs against tip state, so its context must report the tip.
+        assert_eq!(simulated.context.slot, tip_slot);
+
+        // The replacement blockhash still follows the requested commitment.
+        assert_eq!(simulated.value.replacement_blockhash, Some(latest.value));
 
         let production = SurfpoolBankDataRpc
             .get_block_production(
