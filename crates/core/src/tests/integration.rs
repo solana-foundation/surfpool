@@ -4863,6 +4863,33 @@ fn test_pause_clock_acknowledges_the_final_slot() {
     }
 }
 
+#[test]
+fn test_pause_clock_acknowledges_with_a_slow_slot_time() {
+    let rpc_server = SurfnetCheatcodesRpc::empty();
+    let simnet = boot_simnet(BlockProductionMode::Clock, Some(1_500), TestType::no_db())
+        .expect("the simnet should boot");
+    let (plugin_commands_tx, _plugin_commands_rx) = crossbeam_channel::unbounded::<PluginCommand>();
+    let runloop_context = RunloopContext {
+        id: None,
+        svm_locker: simnet.locker.clone(),
+        simnet_commands_tx: simnet.commands.clone(),
+        remote_rpc_client: None,
+        rpc_config: RpcConfig::default(),
+        cheatcode_config: CheatcodeConfig::new(),
+        plugin_commands_tx,
+    };
+    // The handler waits 2 s for the ack; a slot this long must not push the ack past it.
+    let paused = rpc_server
+        .pause_clock(Some(runloop_context.clone()))
+        .expect("pause clock should be acknowledged however long a slot is");
+    std::thread::sleep(Duration::from_millis(3_200));
+    assert_eq!(
+        simnet.locker.get_latest_absolute_slot(),
+        paused.absolute_slot,
+        "the acknowledged slot is the paused slot"
+    );
+}
+
 #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
 #[test_case(TestType::in_memory(); "with in-memory sqlite db")]
 #[test_case(TestType::no_db(); "with no db")]
