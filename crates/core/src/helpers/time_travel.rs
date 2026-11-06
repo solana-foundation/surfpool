@@ -230,24 +230,14 @@ pub fn calculate_time_travel_clock(
                 epoch_schedule,
             ))
         }
-        TimeTravelConfig::AbsoluteEpoch(new_epoch) => {
-            if *new_epoch < epoch_info.epoch {
-                return Err(TimeTravelError::PastEpoch {
-                    target: *new_epoch,
-                    current: epoch_info.epoch,
-                });
-            }
-            let target_slot = epoch_schedule
-                .get_first_slot_in_epoch(*new_epoch)
-                .max(epoch_info.absolute_slot);
-            calculate_absolute_slot_clock(
-                target_slot,
-                epoch_info.absolute_slot,
-                current_updated_at,
-                slot_time,
-                epoch_schedule,
-            )
-        }
+        TimeTravelConfig::AbsoluteEpoch(new_epoch) => calculate_absolute_epoch_clock(
+            *new_epoch,
+            epoch_info.epoch,
+            epoch_info.absolute_slot,
+            current_updated_at,
+            slot_time,
+            epoch_schedule,
+        ),
     }?;
 
     if clock.slot == Slot::MAX {
