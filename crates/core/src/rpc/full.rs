@@ -5045,6 +5045,179 @@ mod tests {
         assert_eq!(res[1].prioritization_fee, 0);
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_recent_prioritization_fees_with_address_lookup_table() {
+        use solana_address_lookup_table_interface::state::{AddressLookupTable, LookupTableMeta};
+
+        let (setup, mempool_rx) =
+            TestSetup::new_with_serial_vm_executor_and_mempool(SurfpoolFullRpc);
+
+        let priced_payer = Keypair::new();
+        let zero_payer = Keypair::new();
+
+        let writable_address = Pubkey::new_unique();
+        let readonly_address = Pubkey::new_unique();
+        let zero_receiver = Pubkey::new_unique();
+        let lookup_key = Pubkey::new_unique();
+
+        // Fund both payers before processing the test transactions.
+        for payer in [&priced_payer, &zero_payer] {
+            setup
+                .rpc
+                .request_airdrop(
+                    Some(setup.context.clone()),
+                    payer.pubkey().to_string(),
+                    2 * LAMPORTS_PER_SOL,
+                    None,
+                )
+                .unwrap();
+        }
+
+        setup
+            .context
+            .svm_locker
+            .confirm_current_block(&None)
+            .await
+            .unwrap();
+
+        // Install a genuine serialized ALT account in the local SVM.
+        let lookup_addresses = vec![writable_address, readonly_address];
+
+        let lookup_table_data = AddressLookupTable {
+            meta: LookupTableMeta {
+                authority: Some(priced_payer.pubkey()),
+                ..Default::default()
+            },
+            addresses: lookup_addresses.clone().into(),
+        };
+
+        setup.context.svm_locker.with_svm_writer(|svm| {
+            svm.set_account(
+                &lookup_key,
+                Account {
+                    lamports: LAMPORTS_PER_SOL,
+                    data: lookup_table_data.serialize_for_tests().unwrap(),
+                    owner: solana_address_lookup_table_interface::program::id(),
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+        });
+
+        let recent_blockhash = setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm| svm.latest_blockhash());
+
+        // Transfer destination is writable. The additional account is readonly.
+        let mut transfer_ix = system_instruction::transfer(
+            &priced_payer.pubkey(),
+            &writable_address,
+            LAMPORTS_PER_SOL,
+        );
+        transfer_ix
+            .accounts
+            .push(AccountMeta::new_readonly(readonly_address, false));
+
+        let instructions = [
+            ComputeBudgetInstruction::set_compute_unit_price(1_500),
+            transfer_ix,
+        ];
+
+        let lookup_table = AddressLookupTableAccount {
+            key: lookup_key,
+            addresses: lookup_addresses,
+        };
+
+        let message = V0Message::try_compile(
+            &priced_payer.pubkey(),
+            &instructions,
+            &[lookup_table],
+            recent_blockhash,
+        )
+        .unwrap();
+
+        // These assertions ensure the test truly exercises BOTH loaded types.
+        assert_eq!(message.address_table_lookups.len(), 1);
+
+        assert_eq!(message.address_table_lookups[0].writable_indexes, vec![0]);
+        assert_eq!(message.address_table_lookups[0].readonly_indexes, vec![1]);
+
+        let priced_tx =
+            VersionedTransaction::try_new(VersionedMessage::V0(message), &[&priced_payer]).unwrap();
+
+        // A separate zero-priced transaction establishes a global minimum
+        // without writing to the ALT-loaded writable address.
+        let zero_tx = build_legacy_transaction(
+            &zero_payer.pubkey(),
+            &[&zero_payer],
+            &[system_instruction::transfer(
+                &zero_payer.pubkey(),
+                &zero_receiver,
+                1_000_000,
+            )],
+            &recent_blockhash,
+        );
+
+        send_and_await_transaction(priced_tx, setup.clone(), mempool_rx.clone())
+            .await
+            .join()
+            .unwrap();
+
+        send_and_await_transaction(zero_tx, setup.clone(), mempool_rx)
+            .await
+            .join()
+            .unwrap();
+
+        setup
+            .context
+            .svm_locker
+            .confirm_current_block(&None)
+            .await
+            .unwrap();
+
+        // Writable ALT account must retain its own fee minimum.
+        let writable_fees = setup
+            .rpc
+            .get_recent_prioritization_fees(
+                Some(setup.context.clone()),
+                Some(vec![writable_address.to_string()]),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(writable_fees.len(), 2);
+        assert_eq!(writable_fees[0].prioritization_fee, 1_500);
+        assert_eq!(writable_fees[1].prioritization_fee, 0);
+
+        // Readonly ALT account must fall back to the slot minimum.
+        let readonly_fees = setup
+            .rpc
+            .get_recent_prioritization_fees(
+                Some(setup.context.clone()),
+                Some(vec![readonly_address.to_string()]),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(readonly_fees.len(), 2);
+        assert_eq!(readonly_fees[0].prioritization_fee, 0);
+        assert_eq!(readonly_fees[1].prioritization_fee, 0);
+
+        // Unfiltered queries must return one entry per slot.
+        let unfiltered_fees = setup
+            .rpc
+            .get_recent_prioritization_fees(Some(setup.context.clone()), None)
+            .await
+            .unwrap();
+
+        assert_eq!(unfiltered_fees.len(), 2);
+        assert!(unfiltered_fees[0].slot > unfiltered_fees[1].slot);
+        assert_eq!(unfiltered_fees[0].prioritization_fee, 0);
+        assert_eq!(unfiltered_fees[1].prioritization_fee, 0);
+    }
+
     /// Airdrops to a payer, then lands one successful and one failed transfer in a
     /// confirmed block. Returns the airdrop, success and failure signatures and the slot.
     async fn confirmed_transfers(
