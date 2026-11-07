@@ -238,14 +238,14 @@ pub struct CuCommand {
     /// Signature of the transaction.
     #[arg(value_name = "SIGNATURE")]
     pub signature: String,
-    /// RPC URL to read the transaction from: a running Surfpool instance or any Solana RPC.
-    /// Defaults to the local Surfpool instance.
-    #[arg(long = "rpc-url", short = 'u', value_name = "RPC_URL")]
+    /// RPC to read the transaction from: `localhost` (a running Surfpool instance, the default),
+    /// `mainnet`, `devnet`, `testnet`, or the URL of any Solana RPC.
+    #[arg(long = "rpc-url", short = 'u', value_name = "URL_OR_MONIKER")]
     pub rpc_url: Option<String>,
-    /// Also write the compute units as collapsed stacks to this file, for a flame graph in
-    /// speedscope.app or inferno-flamegraph.
-    #[arg(long = "folded", value_name = "PATH")]
-    pub folded: Option<PathBuf>,
+    /// Also write the compute units as collapsed stacks to `<SIGNATURE>.folded` in this
+    /// directory, for a flame graph in speedscope.app or inferno-flamegraph.
+    #[arg(long = "output-dir", value_name = "DIR")]
+    pub output_dir: Option<PathBuf>,
     /// Print the invocation tree as JSON.
     #[arg(long = "json")]
     pub json: bool,
@@ -253,10 +253,13 @@ pub struct CuCommand {
 
 impl CuCommand {
     fn get_rpc_url(&self) -> String {
-        self.rpc_url
-            .as_deref()
-            .map(|rpc_url| rpc_url.trim_end_matches('/').to_string())
-            .unwrap_or_else(|| format!("http://{DEFAULT_NETWORK_HOST}:{DEFAULT_RPC_PORT}"))
+        match self.rpc_url.as_deref() {
+            None | Some("localhost") => format!("http://{DEFAULT_NETWORK_HOST}:{DEFAULT_RPC_PORT}"),
+            Some(rpc_url) => match <NetworkType as clap::ValueEnum>::from_str(rpc_url, true) {
+                Ok(network) => network.rpc_url().to_string(),
+                Err(_) => rpc_url.trim_end_matches('/').to_string(),
+            },
+        }
     }
 }
 
@@ -613,6 +616,16 @@ pub enum NetworkType {
     Testnet,
 }
 
+impl NetworkType {
+    fn rpc_url(&self) -> &'static str {
+        match self {
+            NetworkType::Mainnet => DEFAULT_MAINNET_RPC_URL,
+            NetworkType::Devnet => DEFAULT_DEVNET_RPC_URL,
+            NetworkType::Testnet => DEFAULT_TESTNET_RPC_URL,
+        }
+    }
+}
+
 impl StartSimnet {
     pub fn get_airdrop_addresses(&self) -> (Vec<Pubkey>, Vec<SimnetEvent>) {
         let mut airdrop_addresses = vec![];
@@ -772,10 +785,8 @@ impl StartSimnet {
     }
 
     pub fn datasource_rpc_url(&self) -> String {
-        match self.network.network {
-            Some(NetworkType::Mainnet) => DEFAULT_MAINNET_RPC_URL.to_string(),
-            Some(NetworkType::Devnet) => DEFAULT_DEVNET_RPC_URL.to_string(),
-            Some(NetworkType::Testnet) => DEFAULT_TESTNET_RPC_URL.to_string(),
+        match &self.network.network {
+            Some(network) => network.rpc_url().to_string(),
             None => self
                 .network
                 .rpc_url
@@ -1379,6 +1390,16 @@ mod tests {
         }
     }
 
+    fn parse_cu(args: &[&str]) -> CuCommand {
+        match Opts::try_parse_from(args)
+            .expect("cu args should parse")
+            .command
+        {
+            Command::Cu(cmd) => cmd,
+            command => panic!("expected cu command, got {command:?}"),
+        }
+    }
+
     #[test]
     fn start_help_groups_related_flags() {
         let help = start_long_help();
@@ -1504,6 +1525,23 @@ mod tests {
             .expect_err("stop should require a port or RPC URL");
 
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn cu_reads_from_a_network_by_name() {
+        let rpc_url =
+            |args: &[&str]| parse_cu(&[&["surfpool", "cu", "sig"], args].concat()).get_rpc_url();
+        let local = format!("http://{DEFAULT_NETWORK_HOST}:{DEFAULT_RPC_PORT}");
+
+        assert_eq!(rpc_url(&[]), local);
+        assert_eq!(rpc_url(&["-u", "localhost"]), local);
+        assert_eq!(rpc_url(&["-u", "mainnet"]), DEFAULT_MAINNET_RPC_URL);
+        assert_eq!(rpc_url(&["-u", "devnet"]), DEFAULT_DEVNET_RPC_URL);
+        assert_eq!(rpc_url(&["--rpc-url", "Testnet"]), DEFAULT_TESTNET_RPC_URL);
+        assert_eq!(
+            rpc_url(&["-u", "http://127.0.0.1:8898/"]),
+            "http://127.0.0.1:8898"
+        );
     }
 
     #[test]

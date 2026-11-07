@@ -168,7 +168,7 @@ $ surfpool cu <SIGNATURE>
 300 CU unattributed: no program's logs account for them.
 ```
 
-It reads the transaction from the local surfnet by default, or from any RPC with `--rpc-url`. Programs with an IDL registered on the surfnet are shown by name. `--folded cu.txt` also writes a flame graph for [speedscope](https://www.speedscope.app), and `--json` prints the tree for scripts.
+It reads the transaction from the local surfnet by default, or with `-u` from `mainnet`, `devnet`, `testnet` or any RPC URL. Programs with an IDL registered on the surfnet are shown by name. `--output-dir DIR` also writes `DIR/<SIGNATURE>.folded`, a flame graph for [speedscope](https://www.speedscope.app), and `--json` prints the tree for scripts.
 
 ## Crypto Infrastructure as Code: A New Standard in Web3
 

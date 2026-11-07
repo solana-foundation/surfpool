@@ -252,15 +252,26 @@ impl TransactionProfile {
             return Err(format!("transaction {signature} not found"));
         }
         let meta = &transaction["meta"];
-        let logs: Vec<String> = serde_json::from_value(meta["logMessages"].clone())
-            .map_err(|_| format!("the RPC returned no log messages for {signature}"))?;
+        // A transaction that failed before running, on loading its accounts for one, is still
+        // recorded, without logs: Agave records none, a surfnet an empty list.
+        let ran = meta["err"].is_null()
+            || meta["err"]["InstructionError"].is_array()
+            || meta["logMessages"]
+                .as_array()
+                .is_some_and(|logs| !logs.is_empty());
+        let logs: Vec<String> = if ran {
+            serde_json::from_value(meta["logMessages"].clone())
+                .map_err(|_| format!("the RPC returned no log messages for {signature}"))?
+        } else {
+            vec![]
+        };
         let (logged, logs_truncated) = parse_invocations(&logs);
         let invocations = match instruction_tree(transaction) {
-            Some(mut tree) => {
+            Some(mut tree) if ran => {
                 take_compute_units_from_logs(&mut tree, logged);
                 tree
             }
-            None => logged,
+            _ => logged,
         };
         Ok(Self {
             signature: signature.to_string(),
@@ -307,6 +318,10 @@ impl TransactionProfile {
                 thousands(self.slot),
                 self.err
             );
+        }
+
+        if self.invocations.is_empty() && !self.err.is_null() {
+            out.push_str("No instruction ran.\n");
         }
 
         let mut rows = vec![];
@@ -489,10 +504,17 @@ pub async fn handle_cu_command(cmd: CuCommand) -> Result<(), String> {
     let mut profile = TransactionProfile::from_rpc(&cmd.signature, &transaction)?;
     name_programs_from_idls(&client, &mut profile.invocations).await;
 
-    if let Some(path) = &cmd.folded {
-        std::fs::write(path, profile.folded())
-            .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
-    }
+    let folded = match &cmd.output_dir {
+        Some(dir) => {
+            std::fs::create_dir_all(dir)
+                .map_err(|e| format!("failed to create {}: {e}", dir.display()))?;
+            let path = dir.join(format!("{}.folded", cmd.signature));
+            std::fs::write(&path, profile.folded())
+                .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
+            Some(path)
+        }
+        None => None,
+    };
 
     if cmd.json {
         let json = serde_json::to_string_pretty(&profile)
@@ -500,7 +522,7 @@ pub async fn handle_cu_command(cmd: CuCommand) -> Result<(), String> {
         println!("{json}");
     } else {
         print!("{}", profile.render(atty::is(atty::Stream::Stdout)));
-        if let Some(path) = &cmd.folded {
+        if let Some(path) = &folded {
             println!(
                 "\nWrote a flame graph to {}: drop it on https://www.speedscope.app",
                 path.display()
@@ -754,6 +776,30 @@ mod tests {
             panic!("{:?}", profile.invocations);
         };
         assert_eq!(failed.error.as_deref(), Some("custom program error: 0x1"));
+    }
+
+    #[test]
+    fn a_transaction_that_failed_before_running_lists_no_calls() {
+        // Agave records one that failed on loading its accounts without logs, a surfnet with
+        // empty ones.
+        for nothing in [Value::Null, json!([])] {
+            let mut transaction = create_associated_token_account();
+            transaction["meta"]["err"] = json!("ProgramAccountNotFound");
+            transaction["meta"]["computeUnitsConsumed"] = json!(0);
+            transaction["meta"]["logMessages"] = nothing.clone();
+            transaction["meta"]["innerInstructions"] = nothing;
+
+            let profile = TransactionProfile::from_rpc("sig", &transaction).unwrap();
+
+            assert!(profile.invocations.is_empty());
+            assert!(profile.render(false).ends_with("No instruction ran.\n"));
+        }
+
+        // One that failed after running, short of rent, keeps its calls.
+        let mut transaction = create_associated_token_account();
+        transaction["meta"]["err"] = json!({"InsufficientFundsForRent": {"account_index": 0}});
+        let profile = TransactionProfile::from_rpc("sig", &transaction).unwrap();
+        assert_eq!(profile.invocations.len(), 3);
     }
 
     #[test]
