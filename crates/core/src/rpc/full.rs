@@ -2828,7 +2828,6 @@ mod tests {
                         svm_locker,
                         block_production_mode,
                         &None,
-                        None,
                         &simnet_config,
                         None,
                     )
