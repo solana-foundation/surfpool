@@ -803,9 +803,6 @@ pub enum SimnetCommand {
     /// `CompleteStartupTask(RemoteAccounts, ..)`, it runs against unhydrated
     /// state. The readiness gate exists so clients wait for `Ready` rather
     /// than race that window.
-    ///
-    /// The transaction is sanitized: the runloop reads its first signature and
-    /// instruction profiling indexes its accounts before LiteSVM sanitizes it.
     ProcessTransaction(
         Option<(Hash, String)>,
         SanitizedVersionedTransaction,

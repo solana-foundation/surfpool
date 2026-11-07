@@ -221,11 +221,6 @@ pub fn decode_rpc_versioned_transaction(
 /// Decode a transaction sent to an RPC method and sanitize it, refusing one
 /// whose signatures, header and account indexes don't add up with the error
 /// Agave's `sanitize_transaction` returns.
-///
-/// Surfpool reads a transaction before LiteSVM sanitizes it: the runloop takes
-/// its first signature and instruction profiling indexes its accounts. Handing
-/// on the sanitized type means nothing past the RPC layer can see a
-/// transaction that would panic the thread reading it.
 pub fn decode_transaction(
     encoded: String,
     encoding: TransactionBinaryEncoding,
@@ -239,7 +234,7 @@ pub fn decode_transaction(
     })
 }
 
-/// The transaction behind a sanitized one, for LiteSVM, without a copy.
+/// The transaction behind a sanitized one, without a copy.
 pub fn into_versioned_transaction(tx: SanitizedVersionedTransaction) -> VersionedTransaction {
     let (signatures, message) = tx.destruct();
     VersionedTransaction {
