@@ -26,6 +26,8 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use solana_account_decoder::{UiAccountEncoding, UiDataSliceConfig};
+use solana_client::rpc_config::RpcAccountInfoConfig;
 use solana_commitment_config::CommitmentConfig;
 use solana_pubkey::Pubkey;
 use solana_sysvar::last_restart_slot::LastRestartSlot;
@@ -1130,13 +1132,17 @@ async fn bisonfi_scenario_set_spread() {
             wide < tight,
             "{pool}: a 1% ladder must pay the seller less than a 10 bps one, got {wide} vs {tight}"
         );
+        // The whole move is under 1%, so a tolerance on the
+        // ratio itself would also pass a ladder that barely moved.
         let ratio = wide as f64 / tight as f64;
-        let err = (ratio - predicted).abs() / predicted;
+        let err = ((1.0 - ratio) - (1.0 - predicted)).abs() / (1.0 - predicted);
         assert!(
-            err < 0.01,
-            "{pool}: going from a {TIGHT} tick to a {WIDE} tick changed the fill by a factor of \
-             {ratio:.6}, but the 1/2,560,000 unit the template documents requires {predicted:.6} \
-             ({:.3}% off). Either the unit is wrong or not every region is being written",
+            err < 0.05,
+            "{pool}: going from a {TIGHT} tick to a {WIDE} tick cut the fill by {:.4}%, but the \
+             1/2,560,000 unit the template documents requires {:.4}% ({:.2}% off). Either the unit \
+             is wrong or not every region is being written",
+            (1.0 - ratio) * 100.0,
+            (1.0 - predicted) * 100.0,
             err * 100.0
         );
         checked += 1;
@@ -2110,24 +2116,69 @@ fn publish_elf_cache(cache: &std::path::Path, bytes: &[u8]) {
     let _ = std::fs::remove_file(temporary);
 }
 
+/// The program's executable, saved in the temp dir under the slot it was last deployed at, so an
+/// upgrade gets a new file instead of old code running against freshly fetched accounts.
 async fn load_program_elf(cache_name: &str, programdata: &str) -> Vec<u8> {
-    let cache = std::env::temp_dir().join(cache_name);
+    let cache = std::env::temp_dir().join(format!(
+        "{cache_name}-{}.so",
+        last_deployed_slot(programdata).await
+    ));
     if let Ok(bytes) = std::fs::read(&cache) {
-        if bytes.len() > 200_000 {
-            return bytes;
-        }
+        return bytes;
     }
     let bytes = fetch(&[programdata]).await.remove(0)[45..].to_vec();
     publish_elf_cache(&cache, &bytes);
     bytes
 }
 
-/// The program ELF, fetched once per process and reused. Delete the file to pick up a redeploy.
+/// The slot a program was last deployed at, read from bytes 4..12 of its programdata account.
+async fn last_deployed_slot(programdata: &str) -> u64 {
+    let client = SurfnetRemoteClient::new(
+        std::env::var(RPC_URL_ENV).unwrap_or_else(|_| DEFAULT_RPC_URL.to_string()),
+    );
+    let config = RpcAccountInfoConfig {
+        encoding: Some(UiAccountEncoding::Base64),
+        data_slice: Some(UiDataSliceConfig {
+            offset: 4,
+            length: 8,
+        }),
+        commitment: Some(CommitmentConfig::confirmed()),
+        min_context_slot: None,
+    };
+    // Retried for the same reason as [`fetch`]: the public endpoint throttles.
+    let mut attempt = 0;
+    let data = loop {
+        match client
+            .client
+            .get_ui_account_with_config(&Pubkey::from_str_const(programdata), config.clone())
+            .await
+        {
+            Ok(response) => {
+                break response
+                    .value
+                    .unwrap_or_else(|| panic!("{programdata} no longer exists on mainnet"))
+                    .data
+                    .decode()
+                    .expect("base64 programdata slice");
+            }
+            Err(e) => {
+                attempt += 1;
+                if attempt >= 5 {
+                    panic!("failed to fetch {programdata} after {attempt} attempts: {e}");
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(750 * attempt)).await;
+            }
+        }
+    };
+    u64::from_le_bytes(data[..8].try_into().expect("programdata slot"))
+}
+
+/// The program ELF, fetched once per process and reused.
 /// Also loads the market tick: anything that runs the program needs both.
 async fn bisonfi_elf() -> Vec<u8> {
     static ELF: tokio::sync::OnceCell<Vec<u8>> = tokio::sync::OnceCell::const_new();
     load_market_tick().await;
-    ELF.get_or_init(|| load_program_elf("surfpool-bisonfi-program.so", BISONFI_PROGRAMDATA))
+    ELF.get_or_init(|| load_program_elf("surfpool-bisonfi-program", BISONFI_PROGRAMDATA))
         .await
         .clone()
 }
@@ -2835,7 +2886,7 @@ async fn whirlpool_elf() -> Vec<u8> {
         let loader = Pubkey::from_str_const("BPFLoaderUpgradeab1e11111111111111111111111");
         let (programdata, _) = Pubkey::find_program_address(&[prog.as_ref()], &loader);
         // 45 bytes of UpgradeableLoaderState::ProgramData precede the ELF.
-        load_program_elf("surfpool-whirlpool-program.so", &programdata.to_string()).await
+        load_program_elf("surfpool-whirlpool-program", &programdata.to_string()).await
     })
     .await
     .clone()
