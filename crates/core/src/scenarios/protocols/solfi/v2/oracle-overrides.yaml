@@ -1,0 +1,82 @@
+protocol: SolFi
+version: v2
+account_type: XorPriceOracle
+
+raw_layout: true
+
+tags:
+  - pmm
+  - prop-amm
+  - oracle
+
+keep_alive:
+  - template: solfi-oracle-publication
+    address: { type: override }
+    values: { publication_slot: $slot, publication_time_ms: $unix_ms, valid_until_slot: $slot+200 }
+
+templates:
+  - id: solfi-price
+    name: Override Price
+    description: Override the external price coefficient consumed by a SolFi market
+    idl_account_name: XorPriceOracle
+    address:
+      type: pubkey
+    properties:
+      - path: price_exponent
+        offset: 0
+        encoding:
+          i64_xor:
+            mask: 11029298117715798783
+        label: Decimal exponent
+        description: Signed base-10 exponent applied to the coefficient; set it explicitly with price_coefficient.
+      - path: price_coefficient
+        offset: 8
+        encoding:
+          u64_xor:
+            mask: 4962160333955141990
+        label: Price coefficient
+        description: >-
+          Unsigned coefficient before SolFi's fixed XOR encoding. Human price is coefficient times
+          10^exponent times 10^(base_decimals - quote_decimals).
+    llm_context: |
+      FINDING THE ORACLE WHEN THE USER NAMES A PAIR OR STUDIO DOES NOT LIST IT:
+      1. Discover the SolFi market with getProgramAccounts for program
+         SV2EYYJyRz2YhfXwXnhNAevDEui5Q6yrfyo13WtupPF using base64 encoding. Do not rely on a fixed
+         account-size filter. Identify the pair by querying the SPL token vaults stored at market
+         bytes 120..152 and 152..184 and matching both vault mints.
+      2. Decode bytes 24..56 of the matched market as the oracle public key. Fetch it and require the
+         expected SolFi oracle layout before writing.
+      3. Put that oracle in the override as {"account":{"pubkey":"<oracle>"}}. Set
+         fetchBeforeUse: true only on its first override. Do not target the market account with this
+         template.
+
+      PRECONDITION - SET BOTH PRICE FIELDS. The exponent is stored independently from the
+      coefficient, so changing only the coefficient makes the resulting human price depend on the
+      exponent already stored in the selected oracle account.
+
+      This is SolFi's authoritative price input. The 1728-byte market account contains a cached,
+      XOR-looking word at offset 712, but changing that word alone does not move a fill. The program
+      decodes this 168-byte oracle and prices from its coefficient at decoded offset 8.
+
+      CONVERSION:
+        human_price = coefficient * 10^exponent * 10^(base_decimals - quote_decimals)
+
+      Set price_exponent and price_coefficient together so the scenario defines the complete price.
+      For example, at exponent -10, WSOL/USDC (9/6 decimals) at $50 has
+      coefficient 500000000, while USDT/USDC (6/6) at $1 has coefficient 10000000000.
+
+      Set fetchBeforeUse: true if this is the oracle's first override. The oracle address is embedded
+      in the market account at bytes 24..56; do not apply a market's price to a different oracle by
+      assumption.
+
+      THE ORACLE STAYS CURRENT BY ITSELF. While the scenario is registered, Surfpool republishes this
+      oracle every slot as SolFi's maker does on mainnet: publication slot, publication time and a
+      200-slot validity horizon. The price stays as set. If a later fetch is required, reapply
+      solfi-price after that fetch in the same slot.
+
+      DIRECTION: raising the price increases base-to-quote output and reduces the amount of base paid
+      by quote-to-base. The deployed-program test confirms the reciprocal response in both directions.
+
+      EXAMPLE - "SOL is worth $50" on the selected 9/6 WSOL/USDC market at exponent -10:
+        price_exponent: -10
+        price_coefficient: 500000000
