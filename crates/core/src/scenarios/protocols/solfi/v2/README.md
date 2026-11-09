@@ -54,7 +54,7 @@ replaces the full local account and can erase earlier overrides on its other fie
 
 On mainnet SolFi's maker republishes each market's oracle every couple of slots. Nobody runs it
 against a surfnet, so while a scenario with a SolFi override is registered Surfpool republishes the
-oracle every slot ([keep-alive](../../README.md#keep-alive)): the publication slot (byte 16), the
+oracle every slot ([keep-alive](../../../README.md#keep-alive)): the publication slot (byte 16), the
 publication time in milliseconds (byte 24) and a validity horizon of 200 slots (byte 40). The price
 stays as set. There is nothing to schedule:
 

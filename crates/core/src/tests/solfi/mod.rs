@@ -9,7 +9,6 @@ use std::{collections::HashMap, sync::Arc};
 use solana_account::Account;
 use solana_commitment_config::CommitmentConfig;
 use solana_pubkey::Pubkey;
-
 use surfpool_types::KeepAliveClock;
 
 use crate::{

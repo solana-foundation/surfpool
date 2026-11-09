@@ -208,7 +208,11 @@ impl TemplateRegistry {
                     // A slot encoding writes the current slot plus the value, so `$slot` would
                     // write twice the slot.
                     let is_placeholder = value.as_str().is_some_and(|v| v.trim().starts_with('$'));
-                    if is_placeholder && matches!(property.encoding, Some(RawEncoding::Slot { .. }))
+                    if is_placeholder
+                        && matches!(
+                            property.encoding,
+                            Some(RawEncoding::Slot { .. } | RawEncoding::SlotXor { .. })
+                        )
                     {
                         return fail(format!(
                             "'{path}' is slot-encoded and already tracks the slot: give it a lead, \
@@ -1039,21 +1043,23 @@ templates:
 
     #[test]
     fn a_placeholder_on_a_slot_encoded_field_is_refused() {
-        let mut registry = TemplateRegistry::default();
-        registry.load_raw_layout_overrides(KEEP_ALIVE_OVERRIDES, "example");
-        registry.load_keep_alive(
-            None,
-            &KEEP_ALIVE.replace(
-                "{ path: slot, offset: 8, encoding: u64",
-                "{ path: slot, offset: 8, encoding: { slot: { lead: 0 } }",
-            ),
-            "example",
-        );
-        let error = registry.check_keep_alive_imports().unwrap_err();
-        assert!(
-            error.contains("'slot' is slot-encoded and already tracks the slot"),
-            "{error}"
-        );
+        for encoding in ["{ slot: { lead: 0 } }", "{ slot_xor: { lead: 0, mask: 255 } }"] {
+            let mut registry = TemplateRegistry::default();
+            registry.load_raw_layout_overrides(KEEP_ALIVE_OVERRIDES, "example");
+            registry.load_keep_alive(
+                None,
+                &KEEP_ALIVE.replace(
+                    "{ path: slot, offset: 8, encoding: u64",
+                    &format!("{{ path: slot, offset: 8, encoding: {encoding}"),
+                ),
+                "example",
+            );
+            let error = registry.check_keep_alive_imports().unwrap_err();
+            assert!(
+                error.contains("'slot' is slot-encoded and already tracks the slot"),
+                "{encoding}: {error}"
+            );
+        }
     }
 
     #[test]
