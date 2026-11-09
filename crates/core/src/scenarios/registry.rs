@@ -1043,7 +1043,10 @@ templates:
 
     #[test]
     fn a_placeholder_on_a_slot_encoded_field_is_refused() {
-        for encoding in ["{ slot: { lead: 0 } }", "{ slot_xor: { lead: 0, mask: 255 } }"] {
+        for encoding in [
+            "{ slot: { lead: 0 } }",
+            "{ slot_xor: { lead: 0, mask: 255 } }",
+        ] {
             let mut registry = TemplateRegistry::default();
             registry.load_raw_layout_overrides(KEEP_ALIVE_OVERRIDES, "example");
             registry.load_keep_alive(
