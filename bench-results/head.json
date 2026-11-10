@@ -1,0 +1,449 @@
+{
+  "schema_version": 1,
+  "label": "head",
+  "surfpool_version": "surfpool 1.7.0",
+  "commit": "2a01556113ef241a5eaae06b4d8f6bb4e4d92904",
+  "started_at": "2026-11-10T03:02:03.985670125+00:00",
+  "host": {
+    "os": "linux",
+    "arch": "x86_64",
+    "cpus": 16
+  },
+  "config": {
+    "duration_secs": 10,
+    "warmup_secs": 2,
+    "senders": 16,
+    "skip_preflight": false,
+    "readers": 16,
+    "read_accounts": 2000,
+    "gpa_clients": 4,
+    "gpa_accounts": 3000,
+    "slot_time_ms": 250,
+    "scenarios": null
+  },
+  "rounds": [
+    {
+      "index": 1,
+      "samples": [
+        {
+          "scenario": "send_tx_default",
+          "metric": "tps_confirmed",
+          "unit": "tx/s",
+          "value": 1859.237739048627,
+          "direction": "higher_is_better",
+          "gate": true
+        },
+        {
+          "scenario": "send_tx_default",
+          "metric": "send_rate",
+          "unit": "tx/s",
+          "value": 1911.7,
+          "direction": "higher_is_better",
+          "gate": false
+        },
+        {
+          "scenario": "send_tx_default",
+          "metric": "send_latency_p50_ms",
+          "unit": "ms",
+          "value": 8.407777999999999,
+          "direction": "lower_is_better",
+          "gate": false
+        },
+        {
+          "scenario": "send_tx_default",
+          "metric": "send_latency_p99_ms",
+          "unit": "ms",
+          "value": 14.499797,
+          "direction": "lower_is_better",
+          "gate": false
+        },
+        {
+          "scenario": "send_tx_default",
+          "metric": "confirm_latency_p50_ms",
+          "unit": "ms",
+          "value": 164.82662100000002,
+          "direction": "lower_is_better",
+          "gate": false
+        },
+        {
+          "scenario": "send_tx_no_profiling",
+          "metric": "tps_confirmed",
+          "unit": "tx/s",
+          "value": 1976.5004779956412,
+          "direction": "higher_is_better",
+          "gate": true
+        },
+        {
+          "scenario": "send_tx_no_profiling",
+          "metric": "send_rate",
+          "unit": "tx/s",
+          "value": 2027.4,
+          "direction": "higher_is_better",
+          "gate": false
+        },
+        {
+          "scenario": "send_tx_no_profiling",
+          "metric": "send_latency_p50_ms",
+          "unit": "ms",
+          "value": 7.700546,
+          "direction": "lower_is_better",
+          "gate": false
+        },
+        {
+          "scenario": "send_tx_no_profiling",
+          "metric": "send_latency_p99_ms",
+          "unit": "ms",
+          "value": 15.330424,
+          "direction": "lower_is_better",
+          "gate": false
+        },
+        {
+          "scenario": "send_tx_no_profiling",
+          "metric": "confirm_latency_p50_ms",
+          "unit": "ms",
+          "value": 163.518623,
+          "direction": "lower_is_better",
+          "gate": false
+        },
+        {
+          "scenario": "reads",
+          "metric": "rps",
+          "unit": "req/s",
+          "value": 41782.9,
+          "direction": "higher_is_better",
+          "gate": true
+        },
+        {
+          "scenario": "reads",
+          "metric": "get_account_info_p50_ms",
+          "unit": "ms",
+          "value": 0.253691,
+          "direction": "lower_is_better",
+          "gate": false
+        },
+        {
+          "scenario": "reads",
+          "metric": "get_balance_p50_ms",
+          "unit": "ms",
+          "value": 0.173039,
+          "direction": "lower_is_better",
+          "gate": false
+        },
+        {
+          "scenario": "reads",
+          "metric": "get_multiple_accounts_p50_ms",
+          "unit": "ms",
+          "value": 0.677567,
+          "direction": "lower_is_better",
+          "gate": false
+        },
+        {
+          "scenario": "gpa",
+          "metric": "rps",
+          "unit": "req/s",
+          "value": 176.2,
+          "direction": "higher_is_better",
+          "gate": true
+        },
+        {
+          "scenario": "gpa",
+          "metric": "latency_p50_ms",
+          "unit": "ms",
+          "value": 20.839648,
+          "direction": "lower_is_better",
+          "gate": false
+        },
+        {
+          "scenario": "gpa",
+          "metric": "latency_p99_ms",
+          "unit": "ms",
+          "value": 46.011331000000006,
+          "direction": "lower_is_better",
+          "gate": false
+        }
+      ]
+    },
+    {
+      "index": 2,
+      "samples": [
+        {
+          "scenario": "send_tx_default",
+          "metric": "tps_confirmed",
+          "unit": "tx/s",
+          "value": 1899.745024693434,
+          "direction": "higher_is_better",
+          "gate": true
+        },
+        {
+          "scenario": "send_tx_default",
+          "metric": "send_rate",
+          "unit": "tx/s",
+          "value": 1945.8,
+          "direction": "higher_is_better",
+          "gate": false
+        },
+        {
+          "scenario": "send_tx_default",
+          "metric": "send_latency_p50_ms",
+          "unit": "ms",
+          "value": 7.747586,
+          "direction": "lower_is_better",
+          "gate": false
+        },
+        {
+          "scenario": "send_tx_default",
+          "metric": "send_latency_p99_ms",
+          "unit": "ms",
+          "value": 18.913114,
+          "direction": "lower_is_better",
+          "gate": false
+        },
+        {
+          "scenario": "send_tx_default",
+          "metric": "confirm_latency_p50_ms",
+          "unit": "ms",
+          "value": 163.964897,
+          "direction": "lower_is_better",
+          "gate": false
+        },
+        {
+          "scenario": "send_tx_no_profiling",
+          "metric": "tps_confirmed",
+          "unit": "tx/s",
+          "value": 2054.4745205056215,
+          "direction": "higher_is_better",
+          "gate": true
+        },
+        {
+          "scenario": "send_tx_no_profiling",
+          "metric": "send_rate",
+          "unit": "tx/s",
+          "value": 2097.7,
+          "direction": "higher_is_better",
+          "gate": false
+        },
+        {
+          "scenario": "send_tx_no_profiling",
+          "metric": "send_latency_p50_ms",
+          "unit": "ms",
+          "value": 7.402747000000001,
+          "direction": "lower_is_better",
+          "gate": false
+        },
+        {
+          "scenario": "send_tx_no_profiling",
+          "metric": "send_latency_p99_ms",
+          "unit": "ms",
+          "value": 14.156770000000002,
+          "direction": "lower_is_better",
+          "gate": false
+        },
+        {
+          "scenario": "send_tx_no_profiling",
+          "metric": "confirm_latency_p50_ms",
+          "unit": "ms",
+          "value": 166.771779,
+          "direction": "lower_is_better",
+          "gate": false
+        },
+        {
+          "scenario": "reads",
+          "metric": "rps",
+          "unit": "req/s",
+          "value": 41309.5,
+          "direction": "higher_is_better",
+          "gate": true
+        },
+        {
+          "scenario": "reads",
+          "metric": "get_account_info_p50_ms",
+          "unit": "ms",
+          "value": 0.253911,
+          "direction": "lower_is_better",
+          "gate": false
+        },
+        {
+          "scenario": "reads",
+          "metric": "get_balance_p50_ms",
+          "unit": "ms",
+          "value": 0.17356000000000002,
+          "direction": "lower_is_better",
+          "gate": false
+        },
+        {
+          "scenario": "reads",
+          "metric": "get_multiple_accounts_p50_ms",
+          "unit": "ms",
+          "value": 0.680842,
+          "direction": "lower_is_better",
+          "gate": false
+        },
+        {
+          "scenario": "gpa",
+          "metric": "rps",
+          "unit": "req/s",
+          "value": 175.2,
+          "direction": "higher_is_better",
+          "gate": true
+        },
+        {
+          "scenario": "gpa",
+          "metric": "latency_p50_ms",
+          "unit": "ms",
+          "value": 19.727006,
+          "direction": "lower_is_better",
+          "gate": false
+        },
+        {
+          "scenario": "gpa",
+          "metric": "latency_p99_ms",
+          "unit": "ms",
+          "value": 46.825781,
+          "direction": "lower_is_better",
+          "gate": false
+        }
+      ]
+    },
+    {
+      "index": 3,
+      "samples": [
+        {
+          "scenario": "send_tx_default",
+          "metric": "tps_confirmed",
+          "unit": "tx/s",
+          "value": 1853.8484686149861,
+          "direction": "higher_is_better",
+          "gate": true
+        },
+        {
+          "scenario": "send_tx_default",
+          "metric": "send_rate",
+          "unit": "tx/s",
+          "value": 1901.1,
+          "direction": "higher_is_better",
+          "gate": false
+        },
+        {
+          "scenario": "send_tx_default",
+          "metric": "send_latency_p50_ms",
+          "unit": "ms",
+          "value": 8.076098,
+          "direction": "lower_is_better",
+          "gate": false
+        },
+        {
+          "scenario": "send_tx_default",
+          "metric": "send_latency_p99_ms",
+          "unit": "ms",
+          "value": 17.323715,
+          "direction": "lower_is_better",
+          "gate": false
+        },
+        {
+          "scenario": "send_tx_default",
+          "metric": "confirm_latency_p50_ms",
+          "unit": "ms",
+          "value": 168.769422,
+          "direction": "lower_is_better",
+          "gate": false
+        },
+        {
+          "scenario": "send_tx_no_profiling",
+          "metric": "tps_confirmed",
+          "unit": "tx/s",
+          "value": 1923.74651327637,
+          "direction": "higher_is_better",
+          "gate": true
+        },
+        {
+          "scenario": "send_tx_no_profiling",
+          "metric": "send_rate",
+          "unit": "tx/s",
+          "value": 1972.6,
+          "direction": "higher_is_better",
+          "gate": false
+        },
+        {
+          "scenario": "send_tx_no_profiling",
+          "metric": "send_latency_p50_ms",
+          "unit": "ms",
+          "value": 7.953183000000001,
+          "direction": "lower_is_better",
+          "gate": false
+        },
+        {
+          "scenario": "send_tx_no_profiling",
+          "metric": "send_latency_p99_ms",
+          "unit": "ms",
+          "value": 13.990789,
+          "direction": "lower_is_better",
+          "gate": false
+        },
+        {
+          "scenario": "send_tx_no_profiling",
+          "metric": "confirm_latency_p50_ms",
+          "unit": "ms",
+          "value": 163.64060999999998,
+          "direction": "lower_is_better",
+          "gate": false
+        },
+        {
+          "scenario": "reads",
+          "metric": "rps",
+          "unit": "req/s",
+          "value": 43639.1,
+          "direction": "higher_is_better",
+          "gate": true
+        },
+        {
+          "scenario": "reads",
+          "metric": "get_account_info_p50_ms",
+          "unit": "ms",
+          "value": 0.245939,
+          "direction": "lower_is_better",
+          "gate": false
+        },
+        {
+          "scenario": "reads",
+          "metric": "get_balance_p50_ms",
+          "unit": "ms",
+          "value": 0.163125,
+          "direction": "lower_is_better",
+          "gate": false
+        },
+        {
+          "scenario": "reads",
+          "metric": "get_multiple_accounts_p50_ms",
+          "unit": "ms",
+          "value": 0.6520589999999999,
+          "direction": "lower_is_better",
+          "gate": false
+        },
+        {
+          "scenario": "gpa",
+          "metric": "rps",
+          "unit": "req/s",
+          "value": 150.0,
+          "direction": "higher_is_better",
+          "gate": true
+        },
+        {
+          "scenario": "gpa",
+          "metric": "latency_p50_ms",
+          "unit": "ms",
+          "value": 25.829596,
+          "direction": "lower_is_better",
+          "gate": false
+        },
+        {
+          "scenario": "gpa",
+          "metric": "latency_p99_ms",
+          "unit": "ms",
+          "value": 48.906289,
+          "direction": "lower_is_better",
+          "gate": false
+        }
+      ]
+    }
+  ]
+}

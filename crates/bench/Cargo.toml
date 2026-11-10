@@ -4,28 +4,44 @@ version = { workspace = true }
 edition = { workspace = true }
 license = { workspace = true }
 repository = { workspace = true }
+description = "Throughput benchmarks that drive a surfpool binary over its public JSON-RPC interface"
 publish = false
 
-[[bench]]
-name = "transaction_ingestion"
-harness = false
+[[bin]]
+name = "surfpool-bench"
+path = "src/main.rs"
 
 [dependencies]
-bincode = { workspace = true }
-bs58 = { workspace = true }
-criterion = { version = "0.5", features = ["html_reports"] }
-crossbeam-channel = { workspace = true }
-hiro-system-kit = { workspace = true }
-serde_json = { workspace = true }
-solana-compute-budget-interface = { workspace = true }
+anyhow = { workspace = true, features = ["std"] }
+chrono = { workspace = true }
+clap = { workspace = true, features = [
+    "derive",
+    "std",
+    "help",
+    "usage",
+    "error-context",
+    "suggestions",
+] }
+hex = { workspace = true, features = ["std"] }
+serde = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true, features = ["std"] }
+solana-account-decoder-client-types = { workspace = true }
+solana-commitment-config = { workspace = true }
+solana-hash = { workspace = true }
 solana-keypair = { workspace = true }
-solana-message = { workspace = true }
 solana-pubkey = { workspace = true }
+solana-rpc-client = { workspace = true }
+solana-rpc-client-api = { workspace = true }
+solana-signature = { workspace = true }
 solana-signer = { workspace = true }
-solana-system-interface = { workspace = true }
+solana-system-interface = { workspace = true, features = ["bincode"] }
 solana-transaction = { workspace = true }
-solana-account = { workspace = true }
-solana-sdk-ids = { workspace = true }
-
-surfpool-core = { workspace = true }
-surfpool-types = { workspace = true }
+solana-transaction-status-client-types = { workspace = true }
+tokio = { workspace = true, features = [
+    "rt-multi-thread",
+    "macros",
+    "process",
+    "time",
+    "sync",
+    "net",
+] }

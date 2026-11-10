@@ -1,79 +1,216 @@
-name: Performance Benchmarks
+name: Benchmarks
+
+# Throughput benchmarks that drive a release surfpool binary over JSON-RPC.
+# See crates/bench/README.md for what is measured and how to run it locally.
+#
+# Pull requests: build the PR (merged into its base) and the base branch tip,
+# benchmark them in interleaved rounds on the same machine, and fail when a
+# gated metric regresses past the threshold.
+#
+# Pushes to main: benchmark the new tip and append the numbers to the history
+# on the gh-pages branch for trend charts.
+#
+# The job runs on the runner named by the BENCH_RUNS_ON repository variable, a
+# JSON array of labels for the dedicated bare-metal runner, and falls back to
+# GitHub-hosted ubuntu-latest while that variable is unset. Fork pull requests
+# are skipped so untrusted code never runs on the self-hosted machine.
 
 on:
   pull_request:
-    paths:
-      - 'crates/bench/**'
-      - 'crates/core/**'
-      - 'crates/types/**'
-      - '.github/workflows/benchmark.yml'
   push:
-    branches:
-      - main
+    branches: [main]
   workflow_dispatch:
+    inputs:
+      rounds:
+        description: Interleaved rounds per side
+        default: "3"
+      duration_secs:
+        description: Measured seconds per scenario
+        default: "10"
+
+permissions:
+  contents: read
+
+# One bench per ref at a time; a new push to a PR cancels its running bench.
+concurrency:
+  group: benchmark-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Outside the checkout so actions/checkout's clean step does not wipe the
+  # build cache between jobs on the self-hosted runner.
+  CARGO_TARGET_DIR: ${{ github.workspace }}/../surfpool-bench-target
+  BENCH_ROUNDS: ${{ github.event.inputs.rounds || '3' }}
+  BENCH_DURATION_SECS: ${{ github.event.inputs.duration_secs || '10' }}
+  # Relative regression on a gated metric that fails a pull request.
+  BENCH_THRESHOLD: "0.15"
 
 jobs:
-  benchmark:
-    name: Run Transaction Ingestion Benchmarks
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: write
-      issues: write
-
+  pull_request:
+    name: PR vs base (A/B)
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ${{ fromJSON(vars.BENCH_RUNS_ON || '["ubuntu-latest"]') }}
+    timeout-minutes: 120
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v4
         with:
-          components: rustfmt
+          fetch-depth: 0
 
-      - name: Install gnuplot
-        run: sudo apt-get update && sudo apt-get install -y gnuplot
+      - name: Install system dependencies (GitHub-hosted only)
+        if: runner.environment == 'github-hosted'
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev clang libclang-dev
 
-      - name: Cache Cargo registry
-        uses: actions/cache@v4
+      - name: Cache cargo (GitHub-hosted only)
+        if: runner.environment == 'github-hosted'
+        uses: Swatinem/rust-cache@v2
         with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          workspaces: ". -> ../surfpool-bench-target"
 
-      - name: Cache Cargo index
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/git
-          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+      - name: Install pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
 
-      - name: Cache build artifacts
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: ${{ runner.os }}-cargo-build-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Run benchmarks
-        run: cargo bench --bench transaction_ingestion -p surfpool-bench 2>&1 | tee benchmark.log
-
-      - name: Extract benchmark results
+      - name: Resolve base commit
+        id: base
         run: |
-          echo "## Benchmark Results" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Transaction Component Performance" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          if grep -q "time:" benchmark.log; then
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            grep -E "(Benchmarking|time:|change:|No change)" benchmark.log >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-          else
-            echo "Benchmark data not captured" >> $GITHUB_STEP_SUMMARY
-          fi
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Detailed HTML reports available in artifacts." >> $GITHUB_STEP_SUMMARY
+          base=$(git merge-base "origin/${{ github.base_ref }}" HEAD)
+          echo "sha=$base" >> "$GITHUB_OUTPUT"
+          echo "Comparing $(git rev-parse --short HEAD) (PR merged into base) against $(git rev-parse --short "$base") (base)"
 
-      - name: Upload benchmark results
+      - name: Build head
+        run: |
+          cargo build --release --locked -p surfpool-cli -p surfpool-bench
+          mkdir -p bench-bin
+          cp "$CARGO_TARGET_DIR/release/surfpool" bench-bin/surfpool-head
+          cp "$CARGO_TARGET_DIR/release/surfpool-bench" bench-bin/surfpool-bench
+
+      - name: Build base
+        env:
+          BASE_SRC: ${{ github.workspace }}/../surfpool-bench-base
+        run: |
+          git worktree remove --force "$BASE_SRC" 2>/dev/null || rm -rf "$BASE_SRC"
+          git worktree prune
+          git worktree add --detach "$BASE_SRC" "${{ steps.base.outputs.sha }}"
+          (cd "$BASE_SRC" && cargo build --release --locked -p surfpool-cli)
+          cp "$CARGO_TARGET_DIR/release/surfpool" bench-bin/surfpool-base
+          git worktree remove --force "$BASE_SRC"
+
+      - name: Run A/B benchmark
+        run: |
+          bench-bin/surfpool-bench ab \
+            --base-bin bench-bin/surfpool-base \
+            --head-bin bench-bin/surfpool-head \
+            --base-commit "${{ steps.base.outputs.sha }}" \
+            --head-commit "${{ github.event.pull_request.head.sha }}" \
+            --rounds "$BENCH_ROUNDS" \
+            --duration-secs "$BENCH_DURATION_SECS" \
+            --threshold "$BENCH_THRESHOLD" \
+            --out-dir bench-results
+
+      - name: Publish summary
+        if: always()
+        run: |
+          if [ -f bench-results/summary.md ]; then
+            cat bench-results/summary.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Benchmark did not produce a summary; see the job log." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: benchmark-results
-          path: target/criterion
+          path: bench-results
           if-no-files-found: ignore
+
+  main_history:
+    name: Record main history
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ${{ fromJSON(vars.BENCH_RUNS_ON || '["ubuntu-latest"]') }}
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies (GitHub-hosted only)
+        if: runner.environment == 'github-hosted'
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev clang libclang-dev
+
+      - name: Cache cargo (GitHub-hosted only)
+        if: runner.environment == 'github-hosted'
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> ../surfpool-bench-target"
+
+      - name: Install pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Build
+        run: cargo build --release --locked -p surfpool-cli -p surfpool-bench
+
+      - name: Run benchmark
+        run: |
+          mkdir -p bench-results
+          "$CARGO_TARGET_DIR/release/surfpool-bench" run \
+            --surfpool-bin "$CARGO_TARGET_DIR/release/surfpool" \
+            --label main \
+            --commit "$GITHUB_SHA" \
+            --rounds "$BENCH_ROUNDS" \
+            --duration-secs "$BENCH_DURATION_SECS" \
+            --out bench-results/main.json
+          "$CARGO_TARGET_DIR/release/surfpool-bench" export \
+            --input bench-results/main.json \
+            --out bench-results/benchmark-action.json
+
+      - name: Publish summary
+        if: always()
+        run: |
+          if [ -f bench-results/benchmark-action.json ]; then
+            {
+              echo "## Surfpool benchmark on main ($(git rev-parse --short "$GITHUB_SHA"))"
+              echo
+              echo "| Metric | Median | Range |"
+              echo "|---|---:|---:|"
+              jq -r '.[] | "| `\(.name)` | \(.value | . * 10 | round / 10) \(.unit) | \(.range // "") |"' bench-results/benchmark-action.json
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results-main
+          path: bench-results
+          if-no-files-found: ignore
+
+      - name: Ensure gh-pages branch exists
+        if: github.event_name == 'push'
+        run: |
+          if git ls-remote --exit-code --heads origin gh-pages >/dev/null; then
+            exit 0
+          fi
+          tmp=$(mktemp -d)
+          git -C "$tmp" init -q -b gh-pages
+          git -C "$tmp" -c user.name=github-actions -c user.email=github-actions@github.com \
+            commit -q --allow-empty -m "Initialize benchmark history"
+          git -C "$tmp" push -q "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" gh-pages
+          rm -rf "$tmp"
+
+      - name: Append to history
+        if: github.event_name == 'push'
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: surfpool throughput
+          tool: customBiggerIsBetter
+          output-file-path: bench-results/benchmark-action.json
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          gh-pages-branch: gh-pages
+          benchmark-data-dir-path: bench
+          auto-push: true
+          # The pull-request job is the gate; the history is for trends only.
+          fail-on-alert: false
+          comment-on-alert: false
