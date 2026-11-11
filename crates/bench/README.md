@@ -118,6 +118,21 @@ gated metric regresses more than `BENCH_THRESHOLD` (15%). Pull requests from
 forks are skipped, because the job is meant to run on a self-hosted machine and
 must not execute untrusted code there.
 
+**Fork pull requests, on request.** Once you have reviewed a fork PR's code,
+benchmark it by running the workflow manually (Actions → Benchmarks → Run
+workflow) with `pr` set to the PR number and `head_sha` set to the full commit
+you reviewed:
+
+```sh
+gh workflow run benchmark.yml -f pr=951 -f head_sha=$(gh pr view 951 --json headRefOid -q .headRefOid)
+```
+
+The run uses the workflow file from `main`, so the fork cannot alter the steps;
+only the code under test comes from the PR. It refuses to start if the PR head
+no longer matches `head_sha`, so new commits pushed after your review are never
+built unreviewed. Building the PR still executes its `build.rs` and proc-macros
+on the runner, which is why the review comes first.
+
 **Pushes to main.** The job benchmarks the new tip with three rounds, uploads
 the result, and appends the gated metrics to the `bench/` directory of the
 `gh-pages` branch with github-action-benchmark, which renders trend charts at

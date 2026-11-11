@@ -13,7 +13,10 @@ name: Benchmarks
 # The job runs on the runner named by the BENCH_RUNS_ON repository variable, a
 # JSON array of labels for the dedicated bare-metal runner, and falls back to
 # GitHub-hosted ubuntu-latest while that variable is unset. Fork pull requests
-# are skipped so untrusted code never runs on the self-hosted machine.
+# are skipped so untrusted code never runs on the self-hosted machine. To
+# benchmark a fork PR after reviewing its code, dispatch the workflow with the
+# PR number and the exact head commit you reviewed; the run refuses to start
+# if the PR head has moved since.
 
 on:
   pull_request:
@@ -21,6 +24,16 @@ on:
     branches: [main]
   workflow_dispatch:
     inputs:
+      pr:
+        description: >-
+          Pull request number to benchmark against its base. Leave empty to
+          record main history instead.
+        default: ""
+      head_sha:
+        description: >-
+          Full commit SHA of the PR head you reviewed. Required with `pr`; the
+          run fails if the PR head no longer matches it.
+        default: ""
       rounds:
         description: Interleaved rounds per side
         default: "3"
@@ -32,8 +45,9 @@ permissions:
   contents: read
 
 # One bench per ref at a time; a new push to a PR cancels its running bench.
+# A manual run for a PR gets its own group so it does not cancel main history.
 concurrency:
-  group: benchmark-${{ github.ref }}
+  group: benchmark-${{ github.ref }}-${{ github.event.inputs.pr || '' }}
   cancel-in-progress: true
 
 env:
@@ -50,14 +64,43 @@ jobs:
   pull_request:
     name: PR vs base (A/B)
     if: >-
-      github.event_name == 'pull_request' &&
-      github.event.pull_request.head.repo.full_name == github.repository
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.head.repo.full_name == github.repository) ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.pr != '')
     runs-on: ${{ fromJSON(vars.BENCH_RUNS_ON || '["ubuntu-latest"]') }}
     timeout-minutes: 120
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      # A manual run checks out main's workflow, so the fork cannot change
+      # these steps; only the code under test comes from the PR. The head is
+      # pinned to the reviewed SHA, and the PR is merged into its base here
+      # the same way the pull_request event's merge ref would be.
+      - name: Check out reviewed fork PR (manual runs)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.inputs.pr }}
+          REVIEWED_SHA: ${{ github.event.inputs.head_sha }}
+        run: |
+          if [ -z "$REVIEWED_SHA" ]; then
+            echo "::error::head_sha is required when pr is set"; exit 1
+          fi
+          read -r head_sha base_ref < <(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR" --jq '"\(.head.sha) \(.base.ref)"')
+          if [ "$head_sha" != "$REVIEWED_SHA" ]; then
+            echo "::error::PR #$PR head is $head_sha but you reviewed $REVIEWED_SHA; review the new head and dispatch again"
+            exit 1
+          fi
+          git fetch origin "refs/pull/$PR/head" "$base_ref"
+          git checkout --detach "origin/$base_ref"
+          git -c user.name=bench -c user.email=bench@localhost merge --no-ff --no-edit "$REVIEWED_SHA"
+          echo "BASE_REF=$base_ref" >> "$GITHUB_ENV"
+          echo "HEAD_SHA=$REVIEWED_SHA" >> "$GITHUB_ENV"
 
       - name: Install system dependencies (GitHub-hosted only)
         if: runner.environment == 'github-hosted'
@@ -74,10 +117,14 @@ jobs:
 
       - name: Resolve base commit
         id: base
+        env:
+          BASE_REF: ${{ env.BASE_REF || github.base_ref }}
+          HEAD_SHA: ${{ env.HEAD_SHA || github.event.pull_request.head.sha }}
         run: |
-          base=$(git merge-base "origin/${{ github.base_ref }}" HEAD)
+          base=$(git merge-base "origin/$BASE_REF" HEAD)
           echo "sha=$base" >> "$GITHUB_OUTPUT"
-          echo "Comparing $(git rev-parse --short HEAD) (PR merged into base) against $(git rev-parse --short "$base") (base)"
+          echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          echo "Comparing $(git rev-parse --short HEAD) (PR $HEAD_SHA merged into $BASE_REF) against $(git rev-parse --short "$base") (base)"
 
       - name: Build head
         run: |
@@ -106,7 +153,7 @@ jobs:
             --base-bin bench-bin/surfpool-base \
             --head-bin bench-bin/surfpool-head \
             --base-commit "${{ steps.base.outputs.sha }}" \
-            --head-commit "${{ github.event.pull_request.head.sha }}" \
+            --head-commit "${{ steps.base.outputs.head_sha }}" \
             --rounds "$BENCH_ROUNDS" \
             --duration-secs "$BENCH_DURATION_SECS" \
             --threshold "$BENCH_THRESHOLD" \
@@ -131,7 +178,9 @@ jobs:
 
   main_history:
     name: Record main history
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    if: >-
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.pr == '')
     runs-on: ${{ fromJSON(vars.BENCH_RUNS_ON || '["ubuntu-latest"]') }}
     timeout-minutes: 90
     permissions:
