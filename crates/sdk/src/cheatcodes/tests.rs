@@ -173,9 +173,11 @@ async fn set_epoch_stakes_builder_writes_delegations() {
     cheats
         .execute(
             SetEpochStakes::new().entry(
-                EpochStake::delegated(vote_account)
-                    .delegation(StakeDelegation::new(first_stake, 3_000_000_000))
-                    .delegation(StakeDelegation::new(second_stake, 1_000_000_000)),
+                EpochStake::from_delegations(
+                    vote_account,
+                    [StakeDelegation::new(first_stake, 3_000_000_000)],
+                )
+                .delegation(StakeDelegation::new(second_stake, 1_000_000_000)),
             ),
         )
         .unwrap();

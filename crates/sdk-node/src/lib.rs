@@ -446,7 +446,7 @@ impl Surfnet {
                 Some(total) => {
                     EpochStakeBuilder::new(vote_account, lamports_to_u64(total, "stake")?)
                 }
-                None => EpochStakeBuilder::delegated(vote_account),
+                None => EpochStakeBuilder::from_delegations(vote_account, []),
             };
             for delegation in entry.delegations.unwrap_or_default() {
                 let mut parsed = StakeDelegationBuilder::new(
@@ -625,8 +625,8 @@ pub struct EpochStake {
     /// is non-empty, in which case it defaults to their sum and must not be
     /// below it.
     pub stake: Option<Either<f64, BigInt>>,
-    /// Validator identity. When set, a rent-exempt, freshly initialized vote
-    /// account is written at `voteAccount`, replacing any account there.
+    /// Validator identity. When set, a rent-exempt vote account with one vote
+    /// at the current slot is written at `voteAccount`, replacing any account there.
     pub node_pubkey: Option<String>,
     /// Signer for vote transactions; defaults to `nodePubkey`. Requires it.
     pub authorized_voter: Option<String>,
@@ -634,7 +634,8 @@ pub struct EpochStake {
     pub authorized_withdrawer: Option<String>,
     /// Inflation-reward commission, 0 to 100 percent; defaults to 0. Requires `nodePubkey`.
     pub commission: Option<u8>,
-    /// Stake accounts to write as fully active and delegated to `voteAccount`.
+    /// Stake accounts to write as fully active (activated in the previous
+    /// epoch, or as bootstrap stake in epoch 0) and delegated to `voteAccount`.
     pub delegations: Option<Vec<StakeDelegation>>,
 }
 

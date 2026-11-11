@@ -7,7 +7,7 @@ use jsonrpc_core::{BoxFuture, Error, Result, futures::future};
 use jsonrpc_derive::rpc;
 use solana_account::Account;
 use solana_client::rpc_response::{RpcLogsResponse, RpcResponseContext};
-use solana_clock::{Clock, Slot};
+use solana_clock::{Clock, Epoch, Slot};
 use solana_commitment_config::CommitmentConfig;
 use solana_epoch_info::EpochInfo;
 use solana_program_option::COption;
@@ -18,7 +18,9 @@ use solana_stake_interface::{
     state::{Authorized, Delegation, Lockup, Meta, Stake, StakeStateV2},
 };
 use solana_system_interface::program as system_program;
-use solana_vote_interface::state::{VoteInit, VoteStateV3, VoteStateV4, VoteStateVersions};
+use solana_vote_interface::state::{
+    BlockTimestamp, LandedVote, Lockout, VoteInit, VoteStateV3, VoteStateV4, VoteStateVersions,
+};
 use spl_associated_token_account_interface::address::get_associated_token_address_with_program_id;
 use surfpool_types::{
     AccountSnapshot, CheatcodeControlConfig, CheatcodeFilter, ClockCommand, EpochStakeDelegation,
@@ -1382,8 +1384,9 @@ pub trait SurfnetCheatcodes {
     ///   base-58 encoded vote-account public key (`voteAccount`) and its stake
     ///   in lamports (`stake`). An entry may also define the vote account:
     ///   - `nodePubkey` (optional): the validator identity. When present, a
-    ///     rent-exempt, freshly initialized vote account is written at
-    ///     `voteAccount`, replacing any account already there.
+    ///     rent-exempt vote account is written at `voteAccount`, replacing any
+    ///     account already there. It holds one vote at the current slot so
+    ///     delinquency checks on `lastVote` pass.
     ///   - `authorizedVoter`, `authorizedWithdrawer` (optional): default to
     ///     `nodePubkey`.
     ///   - `commission` (optional): percentage from 0 to 100, default 0.
@@ -1391,7 +1394,8 @@ pub trait SurfnetCheatcodes {
     ///   The last three require `nodePubkey`.
     ///
     ///   An entry may also list `delegations`: stake accounts to write as
-    ///   fully active and delegated to `voteAccount`. Each has `stakeAccount`,
+    ///   fully active (activated in the previous epoch, or as bootstrap stake
+    ///   in epoch 0) and delegated to `voteAccount`. Each has `stakeAccount`,
     ///   `stake` (lamports; the account also holds its rent-exempt reserve),
     ///   and optional `staker` (default: the stake account) and `withdrawer`
     ///   (default: the staker). With delegations, `stake` may be omitted and
@@ -1711,14 +1715,20 @@ fn parse_delegation(delegation: &EpochStakeDelegation) -> Result<ParsedDelegatio
 }
 
 /// Serializes a stake account delegated to `vote_pubkey` that the stake
-/// program treats as fully active in every epoch: it uses the bootstrap
-/// activation epoch (`u64::MAX`) so no warmup or stake history is needed.
+/// program treats as fully active now.
+///
+/// It is activated in the previous epoch: the surfnet never records stake
+/// history, so the stake program finds no warmup entry for that epoch and
+/// counts the whole delegation as effective. In epoch 0 there is no previous
+/// epoch, and the bootstrap marker (`u64::MAX`) is used instead.
 #[allow(deprecated)] // Meta::rent_exempt_reserve is part of the on-chain layout
 fn active_stake_account_data(
     vote_pubkey: &Pubkey,
     delegation: &ParsedDelegation,
     rent_exempt_reserve: u64,
+    current_epoch: Epoch,
 ) -> Result<Vec<u8>> {
+    let activation_epoch = current_epoch.checked_sub(1).unwrap_or(u64::MAX);
     let state = StakeStateV2::Stake(
         Meta {
             rent_exempt_reserve,
@@ -1726,7 +1736,7 @@ fn active_stake_account_data(
             lockup: Lockup::default(),
         },
         Stake {
-            delegation: Delegation::new(vote_pubkey, delegation.stake, u64::MAX),
+            delegation: Delegation::new(vote_pubkey, delegation.stake, activation_epoch),
             credits_observed: 0,
         },
         StakeFlags::empty(),
@@ -1779,22 +1789,34 @@ fn vote_init_from_entry(entry: &EpochStakeEntry) -> Result<Option<VoteInit>> {
     }))
 }
 
-/// Serializes a freshly initialized vote state for `vote_pubkey`, in the
-/// version the vote program would write under the surfnet's feature set.
+/// Serializes an initialized vote state for `vote_pubkey`, in the version
+/// the vote program would write under the surfnet's feature set.
+///
+/// The state carries one vote, rooted at the current slot, so clients that
+/// derive delinquency from `lastVote` see the validator as current.
 fn initialized_vote_account_data(
     vote_pubkey: &Pubkey,
     vote_init: &VoteInit,
     clock: &Clock,
     vote_state_v4: bool,
 ) -> Result<Vec<u8>> {
+    let last_vote = LandedVote::from(Lockout::new(clock.slot));
+    let last_timestamp = BlockTimestamp {
+        slot: clock.slot,
+        timestamp: clock.unix_timestamp,
+    };
     let versioned = if vote_state_v4 {
-        VoteStateVersions::new_v4(VoteStateV4::new_with_defaults(
-            vote_pubkey,
-            vote_init,
-            clock,
-        ))
+        let mut state = VoteStateV4::new_with_defaults(vote_pubkey, vote_init, clock);
+        state.votes.push_back(last_vote);
+        state.root_slot = Some(clock.slot);
+        state.last_timestamp = last_timestamp;
+        VoteStateVersions::new_v4(state)
     } else {
-        VoteStateVersions::new_v3(VoteStateV3::new(vote_init, clock))
+        let mut state = VoteStateV3::new(vote_init, clock);
+        state.votes.push_back(last_vote);
+        state.root_slot = Some(clock.slot);
+        state.last_timestamp = last_timestamp;
+        VoteStateVersions::new_v3(state)
     };
     let mut data = vec![0; VoteStateV4::size_of()];
     VoteStateV4::serialize(&versioned, &mut data).map_err(|error| {
@@ -2802,8 +2824,12 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
                     )?;
                 }
                 for delegation in &entry.delegations {
-                    let data =
-                        active_stake_account_data(&entry.vote_pubkey, delegation, stake_reserve)?;
+                    let data = active_stake_account_data(
+                        &entry.vote_pubkey,
+                        delegation,
+                        stake_reserve,
+                        clock.epoch,
+                    )?;
                     write(
                         delegation.stake_account,
                         Account {
@@ -2940,6 +2966,7 @@ mod tests {
     use solana_program_pack::Pack;
     use solana_pubkey::Pubkey;
     use solana_signer::Signer;
+    use solana_stake_interface::stake_history::StakeHistory;
     use solana_system_interface::instruction::create_account;
     use solana_transaction::{Transaction, versioned::VersionedTransaction};
     use spl_associated_token_account_interface::{
@@ -4387,13 +4414,13 @@ mod tests {
             )
             .unwrap();
 
-        let (account, rent_exempt_minimum, epoch) =
+        let (account, rent_exempt_minimum, Clock { epoch, slot, .. }) =
             client.context.svm_locker.with_svm_reader(|svm| {
                 (
                     svm.inner.get_account(&vote_account).unwrap(),
                     svm.inner
                         .minimum_balance_for_rent_exemption(VoteStateV4::size_of()),
-                    svm.inner.get_sysvar::<Clock>().epoch,
+                    svm.inner.get_sysvar::<Clock>(),
                 )
             });
         let account = account.expect("vote account written");
@@ -4401,6 +4428,8 @@ mod tests {
         assert_eq!(account.lamports, rent_exempt_minimum);
         let vote_state = VoteStateV4::deserialize(&account.data, &vote_account).unwrap();
         assert_eq!(vote_state.node_pubkey, node_pubkey);
+        assert_eq!(vote_state.votes.back().map(|vote| vote.slot()), Some(slot));
+        assert_eq!(vote_state.root_slot, Some(slot));
         assert_eq!(vote_state.authorized_withdrawer, withdrawer);
         assert_eq!(
             vote_state.authorized_voters.get_authorized_voter(epoch),
@@ -4455,6 +4484,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_set_epoch_stakes_writes_delegated_stake_accounts() {
         let client = TestSetup::new(SurfnetCheatcodesRpc::empty());
+        // Epoch 0 has no previous epoch, so delegations must fall back to bootstrap stake.
+        client.context.svm_locker.with_svm_writer(|svm| {
+            let mut clock = svm.inner.get_sysvar::<Clock>();
+            clock.epoch = 0;
+            svm.inner.set_sysvar(&clock);
+        });
         let vote_account = Pubkey::new_unique();
         let first_stake = Pubkey::new_unique();
         let second_stake = Pubkey::new_unique();
@@ -4528,6 +4563,53 @@ mod tests {
             }
         );
         assert_eq!(stake.delegation.stake, 12);
+    }
+
+    /// Past epoch 0 a delegation activates in the previous epoch, which the stake
+    /// program counts as fully effective because the surfnet keeps no stake history.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_set_epoch_stakes_activates_delegations_in_previous_epoch() {
+        let client = TestSetup::new(SurfnetCheatcodesRpc::empty());
+        client.context.svm_locker.with_svm_writer(|svm| {
+            let mut clock = svm.inner.get_sysvar::<Clock>();
+            clock.epoch = 5;
+            svm.inner.set_sysvar(&clock);
+        });
+        let vote_account = Pubkey::new_unique();
+        let stake_account = Pubkey::new_unique();
+
+        client
+            .rpc
+            .set_epoch_stakes(
+                Some(client.context.clone()),
+                vec![EpochStakeEntry {
+                    stake: None,
+                    delegations: Some(vec![EpochStakeDelegation {
+                        stake_account: stake_account.to_string(),
+                        stake: 7,
+                        staker: None,
+                        withdrawer: None,
+                    }]),
+                    ..EpochStakeEntry::new(vote_account.to_string(), 0)
+                }],
+            )
+            .unwrap();
+
+        let account = client
+            .context
+            .svm_locker
+            .with_svm_reader(|svm| svm.inner.get_account(&stake_account).unwrap().unwrap());
+        let StakeStateV2::Stake(_, stake, _) =
+            bincode::deserialize::<StakeStateV2>(&account.data).unwrap()
+        else {
+            panic!("expected a delegated stake account");
+        };
+        assert_eq!(stake.delegation.activation_epoch, 4);
+        // With no stake history, the stake program counts the delegation as fully effective.
+        assert_eq!(
+            stake.delegation.stake_v2(5, &StakeHistory::default(), None),
+            7
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

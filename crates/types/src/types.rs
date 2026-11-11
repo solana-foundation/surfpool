@@ -1210,15 +1210,17 @@ pub struct EpochStakeDelegation {
 /// optionally with the fields needed to write the vote account itself and the
 /// stake accounts delegated to it.
 ///
-/// When `node_pubkey` is set, `surfnet_setEpochStakes` writes a rent-exempt,
-/// freshly initialized vote account at `vote_account` owned by the vote
-/// program, replacing any account already there. The other vote-account
-/// fields require `node_pubkey` and default to it (authorities) or zero
-/// (commission).
+/// When `node_pubkey` is set, `surfnet_setEpochStakes` writes a rent-exempt
+/// vote account at `vote_account` owned by the vote program, replacing any
+/// account already there. It holds one vote at the current slot, so clients
+/// that derive delinquency from the last vote see it as current. The other
+/// vote-account fields require `node_pubkey` and default to it (authorities)
+/// or zero (commission).
 ///
 /// Each entry in `delegations` is written as a fully active stake account
-/// delegated to `vote_account`. `stake` then defaults to the sum of the
-/// delegations and, when given, must not be below it.
+/// delegated to `vote_account`, activated in the previous epoch (or as
+/// bootstrap stake when the surfnet is in epoch 0). `stake` then defaults to
+/// the sum of the delegations and, when given, must not be below it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]

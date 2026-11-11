@@ -54,10 +54,15 @@ impl From<StakeDelegation> for EpochStakeDelegation {
 ///
 /// By itself an entry only sets the stake read by the `sol_get_epoch_stake`
 /// syscall. Calling [`EpochStake::node_pubkey`] additionally writes a
-/// rent-exempt, freshly initialized vote account at the address, which
-/// `getVoteAccounts` and on-chain programs can then read, and
+/// rent-exempt vote account at the address, with one vote at the current
+/// slot, which `getVoteAccounts` and on-chain programs can then read.
 /// [`EpochStake::delegation`] writes fully active stake accounts delegated
 /// to it.
+///
+/// Read the result back with the [`RpcClient`](crate::RpcClient) from
+/// [`Surfnet::rpc_client`](crate::Surfnet::rpc_client): `get_vote_accounts`
+/// lists the stakes and `get_program_accounts` on the stake program lists
+/// the delegations.
 ///
 /// ```rust
 /// use surfpool_sdk::{Pubkey, Surfnet};
@@ -95,15 +100,25 @@ impl EpochStake {
     /// With delegations added, `stake` must not be below their sum.
     pub fn new(vote_account: Pubkey, stake: u64) -> Self {
         Self {
+            vote_account,
             stake: Some(stake),
-            ..Self::delegated(vote_account)
+            node_pubkey: None,
+            authorized_voter: None,
+            authorized_withdrawer: None,
+            commission: None,
+            delegations: Vec::new(),
         }
     }
 
-    /// An entry whose total stake is the sum of the delegations added to it.
+    /// An entry whose total stake is the sum of `delegations`, each written
+    /// as a stake account delegated to `vote_account`.
     ///
-    /// Executing it with no delegations is rejected by the surfnet.
-    pub fn delegated(vote_account: Pubkey) -> Self {
+    /// The surfnet rejects an entry with no delegations and no stake, so pass
+    /// at least one.
+    pub fn from_delegations(
+        vote_account: Pubkey,
+        delegations: impl IntoIterator<Item = StakeDelegation>,
+    ) -> Self {
         Self {
             vote_account,
             stake: None,
@@ -111,7 +126,7 @@ impl EpochStake {
             authorized_voter: None,
             authorized_withdrawer: None,
             commission: None,
-            delegations: Vec::new(),
+            delegations: delegations.into_iter().collect(),
         }
     }
 
