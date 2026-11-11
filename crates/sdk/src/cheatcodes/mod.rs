@@ -10,11 +10,11 @@ use solana_pubkey::Pubkey;
 use solana_rpc_client::rpc_client::RpcClient;
 use solana_signer::Signer;
 use spl_associated_token_account_interface::address::get_associated_token_address_with_program_id;
-use surfpool_types::{CheatcodeFilter, EpochStakeEntry};
+use surfpool_types::CheatcodeFilter;
 
 use crate::error::{SurfnetError, SurfnetResult};
 pub mod builders;
-use builders::{CheatcodeBuilder, DeployProgram};
+use builders::{CheatcodeBuilder, DeployProgram, EpochStake, SetEpochStakes};
 
 /// Direct state manipulation helpers for a running Surfnet.
 ///
@@ -329,19 +329,19 @@ impl<'a> Cheatcodes<'a> {
 
     /// Replace the epoch-stake map used by the `sol_get_epoch_stake` syscall.
     ///
-    /// Account creation and stake-account data are intentionally separate from
-    /// this runtime snapshot, matching how the syscall reads an epoch-frozen
-    /// stake distribution on a real cluster. `getVoteAccounts` reports the same
-    /// vote accounts and stakes.
+    /// This writes no accounts: the snapshot is independent of vote and stake
+    /// account data, matching how the syscall reads an epoch-frozen stake
+    /// distribution on a real cluster. `getVoteAccounts` reports the same vote
+    /// accounts and stakes. To also write the vote accounts, execute a
+    /// [`builders::SetEpochStakes`] whose entries set a node pubkey.
     pub fn set_epoch_stakes(&self, stakes: &[(Pubkey, u64)]) -> SurfnetResult<()> {
-        let stakes: Vec<EpochStakeEntry> = stakes
-            .iter()
-            .map(|(vote_account, stake)| EpochStakeEntry {
-                vote_account: vote_account.to_string(),
-                stake: *stake,
-            })
-            .collect();
-        self.call_cheatcode("surfnet_setEpochStakes", serde_json::json!([stakes]))
+        self.execute(
+            SetEpochStakes::new().entries(
+                stakes
+                    .iter()
+                    .map(|(vote_account, stake)| EpochStake::new(*vote_account, *stake)),
+            ),
+        )
     }
 
     /// Deploy a program from local workspace artifacts.

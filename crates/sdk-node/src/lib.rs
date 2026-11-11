@@ -12,7 +12,10 @@ use solana_pubkey::Pubkey;
 use solana_signer::Signer;
 use surfpool_sdk::{
     BlockProductionMode, SimnetEvent, Surfnet as NativeSurfnet,
-    cheatcodes::builders::{DeployProgram, ResetAccount, SetTokenAccount, StreamAccount},
+    cheatcodes::builders::{
+        DeployProgram, EpochStake as EpochStakeBuilder, ResetAccount, SetEpochStakes,
+        SetTokenAccount, StreamAccount,
+    },
 };
 use surfpool_types::{ClockCommand, parse_feature_pubkey};
 
@@ -431,22 +434,36 @@ impl Surfnet {
             .map_err(sdk_error_to_napi)
     }
 
-    /// Replace the epoch-stake map read by the `sol_get_epoch_stake` syscall.
+    /// Replace the epoch-stake map read by the `sol_get_epoch_stake` syscall,
+    /// writing a vote account for each entry that sets `nodePubkey`.
     #[napi]
     pub fn set_epoch_stakes(&self, stakes: Vec<EpochStake>) -> Result<()> {
-        let stakes = stakes
-            .iter()
-            .map(|entry| {
-                Ok((
-                    parse_pubkey(&entry.vote_account, "voteAccount")?,
-                    lamports_to_u64(&entry.stake, "stake")?,
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let mut builder = SetEpochStakes::new();
+        for entry in stakes {
+            let mut stake = EpochStakeBuilder::new(
+                parse_pubkey(&entry.vote_account, "voteAccount")?,
+                lamports_to_u64(&entry.stake, "stake")?,
+            );
+            if let Some(node_pubkey) = parse_optional_pubkey(entry.node_pubkey, "nodePubkey")? {
+                stake = stake.node_pubkey(node_pubkey);
+            }
+            if let Some(voter) = parse_optional_pubkey(entry.authorized_voter, "authorizedVoter")? {
+                stake = stake.authorized_voter(voter);
+            }
+            if let Some(withdrawer) =
+                parse_optional_pubkey(entry.authorized_withdrawer, "authorizedWithdrawer")?
+            {
+                stake = stake.authorized_withdrawer(withdrawer);
+            }
+            if let Some(commission) = entry.commission {
+                stake = stake.commission(commission);
+            }
+            builder = builder.entry(stake);
+        }
 
         self.inner
             .cheatcodes()
-            .set_epoch_stakes(&stakes)
+            .execute(builder)
             .map_err(sdk_error_to_napi)
     }
 
@@ -587,6 +604,15 @@ pub struct EpochStake {
     /// Stake delegated to the vote account, in lamports. Pass a `bigint` for
     /// amounts above `Number.MAX_SAFE_INTEGER`.
     pub stake: Either<f64, BigInt>,
+    /// Validator identity. When set, a rent-exempt, freshly initialized vote
+    /// account is written at `voteAccount`, replacing any account there.
+    pub node_pubkey: Option<String>,
+    /// Signer for vote transactions; defaults to `nodePubkey`. Requires it.
+    pub authorized_voter: Option<String>,
+    /// Signer for withdrawals; defaults to `nodePubkey`. Requires it.
+    pub authorized_withdrawer: Option<String>,
+    /// Inflation-reward commission, 0 to 100 percent; defaults to 0. Requires `nodePubkey`.
+    pub commission: Option<u8>,
 }
 
 #[napi(object)]

@@ -1184,7 +1184,13 @@ pub struct AccountUpdate {
     pub rent_epoch: Option<Epoch>,
 }
 
-/// A vote account's stake in the epoch snapshot used by `sol_get_epoch_stake`.
+/// A vote account's stake in the epoch snapshot used by `sol_get_epoch_stake`,
+/// optionally with the fields needed to write the vote account itself.
+///
+/// When `node_pubkey` is set, `surfnet_setEpochStakes` writes a rent-exempt,
+/// freshly initialized vote account at `vote_account` owned by the vote
+/// program, replacing any account already there. The other optional fields
+/// require `node_pubkey` and default to it (authorities) or zero (commission).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
@@ -1193,6 +1199,36 @@ pub struct EpochStakeEntry {
     pub vote_account: String,
     #[cfg_attr(feature = "ts-bindings", ts(type = "number | bigint"))]
     pub stake: u64,
+    /// Validator identity recorded on the vote account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-bindings", ts(optional))]
+    pub node_pubkey: Option<String>,
+    /// Signer for vote transactions; defaults to `node_pubkey`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-bindings", ts(optional))]
+    pub authorized_voter: Option<String>,
+    /// Signer for withdrawals; defaults to `node_pubkey`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-bindings", ts(optional))]
+    pub authorized_withdrawer: Option<String>,
+    /// Inflation-reward commission as a percentage, 0 to 100; defaults to 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-bindings", ts(optional))]
+    pub commission: Option<u8>,
+}
+
+impl EpochStakeEntry {
+    /// An entry that only sets `vote_account`'s stake, writing no account.
+    pub fn new(vote_account: String, stake: u64) -> Self {
+        Self {
+            vote_account,
+            stake,
+            node_pubkey: None,
+            authorized_voter: None,
+            authorized_withdrawer: None,
+            commission: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
