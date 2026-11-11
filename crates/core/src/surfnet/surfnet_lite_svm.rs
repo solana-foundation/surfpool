@@ -136,6 +136,13 @@ impl SurfnetLiteSvm {
         let epoch_schedule = self.svm.get_sysvar::<EpochSchedule>();
         let last_restart_slot = self.svm.get_sysvar::<LastRestartSlot>();
         let slot_history = self.svm.get_sysvar::<SlotHistory>();
+        // Epoch stakes are runtime state, not accounts, so the rebuild would drop
+        // any snapshot set through `surfnet_setEpochStakes`.
+        let epoch_stakes: Vec<(Pubkey, u64)> = self
+            .svm
+            .epoch_vote_stakes()
+            .map(|(vote_account, stake)| (*vote_account, *stake))
+            .collect();
 
         // todo: this is also resetting the log bytes limit and airdrop keypair, would be nice to avoid
         self.svm = Self::litesvm_settings(feature_set);
@@ -149,6 +156,9 @@ impl SurfnetLiteSvm {
         self.svm.set_sysvar(&epoch_schedule);
         self.svm.set_sysvar(&last_restart_slot);
         self.svm.set_sysvar(&slot_history);
+        self.svm
+            .set_epoch_stakes(epoch_stakes)
+            .expect("restoring a previously valid epoch-stake snapshot cannot overflow");
     }
 
     pub fn set_log_bytes_limit(&mut self, limit: Option<usize>) {

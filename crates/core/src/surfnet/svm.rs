@@ -9533,6 +9533,27 @@ mod tests {
         );
     }
 
+    #[test_case(TestType::sqlite(); "with on-disk sqlite db")]
+    #[test_case(TestType::in_memory(); "with in-memory sqlite db")]
+    fn garbage_collection_keeps_epoch_stakes(test_type: TestType) {
+        let (mut svm, _events_rx, _geyser_rx) = test_type.initialize_svm();
+        let vote_account = Pubkey::new_unique();
+        svm.inner
+            .svm
+            .set_epoch_stakes([(vote_account, 42)])
+            .unwrap();
+
+        svm.inner.garbage_collect(svm.feature_set.clone());
+
+        assert_eq!(
+            (
+                svm.inner.svm.epoch_stake(&vote_account),
+                svm.inner.svm.epoch_total_stake()
+            ),
+            (42, 42)
+        );
+    }
+
     #[test_case(1, 3_600_000, 60_000; "1ms slots")]
     #[test_case(DEFAULT_SLOT_TIME_MS, 14_400, 240; "default slots")]
     #[test_case(4_000, 900, 15; "4s slots")]

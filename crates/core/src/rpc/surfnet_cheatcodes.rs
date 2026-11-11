@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     sync::{Arc, RwLock},
 };
 
@@ -1411,9 +1411,10 @@ pub trait SurfnetCheatcodes {
     /// ```
     ///
     /// # Notes
-    /// This replaces the entire snapshot; pass an empty list to clear it. The
-    /// snapshot is independent of vote and stake account data, matching the
-    /// epoch-frozen distribution read by the syscall on a cluster.
+    /// This replaces the entire snapshot; pass an empty list to clear it. Each
+    /// vote account may appear at most once, and entries with zero stake are
+    /// dropped. The snapshot is independent of vote and stake account data,
+    /// matching the epoch-frozen distribution read by the syscall on a cluster.
     #[rpc(meta, name = "surfnet_setEpochStakes")]
     fn set_epoch_stakes(
         &self,
@@ -2519,13 +2520,21 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
             .into_iter()
             .map(|entry| Ok((verify_pubkey(&entry.vote_account)?, entry.stake)))
             .collect::<Result<Vec<_>>>()?;
+        // LiteSVM keeps the last stake for a repeated vote account but sums every
+        // entry into the total, so duplicates would make the snapshot inconsistent.
+        let mut seen = HashSet::with_capacity(stakes.len());
+        if let Some((duplicate, _)) = stakes.iter().find(|(pubkey, _)| !seen.insert(*pubkey)) {
+            return Err(Error::invalid_params(format!(
+                "duplicate vote account in epoch stakes: {duplicate}"
+            )));
+        }
         svm_locker
             .set_epoch_stakes(stakes)
             .map_err(|error| Error::invalid_params(error.to_string()))?;
-        Ok(RpcResponse {
-            context: RpcResponseContext::new(svm_locker.get_latest_absolute_slot()),
-            value: (),
-        })
+        Ok(cheatcode_response(
+            svm_locker.get_latest_absolute_slot(),
+            (),
+        ))
     }
 
     fn write_program(
@@ -4062,6 +4071,34 @@ mod tests {
             assert_eq!(svm.inner.svm.epoch_stake(&first), 11);
             assert_eq!(svm.inner.svm.epoch_stake(&second), 29);
             assert_eq!(svm.inner.svm.epoch_total_stake(), 40);
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_set_epoch_stakes_rejects_duplicate_vote_accounts() {
+        let client = TestSetup::new(SurfnetCheatcodesRpc::empty());
+        let vote_account = Pubkey::new_unique();
+
+        let error = client
+            .rpc
+            .set_epoch_stakes(
+                Some(client.context.clone()),
+                vec![
+                    EpochStakeEntry {
+                        vote_account: vote_account.to_string(),
+                        stake: 10,
+                    },
+                    EpochStakeEntry {
+                        vote_account: vote_account.to_string(),
+                        stake: 5,
+                    },
+                ],
+            )
+            .unwrap_err();
+
+        assert!(error.message.contains("duplicate vote account"));
+        client.context.svm_locker.with_svm_reader(|svm| {
+            assert_eq!(svm.inner.svm.epoch_total_stake(), 0);
         });
     }
 
