@@ -3,7 +3,10 @@ extern crate napi_derive;
 
 use std::{convert::TryFrom, path::PathBuf, sync::Once};
 
-use napi::{Error, Result, Status};
+use napi::{
+    Error, Result, Status,
+    bindgen_prelude::{BigInt, Either},
+};
 use solana_keypair::Keypair;
 use solana_pubkey::Pubkey;
 use solana_signer::Signer;
@@ -436,7 +439,7 @@ impl Surfnet {
             .map(|entry| {
                 Ok((
                     parse_pubkey(&entry.vote_account, "voteAccount")?,
-                    f64_to_u64(entry.stake, "stake")?,
+                    lamports_to_u64(&entry.stake, "stake")?,
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -581,8 +584,9 @@ pub struct KeypairInfo {
 pub struct EpochStake {
     /// Base-58 vote account address.
     pub vote_account: String,
-    /// Stake delegated to the vote account, in lamports.
-    pub stake: f64,
+    /// Stake delegated to the vote account, in lamports. Pass a `bigint` for
+    /// amounts above `Number.MAX_SAFE_INTEGER`.
+    pub stake: Either<f64, BigInt>,
 }
 
 #[napi(object)]
@@ -841,13 +845,41 @@ fn parse_keypair(bytes: &[u8], field_name: &str) -> Result<Keypair> {
         .map_err(|e| Error::new(Status::InvalidArg, format!("Invalid {field_name}: {e}")))
 }
 
+/// Largest integer a JavaScript `number` represents exactly (`Number.MAX_SAFE_INTEGER`).
+const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
+
+/// Converts a JavaScript `number` to `u64`, rejecting values that are negative,
+/// fractional, non-finite, or above `Number.MAX_SAFE_INTEGER`.
 fn f64_to_u64(value: f64, field_name: &str) -> Result<u64> {
-    if !value.is_finite() || value < 0.0 || value.fract() != 0.0 || value > u64::MAX as f64 {
+    if !value.is_finite() || value < 0.0 || value.fract() != 0.0 {
         return Err(Error::new(
             Status::InvalidArg,
             format!("{field_name} must be a non-negative integer"),
         ));
     }
+    // JS has already rounded anything past 2^53 before it reaches us, so a value
+    // in that range may not be what the caller wrote.
+    if value > MAX_SAFE_INTEGER {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!("{field_name} exceeds Number.MAX_SAFE_INTEGER and may have lost precision"),
+        ));
+    }
 
     Ok(value as u64)
+}
+
+/// Converts a JavaScript `number` or `bigint` to `u64`. A `bigint` must be
+/// non-negative and fit in 64 bits; a `number` follows [`f64_to_u64`].
+fn lamports_to_u64(value: &Either<f64, BigInt>, field_name: &str) -> Result<u64> {
+    match value {
+        Either::A(number) => f64_to_u64(*number, field_name),
+        Either::B(bigint) => match bigint.get_u64() {
+            (false, value, true) => Ok(value),
+            _ => Err(Error::new(
+                Status::InvalidArg,
+                format!("{field_name} must be a non-negative integer that fits in a u64"),
+            )),
+        },
+    }
 }
