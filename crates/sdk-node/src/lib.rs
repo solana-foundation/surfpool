@@ -428,6 +428,25 @@ impl Surfnet {
             .map_err(sdk_error_to_napi)
     }
 
+    /// Replace the epoch-stake map read by the `sol_get_epoch_stake` syscall.
+    #[napi]
+    pub fn set_epoch_stakes(&self, stakes: Vec<EpochStake>) -> Result<()> {
+        let stakes = stakes
+            .iter()
+            .map(|entry| {
+                Ok((
+                    parse_pubkey(&entry.vote_account, "voteAccount")?,
+                    f64_to_u64(entry.stake, "stake")?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        self.inner
+            .cheatcodes()
+            .set_epoch_stakes(&stakes)
+            .map_err(sdk_error_to_napi)
+    }
+
     /// Deploy a program by discovering local program artifacts.
     #[napi]
     pub fn deploy_program(&self, program_name: String) -> Result<String> {
@@ -461,6 +480,9 @@ impl Surfnet {
         }
         if let Some(idl_path) = options.idl_path {
             builder = builder.idl_path(PathBuf::from(idl_path));
+        }
+        if let Some(authority) = parse_optional_pubkey(options.authority, "authority")? {
+            builder = builder.authority(authority);
         }
 
         self.inner
@@ -544,12 +566,23 @@ pub struct DeployOptions {
     pub so_path: Option<String>,
     pub so_bytes: Option<Vec<u8>>,
     pub idl_path: Option<String>,
+    /// Upgrade authority recorded on a newly created ProgramData account.
+    /// Defaults to the system program when omitted.
+    pub authority: Option<String>,
 }
 
 #[napi(object)]
 pub struct KeypairInfo {
     pub public_key: String,
     pub secret_key: Vec<u8>,
+}
+
+#[napi(object)]
+pub struct EpochStake {
+    /// Base-58 vote account address.
+    pub vote_account: String,
+    /// Stake delegated to the vote account, in lamports.
+    pub stake: f64,
 }
 
 #[napi(object)]

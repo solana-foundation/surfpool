@@ -100,6 +100,26 @@ test("token helpers cover ATA derivation, funding, and advanced token-account up
   assert.equal(info.closeAuthority, closeAuthority);
 });
 
+test("setEpochStakes replaces the epoch-stake snapshot and rejects duplicates", () => {
+  const surfnet = Surfnet.start();
+  const voteAccount = Surfnet.newKeypair().publicKey;
+
+  surfnet.setEpochStakes([
+    { voteAccount, stake: 1_000_000_000 },
+    { voteAccount: Surfnet.newKeypair().publicKey, stake: 2_000_000_000 },
+  ]);
+  surfnet.setEpochStakes([]);
+
+  assert.throws(
+    () =>
+      surfnet.setEpochStakes([
+        { voteAccount, stake: 1 },
+        { voteAccount, stake: 2 },
+      ]),
+    /duplicate vote account/,
+  );
+});
+
 test("streamAccount registers streamed accounts via RPC introspection", async () => {
   const surfnet = Surfnet.start();
   const address = Surfnet.newKeypair().publicKey;
@@ -137,6 +157,20 @@ test("deploy() accepts explicit bytes and deployProgram() discovers workspace ar
     assert.equal(deployedProgramId, explicitProgramId);
     const explicitAccount = await getAccountInfo(surfnet.rpcUrl, explicitProgramId);
     assert.equal(explicitAccount.executable, true);
+
+    const authorityProgramId = Surfnet.newKeypair().publicKey;
+    const authority = Surfnet.newKeypair().publicKey;
+    surfnet.deploy({
+      programId: authorityProgramId,
+      soBytes: Uint8Array.from([1, 2, 3, 4]),
+      authority,
+    });
+    const programAccount = await getParsedAccountInfo(surfnet.rpcUrl, authorityProgramId);
+    const programData = await getParsedAccountInfo(
+      surfnet.rpcUrl,
+      programAccount.data.parsed.info.programData,
+    );
+    assert.equal(programData.data.parsed.info.authority, authority);
 
     const workspace = path.join(tempDir, "workspace");
     const deployDir = path.join(workspace, "target", "deploy");

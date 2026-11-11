@@ -806,9 +806,41 @@
               "name": "offset",
               "type": "number",
               "description": "The byte offset at which to write this data chunk."
+            },
+            {
+              "name": "authority",
+              "type": "Option<string>",
+              "description": "The base-58 encoded upgrade authority recorded on a newly created ProgramData account. If omitted, defaults to the system program."
             }
           ],
           "returns": "A `RpcResponse<()>` indicating whether the write was successful."
+        },
+        {
+          "method": "surfnet_setEpochStakes",
+          "description": "A cheat code to replace the epoch-frozen vote-account stake map read by the `sol_get_epoch_stake` syscall. The whole snapshot is replaced; pass an empty list to clear it. Each vote account may appear at most once, and zero-stake entries are dropped. The snapshot is independent of vote and stake account data.",
+          "params": [
+            {
+              "name": "stakes",
+              "type": "array",
+              "description": "A list of `EpochStakeEntry` objects.",
+              "schema": {
+                "voteAccount": "string (base-58 encoded vote account pubkey)",
+                "stake": "u64 (stake in lamports)"
+              }
+            }
+          ],
+          "returns": "A `RpcResponse<()>` indicating whether the epoch-stake snapshot was replaced.",
+          "example": {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "surfnet_setEpochStakes",
+            "params": [
+              [
+                { "voteAccount": "4EXSeLGxVBpAZwq7vm6evLdewpcvE2H56fpqL2pPiLFa", "stake": 11 },
+                { "voteAccount": "7nYBm5mk15oDNewVjNFmEqJ9VgMvT4F74UVoeYDCpScd", "stake": 29 }
+              ]
+            ]
+          }
         },
         {
           "method": "surfnet_timeTravel",
