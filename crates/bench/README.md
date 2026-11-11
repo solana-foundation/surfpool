@@ -48,7 +48,8 @@ target/release/surfpool-bench run \
 Compare two binaries the way CI does. Rounds are interleaved and the side that
 goes first alternates, so slow drift on the machine does not favour one side.
 The command writes `base.json`, `head.json` and `summary.md` into the output
-directory and exits 1 if a gated metric regressed past the threshold.
+directory and exits 1 if a gated metric regressed past the threshold or was
+measured on only one side.
 
 ```sh
 git worktree add /tmp/surfpool-base main

@@ -99,6 +99,9 @@ jobs:
 
       - name: Run A/B benchmark
         run: |
+          # Start from an empty output directory so a failed run cannot
+          # publish stale results from an earlier step or the checkout.
+          rm -rf bench-results
           bench-bin/surfpool-bench ab \
             --base-bin bench-bin/surfpool-base \
             --head-bin bench-bin/surfpool-head \
@@ -154,6 +157,7 @@ jobs:
 
       - name: Run benchmark
         run: |
+          rm -rf bench-results
           mkdir -p bench-results
           "$CARGO_TARGET_DIR/release/surfpool-bench" run \
             --surfpool-bin "$CARGO_TARGET_DIR/release/surfpool" \

@@ -37,6 +37,7 @@ solana-signer = { workspace = true }
 solana-system-interface = { workspace = true, features = ["bincode"] }
 solana-transaction = { workspace = true }
 solana-transaction-status-client-types = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true, features = [
     "rt-multi-thread",
     "macros",

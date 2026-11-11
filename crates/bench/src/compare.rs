@@ -16,6 +16,7 @@ pub struct Row {
     pub unit: String,
     pub base: Option<Stats>,
     pub head: Option<Stats>,
+    pub gate: bool,
     pub status: Status,
 }
 
@@ -61,8 +62,24 @@ pub struct Comparison {
 }
 
 impl Comparison {
-    pub fn has_regressions(&self) -> bool {
-        self.rows.iter().any(|r| r.status == Status::Regression)
+    /// Whether the gate fails: a gated metric regressed past the threshold,
+    /// a gated metric was measured on only one side, or no gated metric was
+    /// measured at all. Informational metrics never fail it.
+    pub fn fails(&self) -> bool {
+        self.rows
+            .iter()
+            .any(|r| r.gate && matches!(r.status, Status::Regression | Status::Missing))
+            || !self.rows.iter().any(|r| r.gate)
+    }
+
+    fn verdict(&self) -> &'static str {
+        if self.rows.iter().any(|r| r.status == Status::Regression) {
+            "❌ **Regression detected**"
+        } else if self.fails() {
+            "❌ **Incomplete**: a gated metric is missing on one side"
+        } else {
+            "✅ **No regression**"
+        }
     }
 
     /// Relative change of the head median against the base median, as a
@@ -78,11 +95,7 @@ impl Comparison {
     /// Renders the comparison as a GitHub-flavored Markdown report.
     pub fn to_markdown(&self) -> String {
         let mut out = String::new();
-        let verdict = if self.has_regressions() {
-            "❌ **Regression detected**"
-        } else {
-            "✅ **No regression**"
-        };
+        let verdict = self.verdict();
         out.push_str(&format!(
             "## Surfpool benchmark: `{}` vs `{}`\n\n{verdict}. A gated metric fails when `{}` is more than {:.0}% worse than `{}`. Values are medians over interleaved rounds, with the range in brackets.\n\n",
             self.head_label,
@@ -204,8 +217,16 @@ pub fn compare(base: &[RunReport], head: &[RunReport], threshold: f64) -> Result
     let (Some(first_base), Some(first_head)) = (base.first(), head.first()) else {
         bail!("both sides need at least one result file");
     };
-    if first_base.config != first_head.config {
-        bail!("base and head were measured with different load configurations");
+    for report in base.iter().chain(head.iter()) {
+        if report.config != first_base.config {
+            bail!(
+                "result file for `{}` was measured with a different load configuration than the first base file",
+                report.label
+            );
+        }
+        if report.rounds.is_empty() {
+            bail!("result file for `{}` has no rounds", report.label);
+        }
     }
     let base_map = collect(base)?;
     let head_map = collect(head)?;
@@ -242,6 +263,7 @@ pub fn compare(base: &[RunReport], head: &[RunReport], threshold: f64) -> Result
             unit: template.unit.clone(),
             base: base_stats,
             head: head_stats,
+            gate: template.gate,
             status,
         });
     }
@@ -308,7 +330,7 @@ mod tests {
         let base = report("base", &[1000.0, 1010.0, 990.0]);
         let head = report("head", &[1000.0, 500.0, 980.0]);
         let cmp = compare(&[base], &[head], 0.15).unwrap();
-        assert!(!cmp.has_regressions());
+        assert!(!cmp.fails());
     }
 
     #[test]
@@ -316,7 +338,7 @@ mod tests {
         let base = report("base", &[1000.0]);
         let head = report("head", &[800.0]);
         let cmp = compare(&[base], &[head], 0.15).unwrap();
-        assert!(cmp.has_regressions());
+        assert!(cmp.fails());
         let statuses: Vec<Status> = cmp.rows.iter().map(|r| r.status).collect();
         // The p99 latency row grew by the same 20% but is informational, and
         // the gated row is listed first.
@@ -327,7 +349,37 @@ mod tests {
     fn improvement_never_fails() {
         let base = report("base", &[1000.0]);
         let head = report("head", &[2000.0]);
-        assert!(!compare(&[base], &[head], 0.15).unwrap().has_regressions());
+        assert!(!compare(&[base], &[head], 0.15).unwrap().fails());
+    }
+
+    #[test]
+    fn a_later_file_with_different_settings_is_rejected() {
+        // Only the first file on each side used to be checked, so a second
+        // base file measured with other settings would be pooled in silently.
+        let mut other = report("base", &[5000.0]);
+        other.config.senders = 64;
+        let base = [report("base", &[1000.0]), other];
+        let head = [report("head", &[1000.0])];
+        assert!(compare(&base, &head, 0.15).is_err());
+    }
+
+    #[test]
+    fn a_gated_metric_missing_on_one_side_fails() {
+        let base = report("base", &[1000.0]);
+        let mut head = report("head", &[1000.0]);
+        for round in &mut head.rounds {
+            round.samples.retain(|s| !s.gate);
+        }
+        let cmp = compare(&[base], &[head], 0.15).unwrap();
+        assert!(cmp.fails());
+        assert!(cmp.to_markdown().contains("Incomplete"));
+    }
+
+    #[test]
+    fn a_file_without_rounds_is_rejected() {
+        let base = report("base", &[1000.0]);
+        let head = report("head", &[]);
+        assert!(compare(&[base], &[head], 0.15).is_err());
     }
 
     #[test]

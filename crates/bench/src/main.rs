@@ -16,7 +16,8 @@ use clap::{Parser, Subcommand};
 use results::{Direction, HostInfo, Round, RunReport, SCHEMA_VERSION, median};
 use workloads::LoadConfig;
 
-/// Exit code when a gated metric regressed past the threshold.
+/// Exit code when the gate fails: a gated metric regressed past the
+/// threshold or is missing on one side.
 const EXIT_REGRESSION: u8 = 1;
 /// Exit code when the benchmark itself failed to run.
 const EXIT_ERROR: u8 = 2;
@@ -45,7 +46,7 @@ enum Command {
         #[arg(long)]
         commit: Option<String>,
         /// Full passes over the selected scenarios.
-        #[arg(long, default_value_t = 1)]
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
         rounds: u32,
         /// Where to write the JSON result. Rewritten after every round.
         #[arg(long)]
@@ -54,7 +55,7 @@ enum Command {
         load: LoadConfig,
     },
     /// Benchmark two binaries in interleaved rounds on this machine, then
-    /// compare them. Exits 1 on a regression.
+    /// compare them. Exits 1 when the gate fails.
     Ab {
         #[arg(long)]
         base_bin: PathBuf,
@@ -65,7 +66,7 @@ enum Command {
         #[arg(long)]
         head_commit: Option<String>,
         /// Interleaved rounds. The side that goes first alternates each round.
-        #[arg(long, default_value_t = 3)]
+        #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u32).range(1..))]
         rounds: u32,
         /// Directory for `base.json`, `head.json` and `summary.md`.
         #[arg(long)]
@@ -79,7 +80,7 @@ enum Command {
         #[command(flatten)]
         load: LoadConfig,
     },
-    /// Compare existing result files. Exits 1 on a regression.
+    /// Compare existing result files. Exits 1 when the gate fails.
     Compare {
         /// Result files for the base side. Repeatable.
         #[arg(long, required = true)]
@@ -170,7 +171,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             let markdown = comparison.to_markdown();
             std::fs::write(out_dir.join("summary.md"), &markdown)?;
             println!("{markdown}");
-            Ok(verdict(comparison.has_regressions(), no_fail))
+            Ok(verdict(comparison.fails(), no_fail))
         }
         Command::Compare {
             base,
@@ -188,7 +189,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
                     .with_context(|| format!("writing {}", path.display()))?;
             }
             println!("{markdown}");
-            Ok(verdict(comparison.has_regressions(), no_fail))
+            Ok(verdict(comparison.fails(), no_fail))
         }
         Command::Export { input, out } => {
             let reports = read_reports(&input)?;
@@ -200,9 +201,9 @@ async fn run(cli: Cli) -> Result<ExitCode> {
     }
 }
 
-fn verdict(regressed: bool, no_fail: bool) -> ExitCode {
-    if regressed && !no_fail {
-        eprintln!("benchmark regression detected");
+fn verdict(failed: bool, no_fail: bool) -> ExitCode {
+    if failed && !no_fail {
+        eprintln!("benchmark gate failed");
         ExitCode::from(EXIT_REGRESSION)
     } else {
         ExitCode::SUCCESS

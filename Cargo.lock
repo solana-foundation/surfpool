@@ -11916,6 +11916,7 @@ dependencies = [
  "solana-system-interface 3.3.0",
  "solana-transaction 4.3.0",
  "solana-transaction-status-client-types",
+ "tempfile",
  "tokio",
 ]
 

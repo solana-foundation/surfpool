@@ -10,6 +10,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
+use tempfile::TempDir;
 use tokio::process::{Child, Command};
 
 /// How long to wait for `getHealth` to answer before giving up on a start.
@@ -24,10 +25,12 @@ pub struct ServerOptions {
     pub slot_time_ms: u64,
 }
 
-/// A running surfpool process bound to free localhost ports. Killed on drop.
+/// A running surfpool process bound to free localhost ports. Killed on drop,
+/// along with its scratch directory.
 pub struct SurfpoolServer {
     child: Child,
-    workdir: PathBuf,
+    // Held only so the directory outlives the process.
+    _workdir: TempDir,
     stderr_path: PathBuf,
     pub rpc_url: String,
 }
@@ -44,14 +47,14 @@ impl SurfpoolServer {
             .with_context(|| format!("resolving surfpool binary {}", bin.display()))?;
         let rpc_port = free_port()?;
         let ws_port = free_port()?;
-        let workdir = std::env::temp_dir().join(format!(
-            "surfpool-bench-{}-{}",
-            std::process::id(),
-            rpc_port
-        ));
-        std::fs::create_dir_all(&workdir)
-            .with_context(|| format!("creating {}", workdir.display()))?;
-        let stderr_path = workdir.join("surfpool.stderr");
+        // A private directory created exclusively, so nothing another user
+        // planted under a guessable name can be followed when the log is
+        // created.
+        let workdir = tempfile::Builder::new()
+            .prefix("surfpool-bench-")
+            .tempdir()
+            .context("creating surfpool scratch directory")?;
+        let stderr_path = workdir.path().join("surfpool.stderr");
         let stderr_file =
             std::fs::File::create(&stderr_path).context("creating surfpool stderr capture")?;
 
@@ -74,7 +77,7 @@ impl SurfpoolServer {
         if !opts.instruction_profiling {
             cmd.arg("--disable-instruction-profiling");
         }
-        cmd.current_dir(&workdir)
+        cmd.current_dir(workdir.path())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(stderr_file))
@@ -86,7 +89,7 @@ impl SurfpoolServer {
         let rpc_url = format!("http://127.0.0.1:{rpc_port}");
         let mut server = Self {
             child,
-            workdir,
+            _workdir: workdir,
             stderr_path,
             rpc_url,
         };
@@ -127,12 +130,11 @@ impl SurfpoolServer {
         )
     }
 
-    /// Kills the process, waits for it to exit, and removes its scratch
-    /// directory.
+    /// Kills the process and waits for it to exit. The scratch directory is
+    /// removed when the handle drops.
     pub async fn stop(mut self) -> Result<()> {
         let _ = self.child.start_kill();
         let _ = self.child.wait().await;
-        let _ = std::fs::remove_dir_all(&self.workdir);
         Ok(())
     }
 }
