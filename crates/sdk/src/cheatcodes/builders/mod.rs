@@ -34,7 +34,7 @@ mod stream_account;
 pub use deploy_program::DeployProgram;
 pub use reset_account::ResetAccount;
 pub use set_account::SetAccount;
-pub use set_epoch_stakes::{EpochStake, SetEpochStakes};
+pub use set_epoch_stakes::{EpochStake, SetEpochStakes, StakeDelegation};
 pub use set_token_account::SetTokenAccount;
 pub use stream_account::StreamAccount;
 

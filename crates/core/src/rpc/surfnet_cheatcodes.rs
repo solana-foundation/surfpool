@@ -13,13 +13,17 @@ use solana_epoch_info::EpochInfo;
 use solana_program_option::COption;
 use solana_pubkey::Pubkey;
 use solana_rpc_client_api::response::Response as RpcResponse;
+use solana_stake_interface::{
+    stake_flags::StakeFlags,
+    state::{Authorized, Delegation, Lockup, Meta, Stake, StakeStateV2},
+};
 use solana_system_interface::program as system_program;
 use solana_vote_interface::state::{VoteInit, VoteStateV3, VoteStateV4, VoteStateVersions};
 use spl_associated_token_account_interface::address::get_associated_token_address_with_program_id;
 use surfpool_types::{
-    AccountSnapshot, CheatcodeControlConfig, CheatcodeFilter, ClockCommand, EpochStakeEntry,
-    ExportSnapshotConfig, GetStreamedAccountsResponse, GetSurfnetInfoResponse, Idl,
-    OfflineAccountConfig, ResetAccountConfig, RpcProfileResultConfig, Scenario, SimnetCommand,
+    AccountSnapshot, CheatcodeControlConfig, CheatcodeFilter, ClockCommand, EpochStakeDelegation,
+    EpochStakeEntry, ExportSnapshotConfig, GetStreamedAccountsResponse, GetSurfnetInfoResponse,
+    Idl, OfflineAccountConfig, ResetAccountConfig, RpcProfileResultConfig, Scenario, SimnetCommand,
     StreamAccountConfig, StreamAccountsEntry, UiKeyedProfileResult,
     types::{
         AccountUpdate, ConfidentialBalanceKeys, DeriveConfidentialKeysResponse,
@@ -1386,6 +1390,13 @@ pub trait SurfnetCheatcodes {
     ///
     ///   The last three require `nodePubkey`.
     ///
+    ///   An entry may also list `delegations`: stake accounts to write as
+    ///   fully active and delegated to `voteAccount`. Each has `stakeAccount`,
+    ///   `stake` (lamports; the account also holds its rent-exempt reserve),
+    ///   and optional `staker` (default: the stake account) and `withdrawer`
+    ///   (default: the staker). With delegations, `stake` may be omitted and
+    ///   defaults to their sum; when given it must not be below that sum.
+    ///
     /// ## Returns
     /// An `RpcResponse<()>` indicating whether the epoch-stake snapshot was
     /// replaced successfully.
@@ -1403,7 +1414,10 @@ pub trait SurfnetCheatcodes {
     ///         "voteAccount": "7nYBm5mk15oDNewVjNFmEqJ9VgMvT4F74UVoeYDCpScd",
     ///         "stake": 29,
     ///         "nodePubkey": "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin",
-    ///         "commission": 5
+    ///         "commission": 5,
+    ///         "delegations": [
+    ///           { "stakeAccount": "5xot9PVkphiX2adznghwrAuxGs2zeWisNSxMW6hU6Hkj", "stake": 20 }
+    ///         ]
     ///       }
     ///     ]
     ///   ]
@@ -1430,8 +1444,10 @@ pub trait SurfnetCheatcodes {
     /// vote account may appear at most once, and entries with zero stake are
     /// dropped. The snapshot is independent of vote and stake account data,
     /// matching the epoch-frozen distribution read by the syscall on a cluster;
-    /// vote accounts are written only for entries that set `nodePubkey`.
-    /// `getVoteAccounts` reports the same vote accounts and stakes.
+    /// vote accounts are written only for entries that set `nodePubkey`, and
+    /// stake accounts only for listed `delegations`. The snapshot is not
+    /// recomputed from stake accounts afterwards. `getVoteAccounts` reports
+    /// the same vote accounts and stakes.
     #[rpc(meta, name = "surfnet_setEpochStakes")]
     fn set_epoch_stakes(
         &self,
@@ -1610,6 +1626,118 @@ fn cheatcode_response<T>(slot: Slot, value: T) -> RpcResponse<T> {
         context: RpcResponseContext::new(slot),
         value,
     }
+}
+
+/// An epoch-stake entry with its pubkeys parsed and its total resolved.
+struct ParsedEpochStake {
+    vote_pubkey: Pubkey,
+    stake: u64,
+    vote_init: Option<VoteInit>,
+    delegations: Vec<ParsedDelegation>,
+}
+
+/// A stake account to write, delegated to the entry's vote account.
+struct ParsedDelegation {
+    stake_account: Pubkey,
+    stake: u64,
+    authorized: Authorized,
+}
+
+/// Parses an entry, resolving its total stake: the given `stake` when present
+/// (rejected if below the delegations' sum), else the sum of its delegations.
+/// An entry with neither is rejected.
+fn parse_epoch_stake_entry(entry: &EpochStakeEntry) -> Result<ParsedEpochStake> {
+    let vote_pubkey = verify_pubkey(&entry.vote_account)?;
+    let vote_init = vote_init_from_entry(entry)?;
+    let delegations = entry
+        .delegations
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(parse_delegation)
+        .collect::<Result<Vec<_>>>()?;
+    let delegated = delegations
+        .iter()
+        .try_fold(0u64, |total, delegation| {
+            total.checked_add(delegation.stake)
+        })
+        .ok_or_else(|| {
+            Error::invalid_params(format!(
+                "delegations for {} overflow u64",
+                entry.vote_account
+            ))
+        })?;
+    let stake = match entry.stake {
+        Some(stake) if stake < delegated => {
+            return Err(Error::invalid_params(format!(
+                "stake for {} ({stake}) is below the sum of its delegations ({delegated})",
+                entry.vote_account
+            )));
+        }
+        Some(stake) => stake,
+        None if delegations.is_empty() => {
+            return Err(Error::invalid_params(format!(
+                "epoch stake entry for {} needs a stake or delegations",
+                entry.vote_account
+            )));
+        }
+        None => delegated,
+    };
+    Ok(ParsedEpochStake {
+        vote_pubkey,
+        stake,
+        vote_init,
+        delegations,
+    })
+}
+
+/// Parses a delegation; the staker defaults to the stake account and the
+/// withdrawer to the staker.
+fn parse_delegation(delegation: &EpochStakeDelegation) -> Result<ParsedDelegation> {
+    let stake_account = verify_pubkey(&delegation.stake_account)?;
+    let staker = match &delegation.staker {
+        Some(staker) => verify_pubkey(staker)?,
+        None => stake_account,
+    };
+    let withdrawer = match &delegation.withdrawer {
+        Some(withdrawer) => verify_pubkey(withdrawer)?,
+        None => staker,
+    };
+    Ok(ParsedDelegation {
+        stake_account,
+        stake: delegation.stake,
+        authorized: Authorized { staker, withdrawer },
+    })
+}
+
+/// Serializes a stake account delegated to `vote_pubkey` that the stake
+/// program treats as fully active in every epoch: it uses the bootstrap
+/// activation epoch (`u64::MAX`) so no warmup or stake history is needed.
+#[allow(deprecated)] // Meta::rent_exempt_reserve is part of the on-chain layout
+fn active_stake_account_data(
+    vote_pubkey: &Pubkey,
+    delegation: &ParsedDelegation,
+    rent_exempt_reserve: u64,
+) -> Result<Vec<u8>> {
+    let state = StakeStateV2::Stake(
+        Meta {
+            rent_exempt_reserve,
+            authorized: delegation.authorized,
+            lockup: Lockup::default(),
+        },
+        Stake {
+            delegation: Delegation::new(vote_pubkey, delegation.stake, u64::MAX),
+            credits_observed: 0,
+        },
+        StakeFlags::empty(),
+    );
+    let mut data = bincode::serialize(&state).map_err(|error| {
+        Error::from(SurfpoolError::internal(format!(
+            "failed to serialize stake state: {error}"
+        )))
+    })?;
+    data.resize(StakeStateV2::size_of(), 0);
+    Ok(data)
 }
 
 /// Returns the vote-account initialization an epoch-stake entry asks for, or
@@ -2598,67 +2726,103 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
         stakes: Vec<EpochStakeEntry>,
     ) -> Result<RpcResponse<()>> {
         let svm_locker = meta.get_svm_locker()?;
-        let mut parsed = Vec::with_capacity(stakes.len());
-        for entry in &stakes {
-            let vote_pubkey = verify_pubkey(&entry.vote_account)?;
-            let vote_init = vote_init_from_entry(entry)?;
-            parsed.push((vote_pubkey, entry.stake, vote_init));
-        }
+        let entries = stakes
+            .iter()
+            .map(parse_epoch_stake_entry)
+            .collect::<Result<Vec<_>>>()?;
         // LiteSVM keeps the last stake for a repeated vote account but sums every
         // entry into the total, so duplicates would make the snapshot inconsistent.
-        let mut seen = HashSet::with_capacity(parsed.len());
-        if let Some((duplicate, ..)) = parsed.iter().find(|(pubkey, ..)| !seen.insert(*pubkey)) {
-            return Err(Error::invalid_params(format!(
-                "duplicate vote account in epoch stakes: {duplicate}"
-            )));
+        // A stake account written twice, or at a vote account's address, would
+        // likewise leave one entry's account clobbered.
+        let mut seen = HashSet::new();
+        for entry in &entries {
+            if !seen.insert(entry.vote_pubkey) {
+                return Err(Error::invalid_params(format!(
+                    "duplicate vote account in epoch stakes: {}",
+                    entry.vote_pubkey
+                )));
+            }
         }
-        // Check the total before writing any vote account, so a rejected request
+        for delegation in entries.iter().flat_map(|entry| &entry.delegations) {
+            if !seen.insert(delegation.stake_account) {
+                return Err(Error::invalid_params(format!(
+                    "stake account {} is also another account in epoch stakes",
+                    delegation.stake_account
+                )));
+            }
+        }
+        // Check the total before writing any account, so a rejected request
         // leaves the surfnet untouched.
-        parsed
+        entries
             .iter()
-            .try_fold(0u64, |total, (_, stake, _)| total.checked_add(*stake))
+            .try_fold(0u64, |total, entry| total.checked_add(entry.stake))
             .ok_or_else(|| Error::invalid_params("total epoch stake overflows u64"))?;
 
-        let vote_accounts = parsed
+        let writes_accounts = entries
             .iter()
-            .filter_map(|(pubkey, _, init)| init.as_ref().map(|init| (*pubkey, init)))
-            .collect::<Vec<_>>();
-        if !vote_accounts.is_empty() {
-            let (clock, vote_state_v4, lamports) = svm_locker.with_svm_reader(|svm| {
-                (
-                    svm.inner.get_sysvar::<Clock>(),
-                    svm.feature_set
-                        .is_active(&agave_feature_set::vote_state_v4::id()),
-                    svm.inner
-                        .minimum_balance_for_rent_exemption(VoteStateV4::size_of()),
-                )
-            });
-            for (vote_pubkey, vote_init) in vote_accounts {
-                reject_managed_sysvar(&vote_pubkey)?;
-                let data =
-                    initialized_vote_account_data(&vote_pubkey, vote_init, &clock, vote_state_v4)?;
+            .any(|entry| entry.vote_init.is_some() || !entry.delegations.is_empty());
+        if writes_accounts {
+            let (clock, vote_state_v4, vote_lamports, stake_reserve) =
+                svm_locker.with_svm_reader(|svm| {
+                    (
+                        svm.inner.get_sysvar::<Clock>(),
+                        svm.feature_set
+                            .is_active(&agave_feature_set::vote_state_v4::id()),
+                        svm.inner
+                            .minimum_balance_for_rent_exemption(VoteStateV4::size_of()),
+                        svm.inner
+                            .minimum_balance_for_rent_exemption(StakeStateV2::size_of()),
+                    )
+                });
+            let mut write = |pubkey: Pubkey, account: Account| -> Result<()> {
+                reject_managed_sysvar(&pubkey)?;
                 svm_locker.apply_account_update(
-                    GetAccountResult::FoundAccount(
-                        vote_pubkey,
-                        solana_account::Account {
-                            lamports,
+                    GetAccountResult::FoundAccount(pubkey, account, AccountSource::Generated),
+                    AccountUpdatePolicy::Authoritative,
+                )?;
+                Ok(())
+            };
+            for entry in &entries {
+                if let Some(vote_init) = &entry.vote_init {
+                    let data = initialized_vote_account_data(
+                        &entry.vote_pubkey,
+                        vote_init,
+                        &clock,
+                        vote_state_v4,
+                    )?;
+                    write(
+                        entry.vote_pubkey,
+                        Account {
+                            lamports: vote_lamports,
                             data,
                             owner: solana_sdk_ids::vote::id(),
                             executable: false,
                             rent_epoch: 0,
                         },
-                        AccountSource::Generated,
-                    ),
-                    AccountUpdatePolicy::Authoritative,
-                )?;
+                    )?;
+                }
+                for delegation in &entry.delegations {
+                    let data =
+                        active_stake_account_data(&entry.vote_pubkey, delegation, stake_reserve)?;
+                    write(
+                        delegation.stake_account,
+                        Account {
+                            lamports: stake_reserve.saturating_add(delegation.stake),
+                            data,
+                            owner: solana_sdk_ids::stake::id(),
+                            executable: false,
+                            rent_epoch: 0,
+                        },
+                    )?;
+                }
             }
         }
 
         svm_locker
             .set_epoch_stakes(
-                parsed
+                entries
                     .into_iter()
-                    .map(|(pubkey, stake, _)| (pubkey, stake))
+                    .map(|entry| (entry.vote_pubkey, entry.stake))
                     .collect(),
             )
             .map_err(|error| Error::invalid_params(error.to_string()))?;
@@ -4213,21 +4377,12 @@ mod tests {
                 Some(client.context.clone()),
                 vec![
                     EpochStakeEntry {
-                        vote_account: vote_account.to_string(),
-                        stake: 40,
                         node_pubkey: Some(node_pubkey.to_string()),
-                        authorized_voter: None,
                         authorized_withdrawer: Some(withdrawer.to_string()),
                         commission: Some(7),
+                        ..EpochStakeEntry::new(vote_account.to_string(), 40)
                     },
-                    EpochStakeEntry {
-                        vote_account: stake_only.to_string(),
-                        stake: 5,
-                        node_pubkey: None,
-                        authorized_voter: None,
-                        authorized_withdrawer: None,
-                        commission: None,
-                    },
+                    EpochStakeEntry::new(stake_only.to_string(), 5),
                 ],
             )
             .unwrap();
@@ -4264,14 +4419,7 @@ mod tests {
     async fn test_set_epoch_stakes_rejects_invalid_vote_account_fields() {
         let client = TestSetup::new(SurfnetCheatcodesRpc::empty());
         let vote_account = Pubkey::new_unique();
-        let base = EpochStakeEntry {
-            vote_account: vote_account.to_string(),
-            stake: 10,
-            node_pubkey: None,
-            authorized_voter: None,
-            authorized_withdrawer: None,
-            commission: None,
-        };
+        let base = EpochStakeEntry::new(vote_account.to_string(), 10);
 
         let without_node = client
             .rpc
@@ -4300,6 +4448,145 @@ mod tests {
 
         client.context.svm_locker.with_svm_reader(|svm| {
             assert!(svm.inner.get_account(&vote_account).unwrap().is_none());
+            assert_eq!(svm.inner.svm.epoch_total_stake(), 0);
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_set_epoch_stakes_writes_delegated_stake_accounts() {
+        let client = TestSetup::new(SurfnetCheatcodesRpc::empty());
+        let vote_account = Pubkey::new_unique();
+        let first_stake = Pubkey::new_unique();
+        let second_stake = Pubkey::new_unique();
+        let staker = Pubkey::new_unique();
+
+        client
+            .rpc
+            .set_epoch_stakes(
+                Some(client.context.clone()),
+                vec![EpochStakeEntry {
+                    stake: None,
+                    delegations: Some(vec![
+                        EpochStakeDelegation {
+                            stake_account: first_stake.to_string(),
+                            stake: 30,
+                            staker: Some(staker.to_string()),
+                            withdrawer: None,
+                        },
+                        EpochStakeDelegation {
+                            stake_account: second_stake.to_string(),
+                            stake: 12,
+                            staker: None,
+                            withdrawer: None,
+                        },
+                    ]),
+                    ..EpochStakeEntry::new(vote_account.to_string(), 0)
+                }],
+            )
+            .unwrap();
+
+        let (first, second, reserve, total) = client.context.svm_locker.with_svm_reader(|svm| {
+            (
+                svm.inner.get_account(&first_stake).unwrap().unwrap(),
+                svm.inner.get_account(&second_stake).unwrap().unwrap(),
+                svm.inner
+                    .minimum_balance_for_rent_exemption(StakeStateV2::size_of()),
+                svm.inner.svm.epoch_stake(&vote_account),
+            )
+        });
+        // The entry gave no stake, so the total is the delegations' sum.
+        assert_eq!(total, 42);
+
+        assert_eq!(first.owner, solana_sdk_ids::stake::id());
+        assert_eq!(first.lamports, reserve + 30);
+        let StakeStateV2::Stake(meta, stake, _) =
+            bincode::deserialize::<StakeStateV2>(&first.data).unwrap()
+        else {
+            panic!("expected a delegated stake account");
+        };
+        assert_eq!(
+            meta.authorized,
+            Authorized {
+                staker,
+                withdrawer: staker
+            }
+        );
+        assert_eq!(stake.delegation.voter_pubkey, vote_account);
+        assert_eq!(stake.delegation.stake, 30);
+        assert!(stake.delegation.is_bootstrap());
+
+        let StakeStateV2::Stake(meta, stake, _) =
+            bincode::deserialize::<StakeStateV2>(&second.data).unwrap()
+        else {
+            panic!("expected a delegated stake account");
+        };
+        assert_eq!(
+            meta.authorized,
+            Authorized {
+                staker: second_stake,
+                withdrawer: second_stake
+            }
+        );
+        assert_eq!(stake.delegation.stake, 12);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_set_epoch_stakes_rejects_inconsistent_delegations() {
+        let client = TestSetup::new(SurfnetCheatcodesRpc::empty());
+        let vote_account = Pubkey::new_unique();
+        let stake_account = Pubkey::new_unique();
+        let delegation = EpochStakeDelegation {
+            stake_account: stake_account.to_string(),
+            stake: 50,
+            staker: None,
+            withdrawer: None,
+        };
+
+        let below_sum = client
+            .rpc
+            .set_epoch_stakes(
+                Some(client.context.clone()),
+                vec![EpochStakeEntry {
+                    delegations: Some(vec![delegation.clone()]),
+                    ..EpochStakeEntry::new(vote_account.to_string(), 10)
+                }],
+            )
+            .unwrap_err();
+        assert!(
+            below_sum
+                .message
+                .contains("below the sum of its delegations")
+        );
+
+        let no_stake = client
+            .rpc
+            .set_epoch_stakes(
+                Some(client.context.clone()),
+                vec![EpochStakeEntry {
+                    stake: None,
+                    ..EpochStakeEntry::new(vote_account.to_string(), 0)
+                }],
+            )
+            .unwrap_err();
+        assert!(no_stake.message.contains("needs a stake or delegations"));
+
+        let reused = client
+            .rpc
+            .set_epoch_stakes(
+                Some(client.context.clone()),
+                vec![
+                    EpochStakeEntry {
+                        delegations: Some(vec![delegation]),
+                        ..EpochStakeEntry::new(vote_account.to_string(), 50)
+                    },
+                    EpochStakeEntry::new(stake_account.to_string(), 1),
+                ],
+            )
+            .unwrap_err();
+        assert!(reused.message.contains("is also another account"));
+
+        client.context.svm_locker.with_svm_reader(|svm| {
+            assert!(svm.inner.get_account(&stake_account).unwrap().is_none());
             assert_eq!(svm.inner.svm.epoch_total_stake(), 0);
         });
     }

@@ -1,14 +1,63 @@
 use solana_pubkey::Pubkey;
-use surfpool_types::EpochStakeEntry;
+use surfpool_types::{EpochStakeDelegation, EpochStakeEntry};
 
 use crate::cheatcodes::builders::CheatcodeBuilder;
+
+/// A stake account that [`SetEpochStakes`] writes as fully active and
+/// delegated to its entry's vote account.
+#[derive(Debug, Clone)]
+pub struct StakeDelegation {
+    stake_account: Pubkey,
+    stake: u64,
+    staker: Option<Pubkey>,
+    withdrawer: Option<Pubkey>,
+}
+
+impl StakeDelegation {
+    /// Delegate `stake` lamports from a stake account written at `stake_account`.
+    ///
+    /// The account also receives its rent-exempt reserve.
+    pub fn new(stake_account: Pubkey, stake: u64) -> Self {
+        Self {
+            stake_account,
+            stake,
+            staker: None,
+            withdrawer: None,
+        }
+    }
+
+    /// Stake authority; defaults to the stake account's own address.
+    pub fn staker(mut self, staker: Pubkey) -> Self {
+        self.staker = Some(staker);
+        self
+    }
+
+    /// Withdraw authority; defaults to the staker.
+    pub fn withdrawer(mut self, withdrawer: Pubkey) -> Self {
+        self.withdrawer = Some(withdrawer);
+        self
+    }
+}
+
+impl From<StakeDelegation> for EpochStakeDelegation {
+    fn from(delegation: StakeDelegation) -> Self {
+        EpochStakeDelegation {
+            stake_account: delegation.stake_account.to_string(),
+            stake: delegation.stake,
+            staker: delegation.staker.map(|p| p.to_string()),
+            withdrawer: delegation.withdrawer.map(|p| p.to_string()),
+        }
+    }
+}
 
 /// One vote account's entry in a [`SetEpochStakes`] request.
 ///
 /// By itself an entry only sets the stake read by the `sol_get_epoch_stake`
 /// syscall. Calling [`EpochStake::node_pubkey`] additionally writes a
 /// rent-exempt, freshly initialized vote account at the address, which
-/// `getVoteAccounts` and on-chain programs can then read.
+/// `getVoteAccounts` and on-chain programs can then read, and
+/// [`EpochStake::delegation`] writes fully active stake accounts delegated
+/// to it.
 ///
 /// ```rust
 /// use surfpool_sdk::{Pubkey, Surfnet};
@@ -32,24 +81,50 @@ use crate::cheatcodes::builders::CheatcodeBuilder;
 #[derive(Debug, Clone)]
 pub struct EpochStake {
     vote_account: Pubkey,
-    stake: u64,
+    stake: Option<u64>,
     node_pubkey: Option<Pubkey>,
     authorized_voter: Option<Pubkey>,
     authorized_withdrawer: Option<Pubkey>,
     commission: Option<u8>,
+    delegations: Vec<StakeDelegation>,
 }
 
 impl EpochStake {
     /// Stake `stake` lamports on `vote_account` without writing an account.
+    ///
+    /// With delegations added, `stake` must not be below their sum.
     pub fn new(vote_account: Pubkey, stake: u64) -> Self {
         Self {
+            stake: Some(stake),
+            ..Self::delegated(vote_account)
+        }
+    }
+
+    /// An entry whose total stake is the sum of the delegations added to it.
+    ///
+    /// Executing it with no delegations is rejected by the surfnet.
+    pub fn delegated(vote_account: Pubkey) -> Self {
+        Self {
             vote_account,
-            stake,
+            stake: None,
             node_pubkey: None,
             authorized_voter: None,
             authorized_withdrawer: None,
             commission: None,
+            delegations: Vec::new(),
         }
+    }
+
+    /// Write a fully active stake account delegated to this vote account.
+    pub fn delegation(mut self, delegation: StakeDelegation) -> Self {
+        self.delegations.push(delegation);
+        self
+    }
+
+    /// Write several delegated stake accounts.
+    pub fn delegations(mut self, delegations: impl IntoIterator<Item = StakeDelegation>) -> Self {
+        self.delegations.extend(delegations);
+        self
     }
 
     /// Write a vote account at the address with this validator identity.
@@ -88,6 +163,11 @@ impl From<EpochStake> for EpochStakeEntry {
             authorized_voter: entry.authorized_voter.map(|p| p.to_string()),
             authorized_withdrawer: entry.authorized_withdrawer.map(|p| p.to_string()),
             commission: entry.commission,
+            delegations: if entry.delegations.is_empty() {
+                None
+            } else {
+                Some(entry.delegations.into_iter().map(Into::into).collect())
+            },
         }
     }
 }

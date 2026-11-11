@@ -817,7 +817,7 @@
         },
         {
           "method": "surfnet_setEpochStakes",
-          "description": "A cheat code to replace the epoch-frozen vote-account stake map read by the `sol_get_epoch_stake` syscall. The whole snapshot is replaced; pass an empty list to clear it. Each vote account may appear at most once, and zero-stake entries are dropped. By default no accounts are written; an entry that sets `nodePubkey` also writes a rent-exempt, freshly initialized vote account at `voteAccount`, replacing any account there. `getVoteAccounts` reports the same vote accounts and stakes.",
+          "description": "A cheat code to replace the epoch-frozen vote-account stake map read by the `sol_get_epoch_stake` syscall. The whole snapshot is replaced; pass an empty list to clear it. Each vote account may appear at most once, and zero-stake entries are dropped. By default no accounts are written; an entry that sets `nodePubkey` also writes a rent-exempt, freshly initialized vote account at `voteAccount`, replacing any account there, and each entry in `delegations` is written as a fully active stake account delegated to `voteAccount`. With delegations, `stake` may be omitted (it defaults to their sum) and must not be below that sum. The snapshot is not recomputed from stake accounts afterwards. `getVoteAccounts` reports the same vote accounts and stakes.",
           "params": [
             {
               "name": "stakes",
@@ -825,11 +825,12 @@
               "description": "A list of `EpochStakeEntry` objects.",
               "schema": {
                 "voteAccount": "string (base-58 encoded vote account pubkey)",
-                "stake": "u64 (stake in lamports)",
+                "stake": "Option<u64> (total stake in lamports; required unless delegations is non-empty)",
                 "nodePubkey": "Option<string> (validator identity; when set, writes the vote account)",
                 "authorizedVoter": "Option<string> (requires nodePubkey; defaults to it)",
                 "authorizedWithdrawer": "Option<string> (requires nodePubkey; defaults to it)",
-                "commission": "Option<u8> (requires nodePubkey; percent 0-100, default 0)"
+                "commission": "Option<u8> (requires nodePubkey; percent 0-100, default 0)",
+                "delegations": "Option<Vec<{ stakeAccount: string, stake: u64, staker?: string, withdrawer?: string }>> (stake accounts written as active delegations to voteAccount)"
               }
             }
           ],
@@ -845,7 +846,10 @@
                   "voteAccount": "7nYBm5mk15oDNewVjNFmEqJ9VgMvT4F74UVoeYDCpScd",
                   "stake": 29,
                   "nodePubkey": "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin",
-                  "commission": 5
+                  "commission": 5,
+                  "delegations": [
+                    { "stakeAccount": "5xot9PVkphiX2adznghwrAuxGs2zeWisNSxMW6hU6Hkj", "stake": 20 }
+                  ]
                 }
               ]
             ]

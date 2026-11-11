@@ -14,7 +14,7 @@ use surfpool_sdk::{
     BlockProductionMode, SimnetEvent, Surfnet as NativeSurfnet,
     cheatcodes::builders::{
         DeployProgram, EpochStake as EpochStakeBuilder, ResetAccount, SetEpochStakes,
-        SetTokenAccount, StreamAccount,
+        SetTokenAccount, StakeDelegation as StakeDelegationBuilder, StreamAccount,
     },
 };
 use surfpool_types::{ClockCommand, parse_feature_pubkey};
@@ -435,15 +435,34 @@ impl Surfnet {
     }
 
     /// Replace the epoch-stake map read by the `sol_get_epoch_stake` syscall,
-    /// writing a vote account for each entry that sets `nodePubkey`.
+    /// writing a vote account for each entry that sets `nodePubkey` and a
+    /// delegated stake account for each listed delegation.
     #[napi]
     pub fn set_epoch_stakes(&self, stakes: Vec<EpochStake>) -> Result<()> {
         let mut builder = SetEpochStakes::new();
         for entry in stakes {
-            let mut stake = EpochStakeBuilder::new(
-                parse_pubkey(&entry.vote_account, "voteAccount")?,
-                lamports_to_u64(&entry.stake, "stake")?,
-            );
+            let vote_account = parse_pubkey(&entry.vote_account, "voteAccount")?;
+            let mut stake = match &entry.stake {
+                Some(total) => {
+                    EpochStakeBuilder::new(vote_account, lamports_to_u64(total, "stake")?)
+                }
+                None => EpochStakeBuilder::delegated(vote_account),
+            };
+            for delegation in entry.delegations.unwrap_or_default() {
+                let mut parsed = StakeDelegationBuilder::new(
+                    parse_pubkey(&delegation.stake_account, "stakeAccount")?,
+                    lamports_to_u64(&delegation.stake, "stake")?,
+                );
+                if let Some(staker) = parse_optional_pubkey(delegation.staker, "staker")? {
+                    parsed = parsed.staker(staker);
+                }
+                if let Some(withdrawer) =
+                    parse_optional_pubkey(delegation.withdrawer, "withdrawer")?
+                {
+                    parsed = parsed.withdrawer(withdrawer);
+                }
+                stake = stake.delegation(parsed);
+            }
             if let Some(node_pubkey) = parse_optional_pubkey(entry.node_pubkey, "nodePubkey")? {
                 stake = stake.node_pubkey(node_pubkey);
             }
@@ -601,9 +620,11 @@ pub struct KeypairInfo {
 pub struct EpochStake {
     /// Base-58 vote account address.
     pub vote_account: String,
-    /// Stake delegated to the vote account, in lamports. Pass a `bigint` for
-    /// amounts above `Number.MAX_SAFE_INTEGER`.
-    pub stake: Either<f64, BigInt>,
+    /// Total stake on the vote account, in lamports. Pass a `bigint` for
+    /// amounts above `Number.MAX_SAFE_INTEGER`. Required unless `delegations`
+    /// is non-empty, in which case it defaults to their sum and must not be
+    /// below it.
+    pub stake: Option<Either<f64, BigInt>>,
     /// Validator identity. When set, a rent-exempt, freshly initialized vote
     /// account is written at `voteAccount`, replacing any account there.
     pub node_pubkey: Option<String>,
@@ -613,6 +634,20 @@ pub struct EpochStake {
     pub authorized_withdrawer: Option<String>,
     /// Inflation-reward commission, 0 to 100 percent; defaults to 0. Requires `nodePubkey`.
     pub commission: Option<u8>,
+    /// Stake accounts to write as fully active and delegated to `voteAccount`.
+    pub delegations: Option<Vec<StakeDelegation>>,
+}
+
+#[napi(object)]
+pub struct StakeDelegation {
+    /// Base-58 address of the stake account to write.
+    pub stake_account: String,
+    /// Delegated lamports; the account also holds its rent-exempt reserve.
+    pub stake: Either<f64, BigInt>,
+    /// Stake authority; defaults to `stakeAccount`.
+    pub staker: Option<String>,
+    /// Withdraw authority; defaults to `staker`.
+    pub withdrawer: Option<String>,
 }
 
 #[napi(object)]

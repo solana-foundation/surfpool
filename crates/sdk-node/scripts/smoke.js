@@ -100,7 +100,7 @@ test("token helpers cover ATA derivation, funding, and advanced token-account up
   assert.equal(info.closeAuthority, closeAuthority);
 });
 
-test("setEpochStakes writes vote accounts, accepts bigint stakes, and rejects bad entries", async () => {
+test("setEpochStakes writes vote and stake accounts, accepts bigint stakes, and rejects bad entries", async () => {
   const surfnet = Surfnet.start();
   const voteAccount = Surfnet.newKeypair().publicKey;
 
@@ -119,6 +119,23 @@ test("setEpochStakes writes vote accounts, accepts bigint stakes, and rejects ba
   assert.throws(
     () => surfnet.setEpochStakes([{ voteAccount, stake: 1, commission: 5 }]),
     /without nodePubkey/,
+  );
+
+  // Delegations write active stake accounts; the total defaults to their sum.
+  const stakeAccount = Surfnet.newKeypair().publicKey;
+  surfnet.setEpochStakes([
+    { voteAccount, delegations: [{ stakeAccount, stake: 2_000_000_000 }] },
+  ]);
+  const stakeInfo = await getParsedAccountInfo(surfnet.rpcUrl, stakeAccount);
+  assert.equal(stakeInfo.owner, "Stake11111111111111111111111111111111111111");
+  assert.equal(stakeInfo.data.parsed.info.stake.delegation.voter, voteAccount);
+  assert.equal(stakeInfo.data.parsed.info.stake.delegation.stake, "2000000000");
+  assert.throws(
+    () =>
+      surfnet.setEpochStakes([
+        { voteAccount, stake: 1, delegations: [{ stakeAccount, stake: 2 }] },
+      ]),
+    /below the sum of its delegations/,
   );
 
   // Large validators can hold more than 2^53 lamports, which a number cannot represent.

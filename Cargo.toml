@@ -152,6 +152,7 @@ solana-signature = { version = "~3.5.2", default-features = false, features = [
 solana-signer = { version = "3.0.1", default-features = false }
 solana-slot-hashes = { version = "~3.2.0", default-features = false }
 solana-system-interface = { version = "3.3.0", default-features = false }
+solana-stake-interface = { version = "4.4.0", default-features = false, features = ["bincode"] }
 solana-sysvar = { version = "~4.2.0", default-features = false, features = ["bincode", "wincode"] }
 solana-sysvar-id = { version = "3.1", default-features = false }
 solana-transaction = { version = "4.2.0", default-features = false, features = ["serde", "wincode"] }

@@ -15,7 +15,7 @@ use super::{
     Cheatcodes,
     builders::{
         DeployProgram, EpochStake, ResetAccount, SetAccount, SetEpochStakes, SetTokenAccount,
-        StreamAccount,
+        StakeDelegation, StreamAccount,
     },
     resolve_target_dir, spl_token_program_id,
 };
@@ -158,6 +158,34 @@ async fn set_epoch_stakes_builder_writes_vote_accounts() {
     assert_eq!(info.node_pubkey, identity.to_string());
     assert_eq!(info.activated_stake, 1_000_000_000);
     assert_eq!(info.commission, 5);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn set_epoch_stakes_builder_writes_delegations() {
+    let _guard = test_lock();
+    let surfnet = Surfnet::start().await.unwrap();
+    let cheats = surfnet.cheatcodes();
+    let client = rpc_client(&cheats);
+    let vote_account = Pubkey::new_unique();
+    let first_stake = Pubkey::new_unique();
+    let second_stake = Pubkey::new_unique();
+
+    cheats
+        .execute(
+            SetEpochStakes::new().entry(
+                EpochStake::delegated(vote_account)
+                    .delegation(StakeDelegation::new(first_stake, 3_000_000_000))
+                    .delegation(StakeDelegation::new(second_stake, 1_000_000_000)),
+            ),
+        )
+        .unwrap();
+
+    let account = client.get_account(&first_stake).unwrap();
+    assert_eq!(account.owner, solana_sdk_ids::stake::ID);
+    assert!(account.lamports > 3_000_000_000);
+
+    let vote_accounts = client.get_vote_accounts().unwrap();
+    assert_eq!(vote_accounts.current[0].activated_stake, 4_000_000_000);
 }
 
 #[tokio::test(flavor = "multi_thread")]

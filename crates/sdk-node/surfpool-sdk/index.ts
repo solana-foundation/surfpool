@@ -8,6 +8,7 @@ import {
   SetTokenAccountUpdate,
   SimnetEventValue,
   SolAccountFunding,
+  StakeDelegation,
   StreamAccountOptions,
   Surfnet as SurfnetInner,
   SurfnetConfig as SurfnetConfigInner,
@@ -22,6 +23,7 @@ export {
   SetTokenAccountUpdate,
   SimnetEventValue,
   SolAccountFunding,
+  StakeDelegation,
   StreamAccountOptions,
 } from "./internal";
 

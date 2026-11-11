@@ -1184,21 +1184,51 @@ pub struct AccountUpdate {
     pub rent_epoch: Option<Epoch>,
 }
 
+/// A stake account that `surfnet_setEpochStakes` writes as fully active and
+/// delegated to its entry's vote account.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts-bindings", ts(export))]
+pub struct EpochStakeDelegation {
+    /// Address of the stake account to write.
+    pub stake_account: String,
+    /// Delegated lamports; the account also holds its rent-exempt reserve.
+    #[cfg_attr(feature = "ts-bindings", ts(type = "number | bigint"))]
+    pub stake: u64,
+    /// Stake authority; defaults to `stake_account`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-bindings", ts(optional))]
+    pub staker: Option<String>,
+    /// Withdraw authority; defaults to `staker`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-bindings", ts(optional))]
+    pub withdrawer: Option<String>,
+}
+
 /// A vote account's stake in the epoch snapshot used by `sol_get_epoch_stake`,
-/// optionally with the fields needed to write the vote account itself.
+/// optionally with the fields needed to write the vote account itself and the
+/// stake accounts delegated to it.
 ///
 /// When `node_pubkey` is set, `surfnet_setEpochStakes` writes a rent-exempt,
 /// freshly initialized vote account at `vote_account` owned by the vote
-/// program, replacing any account already there. The other optional fields
-/// require `node_pubkey` and default to it (authorities) or zero (commission).
+/// program, replacing any account already there. The other vote-account
+/// fields require `node_pubkey` and default to it (authorities) or zero
+/// (commission).
+///
+/// Each entry in `delegations` is written as a fully active stake account
+/// delegated to `vote_account`. `stake` then defaults to the sum of the
+/// delegations and, when given, must not be below it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts-bindings", ts(export))]
 pub struct EpochStakeEntry {
     pub vote_account: String,
-    #[cfg_attr(feature = "ts-bindings", ts(type = "number | bigint"))]
-    pub stake: u64,
+    /// Total stake in lamports. Required unless `delegations` is non-empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-bindings", ts(optional, type = "number | bigint"))]
+    pub stake: Option<u64>,
     /// Validator identity recorded on the vote account.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-bindings", ts(optional))]
@@ -1215,6 +1245,10 @@ pub struct EpochStakeEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts-bindings", ts(optional))]
     pub commission: Option<u8>,
+    /// Stake accounts to write, delegated to `vote_account`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts-bindings", ts(optional))]
+    pub delegations: Option<Vec<EpochStakeDelegation>>,
 }
 
 impl EpochStakeEntry {
@@ -1222,11 +1256,12 @@ impl EpochStakeEntry {
     pub fn new(vote_account: String, stake: u64) -> Self {
         Self {
             vote_account,
-            stake,
+            stake: Some(stake),
             node_pubkey: None,
             authorized_voter: None,
             authorized_withdrawer: None,
             commission: None,
+            delegations: None,
         }
     }
 }
