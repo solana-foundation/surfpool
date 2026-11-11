@@ -12189,6 +12189,7 @@ dependencies = [
  "solana-transaction-status",
  "solana-transaction-status-client-types",
  "solana-version",
+ "solana-vote-interface 6.1.0",
  "solana-zk-sdk 7.0.1",
  "solana-zk-sdk-pod",
  "spl-associated-token-account-interface",

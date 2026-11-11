@@ -331,7 +331,8 @@ impl<'a> Cheatcodes<'a> {
     ///
     /// Account creation and stake-account data are intentionally separate from
     /// this runtime snapshot, matching how the syscall reads an epoch-frozen
-    /// stake distribution on a real cluster.
+    /// stake distribution on a real cluster. `getVoteAccounts` reports the same
+    /// vote accounts and stakes.
     pub fn set_epoch_stakes(&self, stakes: &[(Pubkey, u64)]) -> SurfnetResult<()> {
         let stakes: Vec<EpochStakeEntry> = stakes
             .iter()

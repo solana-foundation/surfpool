@@ -1415,6 +1415,7 @@ pub trait SurfnetCheatcodes {
     /// vote account may appear at most once, and entries with zero stake are
     /// dropped. The snapshot is independent of vote and stake account data,
     /// matching the epoch-frozen distribution read by the syscall on a cluster.
+    /// `getVoteAccounts` reports the same vote accounts and stakes.
     #[rpc(meta, name = "surfnet_setEpochStakes")]
     fn set_epoch_stakes(
         &self,

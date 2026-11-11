@@ -5,11 +5,17 @@ use solana_client::{
         RpcContextConfig, RpcGetVoteAccountsConfig, RpcLeaderScheduleConfig,
         RpcLeaderScheduleConfigWrapper,
     },
-    rpc_response::{RpcIdentity, RpcLeaderSchedule, RpcSnapshotSlotInfo, RpcVoteAccountStatus},
+    rpc_request::MAX_RPC_VOTE_ACCOUNT_INFO_EPOCH_CREDITS_HISTORY,
+    rpc_response::{
+        RpcIdentity, RpcLeaderSchedule, RpcSnapshotSlotInfo, RpcVoteAccountInfo,
+        RpcVoteAccountStatus,
+    },
 };
 use solana_clock::Slot;
 use solana_epoch_info::EpochInfo;
+use solana_pubkey::Pubkey;
 use solana_rpc_client_api::response::Response as RpcResponse;
+use solana_vote_interface::state::VoteStateV4;
 
 use super::{RunloopContext, SurfnetRpcContext};
 use crate::{
@@ -511,9 +517,14 @@ pub trait Minimal {
     /// ```
     ///
     /// # Notes
-    /// - The `current` field contains details about vote accounts that are active and have current stake.
-    /// - The `delinquent` field contains details about vote accounts that have become delinquent due to inactivity or other issues.
-    /// - The `epochCredits` field contains historical voting data.
+    /// - The vote accounts are the ones set with `surfnet_setEpochStakes`, so this method agrees
+    ///   with the `sol_get_epoch_stake` syscall. With no stakes set, both lists are empty.
+    /// - A surfnet has no voting, so every staked vote account is reported in `current` and
+    ///   `delinquent` is always empty; `delinquentSlotDistance` has no effect.
+    /// - `nodePubkey`, `commission`, `epochCredits`, `lastVote`, and `rootSlot` are read from
+    ///   the vote account, fetched from the remote datasource when it is not local. When no
+    ///   vote account exists at the address, `nodePubkey` is the default pubkey and the
+    ///   other fields are zero or empty.
     ///
     /// # See Also
     /// - `getHealth`, `getIdentity`, `getVersion`
@@ -522,7 +533,7 @@ pub trait Minimal {
         &self,
         meta: Self::Metadata,
         config: Option<RpcGetVoteAccountsConfig>,
-    ) -> Result<RpcVoteAccountStatus>;
+    ) -> BoxFuture<Result<RpcVoteAccountStatus>>;
 
     /// Returns the leader schedule for the given configuration or slot.
     ///
@@ -724,21 +735,72 @@ impl Minimal for SurfpoolMinimalRpc {
 
     fn get_vote_accounts(
         &self,
-        _meta: Self::Metadata,
+        meta: Self::Metadata,
         config: Option<RpcGetVoteAccountsConfig>,
-    ) -> Result<RpcVoteAccountStatus> {
-        // validate inputs if provided
-        if let Some(config) = config {
-            // validate vote_pubkey if provided
-            if let Some(vote_pubkey_str) = config.vote_pubkey {
-                verify_pubkey(&vote_pubkey_str)?;
-            }
-        }
+    ) -> BoxFuture<Result<RpcVoteAccountStatus>> {
+        let config = config.unwrap_or_default();
+        let filter_by_vote_pubkey = match config.vote_pubkey.as_deref().map(verify_pubkey) {
+            Some(Ok(pubkey)) => Some(pubkey),
+            Some(Err(e)) => return e.into(),
+            None => None,
+        };
 
-        // Return empty vote accounts
-        Ok(RpcVoteAccountStatus {
-            current: vec![],
-            delinquent: vec![],
+        let SurfnetRpcContext {
+            svm_locker,
+            remote_ctx,
+        } = match meta.get_rpc_context(config.commitment.unwrap_or_default()) {
+            Ok(res) => res,
+            Err(e) => return e.into(),
+        };
+
+        Box::pin(async move {
+            let mut stakes = svm_locker.get_epoch_stakes();
+            if let Some(filter_by_vote_pubkey) = filter_by_vote_pubkey {
+                stakes.retain(|(vote_pubkey, _)| *vote_pubkey == filter_by_vote_pubkey);
+            }
+            // Largest stake first, so repeated calls return the same order.
+            stakes.sort_by(|(a_pubkey, a_stake), (b_pubkey, b_stake)| {
+                b_stake.cmp(a_stake).then_with(|| a_pubkey.cmp(b_pubkey))
+            });
+
+            let vote_pubkeys = stakes.iter().map(|(pubkey, _)| *pubkey).collect::<Vec<_>>();
+            let SvmAccessContext {
+                inner: vote_accounts,
+                ..
+            } = svm_locker
+                .get_multiple_accounts(&remote_ctx, &vote_pubkeys, None)
+                .await?;
+            let commission_rate_in_basis_points = svm_locker.with_svm_reader(|svm| {
+                svm.feature_set
+                    .is_active(&agave_feature_set::commission_rate_in_basis_points::id())
+            });
+
+            let current = stakes
+                .into_iter()
+                .zip(vote_accounts)
+                .map(|((vote_pubkey, activated_stake), account)| {
+                    let vote_state = match account {
+                        GetAccountResult::FoundAccount(_, account, _)
+                        | GetAccountResult::FoundCoupledAccount((_, account), _, _)
+                            if account.owner == solana_sdk_ids::vote::id() =>
+                        {
+                            VoteStateV4::deserialize(&account.data, &vote_pubkey).ok()
+                        }
+                        _ => None,
+                    };
+                    vote_account_info(
+                        vote_pubkey,
+                        activated_stake,
+                        vote_state.as_ref(),
+                        commission_rate_in_basis_points,
+                    )
+                })
+                .collect();
+
+            Ok(RpcVoteAccountStatus {
+                current,
+                delinquent: vec![],
+            })
         })
     }
 
@@ -774,14 +836,63 @@ impl Minimal for SurfpoolMinimalRpc {
     }
 }
 
+/// Builds the `getVoteAccounts` entry for a staked vote account, mirroring Agave's field
+/// derivation. `vote_state` is `None` when no vote account exists at `vote_pubkey`; the
+/// entry then has the default node pubkey and zeroed vote fields.
+fn vote_account_info(
+    vote_pubkey: Pubkey,
+    activated_stake: u64,
+    vote_state: Option<&VoteStateV4>,
+    commission_rate_in_basis_points: bool,
+) -> RpcVoteAccountInfo {
+    let Some(vote_state) = vote_state else {
+        return RpcVoteAccountInfo {
+            vote_pubkey: vote_pubkey.to_string(),
+            node_pubkey: Pubkey::default().to_string(),
+            activated_stake,
+            commission: 0,
+            inflation_rewards_commission_bps: Some(0),
+            epoch_vote_account: true,
+            epoch_credits: vec![],
+            last_vote: 0,
+            root_slot: 0,
+        };
+    };
+
+    let bps = vote_state.inflation_rewards_commission_bps;
+    let commission = if commission_rate_in_basis_points {
+        bps.div_ceil(100).min(u8::MAX as u16) as u8
+    } else {
+        (bps / 100).min(u8::MAX as u16) as u8
+    };
+    let epoch_credits = &vote_state.epoch_credits;
+    let epoch_credits = epoch_credits[epoch_credits
+        .len()
+        .saturating_sub(MAX_RPC_VOTE_ACCOUNT_INFO_EPOCH_CREDITS_HISTORY)..]
+        .to_vec();
+
+    RpcVoteAccountInfo {
+        vote_pubkey: vote_pubkey.to_string(),
+        node_pubkey: vote_state.node_pubkey.to_string(),
+        activated_stake,
+        commission,
+        inflation_rewards_commission_bps: Some(bps),
+        epoch_vote_account: true,
+        epoch_credits,
+        last_vote: vote_state.votes.back().map_or(0, |vote| vote.slot()),
+        root_slot: vote_state.root_slot.unwrap_or(0),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use jsonrpc_core::ErrorCode;
+    use solana_account::Account;
     use solana_client::{rpc_config::RpcContextConfig, rpc_custom_error::RpcCustomError};
     use solana_commitment_config::CommitmentConfig;
     use solana_epoch_info::EpochInfo;
     use solana_genesis_config::GenesisConfig;
-    use solana_pubkey::Pubkey;
+    use solana_vote_interface::state::{LandedVote, Lockout, VoteStateVersions};
 
     use super::*;
     use crate::tests::helpers::TestSetup;
@@ -1183,34 +1294,117 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_get_vote_accounts_valid_config_returns_empty() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_vote_accounts_without_epoch_stakes_returns_empty() {
         let setup = TestSetup::new(SurfpoolMinimalRpc);
 
-        // test with valid configuration including all optional parameters
-        let config = RpcGetVoteAccountsConfig {
-            vote_pubkey: Some("11111111111111111111111111111112".to_string()),
-            commitment: Some(CommitmentConfig::processed()),
-            keep_unstaked_delinquents: Some(true),
-            delinquent_slot_distance: Some(100),
-        };
-
-        let result = setup
+        let vote_accounts = setup
             .rpc
-            .get_vote_accounts(Some(setup.context.clone()), Some(config));
+            .get_vote_accounts(Some(setup.context.clone()), None)
+            .await
+            .unwrap();
 
-        // should succeed with valid inputs
-        assert!(result.is_ok());
-
-        let vote_accounts = result.unwrap();
-
-        // should return empty current and delinquent arrays
-        assert_eq!(vote_accounts.current.len(), 0);
-        assert_eq!(vote_accounts.delinquent.len(), 0);
+        assert!(vote_accounts.current.is_empty());
+        assert!(vote_accounts.delinquent.is_empty());
     }
 
-    #[test]
-    fn test_get_vote_accounts_invalid_pubkey_returns_error() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_vote_accounts_reports_epoch_stakes() {
+        let setup = TestSetup::new(SurfpoolMinimalRpc);
+        let svm_locker = setup.context.svm_locker.clone();
+        let with_account = Pubkey::new_unique();
+        let without_account = Pubkey::new_unique();
+        let node_pubkey = Pubkey::new_unique();
+
+        let vote_state = VoteStateV4 {
+            node_pubkey,
+            inflation_rewards_commission_bps: 700,
+            votes: [100, 120]
+                .into_iter()
+                .map(|slot| LandedVote::from(Lockout::new(slot)))
+                .collect(),
+            root_slot: Some(90),
+            epoch_credits: (0..7).map(|epoch| (epoch, epoch * 10, epoch * 5)).collect(),
+            ..VoteStateV4::default()
+        };
+        let mut data = vec![0; VoteStateV4::size_of()];
+        VoteStateV4::serialize(&VoteStateVersions::new_v4(vote_state), &mut data).unwrap();
+        svm_locker
+            .with_svm_writer(|svm| {
+                svm.set_account(
+                    &with_account,
+                    Account {
+                        lamports: 1_000_000_000,
+                        data,
+                        owner: solana_sdk_ids::vote::id(),
+                        executable: false,
+                        rent_epoch: 0,
+                    },
+                )
+            })
+            .unwrap();
+        svm_locker
+            .set_epoch_stakes(vec![(without_account, 5), (with_account, 40)])
+            .unwrap();
+
+        let vote_accounts = setup
+            .rpc
+            .get_vote_accounts(Some(setup.context.clone()), None)
+            .await
+            .unwrap();
+
+        assert!(vote_accounts.delinquent.is_empty());
+        assert_eq!(
+            vote_accounts.current,
+            vec![
+                RpcVoteAccountInfo {
+                    vote_pubkey: with_account.to_string(),
+                    node_pubkey: node_pubkey.to_string(),
+                    activated_stake: 40,
+                    commission: 7,
+                    inflation_rewards_commission_bps: Some(700),
+                    epoch_vote_account: true,
+                    epoch_credits: (2..7).map(|epoch| (epoch, epoch * 10, epoch * 5)).collect(),
+                    last_vote: 120,
+                    root_slot: 90,
+                },
+                RpcVoteAccountInfo {
+                    vote_pubkey: without_account.to_string(),
+                    node_pubkey: Pubkey::default().to_string(),
+                    activated_stake: 5,
+                    commission: 0,
+                    inflation_rewards_commission_bps: Some(0),
+                    epoch_vote_account: true,
+                    epoch_credits: vec![],
+                    last_vote: 0,
+                    root_slot: 0,
+                },
+            ]
+        );
+
+        let filtered = setup
+            .rpc
+            .get_vote_accounts(
+                Some(setup.context.clone()),
+                Some(RpcGetVoteAccountsConfig {
+                    vote_pubkey: Some(without_account.to_string()),
+                    ..RpcGetVoteAccountsConfig::default()
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            filtered
+                .current
+                .iter()
+                .map(|info| info.vote_pubkey.clone())
+                .collect::<Vec<_>>(),
+            vec![without_account.to_string()]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_vote_accounts_invalid_pubkey_returns_error() {
         let setup = TestSetup::new(SurfpoolMinimalRpc);
 
         // test with invalid vote pubkey that's not valid base58
@@ -1223,7 +1417,8 @@ mod tests {
 
         let result = setup
             .rpc
-            .get_vote_accounts(Some(setup.context.clone()), Some(config));
+            .get_vote_accounts(Some(setup.context.clone()), Some(config))
+            .await;
 
         // should fail due to invalid vote pubkey
         assert!(result.is_err());

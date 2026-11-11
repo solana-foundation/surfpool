@@ -817,7 +817,7 @@
         },
         {
           "method": "surfnet_setEpochStakes",
-          "description": "A cheat code to replace the epoch-frozen vote-account stake map read by the `sol_get_epoch_stake` syscall. The whole snapshot is replaced; pass an empty list to clear it. Each vote account may appear at most once, and zero-stake entries are dropped. The snapshot is independent of vote and stake account data.",
+          "description": "A cheat code to replace the epoch-frozen vote-account stake map read by the `sol_get_epoch_stake` syscall. The whole snapshot is replaced; pass an empty list to clear it. Each vote account may appear at most once, and zero-stake entries are dropped. The snapshot is independent of vote and stake account data. `getVoteAccounts` reports the same vote accounts and stakes.",
           "params": [
             {
               "name": "stakes",
@@ -1127,7 +1127,7 @@
         },
         {
           "method": "getVoteAccounts",
-          "description": "Returns the current vote accounts.",
+          "description": "Returns the vote accounts set with `surfnet_setEpochStakes`, all reported as current (a surfnet has no voting, so none are delinquent). Node pubkey, commission, credits, last vote and root slot come from the vote account when it exists locally or on the remote datasource; otherwise the node pubkey is the default pubkey and the other fields are zero. Empty when no stakes are set.",
           "params": [
             {
               "name": "config",

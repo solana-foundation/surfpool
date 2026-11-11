@@ -104,12 +104,27 @@ async fn set_epoch_stakes_executes_against_surfnet() {
     let _guard = test_lock();
     let surfnet = Surfnet::start().await.unwrap();
     let cheats = surfnet.cheatcodes();
+    let client = rpc_client(&cheats);
     let first = Pubkey::new_unique();
     let second = Pubkey::new_unique();
 
     cheats
         .set_epoch_stakes(&[(first, 11), (second, 29)])
         .unwrap();
+
+    let vote_accounts = client.get_vote_accounts().unwrap();
+    assert_eq!(
+        vote_accounts
+            .current
+            .iter()
+            .map(|info| (info.vote_pubkey.clone(), info.activated_stake))
+            .collect::<Vec<_>>(),
+        vec![(second.to_string(), 29), (first.to_string(), 11)]
+    );
+    assert!(vote_accounts.delinquent.is_empty());
+
+    cheats.set_epoch_stakes(&[]).unwrap();
+    assert!(client.get_vote_accounts().unwrap().current.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
