@@ -37,7 +37,7 @@ use solana_client::{
         RpcLogsResponse, RpcPerfSample, RpcResponseContext,
     },
 };
-use solana_clock::{Clock, Slot};
+use solana_clock::{Clock, Epoch, Slot};
 use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
 use solana_epoch_info::EpochInfo;
 use solana_epoch_schedule::EpochSchedule;
@@ -58,6 +58,9 @@ use solana_sdk_ids::{bpf_loader, system_program};
 use solana_signature::Signature;
 use solana_slot_hashes::{MAX_ENTRIES as MAX_SLOT_HASHES_ENTRIES, SlotHashes};
 use solana_system_interface::instruction as system_instruction;
+use solana_vote_interface::state::{
+    BlockTimestamp, LandedVote, Lockout, MAX_EPOCH_CREDITS_HISTORY, VoteStateV4, VoteStateVersions,
+};
 use solana_sysvar::slot_history::SlotHistory;
 use solana_transaction::versioned::VersionedTransaction;
 use solana_transaction_error::TransactionError;
@@ -767,6 +770,85 @@ fn compose_feature_set(config: &SvmFeatureConfig) -> FeatureSet {
         feature_set.deactivate(pubkey);
     }
     feature_set
+}
+
+/// Lamports the whole validator set earns over `epoch`: the inflation
+/// validator rate at that point of the year, applied to `capitalization` for
+/// the epoch's share of a year. Mirrors the per-epoch budget an Alpenglow bank
+/// pays per-slot rewards from.
+fn alpenglow_epoch_validator_reward(
+    inflation: &Inflation,
+    capitalization: u64,
+    epoch_schedule: &EpochSchedule,
+    epoch: Epoch,
+    slot_secs: f64,
+) -> u64 {
+    const SECONDS_PER_YEAR: f64 = 365.25 * 24.0 * 60.0 * 60.0;
+    let year = epoch_schedule.get_first_slot_in_epoch(epoch) as f64 * slot_secs / SECONDS_PER_YEAR;
+    let epoch_years = epoch_schedule.get_slots_in_epoch(epoch) as f64 * slot_secs / SECONDS_PER_YEAR;
+    (inflation.validator(year) * capitalization as f64 * epoch_years) as u64
+}
+
+/// A validator's reward for one slot: its stake's share of the epoch budget
+/// spread over the epoch's slots, halved because Alpenglow pays the other half
+/// to the block's leader. The surfnet's leader has no vote account, so that
+/// half goes unpaid.
+fn alpenglow_slot_reward(
+    epoch_reward: u64,
+    slots_in_epoch: u64,
+    stake: u64,
+    total_stake: u64,
+) -> u64 {
+    let denominator = slots_in_epoch as u128 * total_stake as u128;
+    if denominator == 0 {
+        return 0;
+    }
+    let reward = epoch_reward as u128 * stake as u128 / denominator;
+    (reward / 2) as u64
+}
+
+/// Records in a vote state that its validator signed the certificates for
+/// `voted.slot`, as an Alpenglow bank does: the tower collapses to a single
+/// vote on the latest slot seen, the root follows it, the timestamp advances
+/// if newer, and `credits` is added to the `epoch` entry of the credit history.
+fn apply_alpenglow_vote(
+    votes: &mut VecDeque<LandedVote>,
+    root_slot: &mut Option<Slot>,
+    epoch_credits: &mut Vec<(Epoch, u64, u64)>,
+    last_timestamp: &mut BlockTimestamp,
+    voted: &BlockTimestamp,
+    epoch: Epoch,
+    credits: u64,
+) {
+    let latest_slot = voted
+        .slot
+        .max(votes.back().map_or(0, |vote| vote.slot()))
+        .max(root_slot.unwrap_or(0));
+    *votes = VecDeque::from([LandedVote::from(Lockout::new(latest_slot))]);
+    *root_slot = Some(root_slot.map_or(voted.slot, |root| root.max(voted.slot)));
+    if voted.timestamp > last_timestamp.timestamp {
+        *last_timestamp = voted.clone();
+    }
+    if credits == 0 {
+        return;
+    }
+    match epoch_credits.last_mut() {
+        None => epoch_credits.push((epoch, credits, 0)),
+        Some((entry_epoch, final_credits, _)) if *entry_epoch == epoch => {
+            *final_credits = final_credits.saturating_add(credits);
+        }
+        // An epoch that earned nothing leaves no entry of its own.
+        Some((entry_epoch, final_credits, initial_credits)) if final_credits == initial_credits => {
+            *entry_epoch = epoch;
+            *final_credits = final_credits.saturating_add(credits);
+        }
+        Some(&mut (_, final_credits, _)) => {
+            epoch_credits.push((epoch, final_credits.saturating_add(credits), final_credits));
+            while epoch_credits.len() > MAX_EPOCH_CREDITS_HISTORY {
+                epoch_credits.remove(0);
+            }
+        }
+    }
 }
 
 fn synthetic_chain_tip_at_index(index: u64) -> BlockIdentifier {
@@ -2387,7 +2469,17 @@ impl SurfnetSvm {
         if self.get_account(pubkey)?.as_ref() == Some(&account) {
             return Ok(());
         }
+        self.set_account_in_block(pubkey, account, slot)
+    }
 
+    /// Writes an account that block `slot` changed outside of any transaction and
+    /// publishes the update to account, program and geyser subscribers.
+    fn set_account_in_block(
+        &mut self,
+        pubkey: &Pubkey,
+        account: Account,
+        slot: Slot,
+    ) -> SurfpoolResult<()> {
         self.set_account(pubkey, account.clone())?;
         self.account_update_slots.insert(*pubkey, slot);
 
@@ -2395,6 +2487,83 @@ impl SurfnetSvm {
         let _ = self.geyser_events_tx.send(GeyserEvent::UpdateAccount(
             GeyserAccountUpdate::block_update(*pubkey, account, slot, write_version),
         ));
+        Ok(())
+    }
+
+    /// Applies the footer of block `slot` to the staked vote accounts the way an
+    /// Alpenglow bank does. Every validator in the epoch stake table is taken to
+    /// have signed the certificates the block carries, so its vote account's
+    /// last vote and root move to the parent slot, its timestamp to the
+    /// parent's, and its epoch credits grow by its share of the slot's
+    /// inflation reward (in lamports, as under Alpenglow). Vote accounts that
+    /// are missing locally, owned by another program, or stored in a pre-V3
+    /// layout are left as they are.
+    fn record_alpenglow_votes(&mut self, slot: Slot, block_time: i64) -> SurfpoolResult<()> {
+        let Some(voted_slot) = slot.checked_sub(1) else {
+            return Ok(());
+        };
+        let stakes: Vec<(Pubkey, u64)> = self
+            .inner
+            .svm
+            .epoch_vote_stakes()
+            .map(|(vote_pubkey, stake)| (*vote_pubkey, *stake))
+            .collect();
+        if stakes.is_empty() {
+            return Ok(());
+        }
+        let total_stake = self.inner.svm.epoch_total_stake();
+        let epoch_schedule = self.inner.get_sysvar::<EpochSchedule>();
+        let epoch = epoch_schedule.get_epoch(slot);
+        let slots_in_epoch = epoch_schedule.get_slots_in_epoch(epoch);
+        let epoch_reward = alpenglow_epoch_validator_reward(
+            &self.inflation,
+            self.total_supply,
+            &epoch_schedule,
+            epoch,
+            self.slot_time as f64 / 1_000.0,
+        );
+        let voted_timestamp = BlockTimestamp {
+            slot: voted_slot,
+            timestamp: block_time.saturating_sub((self.slot_time / 1_000) as i64),
+        };
+
+        for (vote_pubkey, stake) in stakes {
+            let Some(mut account) = self.get_account(&vote_pubkey)? else {
+                continue;
+            };
+            if account.owner != solana_sdk_ids::vote::id() {
+                continue;
+            }
+            let Ok(mut versions) = bincode::deserialize::<VoteStateVersions>(&account.data) else {
+                continue;
+            };
+            let credits = alpenglow_slot_reward(epoch_reward, slots_in_epoch, stake, total_stake);
+            match &mut versions {
+                VoteStateVersions::V3(state) => apply_alpenglow_vote(
+                    &mut state.votes,
+                    &mut state.root_slot,
+                    &mut state.epoch_credits,
+                    &mut state.last_timestamp,
+                    &voted_timestamp,
+                    epoch,
+                    credits,
+                ),
+                VoteStateVersions::V4(state) => apply_alpenglow_vote(
+                    &mut state.votes,
+                    &mut state.root_slot,
+                    &mut state.epoch_credits,
+                    &mut state.last_timestamp,
+                    &voted_timestamp,
+                    epoch,
+                    credits,
+                ),
+                _ => continue,
+            }
+            if VoteStateV4::serialize(&versions, &mut account.data).is_err() {
+                continue;
+            }
+            self.set_account_in_block(&vote_pubkey, account, slot)?;
+        }
         Ok(())
     }
 
@@ -3223,6 +3392,15 @@ impl SurfnetSvm {
         let num_transactions = confirmed_signatures.len() as u64;
         let num_successful_transactions = num_transactions.saturating_sub(num_failed_transactions);
         let block_time = (self.updated_at + self.block_time_lag()) as i64 / 1_000;
+        // Alpenglow has no vote transactions: the bank rewrites the vote accounts named by a
+        // block's certificates while processing its footer. Under Tower BFT the surfnet runs no
+        // validators, so vote accounts keep whatever state they were written with.
+        if self
+            .feature_set
+            .is_active(&agave_feature_set::alpenglow::id())
+        {
+            self.record_alpenglow_votes(slot, block_time)?;
+        }
         self.updated_at += self.slot_time;
 
         // Only store blocks that have transactions (sparse block storage)
@@ -7903,7 +8081,10 @@ mod tests {
     /// Two travels with no block between skip as one.
     #[test]
     fn time_travel_skips_the_slots_it_jumps() {
-        let (mut svm, _events_rx, geyser_rx) = SurfnetSvm::default();
+        // The expected lifecycle roots each block 31 blocks later, as a tower does.
+        let (mut svm, _events_rx, geyser_rx) = TestType::no_db().initialize_svm_with_features(
+            SvmFeatureConfig::new().disable(agave_feature_set::alpenglow::id()),
+        );
         let finalized_blocks = svm.subscribe_for_block_updates(
             CommitmentLevel::Finalized,
             None,
@@ -9552,6 +9733,103 @@ mod tests {
             ),
             (42, 42)
         );
+    }
+
+    /// A rent-exempt vote account initialized at the SVM's current clock.
+    fn initialized_vote_account(svm: &SurfnetSvm, vote_pubkey: &Pubkey) -> Account {
+        use solana_vote_interface::state::{VoteInit, VoteStateVersions};
+
+        let state = solana_vote_interface::state::VoteStateV4::new_with_defaults(
+            vote_pubkey,
+            &VoteInit {
+                node_pubkey: Pubkey::new_unique(),
+                authorized_voter: *vote_pubkey,
+                authorized_withdrawer: *vote_pubkey,
+                commission: 0,
+            },
+            &svm.inner.get_sysvar::<Clock>(),
+        );
+        let mut data = vec![0; solana_vote_interface::state::VoteStateV4::size_of()];
+        solana_vote_interface::state::VoteStateV4::serialize(
+            &VoteStateVersions::new_v4(state),
+            &mut data,
+        )
+        .unwrap();
+        Account {
+            lamports: svm.inner.minimum_balance_for_rent_exemption(data.len()),
+            data,
+            owner: solana_sdk_ids::vote::id(),
+            executable: false,
+            rent_epoch: 0,
+        }
+    }
+
+    #[test_case(TestType::in_memory(); "with in-memory sqlite db")]
+    fn alpenglow_blocks_vote_from_staked_vote_accounts(test_type: TestType) {
+        let (mut svm, _events_rx, _geyser_rx) = test_type.initialize_svm();
+        assert!(
+            svm.feature_set
+                .is_active(&agave_feature_set::alpenglow::id())
+        );
+        svm.total_supply = 600_000_000 * 1_000_000_000;
+        let staked = Pubkey::new_unique();
+        let unstaked = Pubkey::new_unique();
+        let account = initialized_vote_account(&svm, &staked);
+        svm.set_account(&staked, account.clone()).unwrap();
+        svm.set_account(&unstaked, account.clone()).unwrap();
+        svm.inner
+            .svm
+            .set_epoch_stakes([(staked, 1_000 * 1_000_000_000)])
+            .unwrap();
+
+        for _ in 0..3 {
+            svm.confirm_current_block().unwrap();
+        }
+
+        // The last block closed at `latest - 1` and carried certificates for its parent.
+        let parent = svm.get_latest_absolute_slot() - 2;
+        let state = solana_vote_interface::state::VoteStateV4::deserialize(
+            &svm.get_account(&staked).unwrap().unwrap().data,
+            &staked,
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                state.votes.len(),
+                state.votes.back().map(|vote| vote.slot()),
+                state.root_slot,
+            ),
+            (1, Some(parent), Some(parent))
+        );
+        // Block times have second precision, so the timestamp only moves on blocks that
+        // close in a later second than the last one recorded.
+        assert!(
+            state.last_timestamp.timestamp > 0 && state.last_timestamp.slot <= parent,
+            "unexpected timestamp {:?}",
+            state.last_timestamp
+        );
+        let (epoch, credits, previous_credits) = *state.epoch_credits.last().unwrap();
+        assert_eq!(epoch, svm.inner.get_sysvar::<Clock>().epoch);
+        assert!(
+            credits > previous_credits,
+            "staked validator earned no credits"
+        );
+        assert_eq!(svm.get_account(&unstaked).unwrap(), Some(account));
+    }
+
+    #[test_case(TestType::in_memory(); "with in-memory sqlite db")]
+    fn tower_bft_leaves_staked_vote_accounts_static(test_type: TestType) {
+        let (mut svm, _events_rx, _geyser_rx) = test_type.initialize_svm_with_features(
+            SvmFeatureConfig::new().disable(agave_feature_set::alpenglow::id()),
+        );
+        let staked = Pubkey::new_unique();
+        let account = initialized_vote_account(&svm, &staked);
+        svm.set_account(&staked, account.clone()).unwrap();
+        svm.inner.svm.set_epoch_stakes([(staked, 42)]).unwrap();
+
+        svm.confirm_current_block().unwrap();
+
+        assert_eq!(svm.get_account(&staked).unwrap(), Some(account));
     }
 
     #[test_case(1, 3_600_000, 60_000; "1ms slots")]

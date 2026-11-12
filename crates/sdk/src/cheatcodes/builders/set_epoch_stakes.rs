@@ -59,6 +59,12 @@ impl From<StakeDelegation> for EpochStakeDelegation {
 /// [`EpochStake::delegation`] writes fully active stake accounts delegated
 /// to it.
 ///
+/// While the surfnet's `alpenglow` feature is active, staked vote accounts
+/// vote on every block: their last vote, root and timestamp follow the chain
+/// tip, and their epoch credits grow by their share of the inflation reward
+/// once a total supply is set. Without Alpenglow they keep the state they
+/// were written with.
+///
 /// Read the result back with the [`RpcClient`](crate::RpcClient) from
 /// [`Surfnet::rpc_client`](crate::Surfnet::rpc_client): `get_vote_accounts`
 /// lists the stakes and `get_program_accounts` on the stake program lists

@@ -5085,9 +5085,9 @@ checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
 
 [[package]]
 name = "litesvm"
-version = "0.18.1"
+version = "0.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8fe187ac113cebaa49af5dce82dfd1084177e5434d78815f409a6a22676b294"
+checksum = "22637a0a14832bbb20d7c397dfe2af3b5470a475b0645c0898a267ebfc706318"
 dependencies = [
  "agave-feature-set",
  "agave-precompiles",
@@ -5155,9 +5155,9 @@ dependencies = [
 
 [[package]]
 name = "litesvm-token"
-version = "0.18.1"
+version = "0.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c4b84fd985c9b2815f2696de7fda7c99260291f6e62b5c61873bd909281926b4"
+checksum = "b0369cd794d4a455c7ba933ea20e615a291e3434185d021db456fd07e0ba8383"
 dependencies = [
  "litesvm",
  "smallvec",

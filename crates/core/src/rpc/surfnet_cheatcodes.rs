@@ -1452,6 +1452,13 @@ pub trait SurfnetCheatcodes {
     /// stake accounts only for listed `delegations`. The snapshot is not
     /// recomputed from stake accounts afterwards. `getVoteAccounts` reports
     /// the same vote accounts and stakes.
+    ///
+    /// While the `alpenglow` feature is active, every block votes from the
+    /// staked vote accounts as an Alpenglow bank does: their last vote, root
+    /// and timestamp advance to the parent slot, and their epoch credits grow
+    /// by their stake's share of the slot's inflation reward in lamports (zero
+    /// until `surfnet_setSupply` sets a total supply). Without Alpenglow, vote
+    /// accounts keep the state they were written with.
     #[rpc(meta, name = "surfnet_setEpochStakes")]
     fn set_epoch_stakes(
         &self,
@@ -2796,7 +2803,7 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
                             .minimum_balance_for_rent_exemption(StakeStateV2::size_of()),
                     )
                 });
-            let mut write = |pubkey: Pubkey, account: Account| -> Result<()> {
+            let write = |pubkey: Pubkey, account: Account| -> Result<()> {
                 reject_managed_sysvar(&pubkey)?;
                 svm_locker.apply_account_update(
                     GetAccountResult::FoundAccount(pubkey, account, AccountSource::Generated),
