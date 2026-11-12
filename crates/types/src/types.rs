@@ -23,7 +23,9 @@ use solana_epoch_info::EpochInfo;
 use solana_message::inner_instruction::InnerInstructionsList;
 use solana_pubkey::Pubkey;
 use solana_signature::Signature;
-use solana_transaction::versioned::VersionedTransaction;
+use solana_transaction::versioned::{
+    VersionedTransaction, sanitized::SanitizedVersionedTransaction,
+};
 use solana_transaction_context::transaction::TransactionReturnData;
 use solana_transaction_error::TransactionError;
 use txtx_addon_kit::indexmap::IndexMap;
@@ -803,7 +805,7 @@ pub enum SimnetCommand {
     /// than race that window.
     ProcessTransaction(
         Option<(Hash, String)>,
-        VersionedTransaction,
+        SanitizedVersionedTransaction,
         Sender<TransactionStatusEvent>,
         bool,
         Option<bool>,
@@ -815,7 +817,7 @@ pub enum SimnetCommand {
     /// between the bundle snapshot and its commit.
     ProcessBundle(
         Option<(Hash, String)>,
-        Vec<VersionedTransaction>,
+        Vec<SanitizedVersionedTransaction>,
         Sender<Result<String, String>>,
     ),
     /// Runs a state-mutating RPC operation exclusively with transactions and
