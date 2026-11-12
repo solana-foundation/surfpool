@@ -82,6 +82,7 @@ solana-signature = { workspace = true, features = ["rand"] }
 solana-signer = { workspace = true }
 solana-slot-hashes = { workspace = true }
 solana-system-interface = { workspace = true }
+solana-stake-interface = { workspace = true }
 solana-sysvar = { workspace = true }
 solana-sysvar-id = { workspace = true }
 solana-transaction = { workspace = true }
@@ -90,6 +91,7 @@ solana-transaction-error = { workspace = true }
 solana-transaction-status = { workspace = true }
 solana-transaction-status-client-types = { workspace = true }
 solana-version = { workspace = true }
+solana-vote-interface = { workspace = true }
 solana-zk-sdk = { workspace = true }
 solana-zk-sdk-pod = { workspace = true }
 spl-associated-token-account-interface = { workspace = true }

@@ -100,6 +100,69 @@ test("token helpers cover ATA derivation, funding, and advanced token-account up
   assert.equal(info.closeAuthority, closeAuthority);
 });
 
+test("setEpochStakes writes vote and stake accounts, accepts bigint stakes, and rejects bad entries", async () => {
+  const surfnet = Surfnet.start();
+  const voteAccount = Surfnet.newKeypair().publicKey;
+
+  surfnet.setEpochStakes([
+    { voteAccount, stake: 1_000_000_000 },
+    { voteAccount: Surfnet.newKeypair().publicKey, stake: 2_000_000_000 },
+  ]);
+  surfnet.setEpochStakes([]);
+
+  // An entry with nodePubkey also writes the vote account itself.
+  const identity = Surfnet.newKeypair().publicKey;
+  surfnet.setEpochStakes([{ voteAccount, stake: 1_000_000_000, nodePubkey: identity, commission: 5 }]);
+  const voteAccountInfo = await getParsedAccountInfo(surfnet.rpcUrl, voteAccount);
+  assert.equal(voteAccountInfo.owner, "Vote111111111111111111111111111111111111111");
+  assert.equal(voteAccountInfo.data.parsed.info.nodePubkey, identity);
+  assert.throws(
+    () => surfnet.setEpochStakes([{ voteAccount, stake: 1, commission: 5 }]),
+    /without nodePubkey/,
+  );
+
+  // Delegations write active stake accounts; the total defaults to their sum.
+  const stakeAccount = Surfnet.newKeypair().publicKey;
+  surfnet.setEpochStakes([
+    { voteAccount, delegations: [{ stakeAccount, stake: 2_000_000_000 }] },
+  ]);
+  const stakeInfo = await getParsedAccountInfo(surfnet.rpcUrl, stakeAccount);
+  assert.equal(stakeInfo.owner, "Stake11111111111111111111111111111111111111");
+  assert.equal(stakeInfo.data.parsed.info.stake.delegation.voter, voteAccount);
+  assert.equal(stakeInfo.data.parsed.info.stake.delegation.stake, "2000000000");
+  assert.throws(
+    () =>
+      surfnet.setEpochStakes([
+        { voteAccount, stake: 1, delegations: [{ stakeAccount, stake: 2 }] },
+      ]),
+    /below the sum of its delegations/,
+  );
+
+  // Large validators can hold more than 2^53 lamports, which a number cannot represent.
+  surfnet.setEpochStakes([{ voteAccount, stake: 9_007_199_254_740_993n }]);
+  assert.throws(
+    () => surfnet.setEpochStakes([{ voteAccount, stake: 2 ** 53 }]),
+    /stake exceeds Number.MAX_SAFE_INTEGER/,
+  );
+  assert.throws(
+    () => surfnet.setEpochStakes([{ voteAccount, stake: -1n }]),
+    /stake must be a non-negative integer that fits in a u64/,
+  );
+  assert.throws(
+    () => surfnet.setEpochStakes([{ voteAccount, stake: 2n ** 64n }]),
+    /stake must be a non-negative integer that fits in a u64/,
+  );
+
+  assert.throws(
+    () =>
+      surfnet.setEpochStakes([
+        { voteAccount, stake: 1 },
+        { voteAccount, stake: 2 },
+      ]),
+    /duplicate vote account/,
+  );
+});
+
 test("streamAccount registers streamed accounts via RPC introspection", async () => {
   const surfnet = Surfnet.start();
   const address = Surfnet.newKeypair().publicKey;
@@ -137,6 +200,20 @@ test("deploy() accepts explicit bytes and deployProgram() discovers workspace ar
     assert.equal(deployedProgramId, explicitProgramId);
     const explicitAccount = await getAccountInfo(surfnet.rpcUrl, explicitProgramId);
     assert.equal(explicitAccount.executable, true);
+
+    const authorityProgramId = Surfnet.newKeypair().publicKey;
+    const authority = Surfnet.newKeypair().publicKey;
+    surfnet.deploy({
+      programId: authorityProgramId,
+      soBytes: Uint8Array.from([1, 2, 3, 4]),
+      authority,
+    });
+    const programAccount = await getParsedAccountInfo(surfnet.rpcUrl, authorityProgramId);
+    const programData = await getParsedAccountInfo(
+      surfnet.rpcUrl,
+      programAccount.data.parsed.info.programData,
+    );
+    assert.equal(programData.data.parsed.info.authority, authority);
 
     const workspace = path.join(tempDir, "workspace");
     const deployDir = path.join(workspace, "target", "deploy");

@@ -5045,10 +5045,12 @@ fn time_travel_to_a_slot_at_a_time() {
     use crate::rpc::full::{Full, SurfpoolFullRpc};
 
     let slot_time = 1_000;
-    let simnet = boot_simnet(
+    // The confirmation count below assumes a tower's depth: Alpenglow would finalize at once.
+    let simnet = boot_simnet_with_features(
         BlockProductionMode::Manual,
         Some(slot_time),
         TestType::no_db(),
+        SvmFeatureConfig::new().disable(agave_feature_set::alpenglow::id()),
     )
     .expect("the simnet should boot");
     let svm_locker = simnet.locker.clone();
@@ -10715,6 +10717,8 @@ fn test_nonce_accounts() {
         "Create nonce account failed: {:?}",
         create_result.err()
     );
+    // A nonce is set from the current blockhash and can only advance under a later one.
+    svm_locker.with_svm_writer(|svm| svm.confirm_current_block().unwrap());
 
     // Fetch and verify nonce account state
     let nonce_account_data = svm_locker

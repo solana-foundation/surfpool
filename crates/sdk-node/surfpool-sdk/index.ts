@@ -2,11 +2,13 @@ import {
   ClockValue,
   DeployOptions as DeployOptionsInner,
   EpochInfoValue,
+  EpochStake,
   KeypairInfo,
   ResetAccountOptions,
   SetTokenAccountUpdate,
   SimnetEventValue,
   SolAccountFunding,
+  StakeDelegation,
   StreamAccountOptions,
   Surfnet as SurfnetInner,
   SurfnetConfig as SurfnetConfigInner,
@@ -15,11 +17,13 @@ import {
 export {
   ClockValue,
   EpochInfoValue,
+  EpochStake,
   KeypairInfo,
   ResetAccountOptions,
   SetTokenAccountUpdate,
   SimnetEventValue,
   SolAccountFunding,
+  StakeDelegation,
   StreamAccountOptions,
 } from "./internal";
 
@@ -188,6 +192,14 @@ export class Surfnet {
   /** Move Surfnet time forward to an absolute Unix timestamp in milliseconds. */
   timeTravelToTimestamp(timestamp: number): EpochInfoValue {
     return this.inner.timeTravelToTimestamp(timestamp);
+  }
+
+  /**
+   * Replace the epoch-stake map read by the `sol_get_epoch_stake` syscall.
+   * Pass an empty array to clear it.
+   */
+  setEpochStakes(stakes: EpochStake[]): void {
+    this.inner.setEpochStakes(stakes);
   }
 
   /** Deploy a program by discovering local Anchor/Agave artifacts. */

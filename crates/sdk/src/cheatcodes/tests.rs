@@ -13,7 +13,10 @@ use tempfile::tempdir;
 
 use super::{
     Cheatcodes,
-    builders::{DeployProgram, ResetAccount, SetAccount, SetTokenAccount, StreamAccount},
+    builders::{
+        DeployProgram, EpochStake, ResetAccount, SetAccount, SetEpochStakes, SetTokenAccount,
+        StakeDelegation, StreamAccount,
+    },
     resolve_target_dir, spl_token_program_id,
 };
 use crate::{Surfnet, error::SurfnetResult};
@@ -97,6 +100,94 @@ async fn set_account_executes_against_surfnet() {
     assert_eq!(account.lamports, 424_242);
     assert_eq!(account.owner, owner);
     assert_eq!(account.data, data);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn set_epoch_stakes_executes_against_surfnet() {
+    let _guard = test_lock();
+    let surfnet = Surfnet::start().await.unwrap();
+    let cheats = surfnet.cheatcodes();
+    let client = rpc_client(&cheats);
+    let first = Pubkey::new_unique();
+    let second = Pubkey::new_unique();
+
+    cheats
+        .set_epoch_stakes(&[(first, 11), (second, 29)])
+        .unwrap();
+
+    let vote_accounts = client.get_vote_accounts().unwrap();
+    assert_eq!(
+        vote_accounts
+            .current
+            .iter()
+            .map(|info| (info.vote_pubkey.clone(), info.activated_stake))
+            .collect::<Vec<_>>(),
+        vec![(second.to_string(), 29), (first.to_string(), 11)]
+    );
+    assert!(vote_accounts.delinquent.is_empty());
+
+    cheats.set_epoch_stakes(&[]).unwrap();
+    assert!(client.get_vote_accounts().unwrap().current.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn set_epoch_stakes_builder_writes_vote_accounts() {
+    let _guard = test_lock();
+    let surfnet = Surfnet::start().await.unwrap();
+    let cheats = surfnet.cheatcodes();
+    let client = rpc_client(&cheats);
+    let vote_account = Pubkey::new_unique();
+    let identity = Pubkey::new_unique();
+
+    cheats
+        .execute(
+            SetEpochStakes::new().entry(
+                EpochStake::new(vote_account, 1_000_000_000)
+                    .node_pubkey(identity)
+                    .commission(5),
+            ),
+        )
+        .unwrap();
+
+    let account = client.get_account(&vote_account).unwrap();
+    assert_eq!(account.owner, solana_sdk_ids::vote::ID);
+
+    let vote_accounts = client.get_vote_accounts().unwrap();
+    let info = &vote_accounts.current[0];
+    assert_eq!(info.vote_pubkey, vote_account.to_string());
+    assert_eq!(info.node_pubkey, identity.to_string());
+    assert_eq!(info.activated_stake, 1_000_000_000);
+    assert_eq!(info.commission, 5);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn set_epoch_stakes_builder_writes_delegations() {
+    let _guard = test_lock();
+    let surfnet = Surfnet::start().await.unwrap();
+    let cheats = surfnet.cheatcodes();
+    let client = rpc_client(&cheats);
+    let vote_account = Pubkey::new_unique();
+    let first_stake = Pubkey::new_unique();
+    let second_stake = Pubkey::new_unique();
+
+    cheats
+        .execute(
+            SetEpochStakes::new().entry(
+                EpochStake::from_delegations(
+                    vote_account,
+                    [StakeDelegation::new(first_stake, 3_000_000_000)],
+                )
+                .delegation(StakeDelegation::new(second_stake, 1_000_000_000)),
+            ),
+        )
+        .unwrap();
+
+    let account = client.get_account(&first_stake).unwrap();
+    assert_eq!(account.owner, solana_sdk_ids::stake::ID);
+    assert!(account.lamports > 3_000_000_000);
+
+    let vote_accounts = client.get_vote_accounts().unwrap();
+    assert_eq!(vote_accounts.current[0].activated_stake, 4_000_000_000);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -336,6 +427,32 @@ async fn deploy_program_builder_executes_against_surfnet() {
 
     let account = client.get_account(&program_id).unwrap();
     assert!(account.executable);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn deploy_program_builder_sets_upgrade_authority() {
+    let _guard = test_lock();
+    let surfnet = Surfnet::start().await.unwrap();
+    let cheats = surfnet.cheatcodes();
+    let client = rpc_client(&cheats);
+    let program_id = Pubkey::new_unique();
+    let authority = Pubkey::new_unique();
+
+    cheats
+        .deploy(
+            DeployProgram::new(program_id)
+                .authority(authority)
+                .so_bytes(vec![1, 2, 3, 4]),
+        )
+        .unwrap();
+
+    let (program_data, _) = Pubkey::find_program_address(
+        &[program_id.as_ref()],
+        &solana_sdk_ids::bpf_loader_upgradeable::ID,
+    );
+    let account = client.get_account(&program_data).unwrap();
+    assert_eq!(account.data.get(12), Some(&1));
+    assert_eq!(&account.data[13..45], authority.as_ref());
 }
 
 #[tokio::test(flavor = "multi_thread")]

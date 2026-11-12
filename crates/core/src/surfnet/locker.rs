@@ -4175,6 +4175,24 @@ impl SurfnetSvmLocker {
         self.with_svm_writer(|svm_writer| svm_writer.airdrop_pubkeys(lamports, addresses))
     }
 
+    /// Replaces the epoch-frozen vote-account stake map used by `sol_get_epoch_stake`.
+    pub fn set_epoch_stakes(&self, stakes: Vec<(Pubkey, u64)>) -> SurfpoolResult<()> {
+        self.with_svm_writer(move |svm_writer| svm_writer.inner.svm.set_epoch_stakes(stakes))?;
+        Ok(())
+    }
+
+    /// Returns the vote-account stakes read by `sol_get_epoch_stake`, in no particular order.
+    pub fn get_epoch_stakes(&self) -> Vec<(Pubkey, u64)> {
+        self.with_svm_reader(|svm_reader| {
+            svm_reader
+                .inner
+                .svm
+                .epoch_vote_stakes()
+                .map(|(vote_account, stake)| (*vote_account, *stake))
+                .collect()
+        })
+    }
+
     /// Confirms the current block on the underlying SVM, returning `Ok(())` or an error.
     pub async fn confirm_current_block(
         &self,

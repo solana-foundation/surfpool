@@ -5598,7 +5598,11 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_get_blocks_leaves_out_slots_a_time_travel_skipped() {
-        let setup = TestSetup::new(SurfpoolFullRpc);
+        // Under Alpenglow the skipped slot would already be rooted, and `SlotSkipped`.
+        let setup = TestSetup::new_with_features(
+            SurfpoolFullRpc,
+            surfpool_types::SvmFeatureConfig::new().disable(agave_feature_set::alpenglow::id()),
+        );
         let last_block = setup.context.svm_locker.with_svm_writer(|svm_writer| {
             svm_writer.confirm_current_block().unwrap();
             let last_block = svm_writer.get_latest_absolute_slot() - 1;
@@ -6639,7 +6643,11 @@ mod tests {
             minimal::{Minimal, SurfpoolMinimalRpc},
         };
 
-        let setup = TestSetup::new(SurfpoolFullRpc);
+        // Under Alpenglow the last block is already final, so its hash is in the finalized bank.
+        let setup = TestSetup::new_with_features(
+            SurfpoolFullRpc,
+            surfpool_types::SvmFeatureConfig::new().disable(agave_feature_set::alpenglow::id()),
+        );
         let locker = &setup.context.svm_locker;
         for _ in 0..40 {
             locker.confirm_current_block(&None).await.unwrap();

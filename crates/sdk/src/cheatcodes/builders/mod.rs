@@ -27,12 +27,14 @@
 mod deploy_program;
 mod reset_account;
 mod set_account;
+mod set_epoch_stakes;
 mod set_token_account;
 mod stream_account;
 
 pub use deploy_program::DeployProgram;
 pub use reset_account::ResetAccount;
 pub use set_account::SetAccount;
+pub use set_epoch_stakes::{EpochStake, SetEpochStakes, StakeDelegation};
 pub use set_token_account::SetTokenAccount;
 pub use stream_account::StreamAccount;
 

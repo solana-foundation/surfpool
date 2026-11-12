@@ -3,13 +3,19 @@ extern crate napi_derive;
 
 use std::{convert::TryFrom, path::PathBuf, sync::Once};
 
-use napi::{Error, Result, Status};
+use napi::{
+    Error, Result, Status,
+    bindgen_prelude::{BigInt, Either},
+};
 use solana_keypair::Keypair;
 use solana_pubkey::Pubkey;
 use solana_signer::Signer;
 use surfpool_sdk::{
     BlockProductionMode, SimnetEvent, Surfnet as NativeSurfnet,
-    cheatcodes::builders::{DeployProgram, ResetAccount, SetTokenAccount, StreamAccount},
+    cheatcodes::builders::{
+        DeployProgram, EpochStake as EpochStakeBuilder, ResetAccount, SetEpochStakes,
+        SetTokenAccount, StakeDelegation as StakeDelegationBuilder, StreamAccount,
+    },
 };
 use surfpool_types::{ClockCommand, parse_feature_pubkey};
 
@@ -428,6 +434,58 @@ impl Surfnet {
             .map_err(sdk_error_to_napi)
     }
 
+    /// Replace the epoch-stake map read by the `sol_get_epoch_stake` syscall,
+    /// writing a vote account for each entry that sets `nodePubkey` and a
+    /// delegated stake account for each listed delegation.
+    #[napi]
+    pub fn set_epoch_stakes(&self, stakes: Vec<EpochStake>) -> Result<()> {
+        let mut builder = SetEpochStakes::new();
+        for entry in stakes {
+            let vote_account = parse_pubkey(&entry.vote_account, "voteAccount")?;
+            let mut stake = match &entry.stake {
+                Some(total) => {
+                    EpochStakeBuilder::new(vote_account, lamports_to_u64(total, "stake")?)
+                }
+                None => EpochStakeBuilder::from_delegations(vote_account, []),
+            };
+            for delegation in entry.delegations.unwrap_or_default() {
+                let mut parsed = StakeDelegationBuilder::new(
+                    parse_pubkey(&delegation.stake_account, "stakeAccount")?,
+                    lamports_to_u64(&delegation.stake, "stake")?,
+                );
+                if let Some(staker) = parse_optional_pubkey(delegation.staker, "staker")? {
+                    parsed = parsed.staker(staker);
+                }
+                if let Some(withdrawer) =
+                    parse_optional_pubkey(delegation.withdrawer, "withdrawer")?
+                {
+                    parsed = parsed.withdrawer(withdrawer);
+                }
+                stake = stake.delegation(parsed);
+            }
+            if let Some(node_pubkey) = parse_optional_pubkey(entry.node_pubkey, "nodePubkey")? {
+                stake = stake.node_pubkey(node_pubkey);
+            }
+            if let Some(voter) = parse_optional_pubkey(entry.authorized_voter, "authorizedVoter")? {
+                stake = stake.authorized_voter(voter);
+            }
+            if let Some(withdrawer) =
+                parse_optional_pubkey(entry.authorized_withdrawer, "authorizedWithdrawer")?
+            {
+                stake = stake.authorized_withdrawer(withdrawer);
+            }
+            if let Some(commission) = entry.commission {
+                stake = stake.commission(commission);
+            }
+            builder = builder.entry(stake);
+        }
+
+        self.inner
+            .cheatcodes()
+            .execute(builder)
+            .map_err(sdk_error_to_napi)
+    }
+
     /// Deploy a program by discovering local program artifacts.
     #[napi]
     pub fn deploy_program(&self, program_name: String) -> Result<String> {
@@ -461,6 +519,9 @@ impl Surfnet {
         }
         if let Some(idl_path) = options.idl_path {
             builder = builder.idl_path(PathBuf::from(idl_path));
+        }
+        if let Some(authority) = parse_optional_pubkey(options.authority, "authority")? {
+            builder = builder.authority(authority);
         }
 
         self.inner
@@ -544,12 +605,50 @@ pub struct DeployOptions {
     pub so_path: Option<String>,
     pub so_bytes: Option<Vec<u8>>,
     pub idl_path: Option<String>,
+    /// Upgrade authority recorded on a newly created ProgramData account.
+    /// Defaults to the system program when omitted.
+    pub authority: Option<String>,
 }
 
 #[napi(object)]
 pub struct KeypairInfo {
     pub public_key: String,
     pub secret_key: Vec<u8>,
+}
+
+#[napi(object)]
+pub struct EpochStake {
+    /// Base-58 vote account address.
+    pub vote_account: String,
+    /// Total stake on the vote account, in lamports. Pass a `bigint` for
+    /// amounts above `Number.MAX_SAFE_INTEGER`. Required unless `delegations`
+    /// is non-empty, in which case it defaults to their sum and must not be
+    /// below it.
+    pub stake: Option<Either<f64, BigInt>>,
+    /// Validator identity. When set, a rent-exempt vote account with one vote
+    /// at the current slot is written at `voteAccount`, replacing any account there.
+    pub node_pubkey: Option<String>,
+    /// Signer for vote transactions; defaults to `nodePubkey`. Requires it.
+    pub authorized_voter: Option<String>,
+    /// Signer for withdrawals; defaults to `nodePubkey`. Requires it.
+    pub authorized_withdrawer: Option<String>,
+    /// Inflation-reward commission, 0 to 100 percent; defaults to 0. Requires `nodePubkey`.
+    pub commission: Option<u8>,
+    /// Stake accounts to write as fully active (activated in the previous
+    /// epoch, or as bootstrap stake in epoch 0) and delegated to `voteAccount`.
+    pub delegations: Option<Vec<StakeDelegation>>,
+}
+
+#[napi(object)]
+pub struct StakeDelegation {
+    /// Base-58 address of the stake account to write.
+    pub stake_account: String,
+    /// Delegated lamports; the account also holds its rent-exempt reserve.
+    pub stake: Either<f64, BigInt>,
+    /// Stake authority; defaults to `stakeAccount`.
+    pub staker: Option<String>,
+    /// Withdraw authority; defaults to `staker`.
+    pub withdrawer: Option<String>,
 }
 
 #[napi(object)]
@@ -808,13 +907,41 @@ fn parse_keypair(bytes: &[u8], field_name: &str) -> Result<Keypair> {
         .map_err(|e| Error::new(Status::InvalidArg, format!("Invalid {field_name}: {e}")))
 }
 
+/// Largest integer a JavaScript `number` represents exactly (`Number.MAX_SAFE_INTEGER`).
+const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
+
+/// Converts a JavaScript `number` to `u64`, rejecting values that are negative,
+/// fractional, non-finite, or above `Number.MAX_SAFE_INTEGER`.
 fn f64_to_u64(value: f64, field_name: &str) -> Result<u64> {
-    if !value.is_finite() || value < 0.0 || value.fract() != 0.0 || value > u64::MAX as f64 {
+    if !value.is_finite() || value < 0.0 || value.fract() != 0.0 {
         return Err(Error::new(
             Status::InvalidArg,
             format!("{field_name} must be a non-negative integer"),
         ));
     }
+    // JS has already rounded anything past 2^53 before it reaches us, so a value
+    // in that range may not be what the caller wrote.
+    if value > MAX_SAFE_INTEGER {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!("{field_name} exceeds Number.MAX_SAFE_INTEGER and may have lost precision"),
+        ));
+    }
 
     Ok(value as u64)
+}
+
+/// Converts a JavaScript `number` or `bigint` to `u64`. A `bigint` must be
+/// non-negative and fit in 64 bits; a `number` follows [`f64_to_u64`].
+fn lamports_to_u64(value: &Either<f64, BigInt>, field_name: &str) -> Result<u64> {
+    match value {
+        Either::A(number) => f64_to_u64(*number, field_name),
+        Either::B(bigint) => match bigint.get_u64() {
+            (false, value, true) => Ok(value),
+            _ => Err(Error::new(
+                Status::InvalidArg,
+                format!("{field_name} must be a non-negative integer that fits in a u64"),
+            )),
+        },
+    }
 }
