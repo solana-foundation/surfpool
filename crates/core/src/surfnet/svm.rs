@@ -58,9 +58,6 @@ use solana_sdk_ids::{bpf_loader, system_program};
 use solana_signature::Signature;
 use solana_slot_hashes::{MAX_ENTRIES as MAX_SLOT_HASHES_ENTRIES, SlotHashes};
 use solana_system_interface::instruction as system_instruction;
-use solana_vote_interface::state::{
-    BlockTimestamp, LandedVote, Lockout, MAX_EPOCH_CREDITS_HISTORY, VoteStateV4, VoteStateVersions,
-};
 use solana_sysvar::slot_history::SlotHistory;
 use solana_transaction::versioned::VersionedTransaction;
 use solana_transaction_error::TransactionError;
@@ -68,6 +65,9 @@ use solana_transaction_status::{
     BlockEncodingOptions, ConfirmedBlock,
     TransactionConfirmationStatus as RpcTransactionConfirmationStatus, TransactionDetails,
     TransactionStatusMeta, UiConfirmedBlock, UiTransactionEncoding,
+};
+use solana_vote_interface::state::{
+    BlockTimestamp, LandedVote, Lockout, MAX_EPOCH_CREDITS_HISTORY, VoteStateV4, VoteStateVersions,
 };
 use spl_token_2022_interface::extension::{
     BaseStateWithExtensions, StateWithExtensions, interest_bearing_mint::InterestBearingConfig,
@@ -785,7 +785,8 @@ fn alpenglow_epoch_validator_reward(
 ) -> u64 {
     const SECONDS_PER_YEAR: f64 = 365.25 * 24.0 * 60.0 * 60.0;
     let year = epoch_schedule.get_first_slot_in_epoch(epoch) as f64 * slot_secs / SECONDS_PER_YEAR;
-    let epoch_years = epoch_schedule.get_slots_in_epoch(epoch) as f64 * slot_secs / SECONDS_PER_YEAR;
+    let epoch_years =
+        epoch_schedule.get_slots_in_epoch(epoch) as f64 * slot_secs / SECONDS_PER_YEAR;
     (inflation.validator(year) * capitalization as f64 * epoch_years) as u64
 }
 
@@ -2490,18 +2491,19 @@ impl SurfnetSvm {
         Ok(())
     }
 
-    /// Applies the footer of block `slot` to the staked vote accounts the way an
-    /// Alpenglow bank does. Every validator in the epoch stake table is taken to
-    /// have signed the certificates the block carries, so its vote account's
-    /// last vote and root move to the parent slot, its timestamp to the
-    /// parent's, and its epoch credits grow by its share of the slot's
-    /// inflation reward (in lamports, as under Alpenglow). Vote accounts that
-    /// are missing locally, owned by another program, or stored in a pre-V3
+    /// Applies the footer of block `slot`, built on block `parent`, to the staked
+    /// vote accounts the way an Alpenglow bank does. Every validator in the epoch
+    /// stake table is taken to have signed the certificates the block carries, so
+    /// its vote account's last vote and root move to `parent`, its timestamp to
+    /// the parent's block time, and its epoch credits grow by its share of the
+    /// slot's inflation reward (in lamports, as under Alpenglow). Vote accounts
+    /// that are missing locally, owned by another program, or stored in a pre-V3
     /// layout are left as they are.
-    fn record_alpenglow_votes(&mut self, slot: Slot, block_time: i64) -> SurfpoolResult<()> {
-        let Some(voted_slot) = slot.checked_sub(1) else {
+    fn record_alpenglow_votes(&mut self, slot: Slot, parent: Slot) -> SurfpoolResult<()> {
+        // Only the block at slot 0 has no parent.
+        if parent >= slot {
             return Ok(());
-        };
+        }
         let stakes: Vec<(Pubkey, u64)> = self
             .inner
             .svm
@@ -2523,8 +2525,8 @@ impl SurfnetSvm {
             self.slot_time as f64 / 1_000.0,
         );
         let voted_timestamp = BlockTimestamp {
-            slot: voted_slot,
-            timestamp: block_time.saturating_sub((self.slot_time / 1_000) as i64),
+            slot: parent,
+            timestamp: (self.calculate_block_time_for_slot(parent) / 1_000) as i64,
         };
 
         for (vote_pubkey, stake) in stakes {
@@ -3399,7 +3401,7 @@ impl SurfnetSvm {
             .feature_set
             .is_active(&agave_feature_set::alpenglow::id())
         {
-            self.record_alpenglow_votes(slot, block_time)?;
+            self.record_alpenglow_votes(slot, parent)?;
         }
         self.updated_at += self.slot_time;
 
@@ -9815,6 +9817,48 @@ mod tests {
             "staked validator earned no credits"
         );
         assert_eq!(svm.get_account(&unstaked).unwrap(), Some(account));
+    }
+
+    /// The first block after a time travel votes for the block it was built on, not for
+    /// the skipped slot before it.
+    #[test_case(TestType::in_memory(); "with in-memory sqlite db")]
+    fn alpenglow_votes_follow_the_parent_across_a_time_travel(test_type: TestType) {
+        let (mut svm, _events_rx, _geyser_rx) = test_type.initialize_svm();
+        // Block times have second precision: a second per slot keeps every vote's timestamp
+        // newer than the last.
+        svm.slot_time = 1_000;
+        let staked = Pubkey::new_unique();
+        svm.set_account(&staked, initialized_vote_account(&svm, &staked))
+            .unwrap();
+        svm.inner.svm.set_epoch_stakes([(staked, 42)]).unwrap();
+        for _ in 0..3 {
+            svm.confirm_current_block().unwrap();
+        }
+        let last_block = svm.get_latest_absolute_slot() - 1;
+
+        svm.travel_to(last_block + 100).unwrap();
+        svm.confirm_current_block().unwrap();
+
+        let state = solana_vote_interface::state::VoteStateV4::deserialize(
+            &svm.get_account(&staked).unwrap().unwrap().data,
+            &staked,
+        )
+        .unwrap();
+        let parent = svm.get_block_or_reconstruct(last_block).unwrap().unwrap();
+        assert_eq!(
+            (
+                state.votes.back().map(|vote| vote.slot()),
+                state.root_slot,
+                state.last_timestamp.slot,
+                state.last_timestamp.timestamp,
+            ),
+            (
+                Some(last_block),
+                Some(last_block),
+                last_block,
+                parent.block_time
+            )
+        );
     }
 
     #[test_case(TestType::in_memory(); "with in-memory sqlite db")]

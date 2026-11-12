@@ -2780,8 +2780,8 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
                 )));
             }
         }
-        // Check the total before writing any account, so a rejected request
-        // leaves the surfnet untouched.
+        // Every check runs before the first write, so a rejected request leaves
+        // the surfnet untouched.
         entries
             .iter()
             .try_fold(0u64, |total, entry| total.checked_add(entry.stake))
@@ -2803,8 +2803,21 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
                             .minimum_balance_for_rent_exemption(StakeStateV2::size_of()),
                     )
                 });
+            for entry in &entries {
+                if entry.vote_init.is_some() {
+                    reject_managed_sysvar(&entry.vote_pubkey)?;
+                }
+                for delegation in &entry.delegations {
+                    reject_managed_sysvar(&delegation.stake_account)?;
+                    if stake_reserve.checked_add(delegation.stake).is_none() {
+                        return Err(Error::invalid_params(format!(
+                            "stake account {} cannot hold {} lamports on top of its rent-exempt reserve",
+                            delegation.stake_account, delegation.stake
+                        )));
+                    }
+                }
+            }
             let write = |pubkey: Pubkey, account: Account| -> Result<()> {
-                reject_managed_sysvar(&pubkey)?;
                 svm_locker.apply_account_update(
                     GetAccountResult::FoundAccount(pubkey, account, AccountSource::Generated),
                     AccountUpdatePolicy::Authoritative,
@@ -2840,7 +2853,7 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
                     write(
                         delegation.stake_account,
                         Account {
-                            lamports: stake_reserve.saturating_add(delegation.stake),
+                            lamports: stake_reserve + delegation.stake,
                             data,
                             owner: solana_sdk_ids::stake::id(),
                             executable: false,
@@ -4675,6 +4688,66 @@ mod tests {
         assert!(reused.message.contains("is also another account"));
 
         client.context.svm_locker.with_svm_reader(|svm| {
+            assert!(svm.inner.get_account(&stake_account).unwrap().is_none());
+            assert_eq!(svm.inner.svm.epoch_total_stake(), 0);
+        });
+    }
+
+    /// A request rejected for a later entry has written nothing for the earlier ones.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_set_epoch_stakes_rejects_before_writing_any_account() {
+        let client = TestSetup::new(SurfnetCheatcodesRpc::empty());
+        let vote_account = Pubkey::new_unique();
+        let stake_account = Pubkey::new_unique();
+        let valid = EpochStakeEntry {
+            node_pubkey: Some(Pubkey::new_unique().to_string()),
+            delegations: Some(vec![EpochStakeDelegation {
+                stake_account: stake_account.to_string(),
+                stake: 10,
+                staker: None,
+                withdrawer: None,
+            }]),
+            ..EpochStakeEntry::new(vote_account.to_string(), 10)
+        };
+
+        let clock = client
+            .rpc
+            .set_epoch_stakes(
+                Some(client.context.clone()),
+                vec![
+                    valid.clone(),
+                    EpochStakeEntry {
+                        node_pubkey: Some(Pubkey::new_unique().to_string()),
+                        ..EpochStakeEntry::new(solana_sdk_ids::sysvar::clock::ID.to_string(), 1)
+                    },
+                ],
+            )
+            .unwrap_err();
+        assert!(clock.data.unwrap().to_string().contains("Clock sysvar"));
+
+        let overflow = client
+            .rpc
+            .set_epoch_stakes(
+                Some(client.context.clone()),
+                vec![
+                    valid,
+                    EpochStakeEntry {
+                        // Keeps the total in range: the account itself is what overflows.
+                        delegations: Some(vec![EpochStakeDelegation {
+                            stake_account: Pubkey::new_unique().to_string(),
+                            stake: u64::MAX - 10,
+                            staker: None,
+                            withdrawer: None,
+                        }]),
+                        ..EpochStakeEntry::new(Pubkey::new_unique().to_string(), u64::MAX - 10)
+                    },
+                ],
+            )
+            .unwrap_err();
+        assert!(overflow.message.contains("rent-exempt reserve"));
+
+        client.context.svm_locker.with_svm_reader(|svm| {
+            assert!(svm.inner.get_account(&vote_account).unwrap().is_none());
             assert!(svm.inner.get_account(&stake_account).unwrap().is_none());
             assert_eq!(svm.inner.svm.epoch_total_stake(), 0);
         });
