@@ -195,10 +195,40 @@ pub async fn execute_runbook(
     do_setup_logger: bool,
     runbook_id: String,
     manifest: WorkspaceManifest,
-    mut runbook: Runbook,
+    runbook: Runbook,
     runbook_sources: RunbookSources,
     runbook_state_location: Option<RunbookStateLocation>,
 ) -> Result<(), String> {
+    simnet_events_tx.runbook_started(runbook_id.clone());
+    let result = execute_runbook_inner(
+        progress_tx,
+        simnet_events_tx.clone(),
+        cmd,
+        do_setup_logger,
+        runbook_id.clone(),
+        manifest,
+        runbook,
+        runbook_sources,
+        runbook_state_location,
+    )
+    .await;
+    let errors = result.as_ref().err().cloned();
+    simnet_events_tx.runbook_completed(runbook_id, errors);
+    result.map_err(|errors| errors.join("\n"))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_runbook_inner(
+    progress_tx: Sender<BlockEvent>,
+    simnet_events_tx: SimnetEventsTx,
+    cmd: ExecuteRunbook,
+    do_setup_logger: bool,
+    runbook_id: String,
+    manifest: WorkspaceManifest,
+    mut runbook: Runbook,
+    runbook_sources: RunbookSources,
+    runbook_state_location: Option<RunbookStateLocation>,
+) -> Result<(), Vec<String>> {
     let top_level_inputs_map = manifest
         .get_runbook_inputs(&cmd.environment, &cmd.inputs, None)
         .unwrap_or_else(|_| RunbookTopLevelInputsMap::new());
@@ -215,7 +245,8 @@ pub async fn execute_runbook(
             &runbook_id,
             &cmd.log_level,
             false,
-        )?;
+        )
+        .map_err(|error| vec![error])?;
     }
 
     let cloud_svc_context = CloudServiceContext::new();
@@ -229,9 +260,7 @@ pub async fn execute_runbook(
             cloud_svc_context,
         )
         .await;
-    if let Err(diags) = res {
-        log_diagnostic_lines(diags, &simnet_events_tx);
-    }
+    handle_context_build_result(res, &simnet_events_tx)?;
 
     runbook.enable_full_execution_mode();
 
@@ -255,7 +284,10 @@ pub async fn execute_runbook(
         let ctx = RunbookSnapshotContext::new();
 
         let execution_context_backups = runbook.backup_execution_contexts();
-        let new = runbook.simulate_and_snapshot_flows(&old).await?;
+        let new = runbook
+            .simulate_and_snapshot_flows(&old)
+            .await
+            .map_err(|error| vec![error.to_string()])?;
 
         for flow_context in runbook.flow_contexts.iter() {
             if old.flows.get(&flow_context.name).is_none() {
@@ -266,17 +298,17 @@ pub async fn execute_runbook(
             };
         }
 
-        let consolidated_changes = match ctx.diff(old, new) {
-            Ok(changes) => changes,
-            Err(e) => {
-                let _ = simnet_events_tx.warn("Failed to process runbook snapshot");
-                simnet_events_tx.warn(e);
-                return Ok(());
-            }
-        };
+        let consolidated_changes =
+            handle_snapshot_diff_result(ctx.diff(old, new), &simnet_events_tx)?;
 
         let Some(consolidated_changes) = display_snapshot_diffing(consolidated_changes) else {
-            return Ok(());
+            return process_runbook_execution_output(
+                Ok(()),
+                &mut runbook,
+                runbook_state_location,
+                &simnet_events_tx,
+                cmd.output_json,
+            );
         };
 
         runbook.prepare_flows_for_new_plans(
@@ -319,27 +351,19 @@ pub async fn execute_runbook(
     }
 
     if cmd.unsupervised {
-        simnet_events_tx.runbook_started(runbook_id.clone());
         let res = start_unsupervised_runbook_runloop(&mut runbook, &progress_tx).await;
-        let diags = res
-            .as_ref()
-            .map_err(|ds| ds.iter().map(|d| d.message.clone()).collect())
-            .err();
-        let success = process_runbook_execution_output(
+        process_runbook_execution_output(
             res,
             &mut runbook,
             runbook_state_location,
             &simnet_events_tx,
             cmd.output_json,
-        );
-        simnet_events_tx.runbook_completed(runbook_id, diags);
-        if !success {
-            return Err("Runbook execution failed".to_string());
-        }
+        )?;
     } else {
-        let (kill_supervised_execution_tx, block_store_handle) =
+        let (kill_supervised_execution_tx, block_store_handle, execution_result_rx) =
             configure_supervised_execution(runbook, runbook_state_location, &cmd, simnet_events_tx)
-                .await?;
+                .await
+                .map_err(|error| vec![error])?;
 
         ctrlc::set_handler(move || {
             kill_supervised_execution_tx.send(true).unwrap();
@@ -347,6 +371,9 @@ pub async fn execute_runbook(
         .expect("Error setting Ctrl-C handler");
 
         let _ = tokio::join!(block_store_handle);
+        execution_result_rx
+            .await
+            .map_err(|_| vec!["Supervised runbook execution stopped unexpectedly".to_string()])??;
     };
 
     Ok(())
@@ -357,7 +384,14 @@ pub async fn configure_supervised_execution(
     runbook_state_location: Option<RunbookStateLocation>,
     cmd: &ExecuteRunbook,
     simnet_events_tx: SimnetEventsTx,
-) -> Result<(Sender<bool>, JoinHandle<()>), String> {
+) -> Result<
+    (
+        Sender<bool>,
+        JoinHandle<()>,
+        tokio::sync::oneshot::Receiver<Result<(), Vec<String>>>,
+    ),
+    String,
+> {
     #[cfg(feature = "supervisor_ui")]
     let runbook_name = runbook.runbook_id.name.clone();
     #[cfg(feature = "supervisor_ui")]
@@ -401,12 +435,13 @@ pub async fn configure_supervised_execution(
     let moved_runbook_state = runbook_state_location.clone();
     let moved_simnet_events_tx = simnet_events_tx.clone();
     let output_json = cmd.output_json.clone();
+    let (execution_result_tx, execution_result_rx) = tokio::sync::oneshot::channel();
     let _ = hiro_system_kit::thread_named("Runbook Runloop").spawn(move || {
         let simnet_events_tx = moved_simnet_events_tx;
         let runloop_future =
             start_supervised_runbook_runloop(&mut runbook, moved_block_tx, action_item_events_rx);
 
-        let success = process_runbook_execution_output(
+        let result = process_runbook_execution_output(
             hiro_system_kit::nestable_block_on(runloop_future),
             &mut runbook,
             moved_runbook_state,
@@ -414,14 +449,8 @@ pub async fn configure_supervised_execution(
             output_json,
         );
 
-        if let Err(e) = moved_kill_loops_tx.send(true) {
-            error!("Failed to send kill signal: {}", e);
-            std::process::exit(1);
-        }
-
-        if !success {
-            std::process::exit(1);
-        }
+        let _ = moved_kill_loops_tx.send(true);
+        let _ = execution_result_tx.send(result);
     });
 
     let moved_kill_loops_tx = kill_loops_tx.clone();
@@ -549,7 +578,7 @@ pub async fn configure_supervised_execution(
         })
         .unwrap();
 
-    Ok((moved_kill_loops_tx, block_store_handle))
+    Ok((moved_kill_loops_tx, block_store_handle, execution_result_rx))
 }
 
 pub fn display_snapshot_diffing(
@@ -652,6 +681,37 @@ fn log_diagnostic_lines(diags: Vec<Diagnostic>, simnet_events_tx: &SimnetEventsT
     }
 }
 
+fn handle_context_build_result(
+    result: Result<bool, Vec<Diagnostic>>,
+    simnet_events_tx: &SimnetEventsTx,
+) -> Result<(), Vec<String>> {
+    match result {
+        Ok(_) => Ok(()),
+        Err(diags) => {
+            let errors = diags.iter().map(|diag| diag.message.clone()).collect();
+            log_diagnostic_lines(diags, simnet_events_tx);
+            Err(errors)
+        }
+    }
+}
+
+fn handle_snapshot_diff_result<T, E: std::fmt::Display>(
+    result: Result<T, E>,
+    simnet_events_tx: &SimnetEventsTx,
+) -> Result<T, Vec<String>> {
+    match result {
+        Ok(changes) => Ok(changes),
+        Err(error) => {
+            let _ = simnet_events_tx.warn("Failed to process runbook snapshot");
+            simnet_events_tx.warn(error.to_string());
+            Err(vec![
+                "Failed to process runbook snapshot".to_string(),
+                error.to_string(),
+            ])
+        }
+    }
+}
+
 fn log_actions_to_execute(
     actions_to_execute: &IndexMap<String, Vec<(String, Option<String>)>>,
     is_first_time: bool,
@@ -714,13 +774,15 @@ fn process_runbook_execution_output(
     runbook_state_location: Option<RunbookStateLocation>,
     simnet_events_tx: &SimnetEventsTx,
     output_json: Option<Option<String>>,
-) -> bool {
+) -> Result<(), Vec<String>> {
     if let Err(diags) = execution_result {
         simnet_events_tx.warn("Runbook execution aborted");
+        let errors = diags.iter().map(|diag| diag.message.clone()).collect();
         log_diagnostic_lines(diags, simnet_events_tx);
         write_runbook_transient_state(runbook, runbook_state_location, simnet_events_tx);
-        return false;
+        return Err(errors);
     } else {
+        let mut output_error = None;
         let runbook_outputs = runbook.collect_formatted_outputs();
         if !runbook_outputs.is_empty() {
             if let Some(some_output_loc) = output_json {
@@ -741,8 +803,9 @@ fn process_runbook_execution_output(
                                 .info(format!("Outputs written to {}", output_location));
                         }
                         Err(e) => {
-                            simnet_events_tx
-                                .warn(format!("Failed to write runbook outputs: {}", e));
+                            let message = format!("Failed to write runbook outputs: {}", e);
+                            simnet_events_tx.warn(message.clone());
+                            output_error = Some(message);
                         }
                     }
                 } else {
@@ -761,7 +824,10 @@ fn process_runbook_execution_output(
             }
         }
         write_runbook_state(runbook, runbook_state_location, simnet_events_tx);
-        return true;
+        match output_error {
+            Some(error) => Err(vec![error]),
+            None => Ok(()),
+        }
     }
 }
 
@@ -892,5 +958,54 @@ pub fn handle_log_event(
                 );
             }
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{WorkspaceManifest, execute_runbook};
+    use crate::cli::ExecuteRunbook;
+    use crossbeam::channel;
+    use surfpool_types::{SimnetEvent, SimnetEventsTx};
+    use txtx_core::{
+        kit::helpers::fs::FileLocation,
+        types::{Runbook, RunbookSources},
+    };
+    use txtx_gql::kit::types::RunbookId;
+
+    #[tokio::test]
+    async fn execute_runbook_reports_hcl_context_failure_as_completed_with_errors() {
+        let runbook_id = "broken-runbook";
+        let mut sources = RunbookSources::new();
+        sources.add_source(
+            runbook_id.to_string(),
+            FileLocation::working_dir(),
+            "this is not valid HCL {".to_string(),
+        );
+        let (events_tx, events_rx) = SimnetEventsTx::unbounded();
+        let (progress_tx, _progress_rx) = channel::unbounded();
+
+        let result = execute_runbook(
+            progress_tx,
+            events_tx,
+            ExecuteRunbook::default_localnet(runbook_id),
+            false,
+            runbook_id.to_string(),
+            WorkspaceManifest::new("memory".to_string()),
+            Runbook::new(RunbookId::new(None, None, runbook_id), None),
+            sources,
+            None,
+        )
+        .await;
+
+        assert!(result.is_err());
+        let events = events_rx.try_iter().collect::<Vec<_>>();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SimnetEvent::RunbookCompleted(id, Some(errors))
+                if id == runbook_id
+                    && !errors.is_empty()
+                    && matches!(&result, Err(message) if message == &errors.join("\n"))
+        )));
     }
 }
