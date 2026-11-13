@@ -18,3 +18,6 @@ txtx.yml
 crates/types/bindings/
 
 .idea
+
+# surfpool-bench output
+bench-results/
