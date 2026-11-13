@@ -4,6 +4,12 @@ use solana_epoch_schedule::EpochSchedule;
 
 use crate::types::{TimeTravelConfig, TimeTravelError};
 
+const MAX_SUPPORTED_TIMESTAMP_SECONDS: i64 = i64::MAX / 1_000;
+
+pub(crate) fn timestamp_seconds(timestamp_ms: u64) -> i64 {
+    (timestamp_ms / 1_000) as i64
+}
+
 /// The Clock sysvar at `slot` and `unix_timestamp`, filled in the way Agave's `Bank::update_clock`
 /// does: the epoch's start time carries over from `previous` while the epoch stays the same, and
 /// resets to `unix_timestamp` otherwise (a new epoch, or a warp with no previous Clock).
@@ -68,14 +74,16 @@ pub fn calculate_absolute_timestamp_clock(
         return Err(TimeTravelError::ZeroSlotsInEpoch);
     }
 
-    let slot = epoch_info.absolute_slot + (timestamp_target - current_updated_at) / slot_time;
+    let slot = epoch_info
+        .absolute_slot
+        .saturating_add((timestamp_target - current_updated_at) / slot_time);
 
     // timestamp_target is in milliseconds, we need to convert it to seconds
-    let timestamp_target_seconds = timestamp_target / 1000;
+    let timestamp_target_seconds = timestamp_seconds(timestamp_target);
 
     Ok(clock_for_slot(
         slot,
-        timestamp_target_seconds as i64,
+        timestamp_target_seconds,
         None,
         epoch_schedule,
     ))
@@ -113,11 +121,11 @@ pub fn calculate_absolute_slot_clock(
     let timestamp_target = current_updated_at.saturating_add(time_jump_in_ms);
 
     // timestamp_target is in milliseconds, we need to convert it to seconds
-    let timestamp_target_seconds = timestamp_target / 1000;
+    let timestamp_target_seconds = timestamp_seconds(timestamp_target);
 
     Ok(clock_for_slot(
         new_absolute_slot,
-        timestamp_target_seconds as i64,
+        timestamp_target_seconds,
         None,
         epoch_schedule,
     ))
@@ -157,15 +165,37 @@ pub fn calculate_absolute_epoch_clock(
         .get_first_slot_in_epoch(new_epoch)
         .max(current_absolute_slot);
     let time_jump_in_absolute_slots = new_absolute_slot.saturating_sub(current_absolute_slot);
-    let time_jump_in_ms = time_jump_in_absolute_slots * slot_time;
-    let timestamp_target = current_updated_at + time_jump_in_ms;
+    let time_jump_in_ms = time_jump_in_absolute_slots.saturating_mul(slot_time);
+    let timestamp_target = current_updated_at.saturating_add(time_jump_in_ms);
 
     // timestamp_target is in milliseconds, we need to convert it to seconds
-    let timestamp_target_seconds = timestamp_target / 1000;
+    let timestamp_target_seconds = timestamp_seconds(timestamp_target);
 
     Ok(clock_for_slot(
         new_absolute_slot,
-        timestamp_target_seconds as i64,
+        timestamp_target_seconds,
+        None,
+        epoch_schedule,
+    ))
+}
+
+fn calculate_absolute_slot_at_clock(
+    slot: u64,
+    timestamp: u64,
+    current_absolute_slot: u64,
+    epoch_schedule: &EpochSchedule,
+) -> Result<Clock, TimeTravelError> {
+    if slot < current_absolute_slot {
+        return Err(TimeTravelError::PastSlot {
+            target: slot,
+            current: current_absolute_slot,
+        });
+    }
+
+    let timestamp_seconds = timestamp_seconds(timestamp);
+    Ok(clock_for_slot(
+        slot,
+        timestamp_seconds,
         None,
         epoch_schedule,
     ))
@@ -190,7 +220,7 @@ pub fn calculate_time_travel_clock(
     epoch_info: &EpochInfo,
     epoch_schedule: &EpochSchedule,
 ) -> Result<Clock, TimeTravelError> {
-    match config {
+    let mut clock = match config {
         TimeTravelConfig::AbsoluteTimestamp(timestamp_target) => {
             calculate_absolute_timestamp_clock(
                 *timestamp_target,
@@ -207,21 +237,12 @@ pub fn calculate_time_travel_clock(
             slot_time,
             epoch_schedule,
         ),
-        TimeTravelConfig::AbsoluteSlotAt { slot, timestamp } => calculate_absolute_slot_clock(
+        TimeTravelConfig::AbsoluteSlotAt { slot, timestamp } => calculate_absolute_slot_at_clock(
             *slot,
+            *timestamp,
             epoch_info.absolute_slot,
-            current_updated_at,
-            slot_time,
             epoch_schedule,
-        )
-        .map(|clock| {
-            let timestamp_seconds = (*timestamp / 1000) as i64;
-            Clock {
-                epoch_start_timestamp: timestamp_seconds,
-                unix_timestamp: timestamp_seconds,
-                ..clock
-            }
-        }),
+        ),
         TimeTravelConfig::AbsoluteEpoch(new_epoch) => calculate_absolute_epoch_clock(
             *new_epoch,
             epoch_info.epoch,
@@ -230,7 +251,17 @@ pub fn calculate_time_travel_clock(
             slot_time,
             epoch_schedule,
         ),
+    }?;
+
+    if clock.slot == Slot::MAX {
+        return Err(TimeTravelError::LargestSlot);
     }
+
+    clock.unix_timestamp = clock.unix_timestamp.min(MAX_SUPPORTED_TIMESTAMP_SECONDS);
+    clock.epoch_start_timestamp = clock
+        .epoch_start_timestamp
+        .min(MAX_SUPPORTED_TIMESTAMP_SECONDS);
+    Ok(clock)
 }
 
 #[cfg(test)]
@@ -274,6 +305,24 @@ mod tests {
         assert_eq!(clock.epoch_start_timestamp, target_time as i64 / 1_000);
         assert_eq!(clock.epoch, 1); // Should stay in same epoch
         assert_eq!(clock.slot, 433_000 + (1_000_000 / 400)); // Should advance by time difference
+    }
+
+    #[test]
+    fn time_travel_rejects_the_largest_slot() {
+        let epoch_info = create_test_epoch_info(1, 1000, 433_000);
+
+        for config in [
+            TimeTravelConfig::AbsoluteSlot(u64::MAX),
+            TimeTravelConfig::AbsoluteSlotAt {
+                slot: u64::MAX,
+                timestamp: 5_000,
+            },
+        ] {
+            let result =
+                calculate_time_travel_clock(&config, 1_000_000_000, 400, &epoch_info, &schedule());
+
+            assert!(matches!(result, Err(TimeTravelError::LargestSlot)));
+        }
     }
 
     #[test]
@@ -341,6 +390,35 @@ mod tests {
         assert_eq!(
             clock.unix_timestamp,
             (current_time + (target_slot - epoch_info.absolute_slot) * slot_time) as i64 / 1_000
+        );
+    }
+
+    #[test]
+    fn time_travel_caps_timestamps_and_keeps_absolute_slot_at_explicit() {
+        let epoch_info = create_test_epoch_info(1, 1000, 433_000);
+        let result = calculate_time_travel_clock(
+            &TimeTravelConfig::AbsoluteSlotAt {
+                slot: 434_000,
+                timestamp: u64::MAX,
+            },
+            1_000_000_000,
+            400,
+            &epoch_info,
+            &schedule(),
+        )
+        .unwrap();
+
+        assert_eq!(result.slot, 434_000);
+        assert_eq!(result.unix_timestamp, i64::MAX / 1_000);
+        assert_eq!(result.epoch_start_timestamp, i64::MAX / 1_000);
+    }
+
+    #[test]
+    fn timestamp_conversion_stays_positive_after_signed_millisecond_range() {
+        let timestamp_ms = i64::MAX as u64 + 1_200;
+        assert_eq!(
+            timestamp_seconds(timestamp_ms),
+            (timestamp_ms / 1_000) as i64
         );
     }
 
@@ -414,6 +492,22 @@ mod tests {
                 as i64
                 / 1_000
         );
+    }
+
+    #[test]
+    fn time_travel_caps_next_slot_timestamp_after_arithmetic_saturates() {
+        let epoch_info = create_test_epoch_info(1, 1000, 433_000);
+        let result = calculate_time_travel_clock(
+            &TimeTravelConfig::AbsoluteEpoch(2),
+            u64::MAX - 10,
+            250,
+            &epoch_info,
+            &schedule(),
+        )
+        .unwrap();
+
+        assert_eq!(result.slot, 864_000);
+        assert_eq!(result.unix_timestamp, i64::MAX / 1_000);
     }
 
     #[test]
@@ -552,13 +646,13 @@ mod tests {
 
         // A slot whose extrapolated time overflows still lands at the time asked for.
         let config = TimeTravelConfig::AbsoluteSlotAt {
-            slot: u64::MAX,
+            slot: u64::MAX - 1,
             timestamp: 5_000,
         };
         let clock =
             calculate_time_travel_clock(&config, current_time, slot_time, &epoch_info, &schedule())
                 .unwrap();
-        assert_eq!((clock.slot, clock.unix_timestamp), (u64::MAX, 5));
+        assert_eq!((clock.slot, clock.unix_timestamp), (u64::MAX - 1, 5));
     }
 
     #[test]
