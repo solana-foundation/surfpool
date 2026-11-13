@@ -97,7 +97,8 @@ use super::{
     GetAccountResult, GeyserBlockMetadata, GeyserEntryInfo, GeyserEvent, GeyserSlotStatus,
     GeyserTransactionEvent, INITIAL_SLOT, LEGACY_FINALIZATION_SLOT_THRESHOLD, LocalSignatureStatus,
     LocalSignatureStatusOrSubscription, ProgramSubscriptionData, SignatureSubscriptionData,
-    SignatureSubscriptionType, SlotsUpdatesSubscriptionData, remote::SurfnetRemoteClient,
+    SignatureSubscriptionType, SlotsUpdatesSubscriptionData, program_errors,
+    remote::SurfnetRemoteClient,
 };
 use crate::{
     error::{AirdropError, SurfpoolError, SurfpoolResult},
@@ -4986,6 +4987,29 @@ impl SurfnetSvm {
         idl_versions.sort_by(|a, b| b.0.cmp(&a.0));
         self.registered_idls.store(program_id_str, idl_versions)?;
         Ok(())
+    }
+
+    /// The latest IDL registered for `address` at or before `slot`, or at or before the latest
+    /// slot when `slot` is `None`.
+    pub fn get_idl(&self, address: &Pubkey, slot: Option<Slot>) -> Option<Idl> {
+        let query_slot = slot.unwrap_or_else(|| self.get_latest_absolute_slot());
+        self.registered_idls
+            .get(&address.to_string())
+            .ok()
+            .flatten()
+            .and_then(|idl_versions| {
+                idl_versions
+                    .into_iter()
+                    .filter(|VersionedIdl(s, _)| *s <= query_slot)
+                    .max()
+                    .map(|VersionedIdl(_, idl)| idl)
+            })
+    }
+
+    /// The text of `err`, naming the program error behind it when the program's registered IDL,
+    /// its Anchor error log or a built-in error table knows the code.
+    pub fn describe_transaction_error(&self, err: &TransactionError, logs: &[String]) -> String {
+        program_errors::describe_transaction_error(err, logs, |program| self.get_idl(program, None))
     }
 
     fn encode_ui_account_profile_state(

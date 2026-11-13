@@ -3613,10 +3613,17 @@ async fn test_profile_transaction_insufficient_funds(test_type: TestType) {
         .error_message
         .as_ref()
         .unwrap();
-    assert!(
-        error_msg.eq("Error processing Instruction 0: custom program error: 0x1"),
-        "Error message should indicate insufficient funds, got: {}",
-        error_msg
+    let named_error = "Error processing Instruction 0: custom program error: 0x1 (System Program \
+                       error ResultWithNegativeLamports: account does not have enough SOL to \
+                       perform the operation)";
+    assert_eq!(error_msg, named_error);
+    let instruction_profiles = ui_profile_result
+        .instruction_profiles
+        .as_ref()
+        .expect("Instruction profiles should exist");
+    assert_eq!(
+        instruction_profiles[0].error_message.as_deref(),
+        Some(named_error)
     );
 
     // Verify compute units were still consumed
