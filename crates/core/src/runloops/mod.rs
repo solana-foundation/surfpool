@@ -490,40 +490,13 @@ pub async fn start_block_production_runloop(
 
                         // Handle PauseWithConfirmation specially
                         if let ClockCommand::PauseWithConfirmation(response_tx) = update {
-                            // Get current slot and slot_time before pausing
-                            let (current_slot, slot_time) = svm_locker.with_svm_reader(|svm_reader| {
-                                (svm_reader.latest_epoch_info.absolute_slot, svm_reader.slot_time)
-                            });
-
-                            // Send Pause to clock runloop
                             let _ = clock_command_tx.send(ClockCommand::Pause);
 
-                            // Give the clock time to process the pause command
-                            tokio::time::sleep(tokio::time::Duration::from_millis(slot_time / 2)).await;
-
-                            // Loop and check if the slot has stopped advancing
-                            let max_attempts = 10;
-                            let mut attempts = 0;
-                            loop {
-                                tokio::time::sleep(tokio::time::Duration::from_millis(slot_time)).await;
-
-                                let new_slot = svm_locker.with_svm_reader(|svm_reader| {
-                                    svm_reader.latest_epoch_info.absolute_slot
-                                });
-
-                                // If slot hasn't changed, clock has stopped
-                                if new_slot == current_slot || attempts >= max_attempts {
-                                    break;
-                                }
-
-                                attempts += 1;
-                            }
-
-                            // Read epoch info after clock has stopped
+                            // The slot is final once `clock_paused` is set. Only this loop makes
+                            // blocks and it now skips ticks, so no wait (it outlasted the 2 s timeout).
                             let epoch_info = svm_locker.with_svm_reader(|svm_reader| {
                                 svm_reader.latest_epoch_info.clone()
                             });
-                            // Send response
                             let _ = response_tx.send(epoch_info);
                         } else {
                             let _ = clock_command_tx.send(update);
