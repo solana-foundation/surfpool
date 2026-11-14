@@ -1,0 +1,29 @@
+protocol: Meteora
+version: v1
+account_type: Pool
+idl_file_path: idl.json
+
+tags:
+  - damm-v2
+  - amm
+  - constant-product
+  - defi
+
+templates:
+  - id: meteora-damm-v2-sol-usdc
+    name: Override SOL/USDC DAMM v2 Pool
+    description: Override Meteora DAMM v2 SOL/USDC pool state with simulated values
+    idl_account_name: Pool
+    properties: ["sqrt_price", "liquidity", "pool_status"]
+    address:
+      type: pubkey
+      value: 8Pm2kZpnxD3hoMmt4bjStX2Pw2Z9abpbHzZxMPqxPmie
+
+  - id: meteora-damm-v2-met-usdc
+    name: Override MET/USDC DAMM v2 Pool
+    description: Override Meteora DAMM v2 MET/USDC pool state with simulated values
+    idl_account_name: Pool
+    properties: ["sqrt_price", "liquidity", "pool_status"]
+    address:
+      type: pubkey
+      value: BnztueWcXv93mgW7yJe8WYpnCxpz34nujPhfjQT6SLu1
