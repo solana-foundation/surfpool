@@ -19,6 +19,7 @@ Protocols that are natively supported by Surfpool will have their IDLs included 
 - **Kamino** – Lending (v1.23.0), Scope oracle, Farms, Swap/LIMO, Earn vaults and Liquidity, across six programs. See [protocols/kamino/README.md](./protocols/kamino/README.md)
 - **Drift v2** - Perp and spot markets, user state, and global state
 - **Pump v1** - Bonding curve launchpad with curve reserve and global config override templates
+- **Meteora DBC v1** - Dynamic Bonding Curve launchpad with pool (reserves, price, migration state) and pool config (graduation thresholds) override templates. See [protocols/meteora/dbc/README.md](./protocols/meteora/dbc/README.md)
 - **Phoenix Eternal** - Perpetuals venue with trader collateral, mark price, maintenance margin, market fee, withdraw limit, trader capability, stop-loss trigger and delegated permission templates. See [protocols/phoenix-eternal/README.md](./protocols/phoenix-eternal/README.md)
 - **PumpSwap v1** - Constant-product AMM with pool state and global config override templates, including canonical pool derivation for migrated pump.fun coins
 
