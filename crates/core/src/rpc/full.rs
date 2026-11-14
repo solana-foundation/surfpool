@@ -1,5 +1,7 @@
 use std::str::FromStr;
 
+use std::collections::{BTreeMap, HashMap, HashSet};
+
 use itertools::Itertools;
 use jsonrpc_core::{BoxFuture, Error, Result};
 use jsonrpc_derive::rpc;
@@ -2633,54 +2635,106 @@ impl Full for SurfpoolFullRpc {
                 None
             }
 
-            let mut prioritization_fees = vec![];
+            let mut prioritization_fees = BTreeMap::<Slot, (u64, HashMap<Pubkey, u64>)>::new();
+
             for (slot, tx) in recent_transactions {
-                match tx {
-                    SurfnetTransactionStatus::Received => {}
-                    SurfnetTransactionStatus::Processed(data) => {
-                        let (status_meta, _) = data.as_ref();
-                        let tx = &status_meta.transaction;
+                let SurfnetTransactionStatus::Processed(data) = tx else {
+                    continue;
+                };
 
-                        // If the transaction has an ALT and includes a compute budget instruction,
-                        // the ALT accounts are included in the recent prioritization fees,
-                        // so we get _all_ the pubkeys from the message
-                        let loaded_addresses = svm_locker
-                            .get_loaded_addresses(&remote_ctx, &tx.message)
-                            .await?;
-                        let account_keys = svm_locker.get_pubkeys_from_message(
-                            &tx.message,
-                            loaded_addresses.as_ref().map(|l| l.all_loaded_addresses()),
-                        );
+                let (status_meta, _) = data.as_ref();
+                let tx = &status_meta.transaction;
 
-                        let instructions = tx.message.instructions();
+                let loaded_addresses = svm_locker
+                    .get_loaded_addresses(&remote_ctx, &tx.message)
+                    .await?;
 
-                        // Find all compute unit prices in the transaction's instructions
-                        let compute_unit_prices = instructions
+                let account_keys = svm_locker.get_pubkeys_from_message(
+                    &tx.message,
+                    loaded_addresses.as_ref().map(|l| l.all_loaded_addresses()),
+                );
+
+                // Transactions without an explicit CU price contribute zero.
+                let compute_unit_price = tx
+                    .message
+                    .instructions()
+                    .iter()
+                    .filter_map(|ix| get_compute_unit_price(ix.clone(), &account_keys))
+                    .last()
+                    .unwrap_or(0);
+
+                // Every processed transaction contributes to the slot minimum,
+                // regardless of which accounts the caller requested.
+                let (slot_minimum, account_minimums) = prioritization_fees
+                    .entry(slot)
+                    .or_insert_with(|| (compute_unit_price, HashMap::new()));
+
+                *slot_minimum = (*slot_minimum).min(compute_unit_price);
+
+                let Some(requested_accounts) = pubkeys_filter.as_ref() else {
+                    continue;
+                };
+
+                // Static accounts are followed by loaded writable addresses,
+                // then loaded readonly addresses in v0 messages.
+                let (static_count, loaded_writable_count) = match &tx.message {
+                    VersionedMessage::Legacy(message) => (message.account_keys.len(), 0),
+                    VersionedMessage::V0(message) => (
+                        message.account_keys.len(),
+                        message
+                            .address_table_lookups
                             .iter()
-                            .filter_map(|ix| get_compute_unit_price(ix.clone(), &account_keys))
-                            .collect::<Vec<_>>();
+                            .map(|lookup| lookup.writable_indexes.len())
+                            .sum::<usize>(),
+                    ),
+                    VersionedMessage::V1(message) => (message.account_keys.len(), 0),
+                };
 
-                        for compute_unit_price in compute_unit_prices {
-                            if let Some(pubkeys_filter) = &pubkeys_filter {
-                                // If none of the accounts involved in this transaction are in the filter,
-                                // we don't include the prioritization fee, so we continue
-                                if !pubkeys_filter
-                                    .iter()
-                                    .any(|pk| account_keys.iter().any(|a| a == pk))
-                                {
-                                    continue;
-                                }
-                            }
-                            // if there's no filter, or if the filter matches an account in this transaction, we include the fee
-                            prioritization_fees.push(RpcPrioritizationFee {
-                                slot,
-                                prioritization_fee: compute_unit_price,
-                            });
-                        }
+                for (index, pubkey) in account_keys.iter().enumerate() {
+                    if !requested_accounts.contains(pubkey) {
+                        continue;
                     }
+
+                    let is_writable = if index < static_count {
+                        tx.message.is_maybe_writable_with_reserved_addresses(
+                            index,
+                            None::<&HashSet<Pubkey>>,
+                        )
+                    } else {
+                        index < static_count + loaded_writable_count
+                    };
+
+                    if !is_writable {
+                        continue;
+                    }
+
+                    account_minimums
+                        .entry(*pubkey)
+                        .and_modify(|fee| *fee = (*fee).min(compute_unit_price))
+                        .or_insert(compute_unit_price);
                 }
             }
-            Ok(prioritization_fees)
+
+            Ok(prioritization_fees
+                .into_iter()
+                .rev()
+                .map(|(slot, (slot_minimum, account_minimums))| {
+                    let mut fee = slot_minimum;
+
+                    if let Some(requested_accounts) = pubkeys_filter.as_ref() {
+                        for pubkey in requested_accounts {
+                            if let Some(account_fee) = account_minimums.get(pubkey) {
+                                fee = fee.max(*account_fee);
+                            }
+                        }
+                    }
+
+                    RpcPrioritizationFee {
+                        slot,
+                        prioritization_fee: fee,
+                    }
+                })
+                .collect())
         })
     }
 }
@@ -4857,6 +4911,7 @@ mod tests {
 
         let payer_1 = Keypair::new();
         let payer_2 = Keypair::new();
+        let payer_3 = Keypair::new();
         let receiver_pubkey = Pubkey::new_unique();
         let random_pubkey = Pubkey::new_unique();
 
@@ -4880,6 +4935,15 @@ mod tests {
                     None,
                 )
                 .unwrap();
+            let _ = setup
+                .rpc
+                .request_airdrop(
+                    Some(setup.context.clone()),
+                    payer_3.pubkey().to_string(),
+                    2 * LAMPORTS_PER_SOL,
+                    None,
+                )
+                .unwrap();
 
             setup
                 .context
@@ -4889,7 +4953,7 @@ mod tests {
                 .unwrap();
         }
 
-        // send two transactions that include a compute budget instruction
+        // Send two priced transactions and one zero-priced transaction
         {
             let tx_1 = build_legacy_transaction(
                 &payer_1.pubkey(),
@@ -4918,14 +4982,32 @@ mod tests {
                 &recent_blockhash,
             );
 
+            let tx_3 = build_legacy_transaction(
+                &payer_3.pubkey(),
+                &[&payer_3.insecure_clone()],
+                &[system_instruction::transfer(
+                    &payer_3.pubkey(),
+                    &receiver_pubkey,
+                    LAMPORTS_PER_SOL,
+                )],
+                &recent_blockhash,
+            );
+
             send_and_await_transaction(tx_1, setup.clone(), mempool_rx.clone())
                 .await
                 .join()
                 .unwrap();
-            send_and_await_transaction(tx_2, setup.clone(), mempool_rx)
+
+            send_and_await_transaction(tx_2, setup.clone(), mempool_rx.clone())
                 .await
                 .join()
                 .unwrap();
+
+            send_and_await_transaction(tx_3, setup.clone(), mempool_rx)
+                .await
+                .join()
+                .unwrap();
+
             setup
                 .context
                 .svm_locker
@@ -4935,7 +5017,7 @@ mod tests {
         }
 
         // sending the get_recent_prioritization_fees request with an account
-        // should filter the results to only include fees for that account
+        // should return the fee required to write-lock that account in each slot
         let res = setup
             .rpc
             .get_recent_prioritization_fees(
@@ -4944,22 +5026,81 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(res.len(), 1);
+        assert_eq!(res.len(), 2);
+        assert!(res[0].slot > res[1].slot);
         assert_eq!(res[0].prioritization_fee, 1000);
+        assert_eq!(res[1].prioritization_fee, 0);
+
+        let res = setup
+            .rpc
+            .get_recent_prioritization_fees(
+                Some(setup.context.clone()),
+                Some(vec![payer_2.pubkey().to_string()]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.len(), 2);
+        assert!(res[0].slot > res[1].slot);
+        assert_eq!(res[0].prioritization_fee, 1002);
+        assert_eq!(res[1].prioritization_fee, 0);
+
+        let res = setup
+            .rpc
+            .get_recent_prioritization_fees(
+                Some(setup.context.clone()),
+                Some(vec![
+                    payer_1.pubkey().to_string(),
+                    payer_2.pubkey().to_string(),
+                ]),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res.len(), 2);
+        assert_eq!(res[0].prioritization_fee, 1002);
+        assert_eq!(res[1].prioritization_fee, 0);
+
+        let res = setup
+            .rpc
+            .get_recent_prioritization_fees(
+                Some(setup.context.clone()),
+                Some(vec![payer_3.pubkey().to_string()]),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res.len(), 2);
+        assert_eq!(res[0].prioritization_fee, 0);
+        assert_eq!(res[1].prioritization_fee, 0);
+
+        let res = setup
+            .rpc
+            .get_recent_prioritization_fees(
+                Some(setup.context.clone()),
+                Some(vec![compute_budget::id().to_string()]),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res.len(), 2);
+        assert_eq!(res[0].prioritization_fee, 0);
+        assert_eq!(res[1].prioritization_fee, 0);
 
         // sending the get_recent_prioritization_fees request without an account
-        // should return all prioritization fees
+        // should return the minimum prioritization fee for each slot
         let res = setup
             .rpc
             .get_recent_prioritization_fees(Some(setup.context.clone()), None)
             .await
             .unwrap();
+
         assert_eq!(res.len(), 2);
-        assert_eq!(res[0].prioritization_fee, 1000);
-        assert_eq!(res[1].prioritization_fee, 1002);
+        assert!(res[0].slot > res[1].slot);
+        assert_eq!(res[0].prioritization_fee, 0);
+        assert_eq!(res[1].prioritization_fee, 0);
 
         // sending the get_recent_prioritization_fees request with some random account
-        // to filter should return no results
+        // should fall back to each slot's minimum fee
         let res = setup
             .rpc
             .get_recent_prioritization_fees(
@@ -4968,10 +5109,182 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(
-            res.is_empty(),
-            "Expected no prioritization fees for random account"
+        assert_eq!(res.len(), 2);
+        assert_eq!(res[0].prioritization_fee, 0);
+        assert_eq!(res[1].prioritization_fee, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_recent_prioritization_fees_with_address_lookup_table() {
+        use solana_address_lookup_table_interface::state::{AddressLookupTable, LookupTableMeta};
+
+        let (setup, mempool_rx) =
+            TestSetup::new_with_serial_vm_executor_and_mempool(SurfpoolFullRpc);
+
+        let priced_payer = Keypair::new();
+        let zero_payer = Keypair::new();
+
+        let writable_address = Pubkey::new_unique();
+        let readonly_address = Pubkey::new_unique();
+        let zero_receiver = Pubkey::new_unique();
+        let lookup_key = Pubkey::new_unique();
+
+        // Fund both payers before processing the test transactions.
+        for payer in [&priced_payer, &zero_payer] {
+            setup
+                .rpc
+                .request_airdrop(
+                    Some(setup.context.clone()),
+                    payer.pubkey().to_string(),
+                    2 * LAMPORTS_PER_SOL,
+                    None,
+                )
+                .unwrap();
+        }
+
+        setup
+            .context
+            .svm_locker
+            .confirm_current_block(&None)
+            .await
+            .unwrap();
+
+        // Install a genuine serialized ALT account in the local SVM.
+        let lookup_addresses = vec![writable_address, readonly_address];
+
+        let lookup_table_data = AddressLookupTable {
+            meta: LookupTableMeta {
+                authority: Some(priced_payer.pubkey()),
+                ..Default::default()
+            },
+            addresses: lookup_addresses.clone().into(),
+        };
+
+        setup.context.svm_locker.with_svm_writer(|svm| {
+            svm.set_account(
+                &lookup_key,
+                Account {
+                    lamports: LAMPORTS_PER_SOL,
+                    data: lookup_table_data.serialize_for_tests().unwrap(),
+                    owner: solana_address_lookup_table_interface::program::id(),
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+        });
+
+        let recent_blockhash = setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm| svm.latest_blockhash());
+
+        // Transfer destination is writable. The additional account is readonly.
+        let mut transfer_ix = system_instruction::transfer(
+            &priced_payer.pubkey(),
+            &writable_address,
+            LAMPORTS_PER_SOL,
         );
+        transfer_ix
+            .accounts
+            .push(AccountMeta::new_readonly(readonly_address, false));
+
+        let instructions = [
+            ComputeBudgetInstruction::set_compute_unit_price(1_500),
+            transfer_ix,
+        ];
+
+        let lookup_table = AddressLookupTableAccount {
+            key: lookup_key,
+            addresses: lookup_addresses,
+        };
+
+        let message = V0Message::try_compile(
+            &priced_payer.pubkey(),
+            &instructions,
+            &[lookup_table],
+            recent_blockhash,
+        )
+        .unwrap();
+
+        // These assertions ensure the test truly exercises BOTH loaded types.
+        assert_eq!(message.address_table_lookups.len(), 1);
+
+        assert_eq!(message.address_table_lookups[0].writable_indexes, vec![0]);
+        assert_eq!(message.address_table_lookups[0].readonly_indexes, vec![1]);
+
+        let priced_tx =
+            VersionedTransaction::try_new(VersionedMessage::V0(message), &[&priced_payer]).unwrap();
+
+        // A separate zero-priced transaction establishes a global minimum
+        // without writing to the ALT-loaded writable address.
+        let zero_tx = build_legacy_transaction(
+            &zero_payer.pubkey(),
+            &[&zero_payer],
+            &[system_instruction::transfer(
+                &zero_payer.pubkey(),
+                &zero_receiver,
+                1_000_000,
+            )],
+            &recent_blockhash,
+        );
+
+        send_and_await_transaction(priced_tx, setup.clone(), mempool_rx.clone())
+            .await
+            .join()
+            .unwrap();
+
+        send_and_await_transaction(zero_tx, setup.clone(), mempool_rx)
+            .await
+            .join()
+            .unwrap();
+
+        setup
+            .context
+            .svm_locker
+            .confirm_current_block(&None)
+            .await
+            .unwrap();
+
+        // Writable ALT account must retain its own fee minimum.
+        let writable_fees = setup
+            .rpc
+            .get_recent_prioritization_fees(
+                Some(setup.context.clone()),
+                Some(vec![writable_address.to_string()]),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(writable_fees.len(), 2);
+        assert_eq!(writable_fees[0].prioritization_fee, 1_500);
+        assert_eq!(writable_fees[1].prioritization_fee, 0);
+
+        // Readonly ALT account must fall back to the slot minimum.
+        let readonly_fees = setup
+            .rpc
+            .get_recent_prioritization_fees(
+                Some(setup.context.clone()),
+                Some(vec![readonly_address.to_string()]),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(readonly_fees.len(), 2);
+        assert_eq!(readonly_fees[0].prioritization_fee, 0);
+        assert_eq!(readonly_fees[1].prioritization_fee, 0);
+
+        // Unfiltered queries must return one entry per slot.
+        let unfiltered_fees = setup
+            .rpc
+            .get_recent_prioritization_fees(Some(setup.context.clone()), None)
+            .await
+            .unwrap();
+
+        assert_eq!(unfiltered_fees.len(), 2);
+        assert!(unfiltered_fees[0].slot > unfiltered_fees[1].slot);
+        assert_eq!(unfiltered_fees[0].prioritization_fee, 0);
+        assert_eq!(unfiltered_fees[1].prioritization_fee, 0);
     }
 
     /// Airdrops to a payer, then lands one successful and one failed transfer in a
