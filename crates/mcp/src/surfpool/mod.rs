@@ -213,7 +213,9 @@ pub struct CallSurfnetRpcParams {
         A list of all the RPC methods available can be found at str:///rpc_endpoints"
     )]
     pub method: String,
-    #[schemars(description = "The parameters to pass to the RPC method")]
+    #[schemars(
+        description = "The parameters to pass to the RPC method. Wrap every value at every depth by its type: a string as {\"String\":\"...\"}, a whole number as {\"Number\":5}, a boolean as {\"Bool\":true}, a list as {\"Array\":[...]} and an object as {\"Object\":{\"key\":<wrapped value>}}; object keys stay plain. Example for getProgramAccounts with a filter: [{\"String\":\"<program id>\"},{\"Object\":{\"encoding\":{\"String\":\"base64\"},\"filters\":{\"Array\":[{\"Object\":{\"memcmp\":{\"Object\":{\"offset\":{\"Number\":0},\"bytes\":{\"String\":\"<base58>\"}}}}}]}}}]"
+    )]
     pub params: Vec<JsonValue>,
 }
 

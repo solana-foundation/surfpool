@@ -1,0 +1,63 @@
+protocol: Chainlink
+version: v1
+account_type: Transmissions
+idl_file_path: idl.json
+
+tags:
+  - oracle
+  - price-feed
+  - defi
+
+templates:
+  - id: chainlink-data-feed
+    name: Override Chainlink Data Feed
+    description: Override the latest round of a Chainlink data feed, found by address
+    idl_account_name: Transmissions
+    properties:
+      - path: live.answer
+        label: Answer
+        description: Feed value as a scaled integer - multiply the value by 10^decimals
+      - path: live.slot
+        label: Round Slot
+        description: Slot of the round. Consumers age it against the Surfnet clock and reject a slot ahead of it
+      - path: live.timestamp
+        label: Round Timestamp
+        description: Unix seconds of the round, interpreted against the Surfnet clock
+    address:
+      type: pubkey
+    llm_context: |
+      FINDING THE FEED:
+      Chainlink data feeds on Solana are accounts of the Store program
+      HEvSKofvBgfaexv23kMabbYqxasxU3mQ4ibBMEmJWHny. A consumer reads the feed account it was
+      configured with, so the address the consumer names wins over a search.
+      1. A feed address the user gives, or one the consuming program's accounts name, is used
+         as is.
+      2. Otherwise search by the feed's description, the pair text stored at byte 106 such as
+         "SOL / USD", "BTC / USD" or "JLP / USD". Call getProgramAccounts on
+         HEvSKofvBgfaexv23kMabbYqxasxU3mQ4ibBMEmJWHny with the filters
+         [{"dataSize":248},{"memcmp":{"offset":106,"bytes":"<base64>","encoding":"base64"}}],
+         where <base64> encodes the description followed by one zero byte: "SOL / USD" is
+         U09MIC8gVVNEAA==.
+      3. Read each match with getAccountInfo, encoding "jsonParsed". Retired feeds keep their
+         description, so when several match, take the one with the highest live.slot. Read its
+         decimals, then put it in the override's account as {"pubkey":"<feed>"} and set
+         fetchBeforeUse: true.
+
+      VALUE: live.answer = value x 10^decimals. USD price feeds use 8 decimals, so $145.00 is
+      14500000000. Exchange-rate feeds use 6, 8 or 18; read decimals, never assume.
+
+      TIME: consumers age the round against the Surfnet clock, by live.slot or by
+      live.timestamp, and reject a round that is too old or ahead of the clock. A round stamped
+      with the Surfnet's own time is neither, so write both time fields with every value:
+      - live.slot: the Surfnet's slot, from getSlot with {"commitment":"processed"}.
+      - live.timestamp: the Surfnet clock in seconds, from getAccountInfo on
+        SysvarC1ock11111111111111111111111111111111 with encoding "jsonParsed", field
+        result.value.data.parsed.info.unixTimestamp.
+      Both are fixed when the scenario is created and age until it plays. For a stale round,
+      write them and then surfnet_timeTravel past the consumer's limit.
+
+      EXAMPLE - "SOL drops to $20" on the SOL / USD feed (8 decimals), with the Surfnet at slot
+      312000000 and unix time 1761630000:
+      live.answer: 2000000000
+      live.slot: 312000000
+      live.timestamp: 1761630000

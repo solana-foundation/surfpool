@@ -1,3 +1,5 @@
+#[cfg(feature = "integration-tests")]
+pub mod chainlink;
 pub mod helpers;
 pub mod integration;
 #[cfg(feature = "integration-tests")]
