@@ -1438,7 +1438,6 @@ mod tests {
                         svm_locker,
                         BlockProductionMode::Manual,
                         &None,
-                        None,
                         &simnet_config,
                         None,
                     )
