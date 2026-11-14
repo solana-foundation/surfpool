@@ -1,0 +1,33 @@
+protocol: SolFi
+version: v2
+account_type: XorPriceOracle
+raw_layout: true
+
+templates:
+  - id: solfi-oracle-publication
+    name: Oracle publication
+    description: The maker republishing a market's oracle quote
+    idl_account_name: XorPriceOracle
+    address:
+      type: pubkey
+    properties:
+      - path: publication_slot
+        offset: 16
+        encoding:
+          u64_xor:
+            mask: 7407351566499993019
+        description: Slot the quote was published in, XOR-masked.
+      - path: publication_time_ms
+        offset: 24
+        encoding: u64
+        description: >-
+          Unix milliseconds the quote was published at. A swap that sees it newer than at the
+          previous swap restarts the count of large swaps in a row.
+      - path: valid_until_slot
+        offset: 40
+        encoding:
+          u64_xor:
+            mask: 11053579286710561365
+        description: >-
+          Last slot the quote is valid in, XOR-masked. A later slot rejects swaps with SolFi error 23,
+          and the quote widens as it ages within the window.

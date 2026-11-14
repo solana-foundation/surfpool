@@ -1,0 +1,289 @@
+protocol: SolFi
+version: v2
+account_type: Market
+
+raw_layout: true
+
+tags:
+  - pmm
+  - prop-amm
+  - swap
+
+keep_alive:
+  - template: solfi-oracle-publication
+    address: { type: input, value: oracle }
+    values: { publication_slot: $slot, publication_time_ms: $unix_ms, valid_until_slot: $slot+200 }
+
+templates:
+  - id: solfi-size-impact
+    name: Override Spread by Trade Size
+    description: >-
+      Set SolFi's widening at each of the market's eight trade-size breakpoints; equal values give a
+      constant spread
+    idl_account_name: Market
+    address:
+      type: pubkey
+    properties:
+      - {
+          path: quote_to_base_y_0,
+          offset: 792,
+          encoding: u64,
+          label: 'Buy-base knot 1',
+          description: 'Widening at the first configured quote-notional breakpoint; set all eight buy-base knots together.',
+        }
+      - {
+          path: quote_to_base_y_1,
+          offset: 800,
+          encoding: u64,
+          label: 'Buy-base knot 2',
+          description: 'Widening at the second configured quote-notional breakpoint; interpolation begins from adjacent values.',
+        }
+      - {
+          path: quote_to_base_y_2,
+          offset: 808,
+          encoding: u64,
+          label: 'Buy-base knot 3',
+          description: 'Widening at the third configured quote-notional breakpoint.',
+        }
+      - {
+          path: quote_to_base_y_3,
+          offset: 816,
+          encoding: u64,
+          label: 'Buy-base knot 4',
+          description: 'Widening at the fourth configured quote-notional breakpoint.',
+        }
+      - {
+          path: quote_to_base_y_4,
+          offset: 824,
+          encoding: u64,
+          label: 'Buy-base knot 5',
+          description: 'Widening at the fifth configured quote-notional breakpoint.',
+        }
+      - {
+          path: quote_to_base_y_5,
+          offset: 832,
+          encoding: u64,
+          label: 'Buy-base knot 6',
+          description: 'Widening at the sixth configured quote-notional breakpoint.',
+        }
+      - {
+          path: quote_to_base_y_6,
+          offset: 840,
+          encoding: u64,
+          label: 'Buy-base knot 7',
+          description: 'Widening at the seventh configured quote-notional breakpoint.',
+        }
+      - {
+          path: quote_to_base_y_7,
+          offset: 848,
+          encoding: u64,
+          label: 'Buy-base knot 8',
+          description: 'Widening at and above the final configured quote-notional breakpoint.',
+        }
+      - {
+          path: base_to_quote_y_0,
+          offset: 928,
+          encoding: u64,
+          label: 'Sell-base knot 1',
+          description: 'Widening at the first configured quote-notional breakpoint; set all eight sell-base knots together.',
+        }
+      - {
+          path: base_to_quote_y_1,
+          offset: 936,
+          encoding: u64,
+          label: 'Sell-base knot 2',
+          description: 'Widening at the second configured quote-notional breakpoint; interpolation begins from adjacent values.',
+        }
+      - {
+          path: base_to_quote_y_2,
+          offset: 944,
+          encoding: u64,
+          label: 'Sell-base knot 3',
+          description: 'Widening at the third configured quote-notional breakpoint.',
+        }
+      - {
+          path: base_to_quote_y_3,
+          offset: 952,
+          encoding: u64,
+          label: 'Sell-base knot 4',
+          description: 'Widening at the fourth configured quote-notional breakpoint.',
+        }
+      - {
+          path: base_to_quote_y_4,
+          offset: 960,
+          encoding: u64,
+          label: 'Sell-base knot 5',
+          description: 'Widening at the fifth configured quote-notional breakpoint.',
+        }
+      - {
+          path: base_to_quote_y_5,
+          offset: 968,
+          encoding: u64,
+          label: 'Sell-base knot 6',
+          description: 'Widening at the sixth configured quote-notional breakpoint.',
+        }
+      - {
+          path: base_to_quote_y_6,
+          offset: 976,
+          encoding: u64,
+          label: 'Sell-base knot 7',
+          description: 'Widening at the seventh configured quote-notional breakpoint.',
+        }
+      - {
+          path: base_to_quote_y_7,
+          offset: 984,
+          encoding: u64,
+          label: 'Sell-base knot 8',
+          description: 'Widening at and above the final configured quote-notional breakpoint.',
+        }
+      - path: age_multiplier_curve_y
+        offset: 1064
+        encoding: { u64_strided: { count: 8, stride: 8 } }
+        label: Oracle-age multiplier
+        description: Set every knot to 1000 for a neutral, age-independent multiplier.
+      - path: additional_widening_curve_y
+        offset: 1200
+        encoding: { u64_strided: { count: 8, stride: 8 } }
+        label: Additional widening
+        description: Set every knot to 0 to isolate trade-size impact.
+      - path: max_widening
+        offset: 1328
+        encoding: u64
+        label: Maximum effective widening
+        description: Final clamp in tenths of a ppm; 100000 is 1%.
+      - path: oracle
+        type: input
+        value_type: pubkey
+        label: Market oracle
+        description: >-
+          The market's oracle, stored at market bytes 24..56. Surfpool keeps it current while the
+          scenario is registered; it is not written to the market.
+    llm_context: |
+      FINDING A MARKET WHEN THE USER NAMES A PAIR OR STUDIO DOES NOT LIST IT:
+      1. Call Solana JSON-RPC getProgramAccounts for program
+         SV2EYYJyRz2YhfXwXnhNAevDEui5Q6yrfyo13WtupPF with base64 encoding. Do not assume that an
+         account-size filter will remain valid after a program upgrade.
+      2. For each candidate with at least 184 data bytes, decode the oracle at bytes 24..56, the base
+         vault at 120..152 and the quote vault at 152..184 as base58 public keys. Query both vaults
+         as SPL token accounts; their mint fields identify the pair. Reject candidates whose vaults
+         are missing, invalid or do not match the requested mints.
+      3. Prefer a market whose two vaults have usable balances. Empty markets are valid SolFi state
+         but cannot settle the requested trade.
+      4. Put the chosen market account in the override as {"account":{"pubkey":"<market>"}} and
+         set fetchBeforeUse: true. The market address is not an override value.
+
+      SET THE ORACLE INPUT. Put the market's oracle (market bytes 24..56) in `oracle`. While the
+      scenario is registered, Surfpool republishes that oracle every slot as SolFi's maker does on
+      mainnet, so expiry never hides a correctly materialized size curve. If a later upstream fetch
+      of the oracle is required, reapply solfi-price after it in the same slot.
+
+      This is SolFi's spread control. It preserves the eight x breakpoints that are stored in the
+      selected market account and replaces their y values. The deployed program
+      linearly interpolates between adjacent points and clamps to the endpoint outside the populated
+      range. The x axis is raw quote-token notional: quote-to-base uses the quote input directly,
+      while base-to-quote converts the base input at the oracle price before lookup. Do not assume
+      that different markets use the same x values.
+
+      Direction 1 (quote to base / buy base) reads quote_to_base_y_0 through _7. Direction 0 (base
+      to quote / sell base) reads base_to_quote_y_0 through _7. Values should normally be
+      non-decreasing when simulating execution that deteriorates with trade size.
+
+      Set age_multiplier_curve_y to 1000 and additional_widening_curve_y to 0 when the goal is to
+      isolate size impact. Set max_widening high enough not to flatten the requested curve. The age
+      multiplier grows as the oracle ages since its last publication - on WSOL/USDC about 10 bps 10
+      slots after it and 44 bps near the end of a 200-slot horizon. Keep-alive republishes the oracle
+      every slot, so this matters only for an oracle no registered scenario keeps current.
+
+      FINAL UNIT: the effective widening is divided by 10000000, so one final unit is 0.1 ppm;
+      max_widening 100000 is 1%. The curve is scaled by decoded oracle offset 32:
+        final_widening = curve_y * oracle_scale / 1000
+      when the age multiplier is neutral. The verified WSOL/USDC oracle has oracle_scale 10000, so
+      curve_y 10000 plus max_widening 100000 produces exactly 1%. The verified USDT/USDC oracle has
+      oracle_scale 1000, so curve_y 100000 produces exactly 1%.
+
+      A CONSTANT SPREAD is a flat curve: set all eight y values of a direction to the same number.
+      EXAMPLE - deterministic 1% spread in both directions on the selected WSOL/USDC market:
+        quote_to_base_y_0 through quote_to_base_y_7: 10000
+        base_to_quote_y_0 through base_to_quote_y_7: 10000
+        age_multiplier_curve_y: 1000
+        additional_widening_curve_y: 0
+        max_widening: 100000
+
+      DIRECTIONAL RISK-OFF: raise the quote_to_base values when the maker does not want to sell more
+      base; raise the base_to_quote values when it does not want to buy more base.
+
+      REPEATED SWAPS: after nine large swaps in one direction the program multiplies this widening
+      by about ten, capped by max_widening, and additional_widening_curve_y adds a further term keyed
+      by the same count. The oracle's republication restarts the count, so only large swaps within
+      one slot build it up; solfi-swap-pressure sets it directly.
+
+      HOW TO USE: set all eight y values for each direction you care about. A conventional
+      large-trade deterioration uses non-decreasing values. Do not copy x assumptions between
+      markets: this template deliberately leaves the selected market's configured x breakpoints
+      untouched.
+
+  - id: solfi-swap-pressure
+    name: Reset Swap Pressure
+    description: >-
+      Reset SolFi's count of consecutive large swaps in each direction, which widens its quotes
+    idl_account_name: Market
+    address:
+      type: pubkey
+    properties:
+      - path: consecutive_buys
+        offset: 1280
+        encoding: u32
+        label: Large buys in a row
+        description: >-
+          Consecutive large purchases of the base token. Set 0 to reset; from 9 SolFi widens buys up
+          to its maximum.
+      - path: consecutive_sells
+        offset: 1284
+        encoding: u32
+        label: Large sells in a row
+        description: >-
+          Consecutive large sales of the base token. Set 0 to reset; from 9 SolFi widens sells up to
+          its maximum.
+      - path: oracle
+        type: input
+        value_type: pubkey
+        label: Market oracle
+        description: >-
+          The market's oracle, stored at market bytes 24..56. Surfpool keeps it current while the
+          scenario is registered; it is not written to the market.
+    llm_context: |
+      FINDING A MARKET WHEN THE USER NAMES A PAIR OR STUDIO DOES NOT LIST IT:
+      1. Call Solana JSON-RPC getProgramAccounts for program
+         SV2EYYJyRz2YhfXwXnhNAevDEui5Q6yrfyo13WtupPF with base64 encoding. Do not assume that an
+         account-size filter will remain valid after a program upgrade.
+      2. For each candidate with at least 184 data bytes, decode the oracle at bytes 24..56, the base
+         vault at 120..152 and the quote vault at 152..184 as base58 public keys. Query both vaults
+         as SPL token accounts; their mint fields identify the pair. Reject candidates whose vaults
+         are missing, invalid or do not match the requested mints.
+      3. Prefer a market whose two vaults have usable balances. Empty markets are valid SolFi state
+         but cannot settle the requested trade.
+      4. Put the chosen market account in the override as {"account":{"pubkey":"<market>"}} and
+         set fetchBeforeUse: true. The market address is not an override value.
+
+      SolFi counts consecutive large swaps in each direction (small swaps do not count: on WSOL/USDC
+      a 1 SOL swap counts and a 0.5 SOL swap does not; a swap in the other direction does not reset
+      the count). The count widens that direction's quotes in two ways: the
+      additional_widening_curve_y term grows with it, and from 9 the program multiplies the trade
+      size widening by about ten, capped by max_widening. On WSOL/USDC ten 1 SOL sales in a row cost
+      about 95 bps more than the first.
+
+      THE MAKER'S REPUBLICATION RESTARTS THE COUNT. A swap that sees the oracle published later than
+      at the previous swap starts a new count. While the scenario is registered Surfpool republishes
+      the oracle every slot, as the maker does on mainnet, so the count builds up only across large
+      swaps in the same slot. Setting a count to 0 is a complete reset: the next swaps price as if
+      none had happened.
+
+      HOW TO USE: reset before swaps measured within one slot, with consecutive_buys: 0 and/or
+      consecutive_sells: 0. Do not reapply after every swap unless restoring the count is the point
+      of the test - it is state that swaps change, like a vault balance.
+
+      Use fetchBeforeUse: true only on the first override for the market; a later fetch replaces the
+      whole market account and erases earlier overrides on it.
+
+      EXAMPLE - "measure the 1 SOL sales from a clean slate":
+        consecutive_sells: 0
