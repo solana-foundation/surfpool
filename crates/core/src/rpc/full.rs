@@ -26,6 +26,7 @@ use solana_pubkey::Pubkey;
 use solana_rpc_client_api::response::Response as RpcResponse;
 use solana_sdk_ids::compute_budget;
 use solana_signature::Signature;
+use solana_transaction::versioned::VersionedTransaction;
 use solana_transaction_error::TransactionError;
 use solana_transaction_status::{
     EncodedConfirmedTransactionWithStatusMeta, EncodedTransactionWithStatusMeta,
@@ -39,7 +40,7 @@ use surfpool_types::{
 use super::{
     RunloopContext, State, SurfnetRpcContext,
     utils::{
-        decode_and_deserialize, decode_rpc_versioned_transaction,
+        decode_and_deserialize, decode_rpc_versioned_transaction, into_versioned_transaction,
         verify_and_parse_signatures_for_address_params, verify_pubkey,
     },
 };
@@ -1754,11 +1755,13 @@ impl Full for SurfpoolFullRpc {
             let rpc_start = std::time::Instant::now();
 
             let config = config.unwrap_or_default();
-            let unsanitized_tx = decode_rpc_versioned_transaction(data, config.base.encoding)?;
-            let signatures = unsanitized_tx.signatures.clone();
-            let signature = signatures[0];
-            // Clone the message before moving the transaction, as we'll need it for error reporting
-            let tx_message = unsanitized_tx.message.clone();
+            let transaction = decode_rpc_versioned_transaction(data, config.base.encoding)?;
+            let signature = transaction.signatures()[0];
+            // Preflight and error reports read a copy, as the runloop takes the transaction.
+            let tx = VersionedTransaction {
+                signatures: transaction.signatures().to_vec(),
+                message: transaction.get_message().message.clone(),
+            };
 
             let Some(ctx) = meta else {
                 return Err(RpcCustomError::NodeUnhealthy {
@@ -1788,19 +1791,15 @@ impl Full for SurfpoolFullRpc {
                     let sigverify = !config
                         .skip_sig_verify
                         .unwrap_or(svm_reader.skip_signature_verification);
-                    let duplicate =
-                        svm_reader
-                            .processed_slot(&unsanitized_tx)
-                            .is_some_and(|slot| {
-                                slot <= svm_reader.slot_for_commitment(&preflight_commitment)
-                            });
-                    if sigverify && unsanitized_tx.verify_with_results().contains(&false) {
+                    let duplicate = svm_reader.processed_slot(&tx).is_some_and(|slot| {
+                        slot <= svm_reader.slot_for_commitment(&preflight_commitment)
+                    });
+                    if sigverify && tx.verify_with_results().contains(&false) {
                         Some(TransactionError::SignatureFailure)
                     } else if !svm_reader.is_blockhash_visible_at(
-                        tx_message.recent_blockhash(),
+                        tx.message.recent_blockhash(),
                         &preflight_commitment,
-                    ) || (duplicate
-                        && !svm_reader.validate_transaction_blockhash(&unsanitized_tx))
+                    ) || (duplicate && !svm_reader.validate_transaction_blockhash(&tx))
                     {
                         Some(TransactionError::BlockhashNotFound)
                     } else if duplicate {
@@ -1818,7 +1817,7 @@ impl Full for SurfpoolFullRpc {
                                 Some(error.clone()),
                                 None,
                                 false,
-                                &tx_message,
+                                &tx.message,
                                 None,
                                 Some(0),
                             ))
@@ -1840,7 +1839,7 @@ impl Full for SurfpoolFullRpc {
                 .simnet_commands_tx
                 .send(SimnetCommand::ProcessTransaction(
                     ctx.id,
-                    unsanitized_tx,
+                    transaction,
                     status_update_tx,
                     config.base.skip_preflight,
                     config.skip_sig_verify,
@@ -1880,7 +1879,7 @@ impl Full for SurfpoolFullRpc {
                                 Some(error.clone()),
                                 None,
                                 false,
-                                &tx_message,
+                                &tx.message,
                                 None, // No loaded addresses available in error reporting context
                                 Some(metadata.loaded_accounts_data_size),
                             ))
@@ -1972,8 +1971,8 @@ impl Full for SurfpoolFullRpc {
             return SurfpoolError::sig_verify_replace_recent_blockhash_collision().into();
         }
 
-        let mut unsanitized_tx = match decode_rpc_versioned_transaction(data, config.encoding) {
-            Ok(tx) => tx,
+        let mut tx = match decode_rpc_versioned_transaction(data, config.encoding) {
+            Ok(tx) => into_versioned_transaction(tx),
             Err(e) => return Box::pin(async move { Err(e) }),
         };
 
@@ -1987,10 +1986,10 @@ impl Full for SurfpoolFullRpc {
 
         Box::pin(async move {
             let loaded_addresses = svm_locker
-                .get_loaded_addresses(&remote_ctx, &unsanitized_tx.message)
+                .get_loaded_addresses(&remote_ctx, &tx.message)
                 .await?;
             let transaction_pubkeys = svm_locker.get_pubkeys_from_message(
-                &unsanitized_tx.message,
+                &tx.message,
                 loaded_addresses.as_ref().map(|l| l.all_loaded_addresses()),
             );
 
@@ -2009,16 +2008,15 @@ impl Full for SurfpoolFullRpc {
                     let replacement_blockhash = config.replace_recent_blockhash.then(|| {
                         let (blockhash, last_valid_block_height) =
                             svm_reader.latest_blockhash_at(&config.commitment.unwrap_or_default());
-                        unsanitized_tx.message.set_recent_blockhash(blockhash);
+                        tx.message.set_recent_blockhash(blockhash);
                         RpcBlockhash {
                             blockhash: blockhash.to_string(),
                             last_valid_block_height,
                         }
                     });
                     // Clone the message before moving the transaction for result formatting
-                    let tx_message = unsanitized_tx.message.clone();
-                    let simulation =
-                        svm_reader.simulate_transaction(unsanitized_tx, config.sig_verify);
+                    let tx_message = tx.message.clone();
+                    let simulation = svm_reader.simulate_transaction(tx, config.sig_verify);
                     Ok::<_, jsonrpc_core::Error>((
                         read,
                         replacement_blockhash,
@@ -2795,7 +2793,7 @@ mod tests {
             BlockHeader, INITIAL_SLOT, LEGACY_FINALIZATION_SLOT_THRESHOLD,
             remote::SurfnetRemoteClient, svm::MAX_RECENT_BLOCKHASHES_STANDARD,
         },
-        tests::helpers::TestSetup,
+        tests::helpers::{TestSetup, UNSANITARY_TRANSACTION_ERROR, unsanitary_transactions},
         types::{SyntheticBlockhash, TransactionWithStatusMeta},
     };
 
@@ -2945,6 +2943,7 @@ mod tests {
         loop {
             match mempool_rx.recv() {
                 Ok(SimnetCommand::ProcessTransaction(_, tx, status_tx, _, _)) => {
+                    let tx = into_versioned_transaction(tx);
                     let sig = tx.signatures[0];
                     assert!(
                         setup.context.svm_locker.is_transaction_pending(&sig),
@@ -3543,6 +3542,76 @@ mod tests {
 
         assert!(result.is_err());
         assert!(!setup.context.svm_locker.is_transaction_pending(&signature));
+    }
+
+    #[test]
+    fn a_malformed_transaction_does_not_stop_block_production() {
+        let (setup, clock_events_tx, runloop) =
+            new_airdrop_runloop(BlockProductionMode::Transaction);
+        let payer = Keypair::new();
+        setup.context.svm_locker.with_svm_writer(|svm| {
+            svm.airdrop(&payer.pubkey(), LAMPORTS_PER_SOL)
+                .expect("payer airdrop should be accepted")
+                .expect("payer airdrop transaction should succeed");
+        });
+        let recent_blockhash = setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm| svm.latest_blockhash());
+        let send = |transaction: &VersionedTransaction| {
+            hiro_system_kit::nestable_block_on(setup.rpc.send_transaction(
+                Some(setup.context.clone()),
+                bs58::encode(bincode::serialize(transaction).unwrap()).into_string(),
+                Some(SurfpoolRpcSendTransactionConfig {
+                    base: RpcSendTransactionConfig {
+                        skip_preflight: true,
+                        ..RpcSendTransactionConfig::default()
+                    },
+                    skip_sig_verify: None,
+                }),
+            ))
+        };
+
+        for transaction in unsanitary_transactions(&payer, recent_blockhash) {
+            let error = send(&transaction).expect_err("an unsanitary transaction must be refused");
+            assert_eq!(error.code, jsonrpc_core::ErrorCode::InvalidParams);
+            assert_eq!(error.message, UNSANITARY_TRANSACTION_ERROR);
+        }
+        let landed = send(&build_legacy_transaction(
+            &payer.pubkey(),
+            &[&payer],
+            &[transfer(&payer.pubkey(), &Pubkey::new_unique(), 1_000_000)],
+            &recent_blockhash,
+        ));
+
+        stop_airdrop_runloop(&setup, clock_events_tx, runloop);
+        assert!(
+            landed.is_ok(),
+            "the runloop should still process transactions, got {landed:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn simulate_transaction_refuses_an_unsanitary_transaction_as_agave_does() {
+        let setup = TestSetup::new(SurfpoolFullRpc);
+        let recent_blockhash = setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm| svm.latest_blockhash());
+
+        for transaction in unsanitary_transactions(&Keypair::new(), recent_blockhash) {
+            let error = setup
+                .rpc
+                .simulate_transaction(
+                    Some(setup.context.clone()),
+                    bs58::encode(bincode::serialize(&transaction).unwrap()).into_string(),
+                    None,
+                )
+                .await
+                .expect_err("an unsanitary transaction must be refused");
+            assert_eq!(error.code, jsonrpc_core::ErrorCode::InvalidParams);
+            assert_eq!(error.message, UNSANITARY_TRANSACTION_ERROR);
+        }
     }
 
     #[test]
@@ -6291,6 +6360,7 @@ mod tests {
             loop {
                 match mempool_rx.recv() {
                     Ok(SimnetCommand::ProcessTransaction(_, tx, status_tx, _, _)) => {
+                        let tx = into_versioned_transaction(tx);
                         let mut writer = setup.context.svm_locker.0.write().await;
                         let slot = writer.get_latest_absolute_slot();
                         writer.transactions_queued_for_confirmation.push_back((
