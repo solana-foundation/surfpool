@@ -22,6 +22,7 @@ export type * from "./RpcProfileDepth.js";
 export type * from "./RpcProfileResultConfig.js";
 export type * from "./RunbookExecutionStatusReport.js";
 export type * from "./Scenario.js";
+export type * from "./ScenarioScript.js";
 export type * from "./StreamAccountConfig.js";
 export type * from "./StreamAccountsEntry.js";
 export type * from "./StreamedAccountInfo.js";

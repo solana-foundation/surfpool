@@ -39,6 +39,64 @@ non-numeric segment on an array is a hard error, never a silent write elsewhere.
 An override is applied once. Its resulting account state remains in later slots until a transaction
 or another override writes that account again.
 
+### Scripts: scenarios that react
+
+An override is fixed when its scenario is registered. A scenario can also carry `scripts`: Lua
+5.4 source whose `on_slot(ctx)` function runs once per slot, after the slot's block is confirmed
+and before the slot's overrides are applied. A script reads the chain as the block left it and
+queues overrides or account writes, so a scenario can answer what transactions did: a price that
+moves with a taker's flow, depth that comes back at its own pace.
+
+```json
+{
+  "id": "impact", "name": "Taker impact", "description": "", "overrides": [], "tags": [],
+  "scripts": [{
+    "id": "impact",
+    "name": "impact",
+    "source": "function on_slot(ctx) ... end",
+    "activeFrom": 1,
+    "activeUntil": 400
+  }]
+}
+```
+
+```lua
+local TRADER, SYMBOL, TICKS_PER_LOT = "<trader account>", "SOL", 0.036
+base, seen, impact = nil, 0, 0          -- globals persist between slots
+
+function on_slot(ctx)
+  base = base or ctx.phoenix.bbo(SYMBOL).index_ticks
+  local position = ctx.phoenix.position(TRADER, SYMBOL)
+  local flow = position - seen
+  seen = position
+  if flow == 0 then return end
+  impact = impact + TICKS_PER_LOT * flow
+  ctx.override {
+    template = "phoenix-market-move",
+    values = { symbol = SYMBOL, target_ticks = tostring(math.floor(base + impact + 0.5)) },
+  }
+  ctx.override { template = "phoenix-market-uncross", values = { symbol = SYMBOL } }
+end
+```
+
+- **Interval.** `activeFrom` (default 1), `activeUntil` (default: never) and `every` (default 1)
+  are slots counted from the scenario's base slot, as `scenarioRelativeSlot` is. Past its
+  interval a script is removed. Register with the clock paused, or give the base `slot`, when the
+  first slot matters: a slot that passes between reading the base and registering is one the
+  script was not there for.
+- **`ctx`.** `slot`, `elapsed`, `account(pubkey)`, `override{ template, values, account?, label?,
+  fetch? }`, `set_account(pubkey, { lamports?, data?, owner? })`, `random()`, `log(message)`, and
+  `phoenix.markets()`, `phoenix.bbo(symbol)`, `phoenix.position(trader, symbol)`. The table in
+  `script.rs` describes each.
+- **Order.** Scripts due at a slot run in the order they were registered. An account write lands
+  when its script returns; queued overrides apply after the slot's scheduled ones.
+- **Limits.** No `os`, `io`, `require` or `load`; `ctx.random()` is seeded; `pairs` visits keys in
+  sorted order, so a session replays the same. A call past its instruction limit (10 million by
+  default) or a VM past 64 MiB is stopped and applies nothing; 20 failed calls in a row disable
+  the script. A scenario whose script does not load registers nothing.
+- **Not kept.** Scripts are not part of a snapshot, a network reset drops them, and a copy of a
+  surfnet (a profiling sandbox) runs none.
+
 ### Kamino integration tests
 
 Byte-level Kamino coverage lives in `crates/core/src/tests/kamino/`. Those tests fetch the real

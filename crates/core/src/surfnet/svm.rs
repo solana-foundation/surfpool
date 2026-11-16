@@ -603,6 +603,9 @@ pub struct SurfnetSvm {
     pub streamed_accounts: Box<dyn Storage<String, bool>>,
     pub recent_blockhashes: VecDeque<(SyntheticBlockhash, i64)>,
     pub scheduled_overrides: Box<dyn Storage<u64, Vec<OverrideInstance>>>,
+    /// Scripts called once per slot, which read the chain and queue overrides
+    /// ([`crate::scenarios::script`]).
+    pub scenario_scripts: crate::scenarios::script::ScenarioScripts,
     /// Tracks accounts that should not be downloaded from the remote RPC.
     /// This includes accounts explicitly closed locally and accounts marked offline via cheatcodes.
     /// The key is the account pubkey as a string. If `include_owned_accounts` is true,
@@ -882,6 +885,8 @@ impl SurfnetSvm {
             registered_idls: OverlayStorage::wrap(self.registered_idls.clone_box()),
             streamed_accounts: OverlayStorage::wrap(self.streamed_accounts.clone_box()),
             scheduled_overrides: OverlayStorage::wrap(self.scheduled_overrides.clone_box()),
+            // A sandbox confirms no blocks of its own, so it runs no scripts.
+            scenario_scripts: Default::default(),
 
             // Clone non-storage fields normally
             transactions_queued_for_confirmation: self.transactions_queued_for_confirmation.clone(),
@@ -1367,6 +1372,7 @@ impl SurfnetSvm {
             streamed_accounts: streamed_accounts_db,
             recent_blockhashes: VecDeque::new(),
             scheduled_overrides: scheduled_overrides_db,
+            scenario_scripts: Default::default(),
             offline_accounts: offline_accounts_db,
             genesis_slot: default_genesis_slot,
             genesis_updated_at: updated_at,
@@ -2586,6 +2592,7 @@ impl SurfnetSvm {
         self.runbook_executions.clear();
         self.streamed_accounts.clear()?;
         self.scheduled_overrides.clear()?;
+        self.scenario_scripts.clear();
 
         let current_time = chrono::Utc::now().timestamp_millis() as u64;
         self.updated_at = current_time;
@@ -5185,6 +5192,75 @@ impl SurfnetSvm {
     ///
     /// The `slot` parameter is the base slot from which relative override slot heights are calculated.
     /// If not provided, uses the current slot.
+    /// Calls every scenario script due at the slot that just opened, in registration order.
+    /// A script's account writes land before the next script runs; the overrides it queues join
+    /// the slot's scheduled ones, which [`Self::materialize_overrides`] applies next. A script
+    /// that fails, or a write that does, is reported and never stops the slot.
+    pub fn run_scenario_scripts(&mut self) {
+        if self.scenario_scripts.is_empty() {
+            return;
+        }
+        let slot = self.latest_epoch_info.absolute_slot;
+        // The scripts read `self`, so they leave it for the calls.
+        let mut scripts = std::mem::take(&mut self.scenario_scripts);
+        scripts.retire(slot);
+        for index in 0..scripts.len() {
+            if let Some(run) = scripts.run_at(index, self, slot) {
+                self.apply_script_run(run, slot);
+            }
+        }
+        self.scenario_scripts = scripts;
+    }
+
+    fn apply_script_run(&mut self, run: crate::scenarios::script::ScriptRun, slot: Slot) {
+        use crate::scenarios::script::Action;
+
+        for line in run.logs {
+            self.simnet_events_tx
+                .info(format!("[{}] {}", run.name, line));
+        }
+        if let Some(error) = run.error {
+            let disabled = if run.disabled {
+                " (script disabled)"
+            } else {
+                ""
+            };
+            self.simnet_events_tx.warn(format!(
+                "Scenario script {} failed at slot {}{}: {}",
+                run.name, slot, disabled, error
+            ));
+            return;
+        }
+        let mut queued = Vec::new();
+        for action in run.actions {
+            match action {
+                Action::Override(instance) => queued.push(*instance),
+                Action::SetAccount(pubkey, account) => {
+                    if let Err(e) = self.set_account(&pubkey, account) {
+                        self.simnet_events_tx.warn(format!(
+                            "Scenario script {} could not write {} at slot {}: {}",
+                            run.name, pubkey, slot, e
+                        ));
+                    }
+                }
+            }
+        }
+        if queued.is_empty() {
+            return;
+        }
+        let stored = self.scheduled_overrides.get(&slot).and_then(|scheduled| {
+            let mut slot_overrides = scheduled.unwrap_or_default();
+            slot_overrides.extend(queued);
+            self.scheduled_overrides.store(slot, slot_overrides)
+        });
+        if let Err(e) = stored {
+            self.simnet_events_tx.warn(format!(
+                "Scenario script {} could not queue its overrides at slot {}: {}",
+                run.name, slot, e
+            ));
+        }
+    }
+
     pub fn register_scenario(
         &mut self,
         scenario: surfpool_types::Scenario,
@@ -5200,6 +5276,21 @@ impl SurfnetSvm {
             scenario.overrides.len(),
             base_slot
         );
+
+        // Scripts load first: a scenario whose script does not compile registers nothing.
+        let script_ids: Vec<String> = scenario
+            .scripts
+            .iter()
+            .map(|script| script.id.clone())
+            .collect();
+        for (index, script) in scenario.scripts.into_iter().enumerate() {
+            if let Err(e) = self.scenario_scripts.register(script, base_slot) {
+                for id in &script_ids[..index] {
+                    self.scenario_scripts.unregister(id);
+                }
+                return Err(e);
+            }
+        }
 
         // Schedule overrides by adding base slot to their scenario-relative slots
         for override_instance in scenario.overrides {
@@ -9040,6 +9131,7 @@ mod tests {
             description: String::new(),
             tags: vec![],
             overrides: vec![far],
+            scripts: vec![],
         };
 
         assert!(

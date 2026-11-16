@@ -645,6 +645,16 @@ pub struct Scenario {
         description = "Array of string tags for categorization (e.g., ['liquidation', 'arbitrage'])"
     )]
     pub tags: Vec<String>,
+    /// Scripts that run while the scenario plays, each over its own interval of slots.
+    #[schemars(
+        description = "Optional Lua scripts called once per slot, which read the chain and queue overrides. Leave this out unless the scenario must react to what transactions do: fixed changes belong in `overrides`."
+    )]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(
+        feature = "ts-bindings",
+        ts(as = "Option<Vec<ScenarioScript>>", optional)
+    )]
+    pub scripts: Vec<ScenarioScript>,
 }
 
 impl Scenario {
@@ -655,6 +665,7 @@ impl Scenario {
             description,
             overrides: Vec::new(),
             tags: Vec::new(),
+            scripts: Vec::new(),
         }
     }
 
@@ -674,6 +685,47 @@ impl Scenario {
             .filter(|o| o.enabled && o.scenario_relative_slot == slot)
             .collect()
     }
+}
+
+/// A script of a [`Scenario`]: Lua source whose `on_slot(ctx)` function runs once per slot, after
+/// the slot's block is confirmed and before the slot's scheduled overrides are applied. Unlike
+/// the scenario's overrides, which are fixed when it is registered, a script reads the chain as
+/// transactions left it and decides what to override.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS), ts(export))]
+pub struct ScenarioScript {
+    /// Unique identifier; a script registered with an id already in use replaces that script.
+    #[schemars(description = "Unique identifier; a script with an id already in use replaces it")]
+    pub id: String,
+    /// Human-readable name
+    pub name: String,
+    /// Lua 5.4 source defining a global `on_slot(ctx)` function.
+    pub source: String,
+    /// Seed of the script's `ctx.random()`, 0 without one. The same seed, source and chain give
+    /// the same run.
+    #[serde(default)]
+    #[cfg_attr(feature = "ts-bindings", ts(type = "number | bigint", optional))]
+    pub seed: Option<u64>,
+    /// The most Lua VM instructions one `on_slot` call may run before it is stopped.
+    #[serde(default)]
+    #[cfg_attr(feature = "ts-bindings", ts(type = "number | bigint", optional))]
+    pub instruction_limit: Option<u64>,
+    /// The first slot the script is called at, counted from the scenario's base slot as an
+    /// override's `scenarioRelativeSlot` is. Without it, the slot after the base slot.
+    #[serde(default)]
+    #[cfg_attr(feature = "ts-bindings", ts(type = "number | bigint", optional))]
+    pub active_from: Option<Slot>,
+    /// The slot the script stops at, counted the same way: it is called at slots before this
+    /// one, then removed. Without it, the script runs until it is unregistered.
+    #[serde(default)]
+    #[cfg_attr(feature = "ts-bindings", ts(type = "number | bigint", optional))]
+    pub active_until: Option<Slot>,
+    /// Call the script every this many slots, starting at its first active slot. Without it,
+    /// every slot.
+    #[serde(default)]
+    #[cfg_attr(feature = "ts-bindings", ts(type = "number | bigint", optional))]
+    pub every: Option<Slot>,
 }
 
 /// Configuration for scenario execution

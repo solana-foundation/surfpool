@@ -2459,3 +2459,454 @@ async fn trader_configuration_reaches_what_phoenix_reads() {
         (2, 3)
     );
 }
+
+/// A scenario script reacts to what a block did: here it reads a taker's position each slot and
+/// moves the market against the taker's flow, by `impact_ticks_per_lot` for each lot. The impact
+/// lasts: the market stays where the flow pushed it until flow the other way pushes it back, where
+/// a scenario of fixed overrides would have put it back on its schedule whatever the taker did.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_scenario_script_moves_the_market_with_a_takers_flow() {
+    const SYMBOL: &str = "SOL";
+    const LOTS: i64 = 1_000;
+    let remote = Some((client(), CommitmentConfig::confirmed()));
+    let graph = phoenix_mainnet_graph().await;
+    let locker = phoenix_surfnet(&graph).await;
+    let trader = LocalTrader::create(&locker, 10_000).await.unwrap();
+    let (_, orderbook, spline) = graph
+        .markets
+        .iter()
+        .find(|(symbol, _, _)| symbol == SYMBOL)
+        .cloned()
+        .unwrap();
+    let bbo = || hawkeye_bbo_for_market(&graph, &locker, orderbook, spline);
+
+    let start = bbo();
+    // Buying `LOTS` moves the price up by half a percent.
+    let impact_ticks_per_lot = start.index_price_ticks as f64 / 200.0 / LOTS as f64;
+    let source = format!(
+        r#"
+        local TRADER, SYMBOL, IMPACT = "{trader}", "{SYMBOL}", {impact_ticks_per_lot}
+        base, seen, impact = nil, 0, 0
+
+        function on_slot(ctx)
+          base = base or ctx.phoenix.bbo(SYMBOL).index_ticks
+          local position = ctx.phoenix.position(TRADER, SYMBOL)
+          local flow = position - seen
+          seen = position
+          if flow == 0 then return end
+          impact = impact + IMPACT * flow
+          local target = math.floor(base + impact + 0.5)
+          ctx.override {{
+            template = "phoenix-market-move",
+            values = {{ symbol = SYMBOL, target_ticks = tostring(target) }},
+          }}
+          ctx.override {{ template = "phoenix-market-uncross", values = {{ symbol = SYMBOL }} }}
+          ctx.log(SYMBOL .. " flow " .. flow .. " -> " .. target)
+        end
+        "#,
+        trader = trader.account,
+    );
+    let mut scenario = surfpool_types::Scenario::new("impact".into(), "taker impact".into());
+    scenario.scripts.push(surfpool_types::ScenarioScript {
+        id: "impact".into(),
+        name: "impact".into(),
+        source,
+        seed: None,
+        instruction_limit: None,
+        active_from: None,
+        active_until: None,
+        every: None,
+    });
+    locker.register_scenario(scenario, None).unwrap();
+
+    // No flow, no move.
+    locker.confirm_current_block(&remote).await.unwrap();
+    assert_eq!(bbo().index_price_ticks, start.index_price_ticks);
+
+    // The taker buys. The script sees the position at the next slot and moves the market up.
+    trader
+        .place_market_order(&locker, SYMBOL, LOTS)
+        .await
+        .unwrap();
+    locker.confirm_current_block(&remote).await.unwrap();
+    let pushed = bbo();
+    // Where the script puts the index once the taker holds `lots`.
+    let index_at = |lots: i64| {
+        (start.index_price_ticks as f64 + impact_ticks_per_lot * lots as f64).round() as u64
+    };
+    let target = index_at(LOTS);
+    assert!(
+        pushed.index_price_ticks.abs_diff(target) <= 1,
+        "the buy moved the index from {} to {}, expected {target}",
+        start.index_price_ticks,
+        pushed.index_price_ticks
+    );
+    assert!(
+        pushed.best_ask_ticks > start.best_ask_ticks
+            && pushed.best_bid_ticks > start.best_bid_ticks,
+        "the book follows: {start:?} -> {pushed:?}"
+    );
+
+    // The impact lasts: nothing puts the market back while the taker holds.
+    for _ in 0..5 {
+        locker.confirm_current_block(&remote).await.unwrap();
+    }
+    assert_eq!(bbo().index_price_ticks, pushed.index_price_ticks);
+
+    // Buying again costs more than the first time, and pushes further.
+    trader
+        .place_market_order(&locker, SYMBOL, LOTS)
+        .await
+        .unwrap();
+    locker.confirm_current_block(&remote).await.unwrap();
+    let further = bbo();
+    assert!(
+        further.index_price_ticks.abs_diff(index_at(2 * LOTS)) <= 1,
+        "the second buy adds to the first: {}",
+        further.index_price_ticks
+    );
+
+    // Selling it all takes the market back to where it started.
+    trader
+        .place_market_order(&locker, SYMBOL, -2 * LOTS)
+        .await
+        .unwrap();
+    locker.confirm_current_block(&remote).await.unwrap();
+    assert!(
+        bbo().index_price_ticks.abs_diff(start.index_price_ticks) <= 1,
+        "flat again: {} against {}",
+        bbo().index_price_ticks,
+        start.index_price_ticks
+    );
+}
+
+fn scenario_with_script(id: &str, source: String) -> surfpool_types::Scenario {
+    let mut scenario = surfpool_types::Scenario::new(id.into(), id.into());
+    scenario.scripts.push(surfpool_types::ScenarioScript {
+        id: id.into(),
+        name: id.into(),
+        source,
+        seed: None,
+        instruction_limit: None,
+        active_from: None,
+        active_until: None,
+        every: None,
+    });
+    scenario
+}
+
+/// One call of a script on the surfnet as it stands, nothing applied: its logs, or its error.
+fn script_reads(locker: &SurfnetSvmLocker, source: &str) -> Result<Vec<String>, String> {
+    let mut scripts = crate::scenarios::script::ScenarioScripts::default();
+    let scenario = scenario_with_script("reads", source.to_string());
+    locker.with_svm_reader(|svm| {
+        let slot = svm.get_latest_absolute_slot();
+        scripts
+            .register(scenario.scripts[0].clone(), slot)
+            .map_err(|e| e.to_string())?;
+        let run = scripts.run_at(0, svm, slot + 1).expect("due");
+        match run.error {
+            Some(error) => Err(error),
+            None => Ok(run.logs),
+        }
+    })
+}
+
+/// What a script reads of Phoenix is what Hawkeye reports: the listed markets, each book's best
+/// bid and ask with the mark and the index, and a trader's signed position.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_script_reads_phoenix_as_hawkeye_reports_it() {
+    let (locker, graph) = phoenix_behavior_locker().await;
+
+    let listed = script_reads(
+        &locker,
+        r#"function on_slot(ctx)
+             for _, market in ipairs(ctx.phoenix.markets()) do
+               local bbo = ctx.phoenix.bbo(market.symbol)
+               assert(math.type(market.mark_ticks) == "integer" and market.tick_size > 0)
+               ctx.log(table.concat({
+                 market.symbol, market.orderbook, market.mark_ticks,
+                 bbo.bid_ticks, bbo.ask_ticks, bbo.mark_ticks, bbo.index_ticks,
+               }, " "))
+             end
+           end"#,
+    )
+    .unwrap();
+    let map = locker
+        .with_svm_reader(|svm| svm.get_account(&graph.perp_asset_map))
+        .unwrap()
+        .unwrap();
+    let markets = phoenix_markets(graph.perp_asset_map, &map).unwrap();
+    assert_eq!(listed.len(), markets.len());
+    for (line, market) in listed.iter().zip(&markets) {
+        let fields: Vec<&str> = line.split(' ').collect();
+        assert_eq!(
+            fields[..3],
+            [
+                market.symbol.clone(),
+                market.orderbook.to_string(),
+                market.mark_ticks.to_string()
+            ]
+        );
+    }
+    // Every book the graph holds, against Hawkeye read from outside the script.
+    assert!(!graph.markets.is_empty());
+    for (symbol, orderbook, spline) in &graph.markets {
+        let line = listed
+            .iter()
+            .find(|line| line.starts_with(&format!("{symbol} ")))
+            .unwrap_or_else(|| panic!("{symbol} is listed"));
+        let fields: Vec<&str> = line.split(' ').collect();
+        let view = hawkeye_bbo_for_market(&graph, &locker, *orderbook, *spline);
+        assert_eq!(
+            fields[3..],
+            [
+                view.best_bid_ticks.to_string(),
+                view.best_ask_ticks.to_string(),
+                view.mark_price_ticks.to_string(),
+                view.index_price_ticks.to_string(),
+            ],
+            "{symbol}"
+        );
+    }
+
+    // The local trader: long SOL, short BTC, orders alone on ETH, nothing elsewhere.
+    let positions = script_reads(
+        &locker,
+        &format!(
+            r#"function on_slot(ctx)
+                 for _, symbol in ipairs({{ "SOL", "BTC", "ETH" }}) do
+                   ctx.log(symbol .. " " .. ctx.phoenix.position("{}", symbol))
+                 end
+               end"#,
+            graph.trader
+        ),
+    )
+    .unwrap();
+    assert_eq!(positions, ["SOL 1000", "BTC -100", "ETH 0"]);
+
+    // What Phoenix does not have fails the call and names what was asked.
+    let unknown = script_reads(
+        &locker,
+        r#"function on_slot(ctx) ctx.phoenix.bbo("NOPE") end"#,
+    )
+    .unwrap_err();
+    assert!(unknown.contains("no Phoenix market NOPE"), "{unknown}");
+    let stranger = script_reads(
+        &locker,
+        &format!(
+            r#"function on_slot(ctx) ctx.log(ctx.phoenix.position("{}", "SOL")) end"#,
+            Pubkey::new_unique()
+        ),
+    );
+    assert!(
+        stranger.is_err(),
+        "an address with no trader account has no position to read: {stranger:?}"
+    );
+    // A script can guard a read it expects to fail.
+    let guarded = script_reads(
+        &locker,
+        r#"function on_slot(ctx)
+             local ok, why = pcall(ctx.phoenix.bbo, "NOPE")
+             ctx.log(tostring(ok))
+           end"#,
+    )
+    .unwrap();
+    assert_eq!(guarded, ["false"]);
+}
+
+/// The use a trading session has for a script: it owns the price path, a level per slot, and
+/// adds the taker's impact on top, part of it lasting and part decaying by half each slot. Every
+/// slot's index is the path's level plus what the taker's flow left.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_script_drives_a_price_path_and_adds_a_takers_decaying_impact() {
+    const SYMBOL: &str = "SOL";
+    const LOTS: i64 = 1_000;
+    // The path, in basis points of the starting index, by slots since registration.
+    const PATH_BPS: [i64; 9] = [0, 10, 25, 25, -40, -40, -15, 5, 30];
+    // A lot moves the price by this share of the starting index, half of it for good.
+    const IMPACT_BPS_PER_1000_LOTS: f64 = 60.0;
+    let remote = Some((client(), CommitmentConfig::confirmed()));
+    let graph = phoenix_mainnet_graph().await;
+    let locker = phoenix_surfnet(&graph).await;
+    let trader = LocalTrader::create(&locker, 10_000).await.unwrap();
+    let (_, orderbook, spline) = graph
+        .markets
+        .iter()
+        .find(|(symbol, _, _)| symbol == SYMBOL)
+        .cloned()
+        .unwrap();
+    let bbo = || hawkeye_bbo_for_market(&graph, &locker, orderbook, spline);
+    let base = bbo().index_price_ticks as f64;
+
+    let path = PATH_BPS.map(|bps| bps.to_string()).join(", ");
+    let source = format!(
+        r#"
+        local TRADER, SYMBOL = "{trader}", "{SYMBOL}"
+        local PATH = {{ {path} }}
+        local PER_LOT = {IMPACT_BPS_PER_1000_LOTS} / 1000 / 10000
+        base, seen, lasting, fading = nil, 0, 0, 0
+
+        function on_slot(ctx)
+          base = base or ctx.phoenix.bbo(SYMBOL).index_ticks
+          local position = ctx.phoenix.position(TRADER, SYMBOL)
+          local flow = position - seen
+          seen = position
+          fading = fading / 2
+          lasting = lasting + flow * PER_LOT / 2
+          fading = fading + flow * PER_LOT / 2
+          local level = (PATH[ctx.elapsed + 1] or PATH[#PATH]) / 10000
+          local target = math.floor(base * (1 + level + lasting + fading) + 0.5)
+          ctx.override {{
+            template = "phoenix-market-move",
+            values = {{ symbol = SYMBOL, target_ticks = tostring(target) }},
+          }}
+          ctx.override {{ template = "phoenix-market-uncross", values = {{ symbol = SYMBOL }} }}
+        end
+        "#,
+        trader = trader.account,
+    );
+    locker
+        .register_scenario(scenario_with_script("path", source), None)
+        .unwrap();
+
+    // The same model, in Rust: the taker buys before slot 3 and sells before slot 6.
+    let per_lot = IMPACT_BPS_PER_1000_LOTS / 1000.0 / 10_000.0;
+    let (mut lasting, mut fading) = (0.0, 0.0);
+    for (elapsed, level_bps) in PATH_BPS.iter().enumerate().skip(1) {
+        let flow = match elapsed {
+            3 => LOTS,
+            6 => -LOTS,
+            _ => 0,
+        };
+        if flow != 0 {
+            trader
+                .place_market_order(&locker, SYMBOL, flow)
+                .await
+                .unwrap();
+        }
+        locker.confirm_current_block(&remote).await.unwrap();
+
+        fading /= 2.0;
+        lasting += flow as f64 * per_lot / 2.0;
+        fading += flow as f64 * per_lot / 2.0;
+        let level = *level_bps as f64 / 10_000.0;
+        let expected = (base * (1.0 + level + lasting + fading)).round() as u64;
+        let view = bbo();
+        assert!(
+            view.index_price_ticks.abs_diff(expected) <= 1,
+            "slot {elapsed}: index {} against {expected}",
+            view.index_price_ticks
+        );
+        assert!(
+            view.best_bid_ticks < view.best_ask_ticks
+                && view.best_bid_ticks <= expected + expected / 100
+                && view.best_ask_ticks + expected / 100 >= expected,
+            "slot {elapsed}: the book quotes around the level: {view:?}"
+        );
+    }
+    // Flat again: what lasted of the buy and of the sell cancel, and what fades is nearly gone.
+    assert!(lasting.abs() < 1e-12 && fading.abs() < per_lot * LOTS as f64);
+}
+
+/// An override Phoenix refuses is that override's failure: the slot goes on, the market stays
+/// where it was, and the script moves it at the next slot.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_move_phoenix_refuses_leaves_the_market_and_the_script_running() {
+    let remote = Some((client(), CommitmentConfig::confirmed()));
+    let graph = phoenix_mainnet_graph().await;
+    let locker = phoenix_surfnet(&graph).await;
+    let (_, orderbook, spline) = graph
+        .markets
+        .iter()
+        .find(|(symbol, _, _)| symbol == "SOL")
+        .cloned()
+        .unwrap();
+    let bbo = || hawkeye_bbo_for_market(&graph, &locker, orderbook, spline);
+    let start = bbo().index_price_ticks;
+    let target = start + start / 100;
+
+    let source = format!(
+        r#"
+        calls = 0
+        function on_slot(ctx)
+          calls = calls + 1
+          local move = function(symbol, ticks)
+            ctx.override {{
+              template = "phoenix-market-move",
+              values = {{ symbol = symbol, target_ticks = ticks }},
+            }}
+          end
+          if calls == 1 then
+            move("NOPE", "100")
+            move("SOL", "not a price")
+            move("SOL", "0")
+          elseif calls == 3 then
+            move("SOL", "{target}")
+            ctx.override {{ template = "phoenix-market-uncross", values = {{ symbol = "SOL" }} }}
+          end
+        end
+        "#
+    );
+    locker
+        .register_scenario(scenario_with_script("refused", source), None)
+        .unwrap();
+
+    locker.confirm_current_block(&remote).await.unwrap();
+    locker.confirm_current_block(&remote).await.unwrap();
+    assert_eq!(
+        bbo().index_price_ticks,
+        start,
+        "the refused moves moved nothing"
+    );
+    locker.confirm_current_block(&remote).await.unwrap();
+    assert!(bbo().index_price_ticks.abs_diff(target) <= 1);
+}
+
+/// What a script costs a slot. Each Phoenix read runs a Hawkeye view on a copy of the local VM,
+/// which is the price of reading the venue's own numbers; a slot must stay well inside the 400 ms
+/// a mainnet slot lasts.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_script_reading_phoenix_every_slot_keeps_slots_fast() {
+    const BLOCKS: u32 = 40;
+    let remote = Some((client(), CommitmentConfig::confirmed()));
+    let (locker, graph) = phoenix_behavior_locker().await;
+
+    let time = |label: &'static str| {
+        let (locker, remote) = (locker.clone(), remote.clone());
+        async move {
+            let started = std::time::Instant::now();
+            for _ in 0..BLOCKS {
+                locker.confirm_current_block(&remote).await.unwrap();
+            }
+            let per_block = started.elapsed() / BLOCKS;
+            eprintln!("{label}: {per_block:?} a slot");
+            per_block
+        }
+    };
+    let idle = time("no script").await;
+
+    let source = format!(
+        r#"reads = 0
+        function on_slot(ctx)
+          local bbo = ctx.phoenix.bbo("SOL")
+          local position = ctx.phoenix.position("{}", "SOL")
+          assert(bbo.bid_ticks < bbo.ask_ticks and position == 1000)
+          reads = reads + 1
+        end"#,
+        graph.trader
+    );
+    locker
+        .register_scenario(scenario_with_script("reader", source), None)
+        .unwrap();
+    let reading = time("a bbo and a position read").await;
+    assert_eq!(
+        locker.with_svm_reader(|svm| svm.scenario_scripts.len()),
+        1,
+        "the script ran every slot without failing its way out"
+    );
+    assert!(
+        reading < std::time::Duration::from_millis(100),
+        "a slot with two Phoenix reads took {reading:?} ({idle:?} without)"
+    );
+}

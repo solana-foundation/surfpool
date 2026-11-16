@@ -239,8 +239,13 @@ pub fn margin(
 
 /// Hawkeye's BBO view of `market`, read inside the sandbox.
 pub fn bbo(sandbox: &mut Sandbox, exchange: &Exchange, market: &Market) -> SurfpoolResult<BboView> {
+    BboView::from_return_data(&sandbox.view(&bbo_view(exchange, market))?)
+}
+
+/// The instruction of Hawkeye's BBO view of `market`.
+pub fn bbo_view(exchange: &Exchange, market: &Market) -> Instruction {
     let books = [market.orderbook, market.splines];
-    BboView::from_return_data(&sandbox.view(&hawkeye_view(exchange, &books, VIEW_BBO.to_vec()))?)
+    hawkeye_view(exchange, &books, VIEW_BBO.to_vec())
 }
 
 /// Hawkeye's `view_margin_for_asset` of `trader` in the market with `asset_id`.

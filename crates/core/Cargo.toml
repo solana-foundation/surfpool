@@ -43,6 +43,7 @@ libloading = { workspace = true }
 litesvm = { workspace = true }
 litesvm-token = { workspace = true }
 log = { workspace = true }
+mlua = { version = "0.10", features = ["lua54", "vendored", "send", "serialize"] }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_derive = { workspace = true }                                  # must match the serde version, see https://github.com/serde-rs/serde/issues/2584#issuecomment-1685252251
