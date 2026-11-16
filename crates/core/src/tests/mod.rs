@@ -1,4 +1,6 @@
 pub mod helpers;
+#[cfg(feature = "integration-tests")]
+pub mod humidifi;
 pub mod integration;
 #[cfg(feature = "integration-tests")]
 pub mod kamino;
