@@ -86,14 +86,21 @@ end
   script was not there for.
 - **`ctx`.** `slot`, `elapsed`, `account(pubkey)`, `override{ template, values, account?, label?,
   fetch? }`, `set_account(pubkey, { lamports?, data?, owner? })`, `random()`, `log(message)`, and
-  `phoenix.markets()`, `phoenix.bbo(symbol)`, `phoenix.position(trader, symbol)`. The table in
-  `script.rs` describes each.
+  `phoenix.markets()`, `phoenix.bbo(symbol)`, `phoenix.position(trader, symbol)`,
+  `phoenix.quote(symbol, side, lots, trader)`. The table in `script.rs` describes each.
 - **Order.** Scripts due at a slot run in the order they were registered. An account write lands
   when its script returns; queued overrides apply after the slot's scheduled ones.
+- **Writes.** A second `set_account` on an account in one call patches the first: `lamports`,
+  then `data`, writes both. A script's write reaches account subscribers and Geyser plugins as a
+  scheduled override's does.
 - **Limits.** No `os`, `io`, `require` or `load`; `ctx.random()` is seeded; `pairs` visits keys in
   sorted order, so a session replays the same. A call past its instruction limit (10 million by
   default) or a VM past 64 MiB is stopped and applies nothing; 20 failed calls in a row disable
-  the script. A scenario whose script does not load registers nothing.
+  the script. A call queues at most 1,024 writes and overrides, and 64 MiB of logs, account data
+  and override values: one more is refused, an error the script can catch.
+- **All or nothing.** A scenario is refused whole: when a script does not load or an override's
+  slot overflows, nothing of it is registered, and scripts already running under the same ids
+  go on with their state.
 - **Not kept.** Scripts are not part of a snapshot, a network reset drops them, and a copy of a
   surfnet (a profiling sandbox) runs none.
 

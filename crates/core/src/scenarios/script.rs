@@ -50,8 +50,13 @@
 //! `math.random`. So that a session replays the same, `pairs` visits keys in sorted order
 //! (numbers, then strings; other key types are an error) and `next` is gone: Lua's own order
 //! changes from run to run. A call that runs past the script's instruction limit, or a VM past
-//! [`MEMORY_LIMIT_BYTES`], is stopped, and what the call queued is dropped. A script whose calls
-//! fail [`MAX_CONSECUTIVE_FAILURES`] times in a row is disabled.
+//! [`MEMORY_LIMIT_BYTES`], is stopped, and what the call queued is dropped. What a call queues is
+//! limited too: [`ACTIONS_MAX`] writes and overrides, and [`OUTPUT_LIMIT_BYTES`] of logs, account
+//! data and override values. A script whose calls fail [`MAX_CONSECUTIVE_FAILURES`] times in a
+//! row is disabled.
+//!
+//! A second `ctx.set_account` on an account in one call patches the first: setting `lamports`,
+//! then `data`, writes both.
 
 use std::{
     cell::{Cell, RefCell},
@@ -90,6 +95,20 @@ const HOOK_EVERY: u32 = 1_000;
 pub const MEMORY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 /// A script that fails this many calls in a row is disabled.
 pub const MAX_CONSECUTIVE_FAILURES: u32 = 20;
+/// The most one call may queue, in bytes of logs, account data and override values. What a call
+/// queues is copied out of the VM, where [`MEMORY_LIMIT_BYTES`] no longer counts it: one string
+/// queued a thousand times is a thousand copies. The number is the VM's own limit, so a call
+/// queues no more than its VM could hold.
+pub const OUTPUT_LIMIT_BYTES: u64 = MEMORY_LIMIT_BYTES as u64;
+/// What each queued entry is charged on top of its bytes: about what an empty log line, write or
+/// override holds, so that empty entries add up to the limit too.
+const OUTPUT_ENTRY_BYTES: u64 = 256;
+/// The most writes and overrides one call may queue. A scenario moves a handful of accounts a
+/// slot; this is far above that, and keeps the search for an earlier write to an account short.
+pub const ACTIONS_MAX: usize = 1_024;
+/// The deepest an override's `values` may nest. Template values are flat or nearly so, and a
+/// table that holds itself has no depth at all.
+const VALUES_DEPTH_MAX: u32 = 16;
 
 /// What a script asked for in one slot.
 pub enum Action {
@@ -108,7 +127,9 @@ pub struct ScriptRun {
     pub disabled: bool,
 }
 
-struct Loaded {
+/// A script compiled and ready to run: what [`ScenarioScripts::load`] returns and
+/// [`ScenarioScripts::install`] registers.
+pub struct Loaded {
     script: ScenarioScript,
     lua: Lua,
     registered_at: Slot,
@@ -141,9 +162,10 @@ impl ScenarioScripts {
         self.scripts.clear();
     }
 
-    /// Loads `script` and replaces any script with its id. Fails when the source does not compile
-    /// or defines no `on_slot` function.
-    pub fn register(&mut self, script: ScenarioScript, slot: Slot) -> SurfpoolResult<()> {
+    /// Compiles `script`, registering nothing. Fails when the source does not compile or defines
+    /// no `on_slot` function. A scenario loads all of its scripts before it installs any, so one
+    /// that is refused leaves the registered scripts as they were.
+    pub fn load(script: ScenarioScript, slot: Slot) -> SurfpoolResult<Loaded> {
         let limit = script
             .instruction_limit
             .unwrap_or(DEFAULT_INSTRUCTION_LIMIT);
@@ -164,8 +186,7 @@ impl ScenarioScripts {
                 script.name
             )));
         }
-        self.scripts.retain(|loaded| loaded.script.id != script.id);
-        self.scripts.push(Loaded {
+        Ok(Loaded {
             rng: script.seed.unwrap_or(0),
             script,
             lua,
@@ -173,15 +194,24 @@ impl ScenarioScripts {
             used,
             consecutive_failures: 0,
             disabled: false,
-        });
+        })
+    }
+
+    /// Loads `script` and replaces any script with its id.
+    #[cfg(test)]
+    pub(crate) fn register(&mut self, script: ScenarioScript, slot: Slot) -> SurfpoolResult<()> {
+        self.install(vec![Self::load(script, slot)?]);
         Ok(())
     }
 
-    /// Removes the script with `id`. Returns whether there was one.
-    pub fn unregister(&mut self, id: &str) -> bool {
-        let before = self.scripts.len();
-        self.scripts.retain(|loaded| loaded.script.id != id);
-        self.scripts.len() != before
+    /// Registers loaded scripts in order, each replacing any script with its id. Nothing here
+    /// can fail: what can is in [`Self::load`].
+    pub fn install(&mut self, loaded: Vec<Loaded>) {
+        for script in loaded {
+            self.scripts
+                .retain(|registered| registered.script.id != script.script.id);
+            self.scripts.push(script);
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -227,17 +257,16 @@ impl Loaded {
 
     fn run(&mut self, svm: &SurfnetSvm, slot: Slot) -> ScriptRun {
         self.used.store(0, Ordering::Relaxed);
-        let actions = RefCell::new(Vec::new());
-        let logs = RefCell::new(Vec::new());
+        let queue = Queue::default();
         let rng = Cell::new(self.rng);
         let elapsed = slot.saturating_sub(self.registered_at);
-        let result = call_on_slot(&self.lua, svm, slot, elapsed, &actions, &logs, &rng);
+        let result = call_on_slot(&self.lua, svm, slot, elapsed, &queue, &rng);
         self.rng = rng.get();
         let mut run = ScriptRun {
             script_id: self.script.id.clone(),
             name: self.script.name.clone(),
-            actions: actions.into_inner(),
-            logs: logs.into_inner(),
+            actions: queue.actions.into_inner(),
+            logs: queue.logs.into_inner(),
             error: None,
             disabled: false,
         };
@@ -257,6 +286,183 @@ impl Loaded {
         }
         run
     }
+}
+
+/// What one call queues, and how much of its limits that took.
+#[derive(Default)]
+struct Queue {
+    actions: RefCell<Vec<Action>>,
+    logs: RefCell<Vec<String>>,
+    /// Bytes charged so far, against [`OUTPUT_LIMIT_BYTES`].
+    bytes: Cell<u64>,
+}
+
+impl Queue {
+    /// Counts one more entry of `bytes`, or refuses it when the call would pass its limit.
+    /// Called before the entry is copied out of the VM, and before anything is queued.
+    fn charge(&self, bytes: usize) -> mlua::Result<()> {
+        let total = self
+            .bytes
+            .get()
+            .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX))
+            .saturating_add(OUTPUT_ENTRY_BYTES);
+        if total > OUTPUT_LIMIT_BYTES {
+            return Err(lua_error(format!(
+                "the call queued more than its limit of {OUTPUT_LIMIT_BYTES} bytes of logs, \
+                 account data and override values"
+            )));
+        }
+        self.bytes.set(total);
+        Ok(())
+    }
+
+    fn log(&self, lua: &Lua, message: Value) -> mlua::Result<()> {
+        let Some(text) = lua.coerce_string(message)? else {
+            self.charge(0)?;
+            self.logs.borrow_mut().push("nil".to_string());
+            return Ok(());
+        };
+        // A byte that is not UTF-8 becomes a three-byte replacement character.
+        self.charge(text.as_bytes().len().saturating_mul(3))?;
+        self.logs.borrow_mut().push(text.to_string_lossy());
+        Ok(())
+    }
+
+    /// Queues a write of `fields` to `pubkey`: onto the write this call already queued for the
+    /// account when there is one, onto the chain's account otherwise. Starting from the chain
+    /// again would undo the earlier write's fields.
+    fn write(&self, svm: &SurfnetSvm, pubkey: Pubkey, fields: &Table) -> mlua::Result<()> {
+        // Surfnet writes these itself every slot, as `surfnet_setAccount` refuses too.
+        reject_managed_sysvar(&pubkey).map_err(lua_error)?;
+        let lamports = fields.get::<Option<u64>>("lamports")?;
+        let data = fields.get::<Option<mlua::String>>("data")?;
+        let owner = match fields.get::<Option<String>>("owner")? {
+            Some(owner) => Some(parse_pubkey(&owner)?),
+            None => None,
+        };
+        let data_bytes = data.as_ref().map(|data| data.as_bytes().len());
+
+        let mut actions = self.actions.borrow_mut();
+        if queued_write(&mut actions, &pubkey).is_none() {
+            room_for_action(&actions)?;
+            let account = svm
+                .get_account(&pubkey)
+                .map_err(lua_error)?
+                .unwrap_or_default();
+            // The chain's data is held unless the patch replaces it.
+            self.charge(data_bytes.unwrap_or(account.data.len()))?;
+            actions.push(Action::SetAccount(pubkey, account));
+        } else {
+            self.charge(data_bytes.unwrap_or(0))?;
+        }
+        let Some(account) = queued_write(&mut actions, &pubkey) else {
+            unreachable!("the write to {pubkey} was queued above");
+        };
+        if let Some(lamports) = lamports {
+            account.lamports = lamports;
+        }
+        if let Some(data) = data {
+            account.data = data.as_bytes().to_vec();
+        }
+        if let Some(owner) = owner {
+            account.owner = owner;
+        }
+        Ok(())
+    }
+
+    fn override_(&self, lua: &Lua, spec: &Table) -> mlua::Result<()> {
+        room_for_action(&self.actions.borrow())?;
+        let template_id = spec
+            .get::<Option<String>>("template")?
+            .ok_or_else(|| lua_error("override: `template` is required"))?;
+        // As a registered scenario's overrides: a template the registry does not hold
+        // still applies, through the IDL of the account's owner.
+        let carried = template_registry()
+            .get(&template_id)
+            .map(|template| &template.address);
+        let account = match (spec.get::<Option<String>>("account")?, carried) {
+            (Some(pubkey), _) => AccountAddress::Pubkey(parse_pubkey(&pubkey)?.to_string()),
+            (None, Some(AccountAddress::Pubkey(pubkey))) if !pubkey.is_empty() => {
+                AccountAddress::Pubkey(pubkey.clone())
+            }
+            (None, _) => {
+                return Err(lua_error(format!(
+                    "override: {template_id} carries no address, give `account`"
+                )));
+            }
+        };
+        let label = spec.get::<Option<String>>("label")?;
+        let values = spec.get::<Option<Value>>("values")?;
+        // Counted before they are copied: a table can name one string many times.
+        let mut bytes = template_id.len() + label.as_ref().map_or(0, String::len);
+        if let Some(values) = &values {
+            count_value_bytes(values, 0, &mut bytes)?;
+        }
+        self.charge(bytes)?;
+
+        let mut instance = OverrideInstance::new(template_id, 0, account);
+        instance.values = match values {
+            Some(values) => lua.from_value(values)?,
+            None => HashMap::new(),
+        };
+        instance.label = label;
+        instance.fetch_before_use = spec.get::<Option<bool>>("fetch")?.unwrap_or(false);
+        self.actions
+            .borrow_mut()
+            .push(Action::Override(Box::new(instance)));
+        Ok(())
+    }
+}
+
+/// Refuses one more write or override when the call has queued [`ACTIONS_MAX`].
+fn room_for_action(actions: &[Action]) -> mlua::Result<()> {
+    if actions.len() >= ACTIONS_MAX {
+        return Err(lua_error(format!(
+            "the call queued more than its limit of {ACTIONS_MAX} writes and overrides"
+        )));
+    }
+    Ok(())
+}
+
+/// The write to `pubkey` among a call's queued actions.
+fn queued_write<'a>(actions: &'a mut [Action], pubkey: &Pubkey) -> Option<&'a mut Account> {
+    actions.iter_mut().find_map(|action| match action {
+        Action::SetAccount(queued, account) if queued == pubkey => Some(account),
+        Action::SetAccount(..) | Action::Override(_) => None,
+    })
+}
+
+/// Adds to `bytes` what `value` takes once copied out of the VM, and stops at
+/// [`OUTPUT_LIMIT_BYTES`]: past it the copy is refused, so the rest need not be counted.
+/// Recursion is bounded by [`VALUES_DEPTH_MAX`], which a table that holds itself runs into.
+fn count_value_bytes(value: &Value, depth: u32, bytes: &mut usize) -> mlua::Result<()> {
+    // A number, a boolean, or a string's or table's own header.
+    const VALUE_BYTES: usize = 16;
+    *bytes = bytes.saturating_add(VALUE_BYTES);
+    match value {
+        Value::String(text) => *bytes = bytes.saturating_add(text.as_bytes().len()),
+        Value::Table(table) => {
+            if depth >= VALUES_DEPTH_MAX {
+                return Err(lua_error(format!(
+                    "override: `values` nests deeper than {VALUES_DEPTH_MAX} tables"
+                )));
+            }
+            for pair in table.pairs::<Value, Value>() {
+                let (key, value) = pair?;
+                count_value_bytes(&key, depth + 1, bytes)?;
+                count_value_bytes(&value, depth + 1, bytes)?;
+            }
+        }
+        // A scalar is its header. What cannot be copied at all, a function say, is refused
+        // by the copy itself.
+        _ => {}
+    }
+    if u64::try_from(*bytes).unwrap_or(u64::MAX) > OUTPUT_LIMIT_BYTES {
+        return Err(lua_error(format!(
+            "override: `values` is more than the call's limit of {OUTPUT_LIMIT_BYTES} bytes"
+        )));
+    }
+    Ok(())
 }
 
 fn script_error(e: mlua::Error) -> SurfpoolError {
@@ -382,8 +588,7 @@ fn call_on_slot(
     svm: &SurfnetSvm,
     slot: Slot,
     elapsed: u64,
-    actions: &RefCell<Vec<Action>>,
-    logs: &RefCell<Vec<String>>,
+    queue: &Queue,
     rng: &Cell<u64>,
 ) -> mlua::Result<()> {
     // Phoenix's views run on a copy of the VM. Copying it is most of what a read costs, and
@@ -419,65 +624,13 @@ fn call_on_slot(
 
         ctx.set(
             "override",
-            scope.create_function(|lua, spec: Table| {
-                let template_id = spec
-                    .get::<Option<String>>("template")?
-                    .ok_or_else(|| lua_error("override: `template` is required"))?;
-                // As a registered scenario's overrides: a template the registry does not hold
-                // still applies, through the IDL of the account's owner.
-                let carried = template_registry()
-                    .get(&template_id)
-                    .map(|template| &template.address);
-                let account = match (spec.get::<Option<String>>("account")?, carried) {
-                    (Some(pubkey), _) => AccountAddress::Pubkey(parse_pubkey(&pubkey)?.to_string()),
-                    (None, Some(AccountAddress::Pubkey(pubkey))) if !pubkey.is_empty() => {
-                        AccountAddress::Pubkey(pubkey.clone())
-                    }
-                    (None, _) => {
-                        return Err(lua_error(format!(
-                            "override: {template_id} carries no address, give `account`"
-                        )));
-                    }
-                };
-                let values: HashMap<String, serde_json::Value> =
-                    match spec.get::<Option<Value>>("values")? {
-                        Some(values) => lua.from_value(values)?,
-                        None => HashMap::new(),
-                    };
-                let mut instance = OverrideInstance::new(template_id, 0, account);
-                instance.values = values;
-                instance.label = spec.get::<Option<String>>("label")?;
-                instance.fetch_before_use = spec.get::<Option<bool>>("fetch")?.unwrap_or(false);
-                actions
-                    .borrow_mut()
-                    .push(Action::Override(Box::new(instance)));
-                Ok(())
-            })?,
+            scope.create_function(|lua, spec: Table| queue.override_(lua, &spec))?,
         )?;
 
         ctx.set(
             "set_account",
             scope.create_function(|_, (pubkey, fields): (String, Table)| {
-                let pubkey = parse_pubkey(&pubkey)?;
-                // Surfnet writes these itself every slot, as `surfnet_setAccount` refuses too.
-                reject_managed_sysvar(&pubkey).map_err(lua_error)?;
-                let mut account = svm
-                    .get_account(&pubkey)
-                    .map_err(lua_error)?
-                    .unwrap_or_default();
-                if let Some(lamports) = fields.get::<Option<u64>>("lamports")? {
-                    account.lamports = lamports;
-                }
-                if let Some(data) = fields.get::<Option<mlua::String>>("data")? {
-                    account.data = data.as_bytes().to_vec();
-                }
-                if let Some(owner) = fields.get::<Option<String>>("owner")? {
-                    account.owner = parse_pubkey(&owner)?;
-                }
-                actions
-                    .borrow_mut()
-                    .push(Action::SetAccount(pubkey, account));
-                Ok(())
+                queue.write(svm, parse_pubkey(&pubkey)?, &fields)
             })?,
         )?;
 
@@ -491,14 +644,7 @@ fn call_on_slot(
 
         ctx.set(
             "log",
-            scope.create_function(|lua, message: Value| {
-                let text = match lua.coerce_string(message)? {
-                    Some(text) => text.to_string_lossy(),
-                    None => "nil".to_string(),
-                };
-                logs.borrow_mut().push(text);
-                Ok(())
-            })?,
+            scope.create_function(|lua, message: Value| queue.log(lua, message))?,
         )?;
 
         let phoenix = lua.create_table()?;
@@ -1104,20 +1250,14 @@ mod tests {
         scripts.register(script(&source), 0).unwrap();
         let run = run(&mut scripts, &svm, 1);
         assert_eq!(run.error, None);
-        let [
-            Action::SetAccount(first, whole),
-            Action::SetAccount(_, packed),
-        ] = &run.actions[..]
-        else {
-            panic!("two writes");
+        // The second write patches the first: one account, with the first's lamports and owner.
+        let [Action::SetAccount(written, account)] = &run.actions[..] else {
+            panic!("one write, got {}", run.actions.len());
         };
-        assert_eq!(*first, copy);
-        assert_eq!(
-            (whole.lamports, &whole.data, whole.owner),
-            (7, &data, owner)
-        );
-        assert_eq!(packed.data[..8], 1_234_567_890_123u64.to_le_bytes());
-        assert_eq!(packed.data[8..], data[..]);
+        assert_eq!(*written, copy);
+        assert_eq!((account.lamports, account.owner), (7, owner));
+        assert_eq!(account.data[..8], 1_234_567_890_123u64.to_le_bytes());
+        assert_eq!(account.data[8..], data[..]);
     }
 
     #[test]
@@ -1182,6 +1322,222 @@ mod tests {
         assert_eq!(runs[1].logs, vec!["nil"]);
     }
 
+    // ---- What a call queues ----
+
+    #[test]
+    fn a_second_write_to_an_account_patches_the_first() {
+        let mut svm = svm();
+        let (patched, other, owner) = (
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+        );
+        for pubkey in [&patched, &other] {
+            svm.set_account(
+                pubkey,
+                Account {
+                    lamports: 1,
+                    data: b"keep".to_vec(),
+                    ..Account::default()
+                },
+            )
+            .unwrap();
+        }
+        let mut scripts = ScenarioScripts::default();
+        scripts
+            .register(
+                script(&format!(
+                    r#"
+                    function on_slot(ctx)
+                      ctx.set_account("{patched}", {{ lamports = 5 }})
+                      ctx.set_account("{other}", {{ lamports = 9 }})
+                      ctx.set_account("{patched}", {{ data = "new" }})
+                      ctx.set_account("{patched}", {{ owner = "{owner}" }})
+                    end
+                    "#
+                )),
+                0,
+            )
+            .unwrap();
+        let run = run(&mut scripts, &svm, 1);
+        assert_eq!(run.error, None);
+        // One write an account, each holding every field set on it and the chain's for the rest.
+        let [
+            Action::SetAccount(first, first_account),
+            Action::SetAccount(second, second_account),
+        ] = &run.actions[..]
+        else {
+            panic!("two writes, not {}", run.actions.len());
+        };
+        assert_eq!(*first, patched);
+        assert_eq!(
+            (
+                first_account.lamports,
+                &first_account.data[..],
+                first_account.owner
+            ),
+            (5, &b"new"[..], owner)
+        );
+        assert_eq!(*second, other);
+        assert_eq!(
+            (second_account.lamports, &second_account.data[..]),
+            (9, &b"keep"[..])
+        );
+    }
+
+    #[test]
+    fn a_call_queues_no_more_than_its_limits() {
+        let account = Pubkey::new_unique();
+        let over_bytes = format!("limit of {OUTPUT_LIMIT_BYTES} bytes");
+
+        // Logs: a line is charged three times its bytes, so the third of 8 MiB is refused.
+        let logs = error_of(
+            r#"function on_slot(ctx)
+                 local big = string.rep("x", 8 * 1024 * 1024)
+                 for i = 1, 1000 do ctx.log(big) end
+               end"#,
+        );
+        assert!(logs.contains(&over_bytes), "{logs}");
+
+        // Account data, one string written to account after account.
+        let accounts: Vec<String> = (0..8)
+            .map(|_| format!("\"{}\"", Pubkey::new_unique()))
+            .collect();
+        let writes = error_of(&format!(
+            r#"function on_slot(ctx)
+                 local big = string.rep("x", 16 * 1024 * 1024)
+                 for _, account in ipairs({{ {} }}) do ctx.set_account(account, {{ data = big }}) end
+               end"#,
+            accounts.join(", ")
+        ));
+        assert!(writes.contains(&over_bytes), "{writes}");
+
+        // An override's values, refused before they are copied.
+        let values = error_of(&format!(
+            r#"function on_slot(ctx)
+                 local big = string.rep("x", 16 * 1024 * 1024)
+                 ctx.override {{ template = "t", account = "{account}",
+                                values = {{ a = big, b = big, c = big, d = big }} }}
+               end"#
+        ));
+        assert!(values.contains("`values` is more than"), "{values}");
+
+        // Values that hold themselves have no size to count.
+        let nested = error_of(&format!(
+            r#"function on_slot(ctx)
+                 local values = {{}}
+                 values.again = values
+                 ctx.override {{ template = "t", account = "{account}", values = values }}
+               end"#
+        ));
+        assert!(nested.contains("nests deeper than 16 tables"), "{nested}");
+
+        // Entries with nothing in them, by their number.
+        let count = error_of(&format!(
+            r#"function on_slot(ctx)
+                 for i = 1, {} do ctx.override {{ template = "t", account = "{account}" }} end
+               end"#,
+            ACTIONS_MAX + 1
+        ));
+        assert!(
+            count.contains(&format!("limit of {ACTIONS_MAX} writes and overrides")),
+            "{count}"
+        );
+    }
+
+    #[test]
+    fn a_refused_entry_queues_nothing_and_the_call_goes_on() {
+        let account = Pubkey::new_unique();
+        let mut scripts = ScenarioScripts::default();
+        scripts
+            .register(
+                script(&format!(
+                    r#"
+                    function on_slot(ctx)
+                      local big = string.rep("x", 8 * 1024 * 1024)
+                      local queued = 0
+                      for i = 1, 10 do
+                        if pcall(ctx.log, big) then queued = queued + 1 end
+                      end
+                      ctx.set_account("{account}", {{ lamports = queued }})
+                      for i = 1, {ACTIONS_MAX} do
+                        pcall(ctx.override, {{ template = "t", account = "{account}" }})
+                      end
+                      -- A write to an account already queued is no new entry.
+                      ctx.set_account("{account}", {{ data = "late" }})
+                    end
+                    "#
+                )),
+                0,
+            )
+            .unwrap();
+        let svm = svm();
+        // The limits are per call: the second call queues what the first did.
+        for slot in 1..=2 {
+            let run = run(&mut scripts, &svm, slot);
+            assert_eq!(run.error, None);
+            assert_eq!(run.logs.len(), 2);
+            assert_eq!(run.actions.len(), ACTIONS_MAX);
+            assert!(matches!(
+                &run.actions[0],
+                Action::SetAccount(_, written) if written.lamports == 2 && written.data == b"late"
+            ));
+        }
+    }
+
+    #[test]
+    fn a_refused_scenario_leaves_the_running_scripts_and_the_schedule_alone() {
+        let mut svm = svm();
+        let counting = |word: &str| {
+            named(
+                "counter",
+                format!("n = 0 function on_slot(ctx) n = n + 1 ctx.log('{word} ' .. n) end"),
+            )
+        };
+        let logs_at = |svm: &mut SurfnetSvm, slot: Slot| -> Vec<String> {
+            let mut scripts = std::mem::take(&mut svm.scenario_scripts);
+            let logs = scripts
+                .run_slot(svm, slot)
+                .into_iter()
+                .flat_map(|run| run.logs)
+                .collect();
+            svm.scenario_scripts = scripts;
+            logs
+        };
+        svm.register_scenario(scenario_of(vec![counting("old")]), Some(0))
+            .unwrap();
+        assert_eq!(logs_at(&mut svm, 1), vec!["old 1"]);
+
+        // A second script that does not compile: the first, loaded already, replaces nothing.
+        let broken = named("broken", "function on_slot(");
+        assert!(
+            svm.register_scenario(scenario_of(vec![counting("new"), broken]), Some(1))
+                .is_err()
+        );
+        assert_eq!(logs_at(&mut svm, 2), vec!["old 2"]);
+
+        // An override past the last slot: neither the script nor the override before it is in.
+        let target = Pubkey::new_unique();
+        let mut overflowing = scenario_of(vec![counting("new")]);
+        overflowing.overrides = vec![
+            set_token_amount(&target, 5, 1),
+            set_token_amount(&target, u64::MAX, 2),
+        ];
+        let error = svm.register_scenario(overflowing, Some(2)).unwrap_err();
+        assert!(error.to_string().contains("overflows"), "{error}");
+        assert!(svm.scheduled_overrides.get(&7).unwrap().is_none());
+        assert_eq!(logs_at(&mut svm, 3), vec!["old 3"]);
+
+        // The same scenario without the bad override replaces the script and schedules the rest.
+        let mut accepted = scenario_of(vec![counting("new")]);
+        accepted.overrides = vec![set_token_amount(&target, 5, 1)];
+        svm.register_scenario(accepted, Some(3)).unwrap();
+        assert_eq!(svm.scenario_scripts.len(), 1);
+        assert_eq!(logs_at(&mut svm, 4), vec!["new 1"]);
+        let scheduled = svm.scheduled_overrides.get(&8).unwrap();
+        assert_eq!(scheduled.map(|overrides| overrides.len()), Some(1));
+    }
+
     // ---- On a surfnet, through block confirmation ----
 
     use crossbeam_channel::Receiver;
@@ -1189,7 +1545,7 @@ mod tests {
     use spl_token_interface::state::{Account as TokenAccount, AccountState};
     use surfpool_types::{Scenario, SimnetEvent};
 
-    use crate::surfnet::locker::SurfnetSvmLocker;
+    use crate::surfnet::{GeyserEvent, locker::SurfnetSvmLocker};
 
     fn surfnet() -> (SurfnetSvmLocker, Receiver<SimnetEvent>) {
         let (svm, events_rx, _geyser_rx) = SurfnetSvm::default();
@@ -1553,6 +1909,43 @@ mod tests {
         assert!(locker.with_svm_reader(|svm| svm.scenario_scripts.is_empty()));
         confirm(&locker, 2).await;
         assert_eq!(lamports(&locker, &counter), 0);
+    }
+
+    /// A plugin following an account a script writes sees each write, as it sees a scheduled
+    /// override's.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_scripts_write_reaches_geyser() {
+        let (svm, _events_rx, geyser_rx) = SurfnetSvm::default();
+        let locker = SurfnetSvmLocker::new(svm);
+        let written = Pubkey::new_unique();
+        let base = locker.get_latest_absolute_slot();
+        locker
+            .register_scenario(
+                scenario_of(vec![named(
+                    "writer",
+                    format!(
+                        r#"function on_slot(ctx)
+                             -- The third slot writes what the second did: no change, no update.
+                             ctx.set_account("{written}", {{ lamports = math.min(ctx.elapsed, 2) }})
+                           end"#
+                    ),
+                )]),
+                None,
+            )
+            .unwrap();
+        confirm(&locker, 3).await;
+
+        let updates: Vec<(Slot, u64)> = geyser_rx
+            .try_iter()
+            .filter_map(|event| match event {
+                GeyserEvent::UpdateAccount(update) if update.pubkey == written => {
+                    Some((update.slot, update.account.lamports))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(updates, vec![(base + 1, 1), (base + 2, 2)]);
+        assert_eq!(lamports(&locker, &written), 2);
     }
 
     /// The same scenario on two fresh surfnets, driven by the same writes, ends in the same

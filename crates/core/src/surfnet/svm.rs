@@ -5188,10 +5188,6 @@ impl SurfnetSvm {
         Ok(fixtures)
     }
 
-    /// Registers a scenario for execution by scheduling its overrides
-    ///
-    /// The `slot` parameter is the base slot from which relative override slot heights are calculated.
-    /// If not provided, uses the current slot.
     /// Calls every scenario script due at the slot that just opened, in registration order.
     /// A script's account writes land before the next script runs; the overrides it queues join
     /// the slot's scheduled ones, which [`Self::materialize_overrides`] applies next. A script
@@ -5236,7 +5232,8 @@ impl SurfnetSvm {
             match action {
                 Action::Override(instance) => queued.push(*instance),
                 Action::SetAccount(pubkey, account) => {
-                    if let Err(e) = self.set_account(&pubkey, account) {
+                    // As a scheduled override's write: Geyser plugins hear of it too.
+                    if let Err(e) = self.set_scenario_override_account(&pubkey, account, slot) {
                         self.simnet_events_tx.warn(format!(
                             "Scenario script {} could not write {} at slot {}: {}",
                             run.name, pubkey, slot, e
@@ -5261,38 +5258,35 @@ impl SurfnetSvm {
         }
     }
 
+    /// Registers a scenario for execution by scheduling its overrides and installing its scripts.
+    ///
+    /// The `slot` parameter is the base slot from which relative override slot heights are calculated.
+    /// If not provided, uses the current slot.
+    ///
+    /// A scenario that is refused changes nothing: its scripts are compiled and its overrides'
+    /// slots are checked before any of them is registered, so the scripts already running, some
+    /// perhaps under the same ids, go on as they were.
     pub fn register_scenario(
         &mut self,
         scenario: surfpool_types::Scenario,
         slot: Option<Slot>,
     ) -> SurfpoolResult<()> {
+        use crate::scenarios::script::ScenarioScripts;
+
         // Use provided slot or current slot as the base for relative slot heights
         let base_slot = slot.unwrap_or(self.latest_epoch_info.absolute_slot);
 
         info!(
-            "Registering scenario: {} ({}) with {} overrides at base slot {}",
+            "Registering scenario: {} ({}) with {} overrides and {} scripts at base slot {}",
             scenario.name,
             scenario.id,
             scenario.overrides.len(),
+            scenario.scripts.len(),
             base_slot
         );
 
-        // Scripts load first: a scenario whose script does not compile registers nothing.
-        let script_ids: Vec<String> = scenario
-            .scripts
-            .iter()
-            .map(|script| script.id.clone())
-            .collect();
-        for (index, script) in scenario.scripts.into_iter().enumerate() {
-            if let Err(e) = self.scenario_scripts.register(script, base_slot) {
-                for id in &script_ids[..index] {
-                    self.scenario_scripts.unregister(id);
-                }
-                return Err(e);
-            }
-        }
-
-        // Schedule overrides by adding base slot to their scenario-relative slots
+        // Everything that can refuse the scenario, first.
+        let mut scheduled = Vec::with_capacity(scenario.overrides.len());
         for override_instance in scenario.overrides {
             let scenario_relative_slot = override_instance.scenario_relative_slot;
             // Both operands are caller-supplied, so the sum has to be checked.
@@ -5302,10 +5296,20 @@ impl SurfnetSvm {
                     override_instance.id, base_slot, scenario_relative_slot
                 ))
             })?;
+            scheduled.push((absolute_slot, override_instance));
+        }
+        let scripts = scenario
+            .scripts
+            .into_iter()
+            .map(|script| ScenarioScripts::load(script, base_slot))
+            .collect::<SurfpoolResult<Vec<_>>>()?;
 
+        // Only storage can fail from here. The scripts go in last, so a scenario whose
+        // overrides could not all be stored runs no script against half a schedule.
+        for (absolute_slot, override_instance) in scheduled {
             debug!(
                 "Scheduling override at absolute slot {} (base {} + relative {})",
-                absolute_slot, base_slot, scenario_relative_slot
+                absolute_slot, base_slot, override_instance.scenario_relative_slot
             );
 
             let mut slot_overrides = self
@@ -5316,6 +5320,7 @@ impl SurfnetSvm {
             self.scheduled_overrides
                 .store(absolute_slot, slot_overrides)?;
         }
+        self.scenario_scripts.install(scripts);
 
         Ok(())
     }
