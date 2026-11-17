@@ -637,7 +637,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -648,7 +648,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1189,7 +1189,7 @@ dependencies = [
  "anyhow",
  "cargo_metadata",
  "rustc_version",
- "which",
+ "which 8.0.6",
 ]
 
 [[package]]
@@ -2803,7 +2803,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.2",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3050,6 +3050,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "env_home"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7f84e12ccf0a7ddc17a6c41c93326024c42920d7ee630d04950e6926645c0fe"
+
+[[package]]
 name = "env_logger"
 version = "0.11.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3078,13 +3084,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "erased-serde"
+version = "0.4.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e59b668157f32d3459d4bd634861a06ffa2503a461ca5f0916b9f0252605e66"
+dependencies = [
+ "serde",
+ "serde_core",
+ "typeid",
+]
+
+[[package]]
 name = "errno"
 version = "0.3.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4314,7 +4331,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi 0.5.2",
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5170,6 +5187,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
+name = "lua-src"
+version = "547.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1edaf29e3517b49b8b746701e5648ccb5785cde1c119062cbabbc5d5cd115e42"
+dependencies = [
+ "cc",
+]
+
+[[package]]
+name = "luajit-src"
+version = "210.5.12+a4f56a4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b3a8e7962a5368d5f264d045a5a255e90f9aa3fc1941ae15a8d2940d42cac671"
+dependencies = [
+ "cc",
+ "which 7.0.3",
+]
+
+[[package]]
 name = "lz4"
 version = "1.28.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5336,6 +5372,37 @@ dependencies = [
  "net2",
  "winapi 0.2.8",
  "ws2_32-sys",
+]
+
+[[package]]
+name = "mlua"
+version = "0.10.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c1f5f8fbebc7db5f671671134b9321c4b9aa9adeafccfd9a8c020ae45c6a35d0"
+dependencies = [
+ "bstr",
+ "either",
+ "erased-serde 0.4.11",
+ "mlua-sys",
+ "num-traits",
+ "parking_lot 0.12.5",
+ "rustc-hash 2.1.3",
+ "rustversion",
+ "serde",
+ "serde-value",
+]
+
+[[package]]
+name = "mlua-sys"
+version = "0.6.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "380c1f7e2099cafcf40e51d3a9f20a346977587aa4d012eae1f043149a728a93"
+dependencies = [
+ "cc",
+ "cfg-if 1.0.4",
+ "lua-src",
+ "luajit-src",
+ "pkg-config",
 ]
 
 [[package]]
@@ -5834,6 +5901,15 @@ name = "option-ext"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
+
+[[package]]
+name = "ordered-float"
+version = "2.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68f19d67e5a2795c94e73e0bb1cc1a7edeb2e28efd39e2e1c9b7a40c1108b11c"
+dependencies = [
+ "num-traits",
+]
 
 [[package]]
 name = "p256"
@@ -6426,7 +6502,7 @@ dependencies = [
  "once_cell",
  "socket2 0.6.5",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7029,7 +7105,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7086,7 +7162,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7299,6 +7375,16 @@ version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "11fc7cc2c76d73e0f27ee52abbd64eec84d46f370c88371120433196934e4b7f"
 dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "serde-value"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f3a1a3341211875ef120e117ea7fd5228530ae7e7036a779fdc9117be6b3282c"
+dependencies = [
+ "ordered-float",
  "serde",
 ]
 
@@ -7633,7 +7719,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b3b8565691b22d2bdfc066426ed48f837fc0c5f2c8cad8d9718f7f99d6995c1"
 dependencies = [
  "anyhow",
- "erased-serde",
+ "erased-serde 0.3.31",
  "rustversion",
  "serde_core",
 ]
@@ -7734,7 +7820,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -12045,6 +12131,7 @@ dependencies = [
  "litesvm",
  "litesvm-token",
  "log 0.4.33",
+ "mlua",
  "opentelemetry 0.28.0",
  "opentelemetry-prometheus",
  "opentelemetry_sdk 0.28.0",
@@ -12366,10 +12453,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -12378,7 +12465,7 @@ version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8c27177b12a6399ffc08b98f76f7c9a1f4fe9fc967c784c5a071fa8d93cf7e1"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -13079,6 +13166,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "typeid"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bc7d623258602320d5c55d1bc22793b57daff0ec7efc270ea7d55ce1d5f5471c"
+
+[[package]]
 name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13447,6 +13540,18 @@ dependencies = [
 
 [[package]]
 name = "which"
+version = "7.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "24d643ce3fd3e5b54854602a080f34fb10ab75e0b813ee32d00ca2b44fa74762"
+dependencies = [
+ "either",
+ "env_home",
+ "rustix 1.1.4",
+ "winsafe",
+]
+
+[[package]]
+name = "which"
 version = "8.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bae2f2b2b816647a1cab1acc91f5bd20812d53cb344382635ec2181940c8034f"
@@ -13498,7 +13603,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -13971,6 +14076,12 @@ checksum = "0592e1c9d151f854e6fd382574c3a0855250e1d9b2f99d9281c6e6391af352f1"
 dependencies = [
  "memchr",
 ]
+
+[[package]]
+name = "winsafe"
+version = "0.0.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d135d17ab770252ad95e9a872d365cf3090e3be864a34ab46f48555993efc904"
 
 [[package]]
 name = "wit-bindgen"

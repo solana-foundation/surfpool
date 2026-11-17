@@ -395,6 +395,29 @@ impl<'a> Sandbox<'a> {
         self.send(instruction).map_err(SurfpoolError::internal)
     }
 
+    /// The return data of a view that needs `setup` run before it in the same transaction, such
+    /// as a scratch account allocated for it.
+    pub fn view_after(
+        &mut self,
+        setup: &Instruction,
+        view: &Instruction,
+    ) -> SurfpoolResult<Vec<u8>> {
+        self.send_all(&[setup.clone(), view.clone()])
+            .map_err(SurfpoolError::internal)
+    }
+
+    /// A funded account in the copy, for an instruction that needs one to pay.
+    pub fn funded(&mut self) -> SurfpoolResult<Pubkey> {
+        let key = Keypair::new().pubkey();
+        self.svm
+            .inner
+            .airdrop(&key, FEE_PAYER_LAMPORTS)
+            .map_err(|failed| {
+                SurfpoolError::internal(format!("funding an account failed: {:?}", failed.err))
+            })?;
+        Ok(key)
+    }
+
     /// An account as the instructions run so far left it.
     pub fn account(&self, address: &Pubkey) -> SurfpoolResult<Account> {
         local_account(&self.svm, address)
@@ -423,19 +446,22 @@ impl<'a> Sandbox<'a> {
     }
 
     fn send(&mut self, instruction: &Instruction) -> Result<Vec<u8>, String> {
+        self.send_all(std::slice::from_ref(instruction))
+    }
+
+    /// `instructions` in one transaction; the return data is the last one's.
+    fn send_all(&mut self, instructions: &[Instruction]) -> Result<Vec<u8>, String> {
         // A fresh payer gives every transaction its own signature.
         let payer = Keypair::new();
         self.svm
             .inner
             .airdrop(&payer.pubkey(), FEE_PAYER_LAMPORTS)
             .map_err(|failed| format!("funding the fee payer failed: {:?}", failed.err))?;
-        let mut transaction = Transaction::new_with_payer(
-            &[
-                ComputeBudgetInstruction::set_compute_unit_limit(COMPUTE_UNIT_LIMIT),
-                instruction.clone(),
-            ],
-            Some(&payer.pubkey()),
-        );
+        let mut all = vec![ComputeBudgetInstruction::set_compute_unit_limit(
+            COMPUTE_UNIT_LIMIT,
+        )];
+        all.extend_from_slice(instructions);
+        let mut transaction = Transaction::new_with_payer(&all, Some(&payer.pubkey()));
         transaction.partial_sign(&[&payer], self.svm.inner.svm.latest_blockhash());
         self.svm
             .inner

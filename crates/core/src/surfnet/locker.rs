@@ -4216,6 +4216,7 @@ impl SurfnetSvmLocker {
         let mut svm_writer = self.0.write().await;
         svm_writer.bump_state_revision();
         svm_writer.confirm_current_block()?;
+        svm_writer.run_scenario_scripts();
         svm_writer.materialize_overrides(remote_ctx).await
     }
 

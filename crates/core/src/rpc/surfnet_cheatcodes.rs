@@ -1437,6 +1437,17 @@ pub trait SurfnetCheatcodes {
     ///     - `fetchBeforeUse`: If true, fetch fresh account data just before transaction execution (useful for price feeds, oracle updates, and dynamic balances)
     ///     - `account`: Account address (either `{ "pubkey": "..." }` or `{ "pda": { "programId": "...", "seeds": [...] } }`)
     ///   - `tags`: Array of tags for categorization
+    ///   - `scripts` (optional): Array of scripts that let the scenario react to what transactions do. Each is Lua
+    ///     source whose `on_slot(ctx)` function runs once per slot, after the slot's block is confirmed and before
+    ///     the slot's overrides are applied; it reads accounts and queues overrides. Each contains:
+    ///     - `id`: Unique identifier; a script with an id already in use replaces it
+    ///     - `name`: Human-readable name
+    ///     - `source`: Lua 5.4 source defining `on_slot(ctx)`
+    ///     - `activeFrom` (optional): First relative slot the script is called at (default 1)
+    ///     - `activeUntil` (optional): Relative slot the script stops at and is removed (default: never)
+    ///     - `every` (optional): Call it every this many slots (default 1)
+    ///     - `seed` (optional): Seed of the script's `ctx.random()`
+    ///     - `instructionLimit` (optional): Most Lua VM instructions one call may run
     /// - `slot` (optional): The base slot from which relative slot offsets are calculated. If omitted, uses the current slot.
     ///
     /// ## Returns

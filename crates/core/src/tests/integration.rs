@@ -6401,7 +6401,7 @@ fn test_reset_network_time_travel_epoch(test_type: TestType) {
 /// [`boot_simnet`]. A test that starts two surfnets binds two guards; the
 /// second shadowing the first is fine, since a shadowed binding still lives to
 /// the end of the scope.
-fn start_surfnet(
+pub(crate) fn start_surfnet(
     airdrop_addresses: Vec<Pubkey>,
     datasource_rpc_url: Option<String>,
     test_type: TestType,
