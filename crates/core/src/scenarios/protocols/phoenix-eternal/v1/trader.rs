@@ -248,6 +248,101 @@ pub fn bbo_view(exchange: &Exchange, market: &Market) -> Instruction {
     hawkeye_view(exchange, &books, VIEW_BBO.to_vec())
 }
 
+const VIEW_ORDER_QUOTE: [u8; 8] = [0xc8, 0xaf, 0x97, 0x51, 0xfe, 0xab, 0xf8, 0x2c];
+const ORDER_QUOTE_VIEW_MAGIC: u64 = 0x1529cf1c5cb66f88;
+/// The quote view's scratch account: room for a copy of the market's accounts, which Hawkeye
+/// matches against.
+const ORDER_QUOTE_SCRATCH_BYTES: u64 = 4 * 1024 * 1024;
+
+/// What Hawkeye's `view_order_quote` returns: what an order would fill for, matched against a
+/// copy of the book, the makers' splines and resting orders included.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct OrderQuoteView {
+    magic: u64,
+    pub version: u16,
+    pub flags: u8,
+    /// 0 for a bid (a buy), 1 for an ask.
+    pub side: u8,
+    pub asset_id: u32,
+    pub slot: u64,
+    pub requested_base_lots: u64,
+    pub filled_base_lots: u64,
+    /// What the fills trade for, before fees.
+    pub filled_quote_lots: u64,
+    pub fee_quote_lots: u64,
+    pub posted_base_lots: u64,
+    pub unfilled_base_lots: u64,
+    pub average_price_quote_lots_per_base_lot: u64,
+    pub reference_price_ticks: u64,
+    pub slippage_bps: i64,
+    pub effective_base_lots: u64,
+    pub posted_price_ticks: u64,
+    /// 0 when the matcher took the order.
+    pub outcome: u8,
+    pub rejection_reason: u8,
+    padding: [u8; 6],
+}
+
+impl OrderQuoteView {
+    pub fn from_return_data(data: &[u8]) -> SurfpoolResult<Self> {
+        read_view(data, "order quote", ORDER_QUOTE_VIEW_MAGIC)
+    }
+}
+
+/// What a market order of `base_lots` would fill for in `market` right now: a buy when `buy`,
+/// else a sell. Hawkeye matches it against a copy of the book, so nothing trades. `trader` is any
+/// trader account: the quote reads its positions and checks neither its margin nor its rights.
+/// The order takes immediately or not at all, at any price, and passes over the trader's own
+/// resting orders.
+pub fn order_quote(
+    sandbox: &mut Sandbox,
+    exchange: &Exchange,
+    market: &Market,
+    trader: &Pubkey,
+    buy: bool,
+    base_lots: u64,
+) -> SurfpoolResult<OrderQuoteView> {
+    // Hawkeye wants a zero-lamport account of its own to copy the market into, made earlier in
+    // the same transaction; it closes it.
+    let scratch = Pubkey::new_unique();
+    let payer = sandbox.funded()?;
+    let mut create = vec![0_u8; 4];
+    create.extend(0_u64.to_le_bytes());
+    create.extend(ORDER_QUOTE_SCRATCH_BYTES.to_le_bytes());
+    create.extend(HAWKEYE_PROGRAM_ID.to_bytes());
+    let create = Instruction {
+        program_id: solana_sdk_ids::system_program::ID,
+        accounts: vec![
+            AccountMeta::new(payer, true),
+            AccountMeta::new(scratch, true),
+        ],
+        data: create,
+    };
+
+    // The view's parameters: no reference price, then the order packet as Phoenix encodes an
+    // immediate-or-cancel order.
+    let mut data = VIEW_ORDER_QUOTE.to_vec();
+    data.extend(0_u64.to_le_bytes());
+    data.push(2); // immediate or cancel
+    data.push(u8::from(!buy)); // side
+    data.push(0); // no limit price
+    data.extend(base_lots.to_le_bytes());
+    data.push(0); // no quote-lot budget
+    data.extend(0_u64.to_le_bytes()); // no minimum base fill
+    data.extend(0_u64.to_le_bytes()); // no minimum quote fill
+    data.push(2); // self trade: decrement and take
+    data.push(0); // no match limit
+    data.extend([0_u8; 16]); // client order id
+    data.push(0); // no last valid slot
+    data.push(0); // no order flags
+    data.push(0); // don't cancel existing orders
+    let mut view = hawkeye_view(exchange, &[market.orderbook, market.splines, *trader], data);
+    view.accounts.push(AccountMeta::new(scratch, false));
+
+    OrderQuoteView::from_return_data(&sandbox.view_after(&create, &view)?)
+}
+
 /// Hawkeye's `view_margin_for_asset` of `trader` in the market with `asset_id`.
 pub fn asset_view(
     exchange: &Exchange,

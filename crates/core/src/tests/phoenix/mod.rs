@@ -2910,3 +2910,97 @@ async fn a_script_reading_phoenix_every_slot_keeps_slots_fast() {
         "a slot with two Phoenix reads took {reading:?} ({idle:?} without)"
     );
 }
+
+/// A script's quote is what an order of that size would fill for, matched by Hawkeye against a
+/// copy of the book: at the touch for a lot, further out for more, and nothing trades. A size is
+/// what makes it a measure of the book: a sliver of liquidity at the touch moves the best bid and
+/// ask, and hardly moves what a real order fills for.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_script_quotes_what_an_order_would_fill_for() {
+    let (locker, graph) = phoenix_behavior_locker().await;
+    let (_, orderbook, spline) = graph
+        .markets
+        .iter()
+        .find(|(symbol, _, _)| symbol == "SOL")
+        .cloned()
+        .unwrap();
+    let top = hawkeye_bbo_for_market(&graph, &locker, orderbook, spline);
+    let quotes = |locker: &SurfnetSvmLocker| -> Vec<f64> {
+        script_reads(
+            locker,
+            &format!(
+                r#"function on_slot(ctx)
+                     for _, side in ipairs({{ "buy", "sell" }}) do
+                       for _, lots in ipairs({{ 1, 50000, 1000000 }}) do
+                         local q = ctx.phoenix.quote("SOL", side, lots, "{trader}")
+                         assert(q.filled and q.filled_lots == lots, side .. " " .. lots)
+                         ctx.log(string.format("%.6f", q.avg_ticks))
+                       end
+                     end
+                   end"#,
+                trader = graph.trader
+            ),
+        )
+        .unwrap()
+        .iter()
+        .map(|line| line.parse().unwrap())
+        .collect()
+    };
+    let before = quotes(&locker);
+    let (buys, sells) = (&before[..3], &before[3..]);
+    // A lot fills at the touch.
+    assert_eq!(buys[0], top.best_ask_ticks as f64);
+    assert_eq!(sells[0], top.best_bid_ticks as f64);
+    // More costs more, on both sides.
+    assert!(
+        buys[0] <= buys[1] && buys[1] <= buys[2] && buys[0] < buys[2],
+        "{buys:?}"
+    );
+    assert!(
+        sells[0] >= sells[1] && sells[1] >= sells[2] && sells[0] > sells[2],
+        "{sells:?}"
+    );
+    // Nothing traded: the book and the quotes are as they were.
+    let again = hawkeye_bbo_for_market(&graph, &locker, orderbook, spline);
+    assert_eq!(
+        (again.best_bid_ticks, again.best_ask_ticks),
+        (top.best_bid_ticks, top.best_ask_ticks)
+    );
+    assert_eq!(quotes(&locker), before);
+
+    // A taker sells through the bids: every sell quote is worse, the buy side is not.
+    let taker = LocalTrader::create(&locker, 5_000_000).await.unwrap();
+    taker
+        .place_market_order(&locker, "SOL", -1_000_000)
+        .await
+        .unwrap();
+    let after = quotes(&locker);
+    assert!(
+        after[3] < sells[0] && after[4] <= sells[1] && after[5] < sells[2],
+        "{sells:?} then {after:?}"
+    );
+    assert!(after[2] <= buys[2] + 1.0, "{after:?}");
+
+    // What isn't there says so, and a script can tell a book too thin for its size.
+    let unknown = script_reads(
+        &locker,
+        &format!(
+            r#"function on_slot(ctx) ctx.phoenix.quote("SOL", "hold", 1, "{}") end"#,
+            graph.trader
+        ),
+    )
+    .unwrap_err();
+    assert!(unknown.contains("side is buy or sell"), "{unknown}");
+    let thin = script_reads(
+        &locker,
+        &format!(
+            r#"function on_slot(ctx)
+                 local q = ctx.phoenix.quote("SOL", "buy", 4000000000, "{}")
+                 ctx.log(tostring(q.filled) .. " " .. tostring(q.filled_lots < 4000000000))
+               end"#,
+            graph.trader
+        ),
+    )
+    .unwrap();
+    assert_eq!(thin, ["false true"]);
+}

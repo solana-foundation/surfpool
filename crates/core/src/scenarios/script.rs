@@ -35,6 +35,7 @@
 //! | `ctx.phoenix.markets()` | Phoenix Eternal markets: `symbol`, `mark_ticks`, `tick_size`, `base_lot_decimals` |
 //! | `ctx.phoenix.bbo(symbol)` | `{ bid_ticks, ask_ticks, mark_ticks, index_ticks }` |
 //! | `ctx.phoenix.position(trader, symbol)` | The trader's signed base lots in the market |
+//! | `ctx.phoenix.quote(symbol, "buy" or "sell", lots, trader)` | What a market order of `lots` would fill for now, nothing traded: `{ filled, filled_lots, quote_lots, avg_ticks }`. `trader` is any trader account |
 //!
 //! A script is active over an optional interval, in slots counted from its scenario's base slot
 //! as the overrides' are: from `active_from` (default 1) up to but not
@@ -74,7 +75,7 @@ use crate::{
         protocols::phoenix_eternal::v1::{
             market::phoenix_markets,
             state_builder::{Exchange, PHOENIX_GLOBAL_CONFIG, Sandbox, local_account},
-            trader::{AssetView, BboView, asset_view, bbo_view},
+            trader::{AssetView, BboView, asset_view, bbo_view, order_quote},
         },
         template_registry,
     },
@@ -546,6 +547,46 @@ fn call_on_slot(
                     .map_err(lua_error)?
                     .base_lots)
             })?,
+        )?;
+        phoenix.set(
+            "quote",
+            scope.create_function(
+                |lua, (symbol, side, lots, trader): (String, String, u64, String)| {
+                    let buy = match side.as_str() {
+                        "buy" => true,
+                        "sell" => false,
+                        other => {
+                            return Err(lua_error(format!(
+                                "quote: side is buy or sell, not {other}"
+                            )));
+                        }
+                    };
+                    let trader = parse_pubkey(&trader)?;
+                    let exchange = exchange(svm)?;
+                    let market = market(svm, &exchange, &symbol)?;
+                    let mut guard = views.borrow_mut();
+                    let sandbox = guard.get_or_insert_with(|| Sandbox::new(svm));
+                    let quote = order_quote(sandbox, &exchange, &market, &trader, buy, lots)
+                        .map_err(lua_error)?;
+                    let table = lua.create_table()?;
+                    table.set("filled_lots", lua_u64(quote.filled_base_lots))?;
+                    table.set("quote_lots", lua_u64(quote.filled_quote_lots))?;
+                    table.set(
+                        "filled",
+                        quote.outcome == 0 && lots > 0 && quote.filled_base_lots == lots,
+                    )?;
+                    // The average fill, in ticks, when anything filled.
+                    if quote.filled_base_lots > 0 && market.tick_size > 0 {
+                        table.set(
+                            "avg_ticks",
+                            quote.filled_quote_lots as f64
+                                / quote.filled_base_lots as f64
+                                / market.tick_size as f64,
+                        )?;
+                    }
+                    Ok(table)
+                },
+            )?,
         )?;
         ctx.set("phoenix", phoenix)?;
 
