@@ -93,8 +93,7 @@ datasource before its bytes are changed.
 On mainnet GoonFi's maker republishes each market's quote every slot or few. Nobody runs it against a
 surfnet, so while a scenario with a GoonFi override is registered Surfpool republishes the oracle
 every slot ([keep-alive](../../README.md#keep-alive)): it stamps the update slot (byte 16) one slot
-back, because a swap in the update slot itself pays one decay step. The quote stays one slot old and
-every swap gets the best fill. The price stays as set. There is nothing to schedule:
+back, so the quote stays one slot old and every swap gets the best fill. The price stays as set. There is nothing to schedule:
 
 - `goonfi-price` keeps the oracle it writes current.
 - `goonfi-reference-band`, `goonfi-size-impact` and `goonfi-vault-balance` keep the oracle in their
@@ -125,15 +124,14 @@ band again in the later scenario.
 ## How quote age changes the fill
 
 Keep-alive keeps a market a scenario overrides one slot old. A market no override names is not
-republished, and ages like this. A quote fills best one to four slots after its update. From the
-fifth slot, each slot costs one decay step, whose size is set per market, until the quote rejects
+republished, and ages like this. A quote fills best from its update slot to four slots after it.
+From the fifth slot, each slot costs one decay step, whose size is set per market, until the quote rejects
 with `0x15`. The maker can change a market's step; measured on the featured markets in November
 2026:
 
 | Slots since the update | SOL / USDC  | HYPE / USDC | JUP / USDC |
 | ---------------------- | ----------- | ----------- | ---------- |
-| 0 (same slot)          | 0           | -30 bp      | 0          |
-| 1 to 4                 | best fill   | best fill   | best fill  |
+| 0 to 4                 | best fill   | best fill   | best fill  |
 | 5                      | 0           | -30 bp      | 0          |
 | 10                     | 0           | -180 bp     | 0          |
 | 15                     | 0           | -330 bp     | 0          |
@@ -141,9 +139,8 @@ with `0x15`. The maker can change a market's step; measured on the featured mark
 | 20                     |             | -480 bp     | 0          |
 | 21                     |             | `0x15`      | `0x15`     |
 
-A swap in the same slot as the quote update, or as the market's previous swap, pays one decay step.
-From the next slot the fill is normal again; repeated swaps leave nothing behind. Keep-alive stamps
-the quote one slot back, so only the previous-swap rule applies to an overridden market.
+A swap in the same slot as the market's previous swap pays one decay step. From the next slot the
+fill is normal again; repeated swaps leave nothing behind.
 
 ## How trade size changes the fill
 

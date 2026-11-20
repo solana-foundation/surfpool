@@ -15,6 +15,6 @@ templates:
         offset: 16
         encoding: u32
         description: >-
-          Slot the quote was published in. A swap one to four slots later fills best, one in the
-          same slot pays one decay step, and from the fifth slot each slot costs one more until the
-          quote rejects with custom error 0x15.
+          Slot the quote was published in. A swap in that slot or up to four slots later fills best,
+          and from the fifth slot each slot costs one decay step more until the quote rejects with
+          custom error 0x15.

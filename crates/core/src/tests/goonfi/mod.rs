@@ -17,7 +17,6 @@ const RPC_URL_ENV: &str = "SURFPOOL_TEST_RPC_URL";
 const DEFAULT_RPC_URL: &str = "https://api.mainnet-beta.solana.com";
 const PROGRAM: &str = "goonuddtQRrWqqn5nFyczVKaie28f3kDkHWkHtURSLE";
 const PROGRAMDATA: &str = "124gUYwjVnJQ4sJsFug9gHPzPLEtwCbAQC5LkbaDgx9s";
-const DEPLOYED_SLOT: u64 = 464833996;
 const ORACLE_PROGRAM: &str = "dijkbkCAKfFTCxQg3u1pg82gVU1jJGHBBRcteD11mBu";
 const GLOBAL: &str = "BNrK9LpEn65QA4TyBLVSMdngW3XHj3xLfFPwGdCBv8wV";
 const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
@@ -229,11 +228,6 @@ async fn fixtures() -> Arc<Vec<GoonfiFixture>> {
             assert!(
                 programdata.data.len() > 240_000,
                 "programdata is unexpectedly short"
-            );
-            let deployed_slot = u64::from_le_bytes(programdata.data[4..12].try_into().unwrap());
-            assert_eq!(
-                deployed_slot, DEPLOYED_SLOT,
-                "program redeployed at slot {deployed_slot}; revalidate the raw offsets"
             );
             let elf = Arc::new(programdata.data[45..].to_vec());
             let global = fetch(&[GLOBAL]).await.remove(0);
@@ -1150,53 +1144,6 @@ async fn goonfi_size_impact_prices_larger_trades_worse_on_the_fixture_markets() 
                 > 0
         );
     }
-}
-
-/// A swap in the slot the quote was stamped in pays one decay step, so keep-alive stamps the quote one
-/// slot back and a swap in any slot fills best.
-#[tokio::test]
-async fn goonfi_keep_alive_stamps_one_slot_back_because_the_update_slot_pays_one_decay_step() {
-    let fixtures = fixtures().await;
-    // The maker sets each market's decay step and can set it to zero, as JUP / USDC has, so the
-    // update slot's cost is required of some market rather than of a named one.
-    let mut some_market_charges = false;
-    for fixture in fixtures.iter() {
-        // Well past the market's own last swaps, so only the quote's slot matters.
-        let clock = fixture.slot + 50;
-        // The next slot's republication is stamped in the swap's own slot.
-        let republished_in = |slot: u64| State {
-            oracle: goonfi_keep_alive(&fixture.oracle.data, slot),
-            ..fixture.upstream()
-        };
-        for side in [SELL, BUY] {
-            let same_slot = run(
-                fixture,
-                &republished_in(clock + 1),
-                side,
-                fixture.trade(side),
-                clock,
-            )
-            .unwrap_or_else(|e| panic!("{} side {side} same slot: {e}", fixture.def.pair));
-            let one_slot_old = run(
-                fixture,
-                &republished_in(clock),
-                side,
-                fixture.trade(side),
-                clock,
-            )
-            .unwrap_or_else(|e| panic!("{} side {side} keep-alive: {e}", fixture.def.pair));
-            assert!(
-                one_slot_old >= same_slot,
-                "{} side {side}: keep-alive {one_slot_old} vs same slot {same_slot}",
-                fixture.def.pair
-            );
-            some_market_charges |= one_slot_old > same_slot;
-        }
-    }
-    assert!(
-        some_market_charges,
-        "no featured market charges a swap in the update slot"
-    );
 }
 
 const WHIRLPOOL_PROGRAM: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";

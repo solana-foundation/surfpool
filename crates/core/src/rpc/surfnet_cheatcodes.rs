@@ -13,7 +13,6 @@ use solana_epoch_info::EpochInfo;
 use solana_program_option::COption;
 use solana_rpc_client_api::response::Response as RpcResponse;
 use solana_system_interface::program as system_program;
-use solana_transaction::versioned::VersionedTransaction;
 use spl_associated_token_account_interface::address::get_associated_token_address_with_program_id;
 use surfpool_types::{
     AccountSnapshot, CheatcodeControlConfig, CheatcodeFilter, ClockCommand, ExportSnapshotConfig,
@@ -32,7 +31,7 @@ use crate::{
     error::SurfpoolError,
     rpc::{
         State,
-        utils::{decode_and_deserialize, verify_pubkey, verify_pubkeys},
+        utils::{decode_transaction, into_versioned_transaction, verify_pubkey, verify_pubkeys},
     },
     surfnet::{
         AccountSource, GetAccountResult, locker::SvmAccessContext,
@@ -1971,10 +1970,10 @@ impl SurfnetCheatcodes for SurfnetCheatcodesRpc {
         config: Option<RpcProfileResultConfig>,
     ) -> BoxFuture<Result<RpcResponse<UiKeyedProfileResult>>> {
         Box::pin(async move {
-            let (_, transaction) = decode_and_deserialize::<VersionedTransaction>(
+            let transaction = into_versioned_transaction(decode_transaction(
                 transaction_data_b64,
                 solana_transaction_status::TransactionBinaryEncoding::Base64,
-            )?;
+            )?);
 
             let SurfnetRpcContext {
                 svm_locker,
@@ -2581,7 +2580,10 @@ mod tests {
     use super::*;
     use crate::{
         rpc::surfnet_cheatcodes::SurfnetCheatcodesRpc,
-        tests::helpers::{TestSetup, UNHEALTHY_OFFSET, scheduled_override_fixture},
+        tests::helpers::{
+            TestSetup, UNHEALTHY_OFFSET, UNSANITARY_TRANSACTION_ERROR, scheduled_override_fixture,
+            unsanitary_transactions,
+        },
         types::confidential_key_signature,
     };
 
@@ -6193,6 +6195,31 @@ mod tests {
                 .is_err(),
             "the wrong aesKey should fail rather than decrypt"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn profile_transaction_refuses_an_unsanitary_transaction() {
+        let client = TestSetup::new(SurfnetCheatcodesRpc::empty());
+        let recent_blockhash = client
+            .context
+            .svm_locker
+            .with_svm_reader(|svm| svm.latest_blockhash());
+
+        for transaction in unsanitary_transactions(&Keypair::new(), recent_blockhash) {
+            let error = client
+                .rpc
+                .profile_transaction(
+                    Some(client.context.clone()),
+                    base64::engine::general_purpose::STANDARD
+                        .encode(bincode::serialize(&transaction).unwrap()),
+                    None,
+                    None,
+                )
+                .await
+                .expect_err("an unsanitary transaction must be refused");
+            assert_eq!(error.code, jsonrpc_core::ErrorCode::InvalidParams);
+            assert_eq!(error.message, UNSANITARY_TRANSACTION_ERROR);
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
