@@ -7,7 +7,7 @@ use solana_client::{
 use solana_clock::Slot;
 use solana_commitment_config::CommitmentConfig;
 use solana_epoch_schedule::EpochSchedule;
-use solana_rpc_client_api::response::Response as RpcResponse;
+use solana_rpc_client_api::{request::MAX_GET_SLOT_LEADERS, response::Response as RpcResponse};
 
 use super::{RunloopContext, State};
 use crate::SURFPOOL_IDENTITY_PUBKEY;
@@ -475,12 +475,10 @@ impl BankData for SurfpoolBankDataRpc {
         start_slot: Slot,
         limit: u64,
     ) -> Result<Vec<String>> {
-        if limit > 5000 {
-            return Err(jsonrpc_core::Error {
-                code: jsonrpc_core::ErrorCode::InvalidParams,
-                message: "Limit must be less than 5000".to_string(),
-                data: None,
-            });
+        if limit > MAX_GET_SLOT_LEADERS as u64 {
+            return Err(jsonrpc_core::Error::invalid_params(format!(
+                "Invalid limit; max {MAX_GET_SLOT_LEADERS}"
+            )));
         }
 
         let svm_locker = meta.get_svm_locker()?;
@@ -501,7 +499,7 @@ impl BankData for SurfpoolBankDataRpc {
             });
         }
 
-        Ok(vec![SURFPOOL_IDENTITY_PUBKEY.to_string()])
+        Ok(vec![SURFPOOL_IDENTITY_PUBKEY.to_string(); limit as usize])
     }
 
     fn get_block_production(
@@ -598,43 +596,45 @@ mod tests {
     #[test]
     fn test_get_slot_leaders() {
         let setup = TestSetup::new(SurfpoolBankDataRpc);
+        setup.context.svm_locker.with_svm_writer(|svm| {
+            svm.latest_epoch_info.slots_in_epoch = 5001;
+        });
+        let leader = SURFPOOL_IDENTITY_PUBKEY.to_string();
 
         // test with valid parameters
-        let result = setup
-            .rpc
-            .get_slot_leaders(Some(setup.context.clone()), 0, 10)
-            .unwrap();
+        for limit in [10, 0, 1, 5000] {
+            let result = setup
+                .rpc
+                .get_slot_leaders(Some(setup.context.clone()), 0, limit)
+                .unwrap();
 
-        assert_eq!(
-            result[0],
-            SURFPOOL_IDENTITY_PUBKEY.to_string(),
-            "Should only return one leader - itself"
-        );
+            assert_eq!(result.len(), limit as usize);
+            assert!(result.iter().all(|identity| identity == &leader));
+        }
 
         // test with invalid limit
+        for limit in [5001, u64::MAX] {
+            let err = setup
+                .rpc
+                .get_slot_leaders(Some(setup.context.clone()), 0, limit)
+                .unwrap_err();
+
+            assert_eq!(
+                err,
+                jsonrpc_core::Error::invalid_params("Invalid limit; max 5000")
+            );
+        }
+
+        // test with an unavailable slot range
         let err = setup
             .rpc
-            .get_slot_leaders(Some(setup.context.clone()), 0, 6000)
+            .get_slot_leaders(Some(setup.context), 5001, 10)
             .unwrap_err();
 
         assert_eq!(
             err.code,
             jsonrpc_core::ErrorCode::InvalidParams,
-            "Should return InvalidParams error for limit > 5000"
-        );
-
-        let latest_slot = setup.context.svm_locker.get_latest_absolute_slot();
-
-        // test with start_slot >= latest_slot
-        let err = setup
-            .rpc
-            .get_slot_leaders(Some(setup.context), latest_slot + 100, 10)
-            .unwrap_err();
-
-        assert_eq!(
-            err.code,
-            jsonrpc_core::ErrorCode::InvalidParams,
-            "Should return InvalidParams error for start_slot >= latest_slot"
+            "Should return InvalidParams error for an unavailable slot range"
         );
     }
 
