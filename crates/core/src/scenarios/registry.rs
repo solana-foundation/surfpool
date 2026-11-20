@@ -29,6 +29,9 @@ pub const METEORA_DLMM_OVERRIDES_CONTENT: &str =
 pub const KAMINO_V1_IDL_CONTENT: &str = include_str!("./protocols/kamino/v1/idl.json");
 pub const KAMINO_V1_OVERRIDES_CONTENT: &str = include_str!("./protocols/kamino/v1/overrides.yaml");
 
+pub const BISONFI_OVERRIDES_CONTENT: &str = include_str!("./protocols/bisonfi/overrides.yaml");
+pub const BISONFI_KEEP_ALIVE_CONTENT: &str = include_str!("./protocols/bisonfi/keep-alive.yaml");
+
 pub const KAMINO_SCOPE_IDL_CONTENT: &str = include_str!("./protocols/kamino/scope/v1/idl.json");
 pub const KAMINO_SCOPE_OVERRIDES_CONTENT: &str =
     include_str!("./protocols/kamino/scope/v1/overrides.yaml");
@@ -129,6 +132,7 @@ impl TemplateRegistry {
         default.load_raydium_overrides();
         default.load_meteora_overrides();
         default.load_kamino_overrides();
+        default.load_bisonfi_overrides();
         default.load_drift_overrides();
         default.load_whirlpool_overrides();
         default.load_spl_token_overrides();
@@ -257,6 +261,11 @@ impl TemplateRegistry {
             RAYDIUM_AMM_V4_OVERRIDES_CONTENT,
             "raydium",
         );
+    }
+
+    pub fn load_bisonfi_overrides(&mut self) {
+        self.load_raw_layout_overrides(BISONFI_OVERRIDES_CONTENT, "bisonfi");
+        self.load_keep_alive(None, BISONFI_KEEP_ALIVE_CONTENT, "bisonfi");
     }
 
     pub fn load_kamino_overrides(&mut self) {
@@ -721,11 +730,12 @@ mod tests {
 
         // Pyth (1) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Drift (4) + Meteora (2)
         // + Kamino (Lend 17, Scope 3, Farms 5, Swap 2, Vault 5, Liquidity 4 = 36)
-        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + Phoenix Eternal (19) = 81
+        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + BisonFi (3)
+        // + Phoenix Eternal (19) = 84
         assert_eq!(
             registry.count(),
-            81,
-            "Registry should load 81 templates total"
+            84,
+            "Registry should load 84 templates total"
         );
 
         assert!(registry.contains("pyth-price-feed-v2"));
@@ -796,6 +806,33 @@ mod tests {
         assert!(registry.contains("pump-amm-pool-state"));
         assert!(registry.contains("pump-amm-canonical-pool"));
         assert!(registry.contains("pump-amm-global-config"));
+
+        assert!(registry.contains("bisonfi-fair-value"));
+        assert!(registry.contains("bisonfi-depth"));
+        assert!(registry.contains("bisonfi-spread"));
+        assert!(
+            !registry.contains("bisonfi-freshness"),
+            "the quote stays fresh by keep-alive"
+        );
+
+        for template_id in ["bisonfi-fair-value", "bisonfi-depth", "bisonfi-spread"] {
+            let template = registry.get(template_id).expect("BisonFi template");
+            assert_eq!(
+                template.address,
+                AccountAddress::Pubkey(String::new()),
+                "BisonFi account addresses are supplied by the caller"
+            );
+            let imported: Vec<&str> = template
+                .keep_alive
+                .iter()
+                .map(|import| import.template.as_str())
+                .collect();
+            assert_eq!(
+                imported,
+                ["bisonfi-quote-publication", "bisonfi-market-tick"],
+                "every BisonFi template keeps its quote and the market tick alive"
+            );
+        }
 
         assert!(registry.contains("phoenix-market-move"));
         assert!(registry.contains("phoenix-oracle-price"));
