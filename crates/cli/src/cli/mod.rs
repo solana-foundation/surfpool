@@ -653,6 +653,11 @@ impl StartSimnet {
             tpu_port: DEFAULT_TPU_PORT,
             tpu_quic_port: DEFAULT_TPU_QUIC_PORT,
             cheatcode_lock: self.svm.cheatcode_lock(),
+            // From the environment, not a flag: a flag shows in every
+            // process listing, and the secret is what keeps the port private.
+            secret_path: env::var("SURFPOOL_SECRET_PATH")
+                .ok()
+                .filter(|secret| !secret.is_empty()),
         }
     }
 
