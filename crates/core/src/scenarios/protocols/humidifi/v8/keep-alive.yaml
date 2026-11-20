@@ -1,0 +1,23 @@
+protocol: HumidiFi
+version: v8
+account_type: MarketState
+
+raw_layout: true
+
+templates:
+  - id: humidifi-quote-publication
+    name: Quote publication
+    description: The maker republishing a market's quote
+    idl_account_name: MarketState
+    address:
+      type: pubkey
+    properties:
+      - path: last_update_slot
+        offset: 616
+        encoding:
+          u64_xor:
+            mask: 7970776174128919018
+        description: >-
+          Slot the quote was published in, XOR-masked. HumidiFi fills only while the Clock's slot is
+          at most max_staleness_slots (offset 608, a few slots on live markets) past it, and rejects
+          with custom error 0xfaded after that.

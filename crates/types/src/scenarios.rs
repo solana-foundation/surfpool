@@ -1037,6 +1037,9 @@ pub struct YamlOverrideTemplateCollection {
     /// Protocol-specific constants shared by all templates in this collection
     #[serde(default)]
     pub constants: HashMap<String, YamlConstantDefinition>,
+    /// LLM context shared by all templates in this collection, placed before each template's own
+    #[serde(default)]
+    pub llm_context: Option<String>,
     /// Selects offset-and-encoding writes for programs with no usable IDL.
     #[serde(default)]
     pub raw_layout: bool,
@@ -1096,6 +1099,10 @@ pub enum RawEncoding {
         count: usize,
         stride: usize,
     },
+    /// A logical unsigned 64-bit value XORed with `mask` before being written.
+    U64Xor {
+        mask: u64,
+    },
     /// A base58 pubkey, written as 32 bytes.
     Bytes32,
     /// The slot the override materializes at, plus the supplied signed offset. `lead` is used only
@@ -1113,7 +1120,10 @@ impl RawEncoding {
             RawEncoding::U8 => 1,
             RawEncoding::U16 => 2,
             RawEncoding::U32 | RawEncoding::I32 | RawEncoding::I32Strided { .. } => 4,
-            RawEncoding::U64 | RawEncoding::I64 | RawEncoding::Slot { .. } => 8,
+            RawEncoding::U64
+            | RawEncoding::U64Xor { .. }
+            | RawEncoding::I64
+            | RawEncoding::Slot { .. } => 8,
             RawEncoding::U128 | RawEncoding::I128 => 16,
             RawEncoding::Bytes32 => 32,
         }
@@ -1163,6 +1173,14 @@ impl RawEncoding {
             RawEncoding::U16 => int!(u16, "u16"),
             RawEncoding::U32 => int!(u32, "u32"),
             RawEncoding::U64 => int!(u64, "u64"),
+            RawEncoding::U64Xor { mask } => {
+                let d = digits("u64")?;
+                (d.parse::<u64>()
+                    .map_err(|e| format!("invalid u64: '{d}': {e}"))?
+                    ^ mask)
+                    .to_le_bytes()
+                    .to_vec()
+            }
             RawEncoding::U128 => int!(u128, "u128"),
             RawEncoding::I32 | RawEncoding::I32Strided { .. } => int!(i32, "i32"),
             RawEncoding::I64 => int!(i64, "i64"),
@@ -1506,6 +1524,10 @@ impl YamlOverrideTemplateCollection {
                 let account_type = entry
                     .idl_account_name
                     .unwrap_or_else(|| default_account_type.clone());
+                let llm_context = match (&self.llm_context, entry.llm_context) {
+                    (Some(shared), Some(own)) => Some(format!("{}\n\n{own}", shared.trim_end())),
+                    (shared, own) => own.or_else(|| shared.clone()),
+                };
                 let properties =
                     describe_properties_from_idl(entry.properties, idl.as_ref(), &account_type)
                         .map_err(|e| format!("template '{}': {e}", entry.id))?;
@@ -1520,7 +1542,7 @@ impl YamlOverrideTemplateCollection {
                     account_type,
                     constants: constants.clone(),
                     tags: self.tags.clone(),
-                    llm_context: entry.llm_context,
+                    llm_context,
                     raw_layout: self.raw_layout,
                     keep_alive: entry
                         .keep_alive
@@ -2162,6 +2184,21 @@ templates:
             .encode(&json!(1), u64::MAX)
             .expect_err("a positive lead must not wrap past u64::MAX");
         assert!(err.contains("exceeds u64::MAX"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn raw_encoding_xors_u64_fields() {
+        use super::RawEncoding;
+
+        let mask = 0x44dd_2288_77ee_1166;
+        let logical = 9_997_556_206u64;
+        let bytes = RawEncoding::U64Xor { mask }
+            .encode(&json!(logical), 0)
+            .expect("XOR-obfuscated u64");
+        assert_eq!(
+            u64::from_le_bytes(bytes.try_into().unwrap()),
+            logical ^ mask
+        );
     }
 
     #[test]

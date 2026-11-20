@@ -50,6 +50,13 @@ pub const KAMINO_LIQUIDITY_IDL_CONTENT: &str =
 pub const KAMINO_LIQUIDITY_OVERRIDES_CONTENT: &str =
     include_str!("./protocols/kamino/liquidity/v1/overrides.yaml");
 
+pub const HUMIDIFI_MARKET_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/humidifi/v8/market-overrides.yaml");
+pub const HUMIDIFI_VAULT_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/humidifi/v8/vault-overrides.yaml");
+pub const HUMIDIFI_KEEP_ALIVE_CONTENT: &str =
+    include_str!("./protocols/humidifi/v8/keep-alive.yaml");
+
 pub const DRIFT_V2_IDL_CONTENT: &str = include_str!("./protocols/drift/v2/idl.json");
 pub const DRIFT_V2_OVERRIDES_CONTENT: &str = include_str!("./protocols/drift/v2/overrides.yaml");
 
@@ -129,6 +136,7 @@ impl TemplateRegistry {
         default.load_raydium_overrides();
         default.load_meteora_overrides();
         default.load_kamino_overrides();
+        default.load_humidifi_overrides();
         default.load_drift_overrides();
         default.load_whirlpool_overrides();
         default.load_spl_token_overrides();
@@ -291,6 +299,12 @@ impl TemplateRegistry {
             KAMINO_LIQUIDITY_OVERRIDES_CONTENT,
             "kamino-liquidity",
         );
+    }
+
+    pub fn load_humidifi_overrides(&mut self) {
+        self.load_raw_layout_overrides(HUMIDIFI_MARKET_OVERRIDES_CONTENT, "humidifi-market");
+        self.load_raw_layout_overrides(HUMIDIFI_VAULT_OVERRIDES_CONTENT, "humidifi-vault");
+        self.load_keep_alive(None, HUMIDIFI_KEEP_ALIVE_CONTENT, "humidifi");
     }
 
     pub fn load_drift_overrides(&mut self) {
@@ -473,6 +487,42 @@ mod tests {
     use surfpool_types::{AccountAddress, PdaSeed};
 
     use super::*;
+
+    #[test]
+    fn collection_llm_context_leads_every_template_context() {
+        let collection: YamlOverrideTemplateCollection = serde_yaml::from_str(
+            r#"
+protocol: Example
+version: v1
+raw_layout: true
+llm_context: |
+  Shared lookup.
+templates:
+  - id: with-own
+    name: With own
+    description: Has its own context
+    address:
+      type: pubkey
+    llm_context: |
+      Own guidance.
+  - id: without-own
+    name: Without own
+    description: Has no context of its own
+    address:
+      type: pubkey
+"#,
+        )
+        .unwrap();
+        let templates = collection.to_override_templates(None).unwrap();
+        assert_eq!(
+            templates[0].llm_context.as_deref(),
+            Some("Shared lookup.\n\nOwn guidance.\n")
+        );
+        assert_eq!(
+            templates[1].llm_context.as_deref(),
+            Some("Shared lookup.\n")
+        );
+    }
 
     #[test]
     fn account_data_values_exclude_constant_ref_selectors() {
@@ -721,11 +771,12 @@ mod tests {
 
         // Pyth (1) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Drift (4) + Meteora (2)
         // + Kamino (Lend 17, Scope 3, Farms 5, Swap 2, Vault 5, Liquidity 4 = 36)
-        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + Phoenix Eternal (19) = 81
+        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + HumidiFi (3) + Phoenix Eternal (19)
+        // = 84
         assert_eq!(
             registry.count(),
-            81,
-            "Registry should load 81 templates total"
+            84,
+            "Registry should load 84 templates total"
         );
 
         assert!(registry.contains("pyth-price-feed-v2"));
@@ -796,6 +847,13 @@ mod tests {
         assert!(registry.contains("pump-amm-pool-state"));
         assert!(registry.contains("pump-amm-canonical-pool"));
         assert!(registry.contains("pump-amm-global-config"));
+        assert!(registry.contains("humidifi-price"));
+        assert!(
+            !registry.contains("humidifi-freshness"),
+            "keep-alive republishes the HumidiFi quote"
+        );
+        assert!(registry.contains("humidifi-spread"));
+        assert!(registry.contains("humidifi-vault-balance"));
 
         assert!(registry.contains("phoenix-market-move"));
         assert!(registry.contains("phoenix-oracle-price"));
@@ -1338,6 +1396,12 @@ templates: []
             pump_swap_templates.len(),
             3,
             "Should have 3 PumpSwap templates"
+        );
+
+        assert_eq!(
+            registry.by_protocol("HumidiFi").len(),
+            3,
+            "Should have 3 HumidiFi templates"
         );
 
         let phoenix_templates = registry.by_protocol("Phoenix Eternal");
@@ -2096,5 +2160,81 @@ templates: []
             described,
             missing.join("\n  ")
         );
+    }
+
+    #[test]
+    fn test_every_humidifi_property_has_guidance() {
+        let registry = TemplateRegistry::new();
+        let mut checked = 0;
+        for id in [
+            "humidifi-price",
+            "humidifi-spread",
+            "humidifi-vault-balance",
+        ] {
+            let template = registry
+                .get(id)
+                .unwrap_or_else(|| panic!("missing HumidiFi template {id}"));
+            assert!(template.raw_layout, "{id} must use a raw layout");
+            assert!(
+                template
+                    .llm_context
+                    .as_deref()
+                    .is_some_and(|context| context.lines().count() >= 6
+                        && context.contains("fetchBeforeUse: true")),
+                "{id} needs substantive LLM guidance"
+            );
+            for property in &template.properties {
+                assert!(
+                    property
+                        .description
+                        .as_deref()
+                        .is_some_and(|description| !description.trim().is_empty()),
+                    "{id}:{} needs a property description",
+                    property.path
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(
+            checked, 7,
+            "every shipped HumidiFi property must be checked"
+        );
+    }
+
+    #[test]
+    fn humidifi_templates_require_caller_selected_accounts() {
+        let registry = TemplateRegistry::new();
+        for template_id in [
+            "humidifi-price",
+            "humidifi-spread",
+            "humidifi-vault-balance",
+        ] {
+            let template = registry.get(template_id).expect("HumidiFi template");
+            assert_eq!(
+                template.address,
+                AccountAddress::Pubkey(String::new()),
+                "{template_id} must require an explicit target account"
+            );
+            assert!(
+                template.constants.is_empty(),
+                "{template_id} must not embed a backend account catalog"
+            );
+            assert!(
+                template.llm_context.as_deref().is_some_and(
+                    |context| context.contains("9H6tua7jkLhdm3w8BvgpTn5LZNU7g4ZynDmCiNN3q6Rp")
+                ),
+                "{template_id} must name the program its account belongs to"
+            );
+            let [import] = template.keep_alive.as_slice() else {
+                panic!("{template_id} must keep its market quoting");
+            };
+            assert_eq!(import.template, "humidifi-quote-publication");
+            let expected = if template_id == "humidifi-vault-balance" {
+                surfpool_types::KeepAliveAddress::Input("market".to_string())
+            } else {
+                surfpool_types::KeepAliveAddress::Override
+            };
+            assert_eq!(import.address, expected, "{template_id}");
+        }
     }
 }

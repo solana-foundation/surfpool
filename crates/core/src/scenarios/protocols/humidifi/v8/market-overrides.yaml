@@ -1,0 +1,138 @@
+protocol: HumidiFi
+# HumidiFi ships no program semver; these offsets describe schema-8 market accounts.
+version: v8
+account_type: MarketState
+
+raw_layout: true
+
+tags:
+  - pmm
+  - prop-amm
+  - swap
+
+keep_alive:
+  - template: humidifi-quote-publication
+    address: { type: override }
+    values: { last_update_slot: $slot }
+
+llm_context: |
+  FINDING THE ACCOUNT: HumidiFi stores each market's mints and vaults masked, and a search by
+  mint needs those masked bytes, which you cannot compute. Work from a market address the user
+  gives. If they name only a pair, use the market Studio lists for it, or else ask for the
+  market address. Never call getProgramAccounts on the HumidiFi program: the masked mints
+  cannot be matched, and the result is very large. A HumidiFi market is a 1728-byte account
+  owned by program
+  9H6tua7jkLhdm3w8BvgpTn5LZNU7g4ZynDmCiNN3q6Rp. Put the market in the override's account as
+  {"pubkey":"<market>"} and set fetchBeforeUse as described below. The market address is never
+  an override value. An "Invalid pubkey" error means an address was copied wrong; copy it
+  again exactly and retry.
+
+  BEFORE create_scenario, ALWAYS do these steps, also when the user gives only an address:
+  1. Read the market's token accounts: call Solana JSON-RPC getTokenAccountsByOwner twice at
+     once for the market address, once filtered by token program
+     TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA and once by
+     TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb, both with jsonParsed encoding. The filter
+     and the encoding are separate params: the market address, then
+     {"programId":"<token program>"}, then {"encoding":"jsonParsed"}.
+     Every vault is a token account owned by its market, and its mint is not masked.
+  2. Find the pair: the quote token is the stablecoin (USDC, USDT or USD1) and the base token
+     is the only other mint. Tokens someone sent to the market can sit next to the vaults, so
+     if the results show more than one mint besides the stablecoin, or no stablecoin, ask
+     which pair it is instead of guessing. Each result carries its mint's decimals. Name the
+     pair in your answer.
+  3. If the largest account of either pair mint holds almost nothing, say the market looks
+     stopped instead of preparing it.
+
+  Set fetchBeforeUse: true to pull the account from upstream first; false only for a later
+  override that builds on state an earlier override in the same scenario prepared.
+
+templates:
+  - id: humidifi-price
+    name: Override Price
+    description: Move the fair value a HumidiFi market quotes around
+    idl_account_name: MarketState
+    address:
+      type: pubkey
+    properties:
+      - path: fair_value
+        offset: 576
+        encoding:
+          u64_xor:
+            mask: 13355403898140455974
+        label: Fair value
+        description: >-
+          Quote atoms per base atom times 2^48, before HumidiFi's fixed XOR encoding. Pass it as a
+          decimal string.
+    llm_context: |
+      THE QUOTE STAYS CURRENT BY ITSELF. From the slot this override plays, Surfpool republishes this
+      market's quote every slot, as the maker does on mainnet, so this price keeps filling in later
+      slots.
+
+      fair_value is a raw ratio, not a human price, so the number the user gives is never
+      fair_value itself:
+        fair_value = floor(price * 2^48 / 10^(base_decimals - quote_decimals))
+      where price is quote tokens per base token and step 2 gives both tokens' decimals. Pass the
+      result as a decimal STRING; it can exceed what a JSON number holds exactly.
+
+      EXAMPLE - SOL/USDC (9/6 decimals) at 208 USDC per SOL:
+        fair_value: "58546795155816"
+      which is floor(208 * 2^48 / 10^3).
+
+      DIRECTION: raising fair_value makes the base token more expensive, so a quote-to-base swap
+      returns proportionally less base. Halving it doubles that output, subject to the market's own
+      spread and inventory.
+
+  - id: humidifi-spread
+    name: Override Spread
+    description: Replace a HumidiFi market's maker and size-tier spreads with a fixed spread
+    idl_account_name: MarketState
+    address:
+      type: pubkey
+    properties:
+      - path: spread
+        offset: 800
+        encoding:
+          u64_xor:
+            mask: 5782998650930657501
+        label: Spread
+        description: Thousandths of a basis point added to both sides; 25000 is 25 bps.
+      - path: tier_1_spread
+        offset: 176
+        encoding:
+          u64_xor:
+            mask: 4681572970359359418
+        label: First size tier spread
+        description: Basis points times 2^48 for the smallest trade sizes, as a decimal string; 0 removes it.
+      - path: tier_2_spread
+        offset: 256
+        encoding:
+          u64_xor:
+            mask: 4679884163449161652
+        label: Second size tier spread
+        description: Basis points times 2^48 for the middle trade sizes, as a decimal string; 0 removes it.
+      - path: tier_3_spread
+        offset: 336
+        encoding:
+          u64_xor:
+            mask: 4675943453644490670
+        label: Third size tier spread
+        description: Basis points times 2^48 for the largest trade sizes, as a decimal string; 0 removes it.
+    llm_context: |
+      THE QUOTE STAYS CURRENT BY ITSELF. From the slot this override plays, Surfpool republishes this
+      market's quote every slot, as the maker does on mainnet, so this spread keeps filling in later
+      slots.
+
+      HumidiFi widens each side of its fair value by S basis points: a buy pays
+      fair * (1 + S / 10000) per base token and a sell receives fair / (1 + S / 10000). S adds up
+      spread / 1000 and the spread of the size tier the trade falls in.
+
+      UNIT: spread is in thousandths of a basis point, so 25 bps is 25000 and 1% is 100000.
+
+      FIXED SPREAD: set spread to the value you want and the three tier spreads to "0". Every
+      trade size then prices at that spread on both sides.
+      EXAMPLE - 25 bps on each side:
+        spread: 25000, tier_1_spread: "0", tier_2_spread: "0", tier_3_spread: "0"
+
+      The maker rewrites spread with every quote upstream, but the local VM keeps the value written
+      here. A tier spread is basis points times 2^48 as a decimal string; 10 bps is
+      "2814749767106560".
