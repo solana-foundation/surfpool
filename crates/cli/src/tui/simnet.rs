@@ -269,6 +269,7 @@ struct App {
     blink_state: bool,
     last_blink: Instant,
     selected_tab: usize,
+    core_started_tx: Sender<()>,
 }
 
 impl App {
@@ -279,25 +280,17 @@ impl App {
         runbook_progress_rx: Vec<Receiver<BlockEvent>>,
         displayed_url: DisplayedUrl,
         breaker: Option<Keypair>,
-        initial_transactions: u64,
+        core_started_tx: Sender<()>,
     ) -> App {
         let theme = Theme::detect();
         let palette = theme.palette();
 
-        let mut events = vec![];
-        let (rpc_url, ws_url, datasource) = match &displayed_url {
-            DisplayedUrl::Datasource(config) | DisplayedUrl::Studio(config) => (
-                config.rpc_url.clone(),
-                config.ws_url.clone(),
-                config.rpc_datasource_url.clone(),
-            ),
+        let datasource = match &displayed_url {
+            DisplayedUrl::Datasource(config) | DisplayedUrl::Studio(config) => {
+                config.rpc_datasource_url.clone()
+            }
         };
-        events.push((
-            EventType::Success,
-            Local::now(),
-            format!("Surfnet up and running, emulating local Solana validator (RPC: {rpc_url}, WS: {ws_url})"),
-        ));
-        events.push((
+        let events = vec![(
             EventType::Info,
             Local::now(),
             match &datasource {
@@ -306,7 +299,7 @@ impl App {
                 }
                 None => "No datasource configured, working in offline mode".to_string(),
             },
-        ));
+        )];
 
         App {
             state: TableState::default().with_offset(0),
@@ -323,7 +316,7 @@ impl App {
                 block_height: 0,
                 transaction_count: None,
             },
-            successful_transactions: initial_transactions as u32,
+            successful_transactions: 0,
             events,
             transactions: vec![],
             include_debug_logs,
@@ -335,6 +328,7 @@ impl App {
             blink_state: false,
             last_blink: Instant::now(),
             selected_tab: 0,
+            core_started_tx,
         }
     }
 
@@ -400,8 +394,8 @@ pub fn start_app(
     runbook_progress_rx: Vec<Receiver<BlockEvent>>,
     displayed_url: DisplayedUrl,
     breaker: Option<Keypair>,
-    initial_transactions: u64,
     should_exit: Arc<AtomicBool>,
+    core_started_tx: Sender<()>,
 ) -> Result<(), Box<dyn Error>> {
     // setup terminal
     enable_raw_mode()?;
@@ -418,7 +412,7 @@ pub fn start_app(
         runbook_progress_rx,
         displayed_url,
         breaker,
-        initial_transactions,
+        core_started_tx,
     );
     let res = run_app(&mut terminal, app, should_exit);
 
@@ -427,10 +421,9 @@ pub fn start_app(
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
-    if let Err(err) = res {
-        println!("{err:?}");
-    }
-
+    // Surfaced only after the terminal is restored, so an aborted startup
+    // reaches stderr instead of the alternate screen.
+    res?;
     Ok(())
 }
 
@@ -464,6 +457,7 @@ fn run_app<B: Backend<Error = io::Error>>(
         let mut selector = Select::new();
         let mut handles = vec![];
         let mut new_events = vec![];
+        let mut aborted = None;
 
         {
             selector.recv(&app.simnet_events_rx);
@@ -565,10 +559,30 @@ fn run_app<B: Backend<Error = io::Error>>(
                                     app.successful_transactions += 1;
                                 }
                             }
-                            SimnetEvent::Aborted(_error) => {
+                            SimnetEvent::Aborted(error) => {
+                                aborted = Some(error.clone());
                                 break;
                             }
-                            SimnetEvent::CoreStarted(_) => {}
+                            // The surfnet is serving: the replayed transactions
+                            // count toward the total, and the startup dispatcher
+                            // may now seal the plan.
+                            SimnetEvent::CoreStarted(replayed_transactions) => {
+                                app.successful_transactions += *replayed_transactions as u32;
+                                let (rpc_url, ws_url) = match &app.displayed_url {
+                                    DisplayedUrl::Datasource(config)
+                                    | DisplayedUrl::Studio(config) => {
+                                        (config.rpc_url.clone(), config.ws_url.clone())
+                                    }
+                                };
+                                new_events.push((
+                                    EventType::Success,
+                                    Local::now(),
+                                    format!(
+                                        "Surfnet up and running, emulating local Solana validator (RPC: {rpc_url}, WS: {ws_url})"
+                                    ),
+                                ));
+                                let _ = app.core_started_tx.try_send(());
+                            }
                             SimnetEvent::Connected(_) => {}
                             SimnetEvent::Shutdown => {
                                 return Ok(());
@@ -715,6 +729,17 @@ fn run_app<B: Backend<Error = io::Error>>(
             app.tail();
         }
 
+        if let Some(error) = aborted {
+            app.events
+                .push((EventType::Failure, Local::now(), error.clone()));
+            app.tail();
+            show_fatal_error(terminal, &mut app, &error, &should_exit)?;
+            return Err(io::Error::other(error));
+        }
+
+        app.update_blink_state();
+        terminal.draw(|f| ui(f, &mut app))?;
+
         if event::poll(Duration::from_millis(50))? {
             if let Event::Key(key_event) = event::read()? {
                 if key_event.kind == KeyEventKind::Press {
@@ -775,10 +800,71 @@ fn run_app<B: Backend<Error = io::Error>>(
                 }
             }
         }
-
-        app.update_blink_state();
-        terminal.draw(|f| ui(f, &mut app))?;
     }
+}
+
+/// Keeps the TUI on screen with `error` shown over the normal layout until the
+/// user presses a key or the process is asked to exit, so a failed startup is
+/// read in place instead of flashing past as the terminal is restored.
+fn show_fatal_error<B: Backend<Error = io::Error>>(
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+    error: &str,
+    should_exit: &AtomicBool,
+) -> io::Result<()> {
+    loop {
+        terminal.draw(|f| {
+            ui(f, app);
+            render_fatal_error(f, app, error);
+        })?;
+        if should_exit.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(());
+        }
+        if event::poll(Duration::from_millis(100))?
+            && matches!(event::read()?, Event::Key(key) if key.kind == KeyEventKind::Press)
+        {
+            return Ok(());
+        }
+    }
+}
+
+fn render_fatal_error(f: &mut Frame, app: &App, error: &str) {
+    let area = f.area();
+    let width = area.width.saturating_sub(4).clamp(20, 100);
+    let inner_width = width.saturating_sub(4) as usize;
+    // Approximates the paragraph's wrapping: each source line fills ceil(len / width) rows.
+    let message_lines = error
+        .lines()
+        .map(|line| line.chars().count().div_ceil(inner_width.max(1)).max(1) as u16)
+        .sum::<u16>();
+    // Message, blank line, prompt, plus borders and one line of vertical padding each side.
+    let height = (message_lines + 2 + 4).min(area.height);
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(Line::from(" Startup failed ").alignment(Alignment::Center))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Red))
+        .style(Style::new().bg(app.colors.background))
+        .padding(Padding::new(1, 1, 1, 1));
+    let text = Text::from(vec![
+        Line::from(error.to_string()),
+        Line::from(""),
+        Line::from("Press any key to exit").style(Style::default().fg(app.colors.light_gray)),
+    ]);
+    f.render_widget(
+        Paragraph::new(text)
+            .block(block)
+            .wrap(Wrap { trim: false })
+            .alignment(Alignment::Left),
+        popup,
+    );
 }
 
 fn ui(f: &mut Frame, app: &mut App) {
