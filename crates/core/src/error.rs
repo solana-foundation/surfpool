@@ -180,6 +180,14 @@ impl SurfpoolError {
         Self(error)
     }
 
+    pub fn datasource_rpc_error(code: i64, message: String) -> Self {
+        Self(Error {
+            code: jsonrpc_core::ErrorCode::ServerError(code),
+            message,
+            data: None,
+        })
+    }
+
     pub fn get_token_accounts<T>(owner: Pubkey, filter: &TokenAccountsFilter, e: T) -> Self
     where
         T: ToString,

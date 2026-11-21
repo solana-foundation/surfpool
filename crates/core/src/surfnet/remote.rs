@@ -603,11 +603,16 @@ impl SurfnetRemoteClient {
                 json!([signature.to_string(), config]),
             )
             .await
-            .map_err(|error| {
-                SurfpoolError::get_transaction(
+            .map_err(|error| match error.kind() {
+                ClientErrorKind::RpcError(RpcError::RpcResponseError {
+                    code: code @ -32099..=-32001,
+                    message,
+                    ..
+                }) => SurfpoolError::datasource_rpc_error(*code, message.clone()),
+                _ => SurfpoolError::get_transaction(
                     signature,
                     sanitized_client_error(&error, &self.client.url()),
-                )
+                ),
             })?;
 
         Ok(match transaction {
@@ -888,6 +893,85 @@ mod tests {
 
         fn url(&self) -> String {
             "http://returns-error.example".to_string()
+        }
+    }
+
+    struct ReturnsRpcError {
+        code: i64,
+        message: String,
+    }
+
+    #[async_trait]
+    impl RpcSender for ReturnsRpcError {
+        async fn send(
+            &self,
+            _request: RpcRequest,
+            _params: serde_json::Value,
+        ) -> ClientResult<serde_json::Value> {
+            Err(ClientErrorKind::RpcError(RpcError::RpcResponseError {
+                code: self.code,
+                message: self.message.clone(),
+                data: RpcResponseErrorData::Empty,
+            })
+            .into())
+        }
+
+        fn get_transport_stats(&self) -> RpcTransportStats {
+            RpcTransportStats::default()
+        }
+
+        fn url(&self) -> String {
+            "http://returns-rpc-error.example".to_string()
+        }
+    }
+
+    async fn locker_transaction_error(code: i64, message: String) -> jsonrpc_core::Error {
+        let client = SurfnetRemoteClient {
+            client: RpcClient::new_sender(
+                ReturnsRpcError { code, message },
+                RpcClientConfig::default(),
+            )
+            .into(),
+        };
+        let (svm, _, _) = SurfnetSvm::default();
+        let locker = SurfnetSvmLocker::new(svm);
+
+        match locker
+            .get_transaction(
+                &Some(client),
+                &Signature::new_unique(),
+                RpcTransactionConfig::default(),
+            )
+            .await
+        {
+            Ok(_) => panic!("a datasource RPC error should reach the caller"),
+            Err(error) => error.into(),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_validator_error_from_the_datasource_keeps_its_code_and_message() {
+        let upstream = jsonrpc_core::Error::from(RpcCustomError::UnsupportedTransactionVersion(1));
+
+        let error = locker_transaction_error(upstream.code.code(), upstream.message.clone()).await;
+
+        assert_eq!(error.code, jsonrpc_core::ErrorCode::ServerError(-32015));
+        assert_eq!(error.message, upstream.message);
+        assert_eq!(error.data, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_non_validator_error_from_the_datasource_stays_sanitized() {
+        for code in [-32000, -32100] {
+            let error = locker_transaction_error(code, "api-key=SUPERSECRET".to_string()).await;
+            let data = error.data.as_ref().expect("sanitized data").to_string();
+
+            assert_eq!(error.code, jsonrpc_core::ErrorCode::InternalError);
+            assert!(data.contains(&format!(
+                "datasource RPC response error {code} from http://returns-rpc-error.example"
+            )));
+            assert!(!error.message.contains("SUPERSECRET"));
+            assert!(!data.contains("SUPERSECRET"));
         }
     }
 
