@@ -2141,6 +2141,7 @@ mod tests {
         let tx1_encoded = bs58::encode(bincode::serialize(&tx1).unwrap()).into_string();
         let tx2_encoded = bs58::encode(bincode::serialize(&tx2).unwrap()).into_string();
         let expected_sigs = vec![tx1.signatures[0].to_string(), tx2.signatures[0].to_string()];
+        let landing_slot = setup.context.svm_locker.get_latest_absolute_slot();
 
         let bundle_id = setup
             .rpc
@@ -2180,15 +2181,13 @@ mod tests {
             bundle.err.is_ok(),
             "successful multi-tx bundle should report Ok"
         );
-        assert!(
-            matches!(
-                bundle.confirmation_status,
-                SolanaTxConfirmationStatus::Processed
-                    | SolanaTxConfirmationStatus::Confirmed
-                    | SolanaTxConfirmationStatus::Finalized
-            ),
-            "confirmation_status should be a valid Solana status"
+        // No block has been produced since the bundle landed: it is still processed, and is
+        // reported at the slot it landed in.
+        assert_eq!(
+            bundle.confirmation_status,
+            SolanaTxConfirmationStatus::Processed
         );
+        assert_eq!(bundle.slot, landing_slot);
     }
 
     #[test]
