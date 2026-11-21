@@ -614,7 +614,7 @@ impl Surfpool {
     /// Sets token balances for multiple accounts in your local Solana network (surfnet).
     /// This method is exposed as a tool and can be invoked remotely.
     #[tool(
-        description = "Sets token balances for one or more accounts on a local Solana network. Supports both SOL and SPL tokens."
+        description = "Sets token balances for one or more accounts on a local Solana network. Supports SOL and SPL tokens. If token_amount is omitted, the default is 100,000 tokens (100,000 SOL for SOL)."
     )]
     async fn set_token_accounts(
         &self,
@@ -660,7 +660,7 @@ impl Surfpool {
     /// Starts a new local Solana network and sets token balances on it.
     /// This is a convenience method that combines `start_surfnet` and `set_token_accounts`.
     #[tool(
-        description = "Starts a new local Solana network and sets token balances for one or more accounts. This combines `start_surfnet` and `set_token_accounts`."
+        description = "Starts a new local Solana network and sets token balances for one or more accounts. This combines `start_surfnet` and `set_token_accounts`; omitted token_amount defaults to 100,000 tokens (100,000 SOL for SOL)."
     )]
     async fn start_surfnet_with_token_accounts(
         &self,
