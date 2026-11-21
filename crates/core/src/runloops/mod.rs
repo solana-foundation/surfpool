@@ -16,7 +16,7 @@ use agave_geyser_plugin_interface::geyser_plugin_interface::{
     GeyserPlugin, ReplicaBlockInfoV4, ReplicaBlockInfoVersions, ReplicaEntryInfoV2,
     ReplicaEntryInfoVersions, ReplicaTransactionInfoV3, ReplicaTransactionInfoVersions, SlotStatus,
 };
-use chrono::{Local, Utc};
+use chrono::Local;
 use crossbeam_channel::{
     Receiver, RecvTimeoutError, Sender, TrySendError, bounded, select, unbounded,
 };
@@ -394,7 +394,6 @@ pub async fn start_local_surfnet_runloop(
         svm_locker,
         block_production_mode,
         &remote_rpc_client,
-        simnet_config.expiry.map(|e| e * 1000),
         &simnet_config,
         Some(shutdown_rpc_servers),
     )
@@ -410,7 +409,6 @@ pub async fn start_block_production_runloop(
     svm_locker: SurfnetSvmLocker,
     mut block_production_mode: BlockProductionMode,
     remote_rpc_client: &Option<SurfnetRemoteClient>,
-    expiry_duration_ms: Option<u64>,
     simnet_config: &SimnetConfig,
     mut shutdown_rpc_servers: Option<Box<dyn FnOnce() + Send>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -420,8 +418,6 @@ pub async fn start_block_production_runloop(
             solana_commitment_config::CommitmentConfig::confirmed(),
         )
     });
-    let mut next_scheduled_expiry_check: Option<u64> =
-        expiry_duration_ms.map(|expiry_val| Utc::now().timestamp_millis() as u64 + expiry_val);
     let global_skip_sig_verify = simnet_config.skip_signature_verification;
     let ix_profiling_initially_enabled = simnet_config.instruction_profiling_enabled;
     // A queued token asks the next runloop iteration to produce one follow-up
@@ -446,20 +442,6 @@ pub async fn start_block_production_runloop(
                     ClockEvent::Tick => {
                         if block_production_mode.eq(&BlockProductionMode::Clock) {
                             do_produce_block = true;
-                        }
-
-                        if let Some(expiry_ms) = expiry_duration_ms {
-                            if let Some(scheduled_time_ref) = &mut next_scheduled_expiry_check {
-                                let now_ms = Utc::now().timestamp_millis() as u64;
-                                if now_ms >= *scheduled_time_ref {
-                                    let svm = svm_locker.0.read().await;
-                                    if svm.updated_at + expiry_ms < now_ms {
-                                        let _ = simnet_commands_tx.send(SimnetCommand::Terminate(None));
-                                    } else {
-                                        *scheduled_time_ref = svm.updated_at + expiry_ms;
-                                    }
-                                }
-                            }
                         }
                     }
                 }
