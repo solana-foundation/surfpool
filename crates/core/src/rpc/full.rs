@@ -3936,6 +3936,86 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn simulate_transaction_returns_requested_accounts_it_does_not_write_as_agave_does() {
+        let payer = Keypair::new();
+        let pk = Pubkey::new_unique();
+        let lamports = LAMPORTS_PER_SOL;
+        let setup = TestSetup::new_with_serial_vm_executor(SurfpoolFullRpc);
+        let recent_blockhash = setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm_reader| svm_reader.latest_blockhash());
+
+        let _ = setup
+            .rpc
+            .request_airdrop(
+                Some(setup.context.clone()),
+                payer.pubkey().to_string(),
+                2 * lamports,
+                None,
+            )
+            .unwrap();
+
+        let tx = build_legacy_transaction(
+            &payer.pubkey(),
+            &[&payer.insecure_clone()],
+            &[system_instruction::transfer(&payer.pubkey(), &pk, lamports)],
+            &recent_blockhash,
+        );
+
+        // pk is written; the System program is named by the transaction but only read; the Clock
+        // sysvar is not named at all. Agave returns all three.
+        let simulation_res = setup
+            .rpc
+            .simulate_transaction(
+                Some(setup.context),
+                bs58::encode(wincode::serialize(&tx).unwrap()).into_string(),
+                Some(RpcSimulateTransactionConfig {
+                    sig_verify: true,
+                    replace_recent_blockhash: false,
+                    commitment: Some(CommitmentConfig::finalized()),
+                    encoding: None,
+                    accounts: Some(RpcSimulateTransactionAccountsConfig {
+                        encoding: None,
+                        addresses: vec![
+                            pk.to_string(),
+                            system_program::id().to_string(),
+                            solana_sdk_ids::sysvar::clock::ID.to_string(),
+                        ],
+                    }),
+                    min_context_slot: None,
+                    inner_instructions: false,
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            simulation_res.value.err, None,
+            "Unexpected simulation error"
+        );
+        let accounts = simulation_res.value.accounts.expect("accounts were requested");
+        assert_eq!(accounts.len(), 3);
+        assert_eq!(
+            accounts[0].as_ref().map(|a| a.lamports),
+            Some(lamports),
+            "the written account's post-simulation state"
+        );
+        let system = accounts[1]
+            .as_ref()
+            .expect("a read-only account the transaction names");
+        assert!(system.executable);
+        assert_eq!(
+            system.owner,
+            solana_sdk_ids::native_loader::id().to_string()
+        );
+        let clock = accounts[2]
+            .as_ref()
+            .expect("an account the transaction does not name");
+        assert_eq!(clock.owner, solana_sdk_ids::sysvar::id().to_string());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_simulate_transaction_oversized_base64_returns_invalid_params() {
         let setup = TestSetup::new(SurfpoolFullRpc);
         let oversized_encoded_len = MAX_TRANSACTION_SIZE.div_ceil(3) * 4 + 1;
