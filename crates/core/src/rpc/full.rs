@@ -2062,7 +2062,8 @@ impl Full for SurfpoolFullRpc {
                     let mut accounts = None;
                     if let Some(observed_accounts) = config.accounts {
                         let mut ui_accounts = vec![];
-                        for (idx, observed_pubkey) in observed_accounts.addresses.iter().enumerate() {
+                        for (idx, observed_pubkey) in observed_accounts.addresses.iter().enumerate()
+                        {
                             let mut ui_account = None;
                             for (updated_pubkey, account) in tx_info.post_accounts.iter() {
                                 if observed_pubkey.eq(&updated_pubkey.to_string()) {
@@ -4039,7 +4040,10 @@ mod tests {
             simulation_res.value.err, None,
             "Unexpected simulation error"
         );
-        let accounts = simulation_res.value.accounts.expect("accounts were requested");
+        let accounts = simulation_res
+            .value
+            .accounts
+            .expect("accounts were requested");
         assert_eq!(accounts.len(), 3);
         assert_eq!(
             accounts[0].as_ref().map(|a| a.lamports),
