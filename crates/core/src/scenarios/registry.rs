@@ -29,6 +29,17 @@ pub const METEORA_DLMM_OVERRIDES_CONTENT: &str =
 pub const KAMINO_V1_IDL_CONTENT: &str = include_str!("./protocols/kamino/v1/idl.json");
 pub const KAMINO_V1_OVERRIDES_CONTENT: &str = include_str!("./protocols/kamino/v1/overrides.yaml");
 
+pub const SOLFI_ORACLE_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/solfi/v2/oracle-overrides.yaml");
+pub const SOLFI_MARKET_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/solfi/v2/market-overrides.yaml");
+pub const SOLFI_VAULT_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/solfi/v2/vault-overrides.yaml");
+pub const SOLFI_KEEP_ALIVE_CONTENT: &str = include_str!("./protocols/solfi/v2/keep-alive.yaml");
+
+pub const BISONFI_OVERRIDES_CONTENT: &str = include_str!("./protocols/bisonfi/overrides.yaml");
+pub const BISONFI_KEEP_ALIVE_CONTENT: &str = include_str!("./protocols/bisonfi/keep-alive.yaml");
+
 pub const KAMINO_SCOPE_IDL_CONTENT: &str = include_str!("./protocols/kamino/scope/v1/idl.json");
 pub const KAMINO_SCOPE_OVERRIDES_CONTENT: &str =
     include_str!("./protocols/kamino/scope/v1/overrides.yaml");
@@ -138,6 +149,8 @@ impl TemplateRegistry {
         default.load_meteora_overrides();
         default.load_kamino_overrides();
         default.load_goonfi_overrides();
+        default.load_solfi_overrides();
+        default.load_bisonfi_overrides();
         default.load_drift_overrides();
         default.load_whirlpool_overrides();
         default.load_spl_token_overrides();
@@ -209,7 +222,11 @@ impl TemplateRegistry {
                     // A slot encoding writes the current slot plus the value, so `$slot` would
                     // write twice the slot.
                     let is_placeholder = value.as_str().is_some_and(|v| v.trim().starts_with('$'));
-                    if is_placeholder && matches!(property.encoding, Some(RawEncoding::Slot { .. }))
+                    if is_placeholder
+                        && matches!(
+                            property.encoding,
+                            Some(RawEncoding::Slot { .. } | RawEncoding::SlotXor { .. })
+                        )
                     {
                         return fail(format!(
                             "'{path}' is slot-encoded and already tracks the slot: give it a lead, \
@@ -266,6 +283,18 @@ impl TemplateRegistry {
             RAYDIUM_AMM_V4_OVERRIDES_CONTENT,
             "raydium",
         );
+    }
+
+    pub fn load_solfi_overrides(&mut self) {
+        self.load_raw_layout_overrides(SOLFI_ORACLE_OVERRIDES_CONTENT, "solfi-oracle");
+        self.load_raw_layout_overrides(SOLFI_MARKET_OVERRIDES_CONTENT, "solfi-market");
+        self.load_raw_layout_overrides(SOLFI_VAULT_OVERRIDES_CONTENT, "solfi-vault");
+        self.load_keep_alive(None, SOLFI_KEEP_ALIVE_CONTENT, "solfi");
+    }
+
+    pub fn load_bisonfi_overrides(&mut self) {
+        self.load_raw_layout_overrides(BISONFI_OVERRIDES_CONTENT, "bisonfi");
+        self.load_keep_alive(None, BISONFI_KEEP_ALIVE_CONTENT, "bisonfi");
     }
 
     pub fn load_kamino_overrides(&mut self) {
@@ -773,12 +802,12 @@ templates:
 
         // Pyth (1) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Drift (4) + Meteora (2)
         // + Kamino (Lend 17, Scope 3, Farms 5, Swap 2, Vault 5, Liquidity 4 = 36)
-        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + GoonFi (4) + Phoenix Eternal (19)
-        // = 85
+        // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + GoonFi (4) + SolFi (4)
+        // + BisonFi (3) + Phoenix Eternal (19) = 92
         assert_eq!(
             registry.count(),
-            85,
-            "Registry should load 85 templates total"
+            92,
+            "Registry should load 92 templates total"
         );
 
         assert!(registry.contains("pyth-price-feed-v2"));
@@ -857,6 +886,42 @@ templates:
         assert!(registry.contains("goonfi-reference-band"));
         assert!(registry.contains("goonfi-size-impact"));
         assert!(registry.contains("goonfi-vault-balance"));
+
+        assert!(registry.contains("solfi-price"));
+        assert!(
+            !registry.contains("solfi-freshness"),
+            "the oracle stays current by keep-alive"
+        );
+        assert!(registry.contains("solfi-size-impact"));
+        assert!(registry.contains("solfi-swap-pressure"));
+        assert!(registry.contains("solfi-vault-balance"));
+
+        assert!(registry.contains("bisonfi-fair-value"));
+        assert!(registry.contains("bisonfi-depth"));
+        assert!(registry.contains("bisonfi-spread"));
+        assert!(
+            !registry.contains("bisonfi-freshness"),
+            "the quote stays fresh by keep-alive"
+        );
+
+        for template_id in ["bisonfi-fair-value", "bisonfi-depth", "bisonfi-spread"] {
+            let template = registry.get(template_id).expect("BisonFi template");
+            assert_eq!(
+                template.address,
+                AccountAddress::Pubkey(String::new()),
+                "BisonFi account addresses are supplied by the caller"
+            );
+            let imported: Vec<&str> = template
+                .keep_alive
+                .iter()
+                .map(|import| import.template.as_str())
+                .collect();
+            assert_eq!(
+                imported,
+                ["bisonfi-quote-publication", "bisonfi-market-tick"],
+                "every BisonFi template keeps its quote and the market tick alive"
+            );
+        }
 
         assert!(registry.contains("phoenix-market-move"));
         assert!(registry.contains("phoenix-oracle-price"));
@@ -1077,21 +1142,26 @@ templates:
 
     #[test]
     fn a_placeholder_on_a_slot_encoded_field_is_refused() {
-        let mut registry = TemplateRegistry::default();
-        registry.load_raw_layout_overrides(KEEP_ALIVE_OVERRIDES, "example");
-        registry.load_keep_alive(
-            None,
-            &KEEP_ALIVE.replace(
-                "{ path: slot, offset: 8, encoding: u64",
-                "{ path: slot, offset: 8, encoding: { slot: { lead: 0 } }",
-            ),
-            "example",
-        );
-        let error = registry.check_keep_alive_imports().unwrap_err();
-        assert!(
-            error.contains("'slot' is slot-encoded and already tracks the slot"),
-            "{error}"
-        );
+        for encoding in [
+            "{ slot: { lead: 0 } }",
+            "{ slot_xor: { lead: 0, mask: 255 } }",
+        ] {
+            let mut registry = TemplateRegistry::default();
+            registry.load_raw_layout_overrides(KEEP_ALIVE_OVERRIDES, "example");
+            registry.load_keep_alive(
+                None,
+                &KEEP_ALIVE.replace(
+                    "{ path: slot, offset: 8, encoding: u64",
+                    &format!("{{ path: slot, offset: 8, encoding: {encoding}"),
+                ),
+                "example",
+            );
+            let error = registry.check_keep_alive_imports().unwrap_err();
+            assert!(
+                error.contains("'slot' is slot-encoded and already tracks the slot"),
+                "{encoding}: {error}"
+            );
+        }
     }
 
     #[test]
@@ -1422,8 +1492,8 @@ templates: []
         let oracle_templates = registry.by_tags(&[vec!["oracle".to_string()]].concat());
         assert_eq!(
             oracle_templates.len(),
-            5,
-            "Should find 5 oracle templates (Pyth + 3 Kamino Scope + 1 GoonFi)"
+            6,
+            "Should find 6 oracle templates (Pyth + 3 Kamino Scope + 1 GoonFi + 1 SolFi)"
         );
 
         let rewards_templates = registry.by_tags(&[vec!["rewards".to_string()]].concat());
@@ -2232,6 +2302,83 @@ templates: []
             };
             assert_eq!(import.template, "goonfi-quote-publication");
             let expected = if template_id == "goonfi-price" {
+                surfpool_types::KeepAliveAddress::Override
+            } else {
+                surfpool_types::KeepAliveAddress::Input("oracle".to_string())
+            };
+            assert_eq!(
+                import.address, expected,
+                "{template_id} keeps alive the oracle it writes or the one it is given"
+            );
+        }
+    }
+
+    #[test]
+    fn test_every_solfi_property_has_guidance() {
+        let registry = TemplateRegistry::new();
+        let mut checked = 0;
+        for id in [
+            "solfi-price",
+            "solfi-size-impact",
+            "solfi-swap-pressure",
+            "solfi-vault-balance",
+        ] {
+            let template = registry
+                .get(id)
+                .unwrap_or_else(|| panic!("missing SolFi template {id}"));
+            assert!(template.raw_layout, "{id} must use a raw layout");
+            assert!(
+                template
+                    .llm_context
+                    .as_deref()
+                    .is_some_and(|context| context.lines().count() >= 6),
+                "{id} needs substantive LLM guidance"
+            );
+            for property in &template.properties {
+                assert!(
+                    property
+                        .description
+                        .as_deref()
+                        .is_some_and(|description| !description.trim().is_empty()),
+                    "{id}:{} needs a property description",
+                    property.path
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 27, "every shipped SolFi property must be checked");
+    }
+
+    #[test]
+    fn solfi_templates_require_caller_selected_accounts() {
+        let registry = TemplateRegistry::new();
+        for template_id in [
+            "solfi-price",
+            "solfi-size-impact",
+            "solfi-swap-pressure",
+            "solfi-vault-balance",
+        ] {
+            let template = registry.get(template_id).expect("SolFi template");
+            assert_eq!(
+                template.address,
+                surfpool_types::AccountAddress::Pubkey(String::new()),
+                "{template_id} must require an explicit target account"
+            );
+            assert!(
+                template.constants.is_empty(),
+                "{template_id} must not embed a backend account catalog"
+            );
+            assert!(
+                template.llm_context.as_deref().is_some_and(
+                    |context| context.contains("SV2EYYJyRz2YhfXwXnhNAevDEui5Q6yrfyo13WtupPF")
+                ),
+                "{template_id} must explain how to discover its target account"
+            );
+            let [import] = template.keep_alive.as_slice() else {
+                panic!("{template_id} must keep its market's oracle alive");
+            };
+            assert_eq!(import.template, "solfi-oracle-publication");
+            let expected = if template_id == "solfi-price" {
                 surfpool_types::KeepAliveAddress::Override
             } else {
                 surfpool_types::KeepAliveAddress::Input("oracle".to_string())
