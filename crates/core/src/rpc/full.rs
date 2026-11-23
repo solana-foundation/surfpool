@@ -1988,13 +1988,32 @@ impl Full for SurfpoolFullRpc {
             let loaded_addresses = svm_locker
                 .get_loaded_addresses(&remote_ctx, &tx.message)
                 .await?;
-            let transaction_pubkeys = svm_locker.get_pubkeys_from_message(
+            let mut pubkeys_to_load = svm_locker.get_pubkeys_from_message(
                 &tx.message,
                 loaded_addresses.as_ref().map(|l| l.all_loaded_addresses()),
             );
+            // Agave answers a requested account the transaction does not write from the bank, so
+            // the requested accounts are loaded too: a forked surfnet fetches them like the
+            // transaction's own.
+            let observed_pubkeys: Vec<Option<Pubkey>> = config
+                .accounts
+                .as_ref()
+                .map(|accounts| {
+                    accounts
+                        .addresses
+                        .iter()
+                        .map(|address| Pubkey::from_str(address).ok())
+                        .collect()
+                })
+                .unwrap_or_default();
+            for pubkey in observed_pubkeys.iter().flatten() {
+                if !pubkeys_to_load.contains(pubkey) {
+                    pubkeys_to_load.push(*pubkey);
+                }
+            }
 
             svm_locker
-                .get_multiple_accounts(&remote_ctx, &transaction_pubkeys, None)
+                .get_multiple_accounts(&remote_ctx, &pubkeys_to_load, None)
                 .await?;
 
             // Convert TransactionLoadedAddresses to LoadedAddresses before it gets consumed
@@ -2002,7 +2021,7 @@ impl Full for SurfpoolFullRpc {
 
             // Like Agave's simulation bank: the context slot, the replacement blockhash and the
             // simulated state come from one guard, taken once the accounts are loaded.
-            let (read, replacement_blockhash, tx_message, simulation) = svm_locker
+            let (read, replacement_blockhash, tx_message, simulation, observed_state) = svm_locker
                 .with_svm_reader(|svm_reader| {
                     let read = svm_reader.read_slot(config.commitment, config.min_context_slot)?;
                     let replacement_blockhash = config.replace_recent_blockhash.then(|| {
@@ -2017,11 +2036,21 @@ impl Full for SurfpoolFullRpc {
                     // Clone the message before moving the transaction for result formatting
                     let tx_message = tx.message.clone();
                     let simulation = svm_reader.simulate_transaction(tx, config.sig_verify);
+                    // The simulation writes nothing back, so this is also the post-simulation
+                    // state of every requested account the transaction does not write.
+                    let mut observed_state = Vec::with_capacity(observed_pubkeys.len());
+                    for pubkey in observed_pubkeys.iter() {
+                        observed_state.push(match pubkey {
+                            Some(pubkey) => svm_reader.get_account(pubkey)?,
+                            None => None,
+                        });
+                    }
                     Ok::<_, jsonrpc_core::Error>((
                         read,
                         replacement_blockhash,
                         tx_message,
                         simulation,
+                        observed_state,
                     ))
                 })?;
             let loaded_accounts_data_size = match &simulation {
@@ -2033,7 +2062,7 @@ impl Full for SurfpoolFullRpc {
                     let mut accounts = None;
                     if let Some(observed_accounts) = config.accounts {
                         let mut ui_accounts = vec![];
-                        for observed_pubkey in observed_accounts.addresses.iter() {
+                        for (idx, observed_pubkey) in observed_accounts.addresses.iter().enumerate() {
                             let mut ui_account = None;
                             for (updated_pubkey, account) in tx_info.post_accounts.iter() {
                                 if observed_pubkey.eq(&updated_pubkey.to_string()) {
@@ -2048,6 +2077,22 @@ impl Full for SurfpoolFullRpc {
                                             .account,
                                     );
                                 }
+                            }
+                            // post_accounts holds only the accounts the transaction writes.
+                            if ui_account.is_none()
+                                && let (Some(pubkey), Some(account)) =
+                                    (observed_pubkeys[idx], observed_state[idx].as_ref())
+                            {
+                                ui_account = Some(
+                                    svm_locker
+                                        .account_to_rpc_keyed_account(
+                                            &pubkey,
+                                            account,
+                                            &RpcAccountInfoConfig::default(),
+                                            None,
+                                        )
+                                        .account,
+                                );
                             }
                             ui_accounts.push(ui_account);
                         }
