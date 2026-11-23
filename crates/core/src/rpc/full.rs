@@ -4065,6 +4065,178 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn simulate_transaction_fetches_requested_accounts_from_the_datasource() {
+        // An account only the datasource holds, which the transaction does not name: a forked
+        // surfnet must fetch it before it can answer it.
+        let remote_pk = Pubkey::new_unique();
+        let remote_owner = Pubkey::new_unique();
+        let remote_data = b"held by the datasource only".to_vec();
+        let asked_for: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(vec![]));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test datasource should bind");
+        let address = listener
+            .local_addr()
+            .expect("test datasource should have an address");
+        let datasource = {
+            let asked_for = asked_for.clone();
+            let remote_pk = remote_pk.to_string();
+            let account = serde_json::json!({
+                "lamports": 4242,
+                "data": [BASE64_STANDARD.encode(&remote_data), "base64"],
+                "owner": remote_owner.to_string(),
+                "executable": false,
+                "rentEpoch": 0,
+                "space": remote_data.len(),
+            });
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut stream, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let mut buf = vec![];
+                    let mut chunk = [0; 4096];
+                    let body = loop {
+                        let n = stream.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            break None;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        let text = String::from_utf8_lossy(&buf).to_string();
+                        if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                            let len = head
+                                .lines()
+                                .find_map(|l| {
+                                    l.to_ascii_lowercase()
+                                        .strip_prefix("content-length:")
+                                        .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                                })
+                                .unwrap_or(0);
+                            if body.len() >= len {
+                                break Some(body[..len].to_string());
+                            }
+                        }
+                    };
+                    let Some(body) = body else { continue };
+                    let request: serde_json::Value =
+                        serde_json::from_str(&body).expect("the datasource gets JSON-RPC");
+                    let result = if request["method"] == "getMultipleAccounts" {
+                        let keys: Vec<String> = request["params"][0]
+                            .as_array()
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|k| k.as_str().map(str::to_string))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        asked_for.lock().unwrap().extend(keys.iter().cloned());
+                        let value: Vec<serde_json::Value> = keys
+                            .iter()
+                            .map(|k| {
+                                if *k == remote_pk {
+                                    account.clone()
+                                } else {
+                                    serde_json::Value::Null
+                                }
+                            })
+                            .collect();
+                        serde_json::json!({"context": {"slot": 1}, "value": value})
+                    } else {
+                        serde_json::Value::Null
+                    };
+                    let response = serde_json::json!({
+                        "jsonrpc": "2.0", "id": request["id"], "result": result,
+                    })
+                    .to_string();
+                    let _ = stream
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                                response.len(),
+                                response
+                            )
+                            .as_bytes(),
+                        )
+                        .await;
+                }
+            })
+        };
+
+        let payer = Keypair::new();
+        let pk = Pubkey::new_unique();
+        let lamports = LAMPORTS_PER_SOL;
+        let mut setup = TestSetup::new_with_serial_vm_executor(SurfpoolFullRpc);
+        let recent_blockhash = setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm_reader| svm_reader.latest_blockhash());
+        // Both transaction accounts exist locally, so the datasource is asked only for remote_pk.
+        for key in [payer.pubkey(), pk] {
+            let _ = setup
+                .rpc
+                .request_airdrop(
+                    Some(setup.context.clone()),
+                    key.to_string(),
+                    2 * lamports,
+                    None,
+                )
+                .unwrap();
+        }
+        setup.context.remote_rpc_client =
+            Some(SurfnetRemoteClient::new(format!("http://{address}")));
+
+        let tx = build_legacy_transaction(
+            &payer.pubkey(),
+            &[&payer.insecure_clone()],
+            &[system_instruction::transfer(&payer.pubkey(), &pk, lamports)],
+            &recent_blockhash,
+        );
+        let simulation_res = setup
+            .rpc
+            .simulate_transaction(
+                Some(setup.context),
+                bs58::encode(wincode::serialize(&tx).unwrap()).into_string(),
+                Some(RpcSimulateTransactionConfig {
+                    sig_verify: true,
+                    commitment: Some(CommitmentConfig::confirmed()),
+                    accounts: Some(RpcSimulateTransactionAccountsConfig {
+                        encoding: None,
+                        addresses: vec![remote_pk.to_string()],
+                    }),
+                    ..RpcSimulateTransactionConfig::default()
+                }),
+            )
+            .await
+            .unwrap();
+        datasource.abort();
+
+        assert_eq!(
+            simulation_res.value.err, None,
+            "Unexpected simulation error"
+        );
+        assert!(
+            asked_for.lock().unwrap().contains(&remote_pk.to_string()),
+            "the datasource was never asked for the requested account"
+        );
+        assert_eq!(
+            simulation_res.value.accounts,
+            Some(vec![Some(UiAccount {
+                lamports: 4242,
+                data: UiAccountData::Binary(
+                    BASE64_STANDARD.encode(&remote_data),
+                    UiAccountEncoding::Base64
+                ),
+                owner: remote_owner.to_string(),
+                executable: false,
+                rent_epoch: 0,
+                space: Some(remote_data.len() as u64),
+            })]),
+            "the requested account as the datasource holds it"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_simulate_transaction_oversized_base64_returns_invalid_params() {
         let setup = TestSetup::new(SurfpoolFullRpc);
         let oversized_encoded_len = MAX_TRANSACTION_SIZE.div_ceil(3) * 4 + 1;
