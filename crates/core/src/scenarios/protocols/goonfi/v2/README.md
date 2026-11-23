@@ -92,7 +92,7 @@ datasource before its bytes are changed.
 
 On mainnet GoonFi's maker republishes each market's quote every slot or few. Nobody runs it against a
 surfnet, so while a scenario with a GoonFi override is registered Surfpool republishes the oracle
-every slot ([keep-alive](../../README.md#keep-alive)): it stamps the update slot (byte 16) one slot
+every slot ([keep-alive](../../../README.md#keep-alive)): it stamps the update slot (byte 16) one slot
 back, so the quote stays one slot old and every swap gets the best fill. The price stays as set. There is nothing to schedule:
 
 - `goonfi-price` keeps the oracle it writes current.
