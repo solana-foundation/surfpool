@@ -1,0 +1,89 @@
+protocol: HumidiFi
+# HumidiFi ships no program semver; these vaults belong to schema-8 market accounts.
+version: v8
+account_type: TokenAccount
+
+raw_layout: true
+
+tags:
+  - pmm
+  - vault
+  - inventory
+
+keep_alive:
+  - template: humidifi-quote-publication
+    address: { type: input, value: market }
+    values: { last_update_slot: $slot }
+
+templates:
+  - id: humidifi-vault-balance
+    name: Override Vault Balance
+    description: Change one HumidiFi vault's inventory or make its payout direction unfillable
+    idl_account_name: TokenAccount
+    address:
+      type: pubkey
+    properties:
+      - path: amount
+        offset: 64
+        encoding: u64
+        label: Vault token balance
+        description: Raw token amount in the mint's smallest unit.
+      - path: market
+        type: input
+        value_type: pubkey
+        label: Market
+        description: >-
+          The market this vault belongs to, which owns it. Surfpool keeps the market's quote current;
+          it is not written to the vault.
+    llm_context: |
+      FINDING THE ACCOUNT: HumidiFi stores each market's mints and vaults masked, and a search by
+      mint needs those masked bytes, which you cannot compute. Work from a market address the user
+      gives; if they name only a pair, use the market Studio lists for it, or else ask for the market
+      address. Never call getProgramAccounts on the HumidiFi program: the masked mints cannot be
+      matched, and the result is very large. An "Invalid pubkey" error means an address was
+      copied wrong; copy it again exactly and retry.
+      A HumidiFi market is a 1728-byte account owned by program
+      9H6tua7jkLhdm3w8BvgpTn5LZNU7g4ZynDmCiNN3q6Rp. Every vault is a token account owned by its
+      market, so it is found without unmasking. ALWAYS do these steps, also when the user gives
+      only an address:
+      1. Read the market's token accounts: call Solana JSON-RPC getTokenAccountsByOwner twice at
+         once for the market address, once filtered by token program
+         TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA and once by
+         TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb, both with jsonParsed encoding. The filter
+         and the encoding are separate params: the market address, then
+         {"programId":"<token program>"}, then {"encoding":"jsonParsed"}.
+      2. Find the pair: the quote token is the stablecoin (USDC, USDT or USD1) and the base token
+         is the only other mint. If the results show more than one mint besides the stablecoin,
+         or no stablecoin, ask which pair it is instead of guessing. The base vault pays buys
+         (quote in, base out); the quote vault pays sells (base in, quote out). The vault is the
+         account of the paying side's mint holding the most tokens, often next to dust someone
+         sent to the market; if every one holds almost nothing (a drained vault or an empty
+         market), ask for the vault address instead of guessing.
+      3. Put the vault in the override's account as {"pubkey":"<vault>"} and set fetchBeforeUse as
+         described below. The vault address is never an override value, and this template never
+         targets the market account.
+      4. Put the market address in `market`. Surfpool keeps that market's quote current, so the
+         swap being tested is priced instead of rejected as stale.
+
+      The input-side vault only receives tokens, so lowering it leaves that direction's output
+      unchanged.
+
+      HumidiFi prices against its payout inventory: a thin payout vault that can still settle cuts
+      the quoted output drastically. An empty payout vault rejects the swap, usually with HumidiFi
+      custom error 49 (0x31); some markets leave it to the token transfer, which fails with the
+      token program's InsufficientFunds (custom error 1). Emptying both vaults rejects every swap
+      with custom error 310 (0x136).
+      This does not set the mid-price; use humidifi-price for that.
+
+      UNIT: the mint's smallest unit. 25 USDC is 25000000; 0.5 SOL is 500000000. The token accounts
+      from step 1 carry each mint's decimals.
+
+      Apply this override once before the swap being tested. Do not schedule repeated vault resets
+      across swaps: that can manufacture or erase inventory by undoing transaction-owned balance
+      changes.
+
+      LOWER FOR STRESS TESTS. Raising a wrapped-SOL vault amount without matching lamports can
+      create an impossible token account, so lowering is the safe default.
+
+      Set fetchBeforeUse: true to pull the account from upstream first; false only for a later
+      override that builds on state an earlier override in the same scenario prepared.
