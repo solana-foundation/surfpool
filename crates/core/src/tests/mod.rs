@@ -1,3 +1,5 @@
+#[cfg(feature = "integration-tests")]
+pub mod bisonfi;
 pub mod helpers;
 #[cfg(feature = "integration-tests")]
 pub mod humidifi;
@@ -10,3 +12,5 @@ pub mod plugin;
 #[cfg(feature = "integration-tests")]
 pub mod pump;
 pub mod simnet_events;
+#[cfg(feature = "integration-tests")]
+pub mod solfi;

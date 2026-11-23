@@ -1,0 +1,66 @@
+protocol: SolFi
+version: v2
+account_type: TokenAccount
+
+raw_layout: true
+
+tags:
+    - pmm
+    - vault
+    - inventory
+
+keep_alive:
+    - template: solfi-oracle-publication
+      address: { type: input, value: oracle }
+      values: { publication_slot: $slot, publication_time_ms: $unix_ms, valid_until_slot: $slot+200 }
+
+templates:
+    - id: solfi-vault-balance
+      name: Override Vault Balance
+      description: Change one SolFi vault's inventory or make its payout direction unfillable
+      idl_account_name: TokenAccount
+      address:
+          type: pubkey
+      properties:
+          - path: amount
+            offset: 64
+            encoding: u64
+            label: Vault token balance
+            description: Raw token amount in the mint's smallest unit.
+          - path: oracle
+            type: input
+            value_type: pubkey
+            label: Market oracle
+            description: >-
+                The oracle of this vault's market, stored at market bytes 24..56. Surfpool keeps it current
+                while the scenario is registered; it is not written to the vault.
+      llm_context: |
+          FINDING A VAULT WHEN THE USER NAMES A PAIR OR STUDIO DOES NOT LIST IT:
+          1. Discover the SolFi market with getProgramAccounts for program
+             SV2EYYJyRz2YhfXwXnhNAevDEui5Q6yrfyo13WtupPF using base64 encoding. Do not rely on a fixed
+             account-size filter. Decode bytes 120..152 as the base vault and 152..184 as the quote
+             vault, then query both as SPL token accounts and match their mint fields to the pair.
+          2. Choose the vault that pays the simulated direction: base vault for quote-to-base swaps,
+             quote vault for base-to-quote swaps.
+          3. Put that vault in the override as {"account":{"pubkey":"<vault>"}} and set
+             fetchBeforeUse: true. Do not target the market or oracle account with this template.
+          4. Put the same market's oracle, market bytes 24..56, in `oracle`. Surfpool keeps it current
+             while the scenario is registered.
+
+          PRECONDITION - SELECT A VAULT FROM THE MARKET. The base vault is stored at market bytes
+          120..152 and the quote vault at 152..184. Do not apply this to the market or oracle account.
+
+          Apply this to the actual base or quote SPL-token vault referenced by the SolFi market, never to
+          the 1728-byte market itself. The base vault pays quote-to-base swaps; the quote vault pays
+          base-to-quote swaps. Reducing a payout vault far enough makes SolFi reject with error 18.
+
+          Vault balances also enter SolFi's nonlinear inventory policy, so changing the input-side vault
+          can move a quote even though that vault is not paying out. This does not set SolFi's mid-price.
+
+          Apply this override once before the swap being tested. Do not schedule repeated vault resets
+          across swaps: that can manufacture or erase inventory by undoing transaction-owned balance
+          changes.
+
+          LOWER FOR STRESS TESTS. A moderate reduction can move nonlinear inventory policy; a severe
+          reduction of the payout vault produces error 18. Raising a wrapped-native vault amount without
+          matching lamports can create an impossible token account, so lowering is the safe default.
