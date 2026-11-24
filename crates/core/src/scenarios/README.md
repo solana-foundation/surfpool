@@ -23,6 +23,7 @@ Protocols that are natively supported by Surfpool will have their IDLs included 
 - **PumpSwap v1** - Constant-product AMM with pool state and global config override templates, including canonical pool derivation for migrated pump.fun coins
 - **GoonFi V2** - Proprietary market maker (no published IDL), with price, reference-band, size-impact and vault-inventory templates; its oracle is kept alive and callers choose the market, oracle or vault account. See [protocols/goonfi/v2/README.md](./protocols/goonfi/v2/README.md)
 - **HumidiFi v8** - Proprietary market maker (no published IDL), with price, spread and vault-inventory templates; its quote is kept alive. Callers choose the market or vault account. See [protocols/humidifi/v8/README.md](./protocols/humidifi/v8/README.md)
+- **OpenBook v2** - Central limit order book with market fee, expiry and deposit templates for the markets Drift routes through (SOL, BTC, ETH, WIF and BONK against USDC) or any market by address, plus an open orders position template. See [protocols/openbook/v2/README.md](./protocols/openbook/v2/README.md)
  - **SolFi v2** – Proprietary market maker (no published IDL, not Anchor), with price, size-impact,
    swap-pressure and vault-inventory templates; its oracle is kept alive. See
    [protocols/solfi/v2/README.md](./protocols/solfi/v2/README.md)

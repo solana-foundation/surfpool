@@ -94,6 +94,10 @@ pub const PHOENIX_ETERNAL_IDL_CONTENT: &str =
 pub const PHOENIX_ETERNAL_OVERRIDES_CONTENT: &str =
     include_str!("./protocols/phoenix-eternal/v1/overrides.yaml");
 
+pub const OPENBOOK_V2_IDL_CONTENT: &str = include_str!("./protocols/openbook/v2/idl.json");
+pub const OPENBOOK_V2_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/openbook/v2/overrides.yaml");
+
 /// Registry for managing override templates loaded from YAML files
 #[derive(Clone, Debug, Default)]
 pub struct TemplateRegistry {
@@ -160,6 +164,7 @@ impl TemplateRegistry {
         default.load_spl_token_overrides();
         default.load_pump_overrides();
         default.load_phoenix_overrides();
+        default.load_openbook_overrides();
         if let Err(e) = default.check_keep_alive_imports() {
             panic!("unable to load the override templates: {e}");
         }
@@ -378,6 +383,14 @@ impl TemplateRegistry {
             PHOENIX_ETERNAL_IDL_CONTENT,
             PHOENIX_ETERNAL_OVERRIDES_CONTENT,
             "phoenix-eternal",
+        );
+    }
+
+    pub fn load_openbook_overrides(&mut self) {
+        self.load_protocol_overrides(
+            OPENBOOK_V2_IDL_CONTENT,
+            OPENBOOK_V2_OVERRIDES_CONTENT,
+            "openbook",
         );
     }
 
@@ -891,11 +904,11 @@ templates:
         // Pyth (1) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Meteora (2)
         // + Kamino (Lend 17, Scope 3, Farms 5, Swap 2, Vault 5, Liquidity 4 = 36)
         // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + GoonFi (4) + HumidiFi (3)
-        // + SolFi (4) + BisonFi (3) + Phoenix Eternal (19) = 91
+        // + SolFi (4) + BisonFi (3) + Phoenix Eternal (19) + OpenBook v2 (7) = 98
         assert_eq!(
             registry.count(),
-            91,
-            "Registry should load 91 templates total"
+            98,
+            "Registry should load 98 templates total"
         );
 
         assert!(registry.contains("pyth-price-feed-v2"));
@@ -1016,6 +1029,14 @@ templates:
         assert!(registry.contains("phoenix-market-move"));
         assert!(registry.contains("phoenix-oracle-price"));
         assert!(registry.contains("phoenix-trader-collateral"));
+
+        assert!(registry.contains("openbook-v2-sol-usdc-market"));
+        assert!(registry.contains("openbook-v2-btc-usdc-market"));
+        assert!(registry.contains("openbook-v2-eth-usdc-market"));
+        assert!(registry.contains("openbook-v2-wif-usdc-market"));
+        assert!(registry.contains("openbook-v2-bonk-usdc-market"));
+        assert!(registry.contains("openbook-v2-market-custom"));
+        assert!(registry.contains("openbook-v2-open-orders"));
     }
 
     #[test]
@@ -1579,6 +1600,22 @@ templates: []
             19,
             "Should have 19 Phoenix Eternal templates"
         );
+
+        let openbook_templates = registry.by_protocol("OpenBook");
+        assert_eq!(
+            openbook_templates.len(),
+            7,
+            "Should have 7 OpenBook v2 templates (5 markets + custom market + open orders)"
+        );
+        let openbook_accounts: BTreeSet<&str> = openbook_templates
+            .iter()
+            .map(|t| t.account_type.as_str())
+            .collect();
+        assert_eq!(
+            openbook_accounts,
+            BTreeSet::from(["Market", "OpenOrdersAccount"]),
+            "OpenBook v2 templates cover the Market and OpenOrdersAccount accounts"
+        );
     }
 
     #[test]
@@ -1676,6 +1713,8 @@ templates: []
         assert!(ids.contains(&"whirlpool-orca-usdc".to_string()));
         assert!(ids.contains(&"whirlpool-popcat-sol".to_string()));
         assert!(ids.contains(&"whirlpool-custom".to_string()));
+        assert!(ids.contains(&"openbook-v2-market-custom".to_string()));
+        assert!(ids.contains(&"openbook-v2-open-orders".to_string()));
     }
 
     #[test]
@@ -2180,6 +2219,92 @@ templates: []
             template.address,
             AccountAddress::Pubkey("3t4JZcueEzTbVP6kLxXrL3VpWx45jDer4eqysweBchNH".to_string())
         );
+    }
+
+    /// The preset markets are the ones Drift routes spot fills through. Their addresses are
+    /// hardcoded facts about mainnet, so guard their shape and uniqueness, and that the presets
+    /// offer the same fields while the custom template adds the oracle staleness window.
+    #[test]
+    fn test_openbook_v2_preset_markets_have_baked_addresses() {
+        use std::{collections::BTreeSet, str::FromStr};
+
+        use solana_pubkey::Pubkey;
+
+        const PRESETS: &[&str] = &[
+            "openbook-v2-sol-usdc-market",
+            "openbook-v2-btc-usdc-market",
+            "openbook-v2-eth-usdc-market",
+            "openbook-v2-wif-usdc-market",
+            "openbook-v2-bonk-usdc-market",
+        ];
+        const STALENESS: &str = "oracle_config.max_staleness_slots";
+
+        let registry = TemplateRegistry::new();
+        let paths = |id: &str| -> Vec<String> {
+            registry
+                .get(id)
+                .unwrap_or_else(|| panic!("template {} should exist", id))
+                .properties
+                .iter()
+                .map(|p| p.path.clone())
+                .collect()
+        };
+
+        let preset_paths = paths(PRESETS[0]);
+        assert!(
+            preset_paths.iter().any(|p| p == "time_expiry"),
+            "market templates override the expiry"
+        );
+        assert!(
+            !preset_paths.iter().any(|p| p == STALENESS),
+            "no preset market has an oracle, so none offers its staleness window"
+        );
+
+        let custom = registry
+            .get("openbook-v2-market-custom")
+            .expect("openbook-v2-market-custom template should exist");
+        assert_eq!(
+            custom.address,
+            AccountAddress::Pubkey(String::new()),
+            "the custom template lets the caller pick the market"
+        );
+        let mut expected_custom = preset_paths.clone();
+        expected_custom.push(STALENESS.to_string());
+        assert_eq!(
+            paths("openbook-v2-market-custom"),
+            expected_custom,
+            "the custom template offers the preset fields plus the oracle staleness window"
+        );
+
+        let mut addresses = BTreeSet::new();
+        for id in PRESETS {
+            let template = registry.get(id).unwrap();
+            assert_eq!(
+                template.account_type, "Market",
+                "{} should target a Market",
+                id
+            );
+            let AccountAddress::Pubkey(address) = &template.address else {
+                panic!("{} should carry a plain pubkey address, not a PDA", id);
+            };
+            assert!(
+                Pubkey::from_str(address).is_ok(),
+                "{} has an unparseable address: {}",
+                id,
+                address
+            );
+            assert!(
+                addresses.insert(address.clone()),
+                "{} reuses an address already used by another preset",
+                id
+            );
+            assert_eq!(
+                paths(id),
+                preset_paths,
+                "{} should offer the same fields as the other presets",
+                id
+            );
+        }
     }
 
     /// These addresses are hardcoded facts about mainnet, so guard their shape and uniqueness.

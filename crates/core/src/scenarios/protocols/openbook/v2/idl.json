@@ -1,0 +1,4099 @@
+{
+  "address": "opnb2LAfJYbRMAHHvqjCwQxanZn7ReEHp1k81EohpZb",
+  "metadata": {
+    "name": "openbook_v2",
+    "version": "0.1.0",
+    "spec": "0.1.0"
+  },
+  "instructions": [
+    {
+      "name": "create_market",
+      "docs": [
+        "Create a [`Market`](crate::state::Market) for a given token pair."
+      ],
+      "discriminator": [
+        103,
+        226,
+        97,
+        235,
+        200,
+        188,
+        251,
+        254
+      ],
+      "accounts": [
+        {
+          "name": "market",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "market_authority"
+        },
+        {
+          "name": "bids",
+          "docs": [
+            "Accounts are initialized by client,",
+            "anchor discriminator is set first when ix exits,"
+          ],
+          "writable": true
+        },
+        {
+          "name": "asks",
+          "writable": true
+        },
+        {
+          "name": "event_heap",
+          "writable": true
+        },
+        {
+          "name": "payer",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "market_base_vault",
+          "writable": true
+        },
+        {
+          "name": "market_quote_vault",
+          "writable": true
+        },
+        {
+          "name": "base_mint"
+        },
+        {
+          "name": "quote_mint"
+        },
+        {
+          "name": "system_program"
+        },
+        {
+          "name": "token_program"
+        },
+        {
+          "name": "associated_token_program"
+        },
+        {
+          "name": "oracle_a",
+          "optional": true
+        },
+        {
+          "name": "oracle_b",
+          "optional": true
+        },
+        {
+          "name": "collect_fee_admin"
+        },
+        {
+          "name": "open_orders_admin",
+          "optional": true
+        },
+        {
+          "name": "consume_events_admin",
+          "optional": true
+        },
+        {
+          "name": "close_market_admin",
+          "optional": true
+        },
+        {
+          "name": "event_authority"
+        },
+        {
+          "name": "program"
+        }
+      ],
+      "args": [
+        {
+          "name": "name",
+          "type": "string"
+        },
+        {
+          "name": "oracle_config",
+          "type": {
+            "defined": {
+              "name": "OracleConfigParams"
+            }
+          }
+        },
+        {
+          "name": "quote_lot_size",
+          "type": "i64"
+        },
+        {
+          "name": "base_lot_size",
+          "type": "i64"
+        },
+        {
+          "name": "maker_fee",
+          "type": "i64"
+        },
+        {
+          "name": "taker_fee",
+          "type": "i64"
+        },
+        {
+          "name": "time_expiry",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "close_market",
+      "docs": [
+        "Close a [`Market`](crate::state::Market) (only",
+        "[`close_market_admin`](crate::state::Market::close_market_admin))."
+      ],
+      "discriminator": [
+        88,
+        154,
+        248,
+        186,
+        48,
+        14,
+        123,
+        244
+      ],
+      "accounts": [
+        {
+          "name": "close_market_admin",
+          "signer": true
+        },
+        {
+          "name": "market",
+          "writable": true
+        },
+        {
+          "name": "bids",
+          "writable": true
+        },
+        {
+          "name": "asks",
+          "writable": true
+        },
+        {
+          "name": "event_heap",
+          "writable": true
+        },
+        {
+          "name": "sol_destination",
+          "writable": true
+        },
+        {
+          "name": "token_program"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "create_open_orders_indexer",
+      "docs": [
+        "Create an [`OpenOrdersIndexer`](crate::state::OpenOrdersIndexer) account."
+      ],
+      "discriminator": [
+        64,
+        64,
+        153,
+        255,
+        217,
+        71,
+        249,
+        133
+      ],
+      "accounts": [
+        {
+          "name": "payer",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "owner",
+          "signer": true
+        },
+        {
+          "name": "open_orders_indexer",
+          "writable": true
+        },
+        {
+          "name": "system_program"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "close_open_orders_indexer",
+      "docs": [
+        "Close an [`OpenOrdersIndexer`](crate::state::OpenOrdersIndexer) account."
+      ],
+      "discriminator": [
+        103,
+        249,
+        229,
+        231,
+        247,
+        253,
+        197,
+        136
+      ],
+      "accounts": [
+        {
+          "name": "owner",
+          "signer": true
+        },
+        {
+          "name": "open_orders_indexer",
+          "writable": true
+        },
+        {
+          "name": "sol_destination",
+          "writable": true
+        },
+        {
+          "name": "token_program"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "create_open_orders_account",
+      "docs": [
+        "Create an [`OpenOrdersAccount`](crate::state::OpenOrdersAccount)."
+      ],
+      "discriminator": [
+        204,
+        181,
+        175,
+        222,
+        40,
+        125,
+        188,
+        71
+      ],
+      "accounts": [
+        {
+          "name": "payer",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "owner",
+          "signer": true
+        },
+        {
+          "name": "delegate_account",
+          "optional": true
+        },
+        {
+          "name": "open_orders_indexer",
+          "writable": true
+        },
+        {
+          "name": "open_orders_account",
+          "writable": true
+        },
+        {
+          "name": "market"
+        },
+        {
+          "name": "system_program"
+        }
+      ],
+      "args": [
+        {
+          "name": "name",
+          "type": "string"
+        }
+      ]
+    },
+    {
+      "name": "close_open_orders_account",
+      "docs": [
+        "Close an [`OpenOrdersAccount`](crate::state::OpenOrdersAccount)."
+      ],
+      "discriminator": [
+        176,
+        74,
+        115,
+        210,
+        54,
+        179,
+        91,
+        103
+      ],
+      "accounts": [
+        {
+          "name": "owner",
+          "signer": true
+        },
+        {
+          "name": "open_orders_indexer",
+          "writable": true
+        },
+        {
+          "name": "open_orders_account",
+          "writable": true
+        },
+        {
+          "name": "sol_destination",
+          "writable": true
+        },
+        {
+          "name": "system_program"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "place_order",
+      "docs": [
+        "Place an order.",
+        "",
+        "Different types of orders have different effects on the order book,",
+        "as described in [`PlaceOrderType`](crate::state::PlaceOrderType).",
+        "",
+        "`price_lots` refers to the price in lots: the number of quote lots",
+        "per base lot. It is ignored for `PlaceOrderType::Market` orders.",
+        "",
+        "`expiry_timestamp` is a unix timestamp for when this order should",
+        "expire. If 0 is passed in, the order will never expire. If the time",
+        "is in the past, the instruction is skipped. Timestamps in the future",
+        "are reduced to now + 65,535s.",
+        "",
+        "`limit` determines the maximum number of orders from the book to fill,",
+        "and can be used to limit CU spent. When the limit is reached, processing",
+        "stops and the instruction succeeds."
+      ],
+      "discriminator": [
+        51,
+        194,
+        155,
+        175,
+        109,
+        130,
+        96,
+        106
+      ],
+      "accounts": [
+        {
+          "name": "signer",
+          "signer": true
+        },
+        {
+          "name": "open_orders_account",
+          "writable": true
+        },
+        {
+          "name": "open_orders_admin",
+          "signer": true,
+          "optional": true
+        },
+        {
+          "name": "user_token_account",
+          "writable": true
+        },
+        {
+          "name": "market",
+          "writable": true
+        },
+        {
+          "name": "bids",
+          "writable": true
+        },
+        {
+          "name": "asks",
+          "writable": true
+        },
+        {
+          "name": "event_heap",
+          "writable": true
+        },
+        {
+          "name": "market_vault",
+          "writable": true
+        },
+        {
+          "name": "oracle_a",
+          "optional": true
+        },
+        {
+          "name": "oracle_b",
+          "optional": true
+        },
+        {
+          "name": "token_program"
+        }
+      ],
+      "args": [
+        {
+          "name": "args",
+          "type": {
+            "defined": {
+              "name": "PlaceOrderArgs"
+            }
+          }
+        }
+      ],
+      "returns": {
+        "option": "u128"
+      }
+    },
+    {
+      "name": "edit_order",
+      "docs": [
+        "Edit an order."
+      ],
+      "discriminator": [
+        254,
+        208,
+        118,
+        29,
+        173,
+        248,
+        200,
+        70
+      ],
+      "accounts": [
+        {
+          "name": "signer",
+          "signer": true
+        },
+        {
+          "name": "open_orders_account",
+          "writable": true
+        },
+        {
+          "name": "open_orders_admin",
+          "signer": true,
+          "optional": true
+        },
+        {
+          "name": "user_token_account",
+          "writable": true
+        },
+        {
+          "name": "market",
+          "writable": true
+        },
+        {
+          "name": "bids",
+          "writable": true
+        },
+        {
+          "name": "asks",
+          "writable": true
+        },
+        {
+          "name": "event_heap",
+          "writable": true
+        },
+        {
+          "name": "market_vault",
+          "writable": true
+        },
+        {
+          "name": "oracle_a",
+          "optional": true
+        },
+        {
+          "name": "oracle_b",
+          "optional": true
+        },
+        {
+          "name": "token_program"
+        }
+      ],
+      "args": [
+        {
+          "name": "client_order_id",
+          "type": "u64"
+        },
+        {
+          "name": "expected_cancel_size",
+          "type": "i64"
+        },
+        {
+          "name": "place_order",
+          "type": {
+            "defined": {
+              "name": "PlaceOrderArgs"
+            }
+          }
+        }
+      ],
+      "returns": {
+        "option": "u128"
+      }
+    },
+    {
+      "name": "edit_order_pegged",
+      "docs": [
+        "Edit an order pegged."
+      ],
+      "discriminator": [
+        62,
+        187,
+        125,
+        69,
+        26,
+        221,
+        157,
+        133
+      ],
+      "accounts": [
+        {
+          "name": "signer",
+          "signer": true
+        },
+        {
+          "name": "open_orders_account",
+          "writable": true
+        },
+        {
+          "name": "open_orders_admin",
+          "signer": true,
+          "optional": true
+        },
+        {
+          "name": "user_token_account",
+          "writable": true
+        },
+        {
+          "name": "market",
+          "writable": true
+        },
+        {
+          "name": "bids",
+          "writable": true
+        },
+        {
+          "name": "asks",
+          "writable": true
+        },
+        {
+          "name": "event_heap",
+          "writable": true
+        },
+        {
+          "name": "market_vault",
+          "writable": true
+        },
+        {
+          "name": "oracle_a",
+          "optional": true
+        },
+        {
+          "name": "oracle_b",
+          "optional": true
+        },
+        {
+          "name": "token_program"
+        }
+      ],
+      "args": [
+        {
+          "name": "client_order_id",
+          "type": "u64"
+        },
+        {
+          "name": "expected_cancel_size",
+          "type": "i64"
+        },
+        {
+          "name": "place_order",
+          "type": {
+            "defined": {
+              "name": "PlaceOrderPeggedArgs"
+            }
+          }
+        }
+      ],
+      "returns": {
+        "option": "u128"
+      }
+    },
+    {
+      "name": "place_orders",
+      "docs": [
+        "Place multiple orders"
+      ],
+      "discriminator": [
+        60,
+        63,
+        50,
+        123,
+        12,
+        197,
+        60,
+        190
+      ],
+      "accounts": [
+        {
+          "name": "signer",
+          "signer": true
+        },
+        {
+          "name": "open_orders_account",
+          "writable": true
+        },
+        {
+          "name": "open_orders_admin",
+          "signer": true,
+          "optional": true
+        },
+        {
+          "name": "user_quote_account",
+          "writable": true
+        },
+        {
+          "name": "user_base_account",
+          "writable": true
+        },
+        {
+          "name": "market",
+          "writable": true
+        },
+        {
+          "name": "bids",
+          "writable": true
+        },
+        {
+          "name": "asks",
+          "writable": true
+        },
+        {
+          "name": "event_heap",
+          "writable": true
+        },
+        {
+          "name": "market_quote_vault",
+          "writable": true
+        },
+        {
+          "name": "market_base_vault",
+          "writable": true
+        },
+        {
+          "name": "oracle_a",
+          "optional": true
+        },
+        {
+          "name": "oracle_b",
+          "optional": true
+        },
+        {
+          "name": "token_program"
+        }
+      ],
+      "args": [
+        {
+          "name": "orders_type",
+          "type": {
+            "defined": {
+              "name": "PlaceOrderType"
+            }
+          }
+        },
+        {
+          "name": "bids",
+          "type": {
+            "vec": {
+              "defined": {
+                "name": "PlaceMultipleOrdersArgs"
+              }
+            }
+          }
+        },
+        {
+          "name": "asks",
+          "type": {
+            "vec": {
+              "defined": {
+                "name": "PlaceMultipleOrdersArgs"
+              }
+            }
+          }
+        },
+        {
+          "name": "limit",
+          "type": "u8"
+        }
+      ],
+      "returns": {
+        "vec": {
+          "option": "u128"
+        }
+      }
+    },
+    {
+      "name": "cancel_all_and_place_orders",
+      "docs": [
+        "Cancel orders and place multiple orders."
+      ],
+      "discriminator": [
+        128,
+        155,
+        222,
+        60,
+        186,
+        40,
+        225,
+        50
+      ],
+      "accounts": [
+        {
+          "name": "signer",
+          "signer": true
+        },
+        {
+          "name": "open_orders_account",
+          "writable": true
+        },
+        {
+          "name": "open_orders_admin",
+          "signer": true,
+          "optional": true
+        },
+        {
+          "name": "user_quote_account",
+          "writable": true
+        },
+        {
+          "name": "user_base_account",
+          "writable": true
+        },
+        {
+          "name": "market",
+          "writable": true
+        },
+        {
+          "name": "bids",
+          "writable": true
+        },
+        {
+          "name": "asks",
+          "writable": true
+        },
+        {
+          "name": "event_heap",
+          "writable": true
+        },
+        {
+          "name": "market_quote_vault",
+          "writable": true
+        },
+        {
+          "name": "market_base_vault",
+          "writable": true
+        },
+        {
+          "name": "oracle_a",
+          "optional": true
+        },
+        {
+          "name": "oracle_b",
+          "optional": true
+        },
+        {
+          "name": "token_program"
+        }
+      ],
+      "args": [
+        {
+          "name": "orders_type",
+          "type": {
+            "defined": {
+              "name": "PlaceOrderType"
+            }
+          }
+        },
+        {
+          "name": "bids",
+          "type": {
+            "vec": {
+              "defined": {
+                "name": "PlaceMultipleOrdersArgs"
+              }
+            }
+          }
+        },
+        {
+          "name": "asks",
+          "type": {
+            "vec": {
+              "defined": {
+                "name": "PlaceMultipleOrdersArgs"
+              }
+            }
+          }
+        },
+        {
+          "name": "limit",
+          "type": "u8"
+        }
+      ],
+      "returns": {
+        "vec": {
+          "option": "u128"
+        }
+      }
+    },
+    {
+      "name": "place_order_pegged",
+      "docs": [
+        "Place an oracle-peg order."
+      ],
+      "discriminator": [
+        141,
+        185,
+        251,
+        63,
+        74,
+        85,
+        210,
+        145
+      ],
+      "accounts": [
+        {
+          "name": "signer",
+          "signer": true
+        },
+        {
+          "name": "open_orders_account",
+          "writable": true
+        },
+        {
+          "name": "open_orders_admin",
+          "signer": true,
+          "optional": true
+        },
+        {
+          "name": "user_token_account",
+          "writable": true
+        },
+        {
+          "name": "market",
+          "writable": true
+        },
+        {
+          "name": "bids",
+          "writable": true
+        },
+        {
+          "name": "asks",
+          "writable": true
+        },
+        {
+          "name": "event_heap",
+          "writable": true
+        },
+        {
+          "name": "market_vault",
+          "writable": true
+        },
+        {
+          "name": "oracle_a",
+          "optional": true
+        },
+        {
+          "name": "oracle_b",
+          "optional": true
+        },
+        {
+          "name": "token_program"
+        }
+      ],
+      "args": [
+        {
+          "name": "args",
+          "type": {
+            "defined": {
+              "name": "PlaceOrderPeggedArgs"
+            }
+          }
+        }
+      ],
+      "returns": {
+        "option": "u128"
+      }
+    },
+    {
+      "name": "place_take_order",
+      "docs": [
+        "Place an order that shall take existing liquidity off of the book, not",
+        "add a new order off the book.",
+        "",
+        "This type of order allows for instant token settlement for the taker."
+      ],
+      "discriminator": [
+        3,
+        44,
+        71,
+        3,
+        26,
+        199,
+        203,
+        85
+      ],
+      "accounts": [
+        {
+          "name": "signer",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "penalty_payer",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "market",
+          "writable": true
+        },
+        {
+          "name": "market_authority"
+        },
+        {
+          "name": "bids",
+          "writable": true
+        },
+        {
+          "name": "asks",
+          "writable": true
+        },
+        {
+          "name": "market_base_vault",
+          "writable": true
+        },
+        {
+          "name": "market_quote_vault",
+          "writable": true
+        },
+        {
+          "name": "event_heap",
+          "writable": true
+        },
+        {
+          "name": "user_base_account",
+          "writable": true
+        },
+        {
+          "name": "user_quote_account",
+          "writable": true
+        },
+        {
+          "name": "oracle_a",
+          "optional": true
+        },
+        {
+          "name": "oracle_b",
+          "optional": true
+        },
+        {
+          "name": "token_program"
+        },
+        {
+          "name": "system_program"
+        },
+        {
+          "name": "open_orders_admin",
+          "signer": true,
+          "optional": true
+        }
+      ],
+      "args": [
+        {
+          "name": "args",
+          "type": {
+            "defined": {
+              "name": "PlaceTakeOrderArgs"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "consume_events",
+      "docs": [
+        "Process up to `limit` [events](crate::state::AnyEvent).",
+        "",
+        "When a user places a 'take' order, they do not know beforehand which",
+        "market maker will have placed the 'make' order that they get executed",
+        "against. This prevents them from passing in a market maker's",
+        "[`OpenOrdersAccount`](crate::state::OpenOrdersAccount), which is needed",
+        "to credit/debit the relevant tokens to/from the maker. As such, Openbook",
+        "uses a 'crank' system, where `place_order` only emits events, and",
+        "`consume_events` handles token settlement.",
+        "",
+        "Currently, there are two types of events: [`FillEvent`](crate::state::FillEvent)s",
+        "and [`OutEvent`](crate::state::OutEvent)s.",
+        "",
+        "A `FillEvent` is emitted when an order is filled, and it is handled by",
+        "debiting whatever the taker is selling from the taker and crediting",
+        "it to the maker, and debiting whatever the taker is buying from the",
+        "maker and crediting it to the taker. Note that *no tokens are moved*,",
+        "these are just debits and credits to each party's [`Position`](crate::state::Position).",
+        "",
+        "An `OutEvent` is emitted when a limit order needs to be removed from",
+        "the book during a `place_order` invocation, and it is handled by",
+        "crediting whatever the maker would have sold (quote token in a bid,",
+        "base token in an ask) back to the maker."
+      ],
+      "discriminator": [
+        221,
+        145,
+        177,
+        52,
+        31,
+        47,
+        63,
+        201
+      ],
+      "accounts": [
+        {
+          "name": "consume_events_admin",
+          "signer": true,
+          "optional": true
+        },
+        {
+          "name": "market",
+          "writable": true
+        },
+        {
+          "name": "event_heap",
+          "writable": true
+        }
+      ],
+      "args": [
+        {
+          "name": "limit",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "consume_given_events",
+      "docs": [
+        "Process the [events](crate::state::AnyEvent) at the given positions."
+      ],
+      "discriminator": [
+        209,
+        227,
+        54,
+        4,
+        109,
+        172,
+        41,
+        71
+      ],
+      "accounts": [
+        {
+          "name": "consume_events_admin",
+          "signer": true,
+          "optional": true
+        },
+        {
+          "name": "market",
+          "writable": true
+        },
+        {
+          "name": "event_heap",
+          "writable": true
+        }
+      ],
+      "args": [
+        {
+          "name": "slots",
+          "type": {
+            "vec": "u64"
+          }
+        }
+      ]
+    },
+    {
+      "name": "cancel_order",
+      "docs": [
+        "Cancel an order by its `order_id`.",
+        "",
+        "Note that this doesn't emit an [`OutEvent`](crate::state::OutEvent) because a",
+        "maker knows that they will be passing in their own [`OpenOrdersAccount`](crate::state::OpenOrdersAccount)."
+      ],
+      "discriminator": [
+        95,
+        129,
+        237,
+        240,
+        8,
+        49,
+        223,
+        132
+      ],
+      "accounts": [
+        {
+          "name": "signer",
+          "signer": true
+        },
+        {
+          "name": "open_orders_account",
+          "writable": true
+        },
+        {
+          "name": "market"
+        },
+        {
+          "name": "bids",
+          "writable": true
+        },
+        {
+          "name": "asks",
+          "writable": true
+        }
+      ],
+      "args": [
+        {
+          "name": "order_id",
+          "type": "u128"
+        }
+      ]
+    },
+    {
+      "name": "cancel_order_by_client_order_id",
+      "docs": [
+        "Cancel an order by its `client_order_id`.",
+        "",
+        "Note that this doesn't emit an [`OutEvent`](crate::state::OutEvent) because a",
+        "maker knows that they will be passing in their own [`OpenOrdersAccount`](crate::state::OpenOrdersAccount)."
+      ],
+      "discriminator": [
+        115,
+        178,
+        201,
+        8,
+        175,
+        183,
+        123,
+        119
+      ],
+      "accounts": [
+        {
+          "name": "signer",
+          "signer": true
+        },
+        {
+          "name": "open_orders_account",
+          "writable": true
+        },
+        {
+          "name": "market"
+        },
+        {
+          "name": "bids",
+          "writable": true
+        },
+        {
+          "name": "asks",
+          "writable": true
+        }
+      ],
+      "args": [
+        {
+          "name": "client_order_id",
+          "type": "u64"
+        }
+      ],
+      "returns": "i64"
+    },
+    {
+      "name": "cancel_all_orders",
+      "docs": [
+        "Cancel up to `limit` orders, optionally filtering by side"
+      ],
+      "discriminator": [
+        196,
+        83,
+        243,
+        171,
+        17,
+        100,
+        160,
+        143
+      ],
+      "accounts": [
+        {
+          "name": "signer",
+          "signer": true
+        },
+        {
+          "name": "open_orders_account",
+          "writable": true
+        },
+        {
+          "name": "market"
+        },
+        {
+          "name": "bids",
+          "writable": true
+        },
+        {
+          "name": "asks",
+          "writable": true
+        }
+      ],
+      "args": [
+        {
+          "name": "side_option",
+          "type": {
+            "option": {
+              "defined": {
+                "name": "Side"
+              }
+            }
+          }
+        },
+        {
+          "name": "limit",
+          "type": "u8"
+        }
+      ]
+    },
+    {
+      "name": "deposit",
+      "docs": [
+        "Deposit a certain amount of `base` and `quote` lamports into one's",
+        "[`Position`](crate::state::Position).",
+        "",
+        "Makers might wish to `deposit`, rather than have actual tokens moved for",
+        "each trade, in order to reduce CUs."
+      ],
+      "discriminator": [
+        242,
+        35,
+        198,
+        137,
+        82,
+        225,
+        242,
+        182
+      ],
+      "accounts": [
+        {
+          "name": "owner",
+          "signer": true
+        },
+        {
+          "name": "user_base_account",
+          "writable": true
+        },
+        {
+          "name": "user_quote_account",
+          "writable": true
+        },
+        {
+          "name": "open_orders_account",
+          "writable": true
+        },
+        {
+          "name": "market",
+          "writable": true
+        },
+        {
+          "name": "market_base_vault",
+          "writable": true
+        },
+        {
+          "name": "market_quote_vault",
+          "writable": true
+        },
+        {
+          "name": "token_program"
+        }
+      ],
+      "args": [
+        {
+          "name": "base_amount",
+          "type": "u64"
+        },
+        {
+          "name": "quote_amount",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "refill",
+      "docs": [
+        "Refill a certain amount of `base` and `quote` lamports. The amount being passed is the",
+        "total lamports that the [`Position`](crate::state::Position) will have.",
+        "",
+        "Makers might wish to `refill`, rather than have actual tokens moved for",
+        "each trade, in order to reduce CUs."
+      ],
+      "discriminator": [
+        128,
+        207,
+        142,
+        11,
+        54,
+        232,
+        38,
+        201
+      ],
+      "accounts": [
+        {
+          "name": "owner",
+          "signer": true
+        },
+        {
+          "name": "user_base_account",
+          "writable": true
+        },
+        {
+          "name": "user_quote_account",
+          "writable": true
+        },
+        {
+          "name": "open_orders_account",
+          "writable": true
+        },
+        {
+          "name": "market",
+          "writable": true
+        },
+        {
+          "name": "market_base_vault",
+          "writable": true
+        },
+        {
+          "name": "market_quote_vault",
+          "writable": true
+        },
+        {
+          "name": "token_program"
+        }
+      ],
+      "args": [
+        {
+          "name": "base_amount",
+          "type": "u64"
+        },
+        {
+          "name": "quote_amount",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "settle_funds",
+      "docs": [
+        "Withdraw any available tokens."
+      ],
+      "discriminator": [
+        238,
+        64,
+        163,
+        96,
+        75,
+        171,
+        16,
+        33
+      ],
+      "accounts": [
+        {
+          "name": "owner",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "penalty_payer",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "open_orders_account",
+          "writable": true
+        },
+        {
+          "name": "market",
+          "writable": true
+        },
+        {
+          "name": "market_authority"
+        },
+        {
+          "name": "market_base_vault",
+          "writable": true
+        },
+        {
+          "name": "market_quote_vault",
+          "writable": true
+        },
+        {
+          "name": "user_base_account",
+          "writable": true
+        },
+        {
+          "name": "user_quote_account",
+          "writable": true
+        },
+        {
+          "name": "referrer_account",
+          "writable": true,
+          "optional": true
+        },
+        {
+          "name": "token_program"
+        },
+        {
+          "name": "system_program"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "settle_funds_expired",
+      "docs": [
+        "Withdraw any available tokens when the market is expired (only",
+        "[`close_market_admin`](crate::state::Market::close_market_admin))."
+      ],
+      "discriminator": [
+        107,
+        18,
+        56,
+        69,
+        228,
+        56,
+        55,
+        164
+      ],
+      "accounts": [
+        {
+          "name": "close_market_admin",
+          "signer": true
+        },
+        {
+          "name": "owner",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "penalty_payer",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "open_orders_account",
+          "writable": true
+        },
+        {
+          "name": "market",
+          "writable": true
+        },
+        {
+          "name": "market_authority"
+        },
+        {
+          "name": "market_base_vault",
+          "writable": true
+        },
+        {
+          "name": "market_quote_vault",
+          "writable": true
+        },
+        {
+          "name": "user_base_account",
+          "writable": true
+        },
+        {
+          "name": "user_quote_account",
+          "writable": true
+        },
+        {
+          "name": "referrer_account",
+          "writable": true,
+          "optional": true
+        },
+        {
+          "name": "token_program"
+        },
+        {
+          "name": "system_program"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "sweep_fees",
+      "docs": [
+        "Sweep fees, as a [`Market`](crate::state::Market)'s admin."
+      ],
+      "discriminator": [
+        175,
+        225,
+        98,
+        71,
+        118,
+        66,
+        34,
+        148
+      ],
+      "accounts": [
+        {
+          "name": "collect_fee_admin",
+          "signer": true
+        },
+        {
+          "name": "market",
+          "writable": true
+        },
+        {
+          "name": "market_authority"
+        },
+        {
+          "name": "market_quote_vault",
+          "writable": true
+        },
+        {
+          "name": "token_receiver_account",
+          "writable": true
+        },
+        {
+          "name": "token_program"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "set_delegate",
+      "docs": [
+        "Update the [`delegate`](crate::state::OpenOrdersAccount::delegate) of an open orders account."
+      ],
+      "discriminator": [
+        242,
+        30,
+        46,
+        76,
+        108,
+        235,
+        128,
+        181
+      ],
+      "accounts": [
+        {
+          "name": "owner",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "open_orders_account",
+          "writable": true
+        },
+        {
+          "name": "delegate_account",
+          "optional": true
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "set_market_expired",
+      "docs": [
+        "Set market to expired before pruning orders and closing the market (only",
+        "[`close_market_admin`](crate::state::Market::close_market_admin))."
+      ],
+      "discriminator": [
+        219,
+        82,
+        219,
+        236,
+        60,
+        115,
+        197,
+        64
+      ],
+      "accounts": [
+        {
+          "name": "close_market_admin",
+          "signer": true
+        },
+        {
+          "name": "market",
+          "writable": true
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "prune_orders",
+      "docs": [
+        "Remove orders from the book when the market is expired (only",
+        "[`close_market_admin`](crate::state::Market::close_market_admin))."
+      ],
+      "discriminator": [
+        27,
+        213,
+        159,
+        191,
+        12,
+        116,
+        112,
+        121
+      ],
+      "accounts": [
+        {
+          "name": "close_market_admin",
+          "signer": true
+        },
+        {
+          "name": "open_orders_account",
+          "writable": true
+        },
+        {
+          "name": "market"
+        },
+        {
+          "name": "bids",
+          "writable": true
+        },
+        {
+          "name": "asks",
+          "writable": true
+        }
+      ],
+      "args": [
+        {
+          "name": "limit",
+          "type": "u8"
+        }
+      ]
+    },
+    {
+      "name": "stub_oracle_create",
+      "discriminator": [
+        172,
+        63,
+        101,
+        83,
+        141,
+        76,
+        199,
+        216
+      ],
+      "accounts": [
+        {
+          "name": "payer",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "owner",
+          "signer": true
+        },
+        {
+          "name": "oracle",
+          "writable": true
+        },
+        {
+          "name": "mint"
+        },
+        {
+          "name": "system_program"
+        }
+      ],
+      "args": [
+        {
+          "name": "price",
+          "type": "f64"
+        }
+      ]
+    },
+    {
+      "name": "stub_oracle_close",
+      "discriminator": [
+        92,
+        137,
+        45,
+        3,
+        45,
+        60,
+        117,
+        224
+      ],
+      "accounts": [
+        {
+          "name": "owner",
+          "signer": true
+        },
+        {
+          "name": "oracle",
+          "writable": true
+        },
+        {
+          "name": "sol_destination",
+          "writable": true
+        },
+        {
+          "name": "token_program"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "stub_oracle_set",
+      "discriminator": [
+        109,
+        198,
+        79,
+        121,
+        65,
+        202,
+        161,
+        142
+      ],
+      "accounts": [
+        {
+          "name": "owner",
+          "signer": true
+        },
+        {
+          "name": "oracle",
+          "writable": true
+        }
+      ],
+      "args": [
+        {
+          "name": "price",
+          "type": "f64"
+        }
+      ]
+    }
+  ],
+  "accounts": [
+    {
+      "name": "Market",
+      "discriminator": [
+        219,
+        190,
+        213,
+        55,
+        0,
+        227,
+        198,
+        154
+      ]
+    },
+    {
+      "name": "OpenOrdersAccount",
+      "discriminator": [
+        255,
+        194,
+        78,
+        123,
+        16,
+        105,
+        208,
+        165
+      ]
+    },
+    {
+      "name": "OpenOrdersIndexer",
+      "discriminator": [
+        195,
+        83,
+        128,
+        213,
+        204,
+        91,
+        19,
+        150
+      ]
+    },
+    {
+      "name": "StubOracle",
+      "discriminator": [
+        224,
+        251,
+        254,
+        99,
+        177,
+        174,
+        137,
+        4
+      ]
+    },
+    {
+      "name": "BookSide",
+      "discriminator": [
+        72,
+        44,
+        225,
+        141,
+        178,
+        130,
+        97,
+        57
+      ]
+    },
+    {
+      "name": "EventHeap",
+      "discriminator": [
+        119,
+        59,
+        61,
+        19,
+        165,
+        84,
+        57,
+        175
+      ]
+    }
+  ],
+  "events": [
+    {
+      "name": "DepositLog",
+      "discriminator": [
+        141,
+        186,
+        168,
+        252,
+        108,
+        141,
+        72,
+        94
+      ]
+    },
+    {
+      "name": "FillLog",
+      "discriminator": [
+        150,
+        23,
+        41,
+        148,
+        152,
+        162,
+        215,
+        64
+      ]
+    },
+    {
+      "name": "MarketMetaDataLog",
+      "discriminator": [
+        209,
+        87,
+        212,
+        236,
+        164,
+        58,
+        60,
+        117
+      ]
+    },
+    {
+      "name": "TotalOrderFillEvent",
+      "discriminator": [
+        8,
+        235,
+        48,
+        58,
+        174,
+        76,
+        156,
+        105
+      ]
+    },
+    {
+      "name": "SetDelegateLog",
+      "discriminator": [
+        53,
+        130,
+        151,
+        92,
+        109,
+        57,
+        145,
+        112
+      ]
+    },
+    {
+      "name": "SettleFundsLog",
+      "discriminator": [
+        10,
+        50,
+        240,
+        117,
+        237,
+        67,
+        230,
+        233
+      ]
+    },
+    {
+      "name": "SweepFeesLog",
+      "discriminator": [
+        210,
+        242,
+        26,
+        77,
+        94,
+        48,
+        255,
+        61
+      ]
+    },
+    {
+      "name": "OpenOrdersPositionLog",
+      "discriminator": [
+        196,
+        249,
+        148,
+        33,
+        168,
+        228,
+        73,
+        6
+      ]
+    }
+  ],
+  "errors": [
+    {
+      "code": 6000,
+      "name": "SomeError",
+      "msg": ""
+    },
+    {
+      "code": 6001,
+      "name": "InvalidInputNameLength",
+      "msg": "Name lenght above limit"
+    },
+    {
+      "code": 6002,
+      "name": "InvalidInputMarketExpired",
+      "msg": "Market cannot be created as expired"
+    },
+    {
+      "code": 6003,
+      "name": "InvalidInputMarketFees",
+      "msg": "Taker fees should be positive and if maker fees are negative, greater or equal to their abs value"
+    },
+    {
+      "code": 6004,
+      "name": "InvalidInputLots",
+      "msg": "Lots cannot be negative"
+    },
+    {
+      "code": 6005,
+      "name": "InvalidInputLotsSize",
+      "msg": "Lots size above market limits"
+    },
+    {
+      "code": 6006,
+      "name": "InvalidInputOrdersAmounts",
+      "msg": "Input amounts above limits"
+    },
+    {
+      "code": 6007,
+      "name": "InvalidInputCancelSize",
+      "msg": "Price lots should be greater than zero"
+    },
+    {
+      "code": 6008,
+      "name": "InvalidInputPriceLots",
+      "msg": "Expected cancel size should be greater than zero"
+    },
+    {
+      "code": 6009,
+      "name": "InvalidInputPegLimit",
+      "msg": "Peg limit should be greater than zero"
+    },
+    {
+      "code": 6010,
+      "name": "InvalidInputOrderType",
+      "msg": "The order type is invalid. A taker order must be Market or ImmediateOrCancel"
+    },
+    {
+      "code": 6011,
+      "name": "InvalidInputOrderId",
+      "msg": "Order id cannot be zero"
+    },
+    {
+      "code": 6012,
+      "name": "InvalidInputHeapSlots",
+      "msg": "Slot above heap limit"
+    },
+    {
+      "code": 6013,
+      "name": "InvalidOracleTypes",
+      "msg": "Cannot combine two oracles of different providers"
+    },
+    {
+      "code": 6014,
+      "name": "InvalidSecondOracle",
+      "msg": "Cannot configure secondary oracle without primary"
+    },
+    {
+      "code": 6015,
+      "name": "NoCloseMarketAdmin",
+      "msg": "This market does not have a `close_market_admin` and thus cannot be closed."
+    },
+    {
+      "code": 6016,
+      "name": "InvalidCloseMarketAdmin",
+      "msg": "The signer of this transaction is not this market's `close_market_admin`."
+    },
+    {
+      "code": 6017,
+      "name": "InvalidOpenOrdersAdmin",
+      "msg": "The `open_orders_admin` required by this market to sign all instructions that creates orders is missing or is not valid"
+    },
+    {
+      "code": 6018,
+      "name": "InvalidConsumeEventsAdmin",
+      "msg": "The `consume_events_admin` required by this market to sign all instructions that consume events is missing or is not valid"
+    },
+    {
+      "code": 6019,
+      "name": "InvalidMarketVault",
+      "msg": "Provided `market_vault` is invalid"
+    },
+    {
+      "code": 6020,
+      "name": "IndexerActiveOO",
+      "msg": "Cannot be closed due to the existence of open orders accounts"
+    },
+    {
+      "code": 6021,
+      "name": "OraclePegInvalidOracleState",
+      "msg": "Cannot place a peg order due to invalid oracle state"
+    },
+    {
+      "code": 6022,
+      "name": "UnknownOracleType",
+      "msg": "oracle type cannot be determined"
+    },
+    {
+      "code": 6023,
+      "name": "OracleConfidence",
+      "msg": "an oracle does not reach the confidence threshold"
+    },
+    {
+      "code": 6024,
+      "name": "OracleStale",
+      "msg": "an oracle is stale"
+    },
+    {
+      "code": 6025,
+      "name": "OrderIdNotFound",
+      "msg": "Order id not found on the orderbook"
+    },
+    {
+      "code": 6026,
+      "name": "EventHeapContainsElements",
+      "msg": "Event heap contains elements and market can't be closed"
+    },
+    {
+      "code": 6027,
+      "name": "InvalidOrderPostIOC",
+      "msg": "ImmediateOrCancel is not a PostOrderType"
+    },
+    {
+      "code": 6028,
+      "name": "InvalidOrderPostMarket",
+      "msg": "Market is not a PostOrderType"
+    },
+    {
+      "code": 6029,
+      "name": "WouldSelfTrade",
+      "msg": "would self trade"
+    },
+    {
+      "code": 6030,
+      "name": "MarketHasExpired",
+      "msg": "The Market has already expired."
+    },
+    {
+      "code": 6031,
+      "name": "InvalidPriceLots",
+      "msg": "Price lots should be greater than zero"
+    },
+    {
+      "code": 6032,
+      "name": "InvalidOraclePrice",
+      "msg": "Oracle price above market limits"
+    },
+    {
+      "code": 6033,
+      "name": "MarketHasNotExpired",
+      "msg": "The Market has not expired yet."
+    },
+    {
+      "code": 6034,
+      "name": "NoOwnerOrDelegate",
+      "msg": "No correct owner or delegate."
+    },
+    {
+      "code": 6035,
+      "name": "NoOwner",
+      "msg": "No correct owner"
+    },
+    {
+      "code": 6036,
+      "name": "OpenOrdersFull",
+      "msg": "No free order index in open orders account"
+    },
+    {
+      "code": 6037,
+      "name": "BookContainsElements",
+      "msg": "Book contains elements"
+    },
+    {
+      "code": 6038,
+      "name": "OpenOrdersOrderNotFound",
+      "msg": "Could not find order in user account"
+    },
+    {
+      "code": 6039,
+      "name": "InvalidPostAmount",
+      "msg": "Amount to post above book limits"
+    },
+    {
+      "code": 6040,
+      "name": "DisabledOraclePeg",
+      "msg": "Oracle peg orders are not enabled for this market"
+    },
+    {
+      "code": 6041,
+      "name": "NonEmptyMarket",
+      "msg": "Cannot close a non-empty market"
+    },
+    {
+      "code": 6042,
+      "name": "NonEmptyOpenOrdersPosition",
+      "msg": "Cannot close a non-empty open orders account"
+    },
+    {
+      "code": 6043,
+      "name": "WouldExecutePartially",
+      "msg": "Fill-Or-Kill order would generate a partial execution"
+    }
+  ],
+  "types": [
+    {
+      "name": "NonZeroPubkeyOption",
+      "docs": [
+        "Like `Option`, but implemented for `Pubkey` to be used with `zero_copy`"
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "key",
+            "type": "pubkey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Position",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "bids_base_lots",
+            "docs": [
+              "Base lots in open bids"
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "asks_base_lots",
+            "docs": [
+              "Base lots in open asks"
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "base_free_native",
+            "type": "u64"
+          },
+          {
+            "name": "quote_free_native",
+            "type": "u64"
+          },
+          {
+            "name": "locked_maker_fees",
+            "type": "u64"
+          },
+          {
+            "name": "referrer_rebates_available",
+            "type": "u64"
+          },
+          {
+            "name": "penalty_heap_count",
+            "docs": [
+              "Count of ixs when events are added to the heap",
+              "To avoid this, send remaining accounts in order to process the events"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "maker_volume",
+            "docs": [
+              "Cumulative maker volume in quote native units (display only)"
+            ],
+            "type": "u128"
+          },
+          {
+            "name": "taker_volume",
+            "docs": [
+              "Cumulative taker volume in quote native units (display only)"
+            ],
+            "type": "u128"
+          },
+          {
+            "name": "bids_quote_lots",
+            "docs": [
+              "Quote lots in open bids"
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "reserved",
+            "type": {
+              "array": [
+                "u8",
+                64
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "OpenOrder",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "id",
+            "type": "u128"
+          },
+          {
+            "name": "client_id",
+            "type": "u64"
+          },
+          {
+            "name": "locked_price",
+            "docs": [
+              "Price at which user's assets were locked"
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "is_free",
+            "type": "u8"
+          },
+          {
+            "name": "side_and_tree",
+            "type": "u8"
+          },
+          {
+            "name": "padding",
+            "type": {
+              "array": [
+                "u8",
+                6
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "OracleConfig",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "conf_filter",
+            "type": "f64"
+          },
+          {
+            "name": "max_staleness_slots",
+            "type": "i64"
+          },
+          {
+            "name": "reserved",
+            "type": {
+              "array": [
+                "u8",
+                72
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "OracleConfigParams",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "conf_filter",
+            "type": "f32"
+          },
+          {
+            "name": "max_staleness_slots",
+            "type": {
+              "option": "u32"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "EventHeapHeader",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "free_head",
+            "type": "u16"
+          },
+          {
+            "name": "used_head",
+            "type": "u16"
+          },
+          {
+            "name": "count",
+            "type": "u16"
+          },
+          {
+            "name": "padd",
+            "type": "u16"
+          },
+          {
+            "name": "seq_num",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "EventNode",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "next",
+            "type": "u16"
+          },
+          {
+            "name": "prev",
+            "type": "u16"
+          },
+          {
+            "name": "pad",
+            "type": {
+              "array": [
+                "u8",
+                4
+              ]
+            }
+          },
+          {
+            "name": "event",
+            "type": {
+              "defined": {
+                "name": "AnyEvent"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "AnyEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "event_type",
+            "type": "u8"
+          },
+          {
+            "name": "padding",
+            "type": {
+              "array": [
+                "u8",
+                143
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "FillEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "event_type",
+            "type": "u8"
+          },
+          {
+            "name": "taker_side",
+            "type": "u8"
+          },
+          {
+            "name": "maker_out",
+            "type": "u8"
+          },
+          {
+            "name": "maker_slot",
+            "type": "u8"
+          },
+          {
+            "name": "padding",
+            "type": {
+              "array": [
+                "u8",
+                4
+              ]
+            }
+          },
+          {
+            "name": "timestamp",
+            "type": "u64"
+          },
+          {
+            "name": "seq_num",
+            "type": "u64"
+          },
+          {
+            "name": "maker",
+            "type": "pubkey"
+          },
+          {
+            "name": "maker_timestamp",
+            "type": "u64"
+          },
+          {
+            "name": "taker",
+            "type": "pubkey"
+          },
+          {
+            "name": "taker_client_order_id",
+            "type": "u64"
+          },
+          {
+            "name": "price",
+            "type": "i64"
+          },
+          {
+            "name": "peg_limit",
+            "type": "i64"
+          },
+          {
+            "name": "quantity",
+            "type": "i64"
+          },
+          {
+            "name": "maker_client_order_id",
+            "type": "u64"
+          },
+          {
+            "name": "reserved",
+            "type": {
+              "array": [
+                "u8",
+                8
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "OutEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "event_type",
+            "type": "u8"
+          },
+          {
+            "name": "side",
+            "type": "u8"
+          },
+          {
+            "name": "owner_slot",
+            "type": "u8"
+          },
+          {
+            "name": "padding0",
+            "type": {
+              "array": [
+                "u8",
+                5
+              ]
+            }
+          },
+          {
+            "name": "timestamp",
+            "type": "u64"
+          },
+          {
+            "name": "seq_num",
+            "type": "u64"
+          },
+          {
+            "name": "owner",
+            "type": "pubkey"
+          },
+          {
+            "name": "quantity",
+            "type": "i64"
+          },
+          {
+            "name": "padding1",
+            "type": {
+              "array": [
+                "u8",
+                80
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "InnerNode",
+      "docs": [
+        "InnerNodes and LeafNodes compose the binary tree of orders.",
+        "",
+        "Each InnerNode has exactly two children, which are either InnerNodes themselves,",
+        "or LeafNodes. The children share the top `prefix_len` bits of `key`. The left",
+        "child has a 0 in the next bit, and the right a 1."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "tag",
+            "type": "u8"
+          },
+          {
+            "name": "padding",
+            "type": {
+              "array": [
+                "u8",
+                3
+              ]
+            }
+          },
+          {
+            "name": "prefix_len",
+            "docs": [
+              "number of highest `key` bits that all children share",
+              "e.g. if it's 2, the two highest bits of `key` will be the same on all children"
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "key",
+            "docs": [
+              "only the top `prefix_len` bits of `key` are relevant"
+            ],
+            "type": "u128"
+          },
+          {
+            "name": "children",
+            "docs": [
+              "indexes into `BookSide::nodes`"
+            ],
+            "type": {
+              "array": [
+                "u32",
+                2
+              ]
+            }
+          },
+          {
+            "name": "child_earliest_expiry",
+            "docs": [
+              "The earliest expiry timestamp for the left and right subtrees.",
+              "",
+              "Needed to be able to find and remove expired orders without having to",
+              "iterate through the whole bookside."
+            ],
+            "type": {
+              "array": [
+                "u64",
+                2
+              ]
+            }
+          },
+          {
+            "name": "reserved",
+            "type": {
+              "array": [
+                "u8",
+                40
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "LeafNode",
+      "docs": [
+        "LeafNodes represent an order in the binary tree"
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "tag",
+            "docs": [
+              "NodeTag"
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "owner_slot",
+            "docs": [
+              "Index into the owning OpenOrdersAccount's OpenOrders"
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "time_in_force",
+            "docs": [
+              "Time in seconds after `timestamp` at which the order expires.",
+              "A value of 0 means no expiry."
+            ],
+            "type": "u16"
+          },
+          {
+            "name": "padding",
+            "type": {
+              "array": [
+                "u8",
+                4
+              ]
+            }
+          },
+          {
+            "name": "key",
+            "docs": [
+              "The binary tree key, see new_node_key()"
+            ],
+            "type": "u128"
+          },
+          {
+            "name": "owner",
+            "docs": [
+              "Address of the owning OpenOrdersAccount"
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "quantity",
+            "docs": [
+              "Number of base lots to buy or sell, always >=1"
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "timestamp",
+            "docs": [
+              "The time the order was placed"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "peg_limit",
+            "docs": [
+              "If the effective price of an oracle pegged order exceeds this limit,",
+              "it will be considered invalid and may be removed.",
+              "",
+              "Only applicable in the oracle_pegged OrderTree"
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "client_order_id",
+            "docs": [
+              "User defined id for this order, used in FillEvents"
+            ],
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "AnyNode",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "tag",
+            "type": "u8"
+          },
+          {
+            "name": "data",
+            "type": {
+              "array": [
+                "u8",
+                87
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "OrderTreeRoot",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "maybe_node",
+            "type": "u32"
+          },
+          {
+            "name": "leaf_count",
+            "type": "u32"
+          }
+        ]
+      }
+    },
+    {
+      "name": "OrderTreeNodes",
+      "docs": [
+        "A binary tree on AnyNode::key()",
+        "",
+        "The key encodes the price in the top 64 bits."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "order_tree_type",
+            "type": "u8"
+          },
+          {
+            "name": "padding",
+            "type": {
+              "array": [
+                "u8",
+                3
+              ]
+            }
+          },
+          {
+            "name": "bump_index",
+            "type": "u32"
+          },
+          {
+            "name": "free_list_len",
+            "type": "u32"
+          },
+          {
+            "name": "free_list_head",
+            "type": "u32"
+          },
+          {
+            "name": "reserved",
+            "type": {
+              "array": [
+                "u8",
+                512
+              ]
+            }
+          },
+          {
+            "name": "nodes",
+            "type": {
+              "array": [
+                {
+                  "defined": {
+                    "name": "AnyNode"
+                  }
+                },
+                1024
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "I80F48",
+      "docs": [
+        "Nothing in Rust shall use these types. They only exist so that the Anchor IDL",
+        "knows about them and typescript can deserialize it."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "val",
+            "type": "i128"
+          }
+        ]
+      }
+    },
+    {
+      "name": "PlaceOrderArgs",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "side",
+            "type": {
+              "defined": {
+                "name": "Side"
+              }
+            }
+          },
+          {
+            "name": "price_lots",
+            "type": "i64"
+          },
+          {
+            "name": "max_base_lots",
+            "type": "i64"
+          },
+          {
+            "name": "max_quote_lots_including_fees",
+            "type": "i64"
+          },
+          {
+            "name": "client_order_id",
+            "type": "u64"
+          },
+          {
+            "name": "order_type",
+            "type": {
+              "defined": {
+                "name": "PlaceOrderType"
+              }
+            }
+          },
+          {
+            "name": "expiry_timestamp",
+            "type": "u64"
+          },
+          {
+            "name": "self_trade_behavior",
+            "type": {
+              "defined": {
+                "name": "SelfTradeBehavior"
+              }
+            }
+          },
+          {
+            "name": "limit",
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "PlaceMultipleOrdersArgs",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "price_lots",
+            "type": "i64"
+          },
+          {
+            "name": "max_quote_lots_including_fees",
+            "type": "i64"
+          },
+          {
+            "name": "expiry_timestamp",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "PlaceOrderPeggedArgs",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "side",
+            "type": {
+              "defined": {
+                "name": "Side"
+              }
+            }
+          },
+          {
+            "name": "price_offset_lots",
+            "type": "i64"
+          },
+          {
+            "name": "peg_limit",
+            "type": "i64"
+          },
+          {
+            "name": "max_base_lots",
+            "type": "i64"
+          },
+          {
+            "name": "max_quote_lots_including_fees",
+            "type": "i64"
+          },
+          {
+            "name": "client_order_id",
+            "type": "u64"
+          },
+          {
+            "name": "order_type",
+            "type": {
+              "defined": {
+                "name": "PlaceOrderType"
+              }
+            }
+          },
+          {
+            "name": "expiry_timestamp",
+            "type": "u64"
+          },
+          {
+            "name": "self_trade_behavior",
+            "type": {
+              "defined": {
+                "name": "SelfTradeBehavior"
+              }
+            }
+          },
+          {
+            "name": "limit",
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "PlaceTakeOrderArgs",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "side",
+            "type": {
+              "defined": {
+                "name": "Side"
+              }
+            }
+          },
+          {
+            "name": "price_lots",
+            "type": "i64"
+          },
+          {
+            "name": "max_base_lots",
+            "type": "i64"
+          },
+          {
+            "name": "max_quote_lots_including_fees",
+            "type": "i64"
+          },
+          {
+            "name": "order_type",
+            "type": {
+              "defined": {
+                "name": "PlaceOrderType"
+              }
+            }
+          },
+          {
+            "name": "limit",
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "OracleType",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "Pyth"
+          },
+          {
+            "name": "Stub"
+          },
+          {
+            "name": "SwitchboardV1"
+          },
+          {
+            "name": "SwitchboardV2"
+          },
+          {
+            "name": "RaydiumCLMM"
+          }
+        ]
+      }
+    },
+    {
+      "name": "OrderState",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "Valid"
+          },
+          {
+            "name": "Invalid"
+          },
+          {
+            "name": "Skipped"
+          }
+        ]
+      }
+    },
+    {
+      "name": "BookSideOrderTree",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "Fixed"
+          },
+          {
+            "name": "OraclePegged"
+          }
+        ]
+      }
+    },
+    {
+      "name": "EventType",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "Fill"
+          },
+          {
+            "name": "Out"
+          }
+        ]
+      }
+    },
+    {
+      "name": "NodeTag",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "Uninitialized"
+          },
+          {
+            "name": "InnerNode"
+          },
+          {
+            "name": "LeafNode"
+          },
+          {
+            "name": "FreeNode"
+          },
+          {
+            "name": "LastFreeNode"
+          }
+        ]
+      }
+    },
+    {
+      "name": "PlaceOrderType",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "Limit"
+          },
+          {
+            "name": "ImmediateOrCancel"
+          },
+          {
+            "name": "PostOnly"
+          },
+          {
+            "name": "Market"
+          },
+          {
+            "name": "PostOnlySlide"
+          },
+          {
+            "name": "FillOrKill"
+          }
+        ]
+      }
+    },
+    {
+      "name": "PostOrderType",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "Limit"
+          },
+          {
+            "name": "PostOnly"
+          },
+          {
+            "name": "PostOnlySlide"
+          }
+        ]
+      }
+    },
+    {
+      "name": "SelfTradeBehavior",
+      "docs": [
+        "Self trade behavior controls how taker orders interact with resting limit orders of the same account.",
+        "This setting has no influence on placing a resting or oracle pegged limit order that does not match",
+        "immediately, instead it's the responsibility of the user to correctly configure his taker orders."
+      ],
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "DecrementTake"
+          },
+          {
+            "name": "CancelProvide"
+          },
+          {
+            "name": "AbortTransaction"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Side",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "Bid"
+          },
+          {
+            "name": "Ask"
+          }
+        ]
+      }
+    },
+    {
+      "name": "SideAndOrderTree",
+      "docs": [
+        "SideAndOrderTree is a storage optimization, so we don't need two bytes for the data"
+      ],
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "BidFixed"
+          },
+          {
+            "name": "AskFixed"
+          },
+          {
+            "name": "BidOraclePegged"
+          },
+          {
+            "name": "AskOraclePegged"
+          }
+        ]
+      }
+    },
+    {
+      "name": "OrderParams",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "Market"
+          },
+          {
+            "name": "ImmediateOrCancel",
+            "fields": [
+              {
+                "name": "price_lots",
+                "type": "i64"
+              }
+            ]
+          },
+          {
+            "name": "Fixed",
+            "fields": [
+              {
+                "name": "price_lots",
+                "type": "i64"
+              },
+              {
+                "name": "order_type",
+                "type": {
+                  "defined": {
+                    "name": "PostOrderType"
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "name": "OraclePegged",
+            "fields": [
+              {
+                "name": "price_offset_lots",
+                "type": "i64"
+              },
+              {
+                "name": "order_type",
+                "type": {
+                  "defined": {
+                    "name": "PostOrderType"
+                  }
+                }
+              },
+              {
+                "name": "peg_limit",
+                "type": "i64"
+              }
+            ]
+          },
+          {
+            "name": "FillOrKill",
+            "fields": [
+              {
+                "name": "price_lots",
+                "type": "i64"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "OrderTreeType",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "Bids"
+          },
+          {
+            "name": "Asks"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Market",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "bump",
+            "docs": [
+              "PDA bump"
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "base_decimals",
+            "docs": [
+              "Number of decimals used for the base token.",
+              "",
+              "Used to convert the oracle's price into a native/native price."
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "quote_decimals",
+            "type": "u8"
+          },
+          {
+            "name": "padding1",
+            "type": {
+              "array": [
+                "u8",
+                5
+              ]
+            }
+          },
+          {
+            "name": "market_authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "time_expiry",
+            "docs": [
+              "No expiry = 0. Market will expire and no trading allowed after time_expiry"
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "collect_fee_admin",
+            "docs": [
+              "Admin who can collect fees from the market"
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "open_orders_admin",
+            "docs": [
+              "Admin who must sign off on all order creations"
+            ],
+            "type": {
+              "defined": {
+                "name": "NonZeroPubkeyOption"
+              }
+            }
+          },
+          {
+            "name": "consume_events_admin",
+            "docs": [
+              "Admin who must sign off on all event consumptions"
+            ],
+            "type": {
+              "defined": {
+                "name": "NonZeroPubkeyOption"
+              }
+            }
+          },
+          {
+            "name": "close_market_admin",
+            "docs": [
+              "Admin who can set market expired, prune orders and close the market"
+            ],
+            "type": {
+              "defined": {
+                "name": "NonZeroPubkeyOption"
+              }
+            }
+          },
+          {
+            "name": "name",
+            "docs": [
+              "Name. Trailing zero bytes are ignored."
+            ],
+            "type": {
+              "array": [
+                "u8",
+                16
+              ]
+            }
+          },
+          {
+            "name": "bids",
+            "docs": [
+              "Address of the BookSide account for bids"
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "asks",
+            "docs": [
+              "Address of the BookSide account for asks"
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "event_heap",
+            "docs": [
+              "Address of the EventHeap account"
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "oracle_a",
+            "docs": [
+              "Oracles account address"
+            ],
+            "type": {
+              "defined": {
+                "name": "NonZeroPubkeyOption"
+              }
+            }
+          },
+          {
+            "name": "oracle_b",
+            "type": {
+              "defined": {
+                "name": "NonZeroPubkeyOption"
+              }
+            }
+          },
+          {
+            "name": "oracle_config",
+            "docs": [
+              "Oracle configuration"
+            ],
+            "type": {
+              "defined": {
+                "name": "OracleConfig"
+              }
+            }
+          },
+          {
+            "name": "quote_lot_size",
+            "docs": [
+              "Number of quote native in a quote lot. Must be a power of 10.",
+              "",
+              "Primarily useful for increasing the tick size on the market: A lot price",
+              "of 1 becomes a native price of quote_lot_size/base_lot_size becomes a",
+              "ui price of quote_lot_size*base_decimals/base_lot_size/quote_decimals."
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "base_lot_size",
+            "docs": [
+              "Number of base native in a base lot. Must be a power of 10.",
+              "",
+              "Example: If base decimals for the underlying asset is 6, base lot size",
+              "is 100 and and base position lots is 10_000 then base position native is",
+              "1_000_000 and base position ui is 1."
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "seq_num",
+            "docs": [
+              "Total number of orders seen"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "registration_time",
+            "docs": [
+              "Timestamp in seconds that the market was registered at."
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "maker_fee",
+            "docs": [
+              "Fees",
+              "",
+              "Fee (in 10^-6) when matching maker orders.",
+              "maker_fee < 0 it means some of the taker_fees goes to the maker",
+              "maker_fee > 0, it means no taker_fee to the maker, and maker fee goes to the referral"
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "taker_fee",
+            "docs": [
+              "Fee (in 10^-6) for taker orders, always >= 0."
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "fees_accrued",
+            "docs": [
+              "Total fees accrued in native quote"
+            ],
+            "type": "u128"
+          },
+          {
+            "name": "fees_to_referrers",
+            "docs": [
+              "Total fees settled in native quote"
+            ],
+            "type": "u128"
+          },
+          {
+            "name": "referrer_rebates_accrued",
+            "docs": [
+              "Referrer rebates to be distributed"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "fees_available",
+            "docs": [
+              "Fees generated and available to withdraw via sweep_fees"
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "maker_volume",
+            "docs": [
+              "Cumulative maker volume (same as taker volume) in quote native units"
+            ],
+            "type": "u128"
+          },
+          {
+            "name": "taker_volume_wo_oo",
+            "docs": [
+              "Cumulative taker volume in quote native units due to place take orders"
+            ],
+            "type": "u128"
+          },
+          {
+            "name": "base_mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "quote_mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "market_base_vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "base_deposit_total",
+            "type": "u64"
+          },
+          {
+            "name": "market_quote_vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "quote_deposit_total",
+            "type": "u64"
+          },
+          {
+            "name": "reserved",
+            "type": {
+              "array": [
+                "u8",
+                128
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "OpenOrdersAccount",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "owner",
+            "type": "pubkey"
+          },
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "name",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "delegate",
+            "type": {
+              "defined": {
+                "name": "NonZeroPubkeyOption"
+              }
+            }
+          },
+          {
+            "name": "account_num",
+            "type": "u32"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "version",
+            "type": "u8"
+          },
+          {
+            "name": "padding",
+            "type": {
+              "array": [
+                "u8",
+                2
+              ]
+            }
+          },
+          {
+            "name": "position",
+            "type": {
+              "defined": {
+                "name": "Position"
+              }
+            }
+          },
+          {
+            "name": "open_orders",
+            "type": {
+              "array": [
+                {
+                  "defined": {
+                    "name": "OpenOrder"
+                  }
+                },
+                24
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "OpenOrdersIndexer",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "created_counter",
+            "type": "u32"
+          },
+          {
+            "name": "addresses",
+            "type": {
+              "vec": "pubkey"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "StubOracle",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "owner",
+            "type": "pubkey"
+          },
+          {
+            "name": "mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "price",
+            "type": "f64"
+          },
+          {
+            "name": "last_update_ts",
+            "type": "i64"
+          },
+          {
+            "name": "last_update_slot",
+            "type": "u64"
+          },
+          {
+            "name": "deviation",
+            "type": "f64"
+          },
+          {
+            "name": "reserved",
+            "type": {
+              "array": [
+                "u8",
+                104
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "BookSide",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "roots",
+            "type": {
+              "array": [
+                {
+                  "defined": {
+                    "name": "OrderTreeRoot"
+                  }
+                },
+                2
+              ]
+            }
+          },
+          {
+            "name": "reserved_roots",
+            "type": {
+              "array": [
+                {
+                  "defined": {
+                    "name": "OrderTreeRoot"
+                  }
+                },
+                4
+              ]
+            }
+          },
+          {
+            "name": "reserved",
+            "type": {
+              "array": [
+                "u8",
+                256
+              ]
+            }
+          },
+          {
+            "name": "nodes",
+            "type": {
+              "defined": {
+                "name": "OrderTreeNodes"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "EventHeap",
+      "docs": [
+        "Container for the different EventTypes.",
+        "",
+        "Events are stored in a fixed-array of nodes. Free nodes are connected by a single-linked list",
+        "starting at free_head while used nodes form a circular doubly-linked list starting at",
+        "used_head."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "header",
+            "type": {
+              "defined": {
+                "name": "EventHeapHeader"
+              }
+            }
+          },
+          {
+            "name": "nodes",
+            "type": {
+              "array": [
+                {
+                  "defined": {
+                    "name": "EventNode"
+                  }
+                },
+                600
+              ]
+            }
+          },
+          {
+            "name": "reserved",
+            "type": {
+              "array": [
+                "u8",
+                64
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "DepositLog",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "open_orders_account",
+            "type": "pubkey"
+          },
+          {
+            "name": "signer",
+            "type": "pubkey"
+          },
+          {
+            "name": "base_amount",
+            "type": "u64"
+          },
+          {
+            "name": "quote_amount",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "FillLog",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "taker_side",
+            "type": "u8"
+          },
+          {
+            "name": "maker_slot",
+            "type": "u8"
+          },
+          {
+            "name": "maker_out",
+            "type": "bool"
+          },
+          {
+            "name": "timestamp",
+            "type": "u64"
+          },
+          {
+            "name": "seq_num",
+            "type": "u64"
+          },
+          {
+            "name": "maker",
+            "type": "pubkey"
+          },
+          {
+            "name": "maker_client_order_id",
+            "type": "u64"
+          },
+          {
+            "name": "maker_fee",
+            "type": "u64"
+          },
+          {
+            "name": "maker_timestamp",
+            "type": "u64"
+          },
+          {
+            "name": "taker",
+            "type": "pubkey"
+          },
+          {
+            "name": "taker_client_order_id",
+            "type": "u64"
+          },
+          {
+            "name": "taker_fee_ceil",
+            "type": "u64"
+          },
+          {
+            "name": "price",
+            "type": "i64"
+          },
+          {
+            "name": "quantity",
+            "type": "i64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "MarketMetaDataLog",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "name",
+            "type": "string"
+          },
+          {
+            "name": "base_mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "quote_mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "base_decimals",
+            "type": "u8"
+          },
+          {
+            "name": "quote_decimals",
+            "type": "u8"
+          },
+          {
+            "name": "base_lot_size",
+            "type": "i64"
+          },
+          {
+            "name": "quote_lot_size",
+            "type": "i64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "TotalOrderFillEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "side",
+            "type": "u8"
+          },
+          {
+            "name": "taker",
+            "type": "pubkey"
+          },
+          {
+            "name": "total_quantity_paid",
+            "type": "u64"
+          },
+          {
+            "name": "total_quantity_received",
+            "type": "u64"
+          },
+          {
+            "name": "fees",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "SetDelegateLog",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "open_orders_account",
+            "type": "pubkey"
+          },
+          {
+            "name": "delegate",
+            "type": {
+              "option": "pubkey"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "SettleFundsLog",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "open_orders_account",
+            "type": "pubkey"
+          },
+          {
+            "name": "base_native",
+            "type": "u64"
+          },
+          {
+            "name": "quote_native",
+            "type": "u64"
+          },
+          {
+            "name": "referrer_rebate",
+            "type": "u64"
+          },
+          {
+            "name": "referrer",
+            "type": {
+              "option": "pubkey"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "SweepFeesLog",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount",
+            "type": "u64"
+          },
+          {
+            "name": "receiver",
+            "type": "pubkey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "OpenOrdersPositionLog",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "owner",
+            "type": "pubkey"
+          },
+          {
+            "name": "open_orders_account_num",
+            "type": "u32"
+          },
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "bids_base_lots",
+            "type": "i64"
+          },
+          {
+            "name": "bids_quote_lots",
+            "type": "i64"
+          },
+          {
+            "name": "asks_base_lots",
+            "type": "i64"
+          },
+          {
+            "name": "base_free_native",
+            "type": "u64"
+          },
+          {
+            "name": "quote_free_native",
+            "type": "u64"
+          },
+          {
+            "name": "locked_maker_fees",
+            "type": "u64"
+          },
+          {
+            "name": "referrer_rebates_available",
+            "type": "u64"
+          },
+          {
+            "name": "maker_volume",
+            "type": "u128"
+          },
+          {
+            "name": "taker_volume",
+            "type": "u128"
+          }
+        ]
+      }
+    }
+  ]
+}

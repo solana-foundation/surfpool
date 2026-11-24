@@ -1,0 +1,143 @@
+protocol: OpenBook
+version: v2
+account_type: Market
+idl_file_path: idl.json
+
+tags:
+  - clob
+  - orderbook
+  - spot-trading
+  - defi
+
+# The preset markets are the OpenBook v2 markets Drift routes its spot fills through
+# (its OpenbookV2FulfillmentConfig accounts). OpenBook v2 markets are permissionless, so
+# a pair such as SOL/USDC has many markets; these are the ones with real flow.
+templates:
+  - id: openbook-v2-sol-usdc-market
+    name: Override SOL/USDC Market
+    description: Override fees, expiry and deposit totals of the SOL/USDC OpenBook v2 market
+    idl_account_name: Market
+    properties: &market_properties
+      - path: maker_fee
+        label: Maker Fee
+        description: Maker fee in 10^-6 (100 = 1 bps). Negative values rebate makers out of the taker fee
+      - path: taker_fee
+        label: Taker Fee
+        description: Taker fee in 10^-6 (100 = 1 bps), always >= 0
+      - path: time_expiry
+        label: Expiry Time
+        description: Unix timestamp after which deposits and new orders are refused. 0 = never expires, -1 = expired now
+      - path: base_deposit_total
+        label: Base Deposit Total
+        description: Base tokens (native units) the market tracks as deposited in its base vault
+      - path: quote_deposit_total
+        label: Quote Deposit Total
+        description: Quote tokens (native units) the market tracks as deposited in its quote vault
+      - path: fees_available
+        label: Fees Available
+        description: Quote fees (native units) withdrawable through sweep_fees
+    address:
+      type: pubkey
+      value: AFgkED1FUVfBe2trPUDqSqK9QKd4stJrfzq5q1RwAFTa
+
+  - id: openbook-v2-btc-usdc-market
+    name: Override BTC/USDC Market
+    description: Override fees, expiry and deposit totals of the BTC/USDC OpenBook v2 market
+    idl_account_name: Market
+    properties: *market_properties
+    address:
+      type: pubkey
+      value: 2HXgKaXKsMUEzQaSBZiXSd54eMHaS3roiefyGWtkW97W
+
+  - id: openbook-v2-eth-usdc-market
+    name: Override ETH/USDC Market
+    description: Override fees, expiry and deposit totals of the ETH/USDC OpenBook v2 market
+    idl_account_name: Market
+    properties: *market_properties
+    address:
+      type: pubkey
+      value: AT1R2jUNb9iTo4EaRfKSTPiNTX4Jb64KSwnVmig6Hu4t
+
+  - id: openbook-v2-wif-usdc-market
+    name: Override WIF/USDC Market
+    description: Override fees, expiry and deposit totals of the WIF/USDC OpenBook v2 market
+    idl_account_name: Market
+    properties: *market_properties
+    address:
+      type: pubkey
+      value: CwGmEwYFo7u5D7vghGwtcCbRToWosytaZa3Ys3JAto6J
+
+  - id: openbook-v2-bonk-usdc-market
+    name: Override BONK/USDC Market
+    description: Override fees, expiry and deposit totals of the BONK/USDC OpenBook v2 market
+    idl_account_name: Market
+    properties: *market_properties
+    address:
+      type: pubkey
+      value: D3gZwng2MgZGjktYcKpbR8Bz8653i4qCgzHCf5E4TcZb
+
+  - id: openbook-v2-market-custom
+    name: Override Custom Market
+    description: Override fees, expiry, deposit totals and oracle staleness of any OpenBook v2 market by address
+    idl_account_name: Market
+    # The preset markets' fields, plus the oracle staleness window: none of the presets has an
+    # oracle, but markets created with one refuse oracle-pegged orders once it goes stale.
+    properties:
+      - path: maker_fee
+        label: Maker Fee
+        description: Maker fee in 10^-6 (100 = 1 bps). Negative values rebate makers out of the taker fee
+      - path: taker_fee
+        label: Taker Fee
+        description: Taker fee in 10^-6 (100 = 1 bps), always >= 0
+      - path: time_expiry
+        label: Expiry Time
+        description: Unix timestamp after which deposits and new orders are refused. 0 = never expires, -1 = expired now
+      - path: base_deposit_total
+        label: Base Deposit Total
+        description: Base tokens (native units) the market tracks as deposited in its base vault
+      - path: quote_deposit_total
+        label: Quote Deposit Total
+        description: Quote tokens (native units) the market tracks as deposited in its quote vault
+      - path: fees_available
+        label: Fees Available
+        description: Quote fees (native units) withdrawable through sweep_fees
+      - path: oracle_config.max_staleness_slots
+        label: Oracle Max Staleness (slots)
+        description: Slots an oracle update stays valid for oracle-pegged orders. -1 disables the check. Has no effect on a market without an oracle
+    address:
+      type: pubkey
+    llm_context: |
+      Set fetchBeforeUse: true so the market is fetched from mainnet before the overrides apply.
+      base_deposit_total and quote_deposit_total are bookkeeping: changing them does not move tokens
+      in the market vaults, so settling more than the vaults hold will fail.
+
+  - id: openbook-v2-open-orders
+    name: Override Open Orders Position
+    description: Override the balances and locked order lots of an OpenBook v2 open orders account
+    idl_account_name: OpenOrdersAccount
+    properties:
+      - path: position.base_free_native
+        label: Free Base
+        description: Base tokens (native units) the owner can settle out of the market
+      - path: position.quote_free_native
+        label: Free Quote
+        description: Quote tokens (native units) the owner can settle out of the market
+      - path: position.bids_base_lots
+        label: Base Lots in Bids
+        description: Base lots locked in the owner's open bids
+      - path: position.bids_quote_lots
+        label: Quote Lots in Bids
+        description: Quote lots locked in the owner's open bids
+      - path: position.asks_base_lots
+        label: Base Lots in Asks
+        description: Base lots locked in the owner's open asks
+      - path: position.locked_maker_fees
+        label: Locked Maker Fees
+        description: Maker fees (native quote) reserved for the owner's open bids
+    address:
+      type: pubkey
+    llm_context: |
+      Set fetchBeforeUse: true so the account is fetched from mainnet before the overrides apply.
+      Free balances are settled out of the market vaults, which these overrides do not change:
+      raise the market's deposit totals and the vault token balances too, or settle_funds will fail.
+      Locked lots should match the orders in open_orders and on the book.
