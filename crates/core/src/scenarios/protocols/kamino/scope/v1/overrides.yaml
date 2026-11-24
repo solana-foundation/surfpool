@@ -1,5 +1,5 @@
 protocol: kamino-scope
-version: v0.39.0
+version: v0.45.0
 account_type: OraclePrices
 idl_file_path: idl.json
 

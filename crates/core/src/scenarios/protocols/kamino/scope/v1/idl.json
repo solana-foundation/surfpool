@@ -2,7 +2,7 @@
   "address": "HFn8GnPADiny6XqUoWE8uRPPxb29ikn4yTuPa9MF2fWJ",
   "metadata": {
     "name": "scope",
-    "version": "0.39.0",
+    "version": "0.45.0",
     "spec": "0.1.0"
   },
   "instructions": [],
@@ -129,6 +129,13 @@
             "type": {
               "option": "u16"
             }
+          },
+          {
+            "name": "sources_max_age_s",
+            "docs": [
+              "Max age of the source and bound entries."
+            ],
+            "type": "u64"
           }
         ]
       }
@@ -175,22 +182,6 @@
       }
     },
     {
-      "name": "V8V10",
-      "type": {
-        "kind": "struct",
-        "fields": [
-          {
-            "name": "market_status_behavior",
-            "type": {
-              "defined": {
-                "name": "MarketStatusBehavior"
-              }
-            }
-          }
-        ]
-      }
-    },
-    {
       "name": "ChainlinkStandardPriceData",
       "docs": [
         "Price data for standard Chainlink types (v3, v7, v8, v9)"
@@ -208,7 +199,11 @@
     {
       "name": "ChainlinkXPriceData",
       "docs": [
-        "Price data for ChainlinkX type (v10)"
+        "Price data for ChainlinkX type (v10)",
+        "",
+        "The entry may price a multiplier only while it is *approved*: named by an operator in a",
+        "resume, adopted by the entry on its first refresh, or, where an auto approval threshold is",
+        "configured, within that threshold of the reference. Anything else suspends the entry."
       ],
       "type": {
         "kind": "struct",
@@ -223,7 +218,31 @@
           },
           {
             "name": "activation_date_time",
-            "type": "u64"
+            "docs": [
+              "One timestamp, whose meaning is based on `suspended`:",
+              "- while suspended: the activation the report announced for the switch the entry suspended",
+              "on, as the `u32` the report carries;",
+              "- when not suspended: when the reference was set, which is when its 24h period started.",
+              "",
+              "`0` when there is neither. A `u32` because the whole record has to fit the entry's 24",
+              "bytes, so a period start past 2106 cannot be recorded and the refresh rejects it."
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "approved_multiplier_bits",
+            "docs": [
+              "Raw `f64` bits of one multiplier, whose meaning is based on `suspended`:",
+              "- while suspended: the value a resume approved, and the price comes back only once a report",
+              "carries it, or one within the threshold of it;",
+              "- when not suspended: the reference auto approval measures a change against.",
+              "",
+              "`None` on an entry that has published nothing yet, which takes whatever the next report",
+              "carries."
+            ],
+            "type": {
+              "option": "u64"
+            }
           }
         ]
       }
@@ -902,11 +921,24 @@
             "type": "u64"
           },
           {
+            "name": "eager_eval_price_move_bps",
+            "type": "u16"
+          },
+          {
+            "name": "padding",
+            "type": {
+              "array": [
+                "u8",
+                6
+              ]
+            }
+          },
+          {
             "name": "reserved",
             "type": {
               "array": [
                 "u64",
-                15
+                14
               ]
             }
           }
@@ -999,6 +1031,12 @@
             "name": "MetadataGroupIdsBitset",
             "fields": [
               "u64"
+            ]
+          },
+          {
+            "name": "MetadataEagerEvalBps",
+            "fields": [
+              "u16"
             ]
           }
         ]
@@ -1114,20 +1152,6 @@
       }
     },
     {
-      "name": "TokenTypes",
-      "type": {
-        "kind": "enum",
-        "variants": [
-          {
-            "name": "TokenA"
-          },
-          {
-            "name": "TokenB"
-          }
-        ]
-      }
-    },
-    {
       "name": "RefPriceToleranceOrTwapSource",
       "type": {
         "kind": "enum",
@@ -1194,7 +1218,7 @@
             "name": "SplStake"
           },
           {
-            "name": "KToken"
+            "name": "DeprecatedPlaceholder8"
           },
           {
             "name": "DeprecatedPlaceholder5"
@@ -1203,10 +1227,10 @@
             "name": "MsolStake"
           },
           {
-            "name": "KTokenToTokenA"
+            "name": "DeprecatedPlaceholder9"
           },
           {
-            "name": "KTokenToTokenB"
+            "name": "DeprecatedPlaceholder10"
           },
           {
             "name": "JupiterLpFetch"
@@ -1239,16 +1263,16 @@
             "name": "DeprecatedPlaceholder7"
           },
           {
-            "name": "PythPull"
+            "name": "DeprecatedPlaceholder12"
           },
           {
-            "name": "PythPullEMA"
+            "name": "DeprecatedPlaceholder13"
           },
           {
             "name": "FixedPrice"
           },
           {
-            "name": "SwitchboardOnDemand"
+            "name": "DeprecatedPlaceholder11"
           },
           {
             "name": "JitoRestaking"
@@ -1321,6 +1345,21 @@
           },
           {
             "name": "PythLazerEMA"
+          },
+          {
+            "name": "KlendCTokenExchangeRate"
+          },
+          {
+            "name": "Token2022Multiplier"
+          },
+          {
+            "name": "Canary"
+          },
+          {
+            "name": "ExponentTranching"
+          },
+          {
+            "name": "CanaryBreakers"
           }
         ]
       }
