@@ -1652,7 +1652,7 @@ templates: []
     }
 
     #[test]
-    fn test_clock_sensitive_tag_marks_pyth_and_every_phoenix_template() {
+    fn test_clock_sensitive_tag_marks_pyth_and_every_phoenix_and_openbook_template() {
         let registry = TemplateRegistry::new();
         let tagged: Vec<&str> = registry
             .by_tags(&["clock-sensitive".to_string()])
@@ -1665,9 +1665,17 @@ templates: []
             !phoenix.is_empty(),
             "the Phoenix Eternal templates are registered"
         );
-        for template in std::iter::once("pyth-price-feed-v2")
-            .chain(phoenix.iter().map(|template| template.id.as_str()))
-        {
+        let openbook = registry.by_protocol("OpenBook");
+        assert!(
+            !openbook.is_empty(),
+            "the OpenBook v2 templates are registered"
+        );
+        for template in std::iter::once("pyth-price-feed-v2").chain(
+            phoenix
+                .iter()
+                .chain(openbook.iter())
+                .map(|template| template.id.as_str()),
+        ) {
             assert!(
                 tagged.contains(&template),
                 "{template} must be clock-sensitive"

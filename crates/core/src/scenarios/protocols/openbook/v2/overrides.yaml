@@ -8,6 +8,7 @@ tags:
   - orderbook
   - spot-trading
   - defi
+  - clock-sensitive
 
 # The preset markets are the OpenBook v2 markets Drift routes its spot fills through
 # (its OpenbookV2FulfillmentConfig accounts). OpenBook v2 markets are permissionless, so
