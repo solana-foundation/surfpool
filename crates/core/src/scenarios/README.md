@@ -51,13 +51,14 @@ it skips are never applied; step one slot at a time to play a scenario under a p
 
 ### On-chain integration tests
 
-Byte-level Kamino and BisonFi coverage lives in `crates/core/src/tests/kamino/` and
-`crates/core/src/tests/bisonfi/`. These tests fetch real accounts from mainnet, so they need a
-network connection and are compiled only behind a feature:
+Byte-level Kamino, BisonFi and OpenBook v2 coverage lives in `crates/core/src/tests/kamino/`,
+`crates/core/src/tests/bisonfi/` and `crates/core/src/tests/openbook/`. These tests fetch real
+accounts from mainnet, so they need a network connection and are compiled only behind a feature:
 
 ```
 cargo test -p surfpool-core --features integration-tests kamino
 cargo test -p surfpool-core --features integration-tests bisonfi
+cargo test -p surfpool-core --features integration-tests openbook
 ```
 
 Set `SURFPOOL_TEST_RPC_URL` to use a private endpoint instead of the public one. The default test
