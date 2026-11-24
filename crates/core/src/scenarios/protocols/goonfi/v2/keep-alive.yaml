@@ -1,0 +1,20 @@
+protocol: GoonFi
+version: v2
+account_type: PriceOracle
+raw_layout: true
+
+templates:
+  - id: goonfi-quote-publication
+    name: Quote publication
+    description: The maker republishing a market's oracle quote
+    idl_account_name: PriceOracle
+    address:
+      type: pubkey
+    properties:
+      - path: last_update_slot
+        offset: 16
+        encoding: u32
+        description: >-
+          Slot the quote was published in. A swap in that slot or up to four slots later fills best,
+          and from the fifth slot each slot costs one decay step more until the quote rejects with
+          custom error 0x15.

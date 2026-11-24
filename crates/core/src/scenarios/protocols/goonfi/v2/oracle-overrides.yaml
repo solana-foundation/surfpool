@@ -1,0 +1,90 @@
+protocol: GoonFi
+version: v2
+account_type: PriceOracle
+
+raw_layout: true
+
+tags:
+  - pmm
+  - prop-amm
+  - oracle
+
+keep_alive:
+  - template: goonfi-quote-publication
+    address: { type: override }
+    values: { last_update_slot: $slot-1 }
+
+llm_context: |
+  FINDING THE MARKET WHEN THE USER NAMES A PAIR OR STUDIO DOES NOT LIST IT:
+  1. Resolve both token symbols with get_token_address, both calls at once.
+  2. Make three getProgramAccounts calls at once, each with two positional params: the program
+     id string "goonuddtQRrWqqn5nFyczVKaie28f3kDkHWkHtURSLE", then the config object
+     {"encoding":"base58","dataSlice":{"offset":208,"length":32},"filters":[
+     {"memcmp":{"offset":0,"bytes":"99nuWqpQZwP"}},{"memcmp":{"offset":80,"bytes":"<base mint>"}},
+     {"memcmp":{"offset":112,"bytes":"<quote mint>"}}]}.
+     The second call uses dataSlice {"offset":144,"length":32} and the third
+     {"offset":176,"length":32}. Offset 0 is the market tag. Each result's pubkey is a market
+     for the pair. Its data is the market's oracle in the first call, its base vault in the
+     second and its quote vault in the third.
+  3. No result means a mistyped mint, a symbol get_token_address maps to another token, or no
+     market for the pair. Copy both mints again exactly and repeat once; if there is still no
+     result, ask the user for the mints or the market address instead of saying none exists.
+  4. Always check the vaults, even for a single result, and before create_scenario: call
+     getMultipleAccounts with encoding "jsonParsed" on the vaults from the second and third
+     calls, never on the oracles from the first. Each vault comes back as a parsed spl-token
+     account with a tokenAmount; raw bytes mean an oracle was passed. The base vault pays buys
+     and the quote vault pays sells. Keep the market whose base vault holds the most tokens; a
+     pair can also have stopped markets. If both of its vaults hold almost nothing, say the
+     market looks stopped instead of preparing it; if one does, say which direction cannot fill.
+  5. For a market address the user gives, read its oracle with getAccountInfo, encoding
+     "base58" and dataSlice {"offset":208,"length":32}; read its vaults the same way at offsets
+     144 and 176 and check them as in step 4.
+  6. Put the oracle in the override's account as {"pubkey":"<oracle>"} and set fetchBeforeUse
+     as described below. The oracle address is never an override value.
+
+templates:
+  - id: goonfi-price
+    name: Override Price
+    description: Move the bid and ask a GoonFi market quotes from its oracle
+    idl_account_name: PriceOracle
+    address:
+      type: pubkey
+    properties:
+      - path: bid_price_x1e6
+        offset: 0
+        encoding: u64
+        label: Bid price
+        description: Price GoonFi buys base at, quote per base times 10^6, independent of mint decimals.
+      - path: ask_price_x1e6
+        offset: 8
+        encoding: u64
+        label: Ask price
+        description: Price GoonFi sells base at, quote per base times 10^6; keep it at or above the bid.
+    llm_context: |
+      PRECONDITION - MOVE THE REFERENCE BAND TOO. The market account holds a reference band that
+      guards this quote. A sell whose bid sits above reference A, or a buy whose ask sits below
+      reference B, rejects with custom error 0x24 (36). Apply goonfi-reference-band to the paired
+      market, scaled by the same factor, in the same scenario.
+
+      This is GoonFi's authoritative price input. The 32-byte oracle is owned by a companion
+      publisher program and the market points at it from bytes 208..240.
+
+      CONVERSION:
+        bid_price_x1e6 = human_price * 10^6
+      The scale is independent of mint decimals: SOL at 99.74 USDC is 99740000 on a 9/6 market,
+      and USDT at 1.0001 USDC is 1000100 on a 6/6 market. Set both fields above 0 with ask >= bid;
+      a zero price rejects with custom error 0x9 (9).
+
+      Set fetchBeforeUse: true to pull the account from upstream first; false only for a later override
+      that builds on state an earlier override in the same scenario prepared.
+
+      THE QUOTE STAYS CURRENT BY ITSELF. While the scenario is registered, Surfpool republishes this
+      oracle every slot as GoonFi's maker does on mainnet, stamped one slot back so a swap fills
+      best. The price stays as set.
+
+      DIRECTION: raising the bid raises what a seller receives; lowering the ask raises what a buyer
+      receives. A coupled 2x move doubles a sell's output.
+
+      EXAMPLE - "SOL is worth $150" on the selected SOL/USDC market, paired with the band:
+        bid_price_x1e6: 150000000
+        ask_price_x1e6: 150000000
