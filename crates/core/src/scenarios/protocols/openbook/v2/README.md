@@ -76,11 +76,32 @@ pruned, settled and closed. This is what a frontend or keeper has to handle when
 Set `taker_fee` (always `>= 0`) and `maker_fee`. A negative `maker_fee` pays makers a rebate out
 of the taker fee, so it must not exceed the taker fee in size.
 
+# The bundled IDL
+
+OpenBook publishes its IDL in the legacy (pre Anchor 0.30) format, which Surfpool cannot read.
+`idl.json` is that IDL converted, with nothing added or removed:
+
+```
+anchor idl convert openbook_v2.json -p opnb2LAfJYbRMAHHvqjCwQxanZn7ReEHp1k81EohpZb -o idl.json
+```
+
+| | |
+|---|---|
+| Source | [`idl/openbook_v2.json`](https://github.com/openbook-dex/openbook-v2/blob/f3e17421e675b083b584867594bf3cf4f675d156/idl/openbook_v2.json) at `f3e1742` (v0.2.10) |
+| Source SHA-256 | `a7da6ea7433682b61b23a08a66d63665b0d0631434eeabe335ea32b3c111ee80` |
+| Converter | Anchor CLI 1.2.2 |
+| `idl.json` SHA-256 | `9df8ab9d4f15053a2871648f6457897ce8600544b029eb82ceac542dce0185ff` |
+
+The legacy IDL has no program address or discriminators. `-p` sets the address, and the converter
+derives each discriminator from the account's name, as Anchor does.
+
 # Testing
 
 `crates/core/src/tests/openbook/` fetches the preset markets and a live open orders account from
 mainnet, checks that they round-trip through the bundled IDL unchanged, and checks that overrides
-change only their target bytes:
+change only their target bytes. Its last test runs the deployed program: it takes an order on the
+live SOL/USDC market, and refuses the same order as `MarketHasExpired` once `time_expiry` is
+overridden to `-1`:
 
 ```
 cargo test -p surfpool-core --features integration-tests openbook

@@ -10,12 +10,21 @@
 //! Set `SURFPOOL_TEST_RPC_URL` to use a private endpoint if the public one rate-limits.
 //!
 //! The bundled IDL was converted from OpenBook's legacy Anchor IDL, so these guard what the
-//! conversion could get wrong: discriminators, field order and sizes against the live layout.
+//! conversion could get wrong: discriminators, field order and sizes against the live layout. The
+//! last test runs the deployed program against an overridden market.
 
 use std::{collections::HashMap, ops::Range};
 
+use solana_account::Account;
+use solana_clock::Clock;
 use solana_commitment_config::CommitmentConfig;
+use solana_instruction::{AccountMeta, Instruction, error::InstructionError};
+use solana_keypair::Keypair;
+use solana_program_pack::Pack;
 use solana_pubkey::Pubkey;
+use solana_signer::Signer;
+use solana_transaction::Transaction;
+use solana_transaction_error::TransactionError;
 
 use crate::{
     scenarios::TemplateRegistry,
@@ -69,8 +78,17 @@ const QUOTE_DEPOSIT_TOTAL: Range<usize> = 712..720;
 const BASE_FREE_NATIVE: Range<usize> = 160..168;
 const QUOTE_FREE_NATIVE: Range<usize> = 168..176;
 
-/// Fetches the accounts in one request, so every account returned is from the same slot.
+/// The account data of [`fetch_accounts`].
 async fn fetch(addresses: &[&str]) -> Vec<Vec<u8>> {
+    fetch_accounts(addresses)
+        .await
+        .into_iter()
+        .map(|account| account.data)
+        .collect()
+}
+
+/// Fetches the accounts in one request, so every account returned is from the same slot.
+async fn fetch_accounts(addresses: &[&str]) -> Vec<Account> {
     let client = SurfnetRemoteClient::new(
         std::env::var(RPC_URL_ENV).unwrap_or_else(|_| DEFAULT_RPC_URL.to_string()),
     );
@@ -87,7 +105,7 @@ async fn fetch(addresses: &[&str]) -> Vec<Vec<u8>> {
         .zip(addresses)
         .map(|(result, address)| match result {
             GetAccountResult::FoundAccount(_, account, _)
-            | GetAccountResult::FoundCoupledAccount((_, account), _, _) => account.data,
+            | GetAccountResult::FoundCoupledAccount((_, account), _, _) => account,
             GetAccountResult::None(_) => {
                 panic!("{address} no longer exists on mainnet; the test needs a new address")
             }
@@ -256,4 +274,177 @@ async fn open_orders_override_touches_only_target_fields() {
     assert_only_fields_changed(&forged, &data, &[BASE_FREE_NATIVE, QUOTE_FREE_NATIVE]);
     assert_eq!(read_u64(&forged, BASE_FREE_NATIVE), base_free);
     assert_eq!(read_u64(&forged, QUOTE_FREE_NATIVE), quote_free);
+}
+
+const PROGRAM_ID: Pubkey = Pubkey::from_str_const("opnb2LAfJYbRMAHHvqjCwQxanZn7ReEHp1k81EohpZb");
+/// `MarketHasExpired` in OpenBook's `OpenBookError`.
+const MARKET_HAS_EXPIRED: u32 = 6030;
+
+/// Reads the pubkey a market stores at `offset`.
+fn market_key(market: &[u8], offset: usize) -> Pubkey {
+    Pubkey::new_from_array(market[offset..offset + 32].try_into().unwrap())
+}
+
+/// A token account of `mint` owned by `owner`.
+fn token_account(mint: Pubkey, owner: Pubkey, amount: u64) -> Account {
+    let mut data = vec![0; spl_token_interface::state::Account::LEN];
+    spl_token_interface::state::Account {
+        mint,
+        owner,
+        amount,
+        state: spl_token_interface::state::AccountState::Initialized,
+        ..Default::default()
+    }
+    .pack_into_slice(&mut data);
+    Account {
+        lamports: 2_039_280,
+        data,
+        owner: spl_token_interface::id(),
+        executable: false,
+        rent_epoch: 0,
+    }
+}
+
+/// A small immediate-or-cancel buy on `market`, which the deployed program can always accept: the
+/// limit price is far above the book, and an empty book leaves it unfilled rather than failing.
+fn take_order(
+    signer: Pubkey,
+    market: Pubkey,
+    market_data: &[u8],
+    user: [Pubkey; 2],
+) -> Instruction {
+    // place_take_order's discriminator, then PlaceTakeOrderArgs: side Bid, price_lots,
+    // max_base_lots, max_quote_lots_including_fees, order_type ImmediateOrCancel, limit.
+    let mut data = vec![3, 44, 71, 3, 26, 199, 203, 85, 0];
+    data.extend_from_slice(&10_000_000i64.to_le_bytes());
+    data.extend_from_slice(&10i64.to_le_bytes());
+    data.extend_from_slice(&10_000_000i64.to_le_bytes());
+    data.extend_from_slice(&[1, 10]);
+
+    Instruction {
+        program_id: PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(signer, true),
+            AccountMeta::new(signer, true),
+            AccountMeta::new(market, false),
+            AccountMeta::new_readonly(market_key(market_data, 16), false),
+            AccountMeta::new(market_key(market_data, 200), false),
+            AccountMeta::new(market_key(market_data, 232), false),
+            AccountMeta::new(market_key(market_data, 640), false),
+            AccountMeta::new(market_key(market_data, 680), false),
+            AccountMeta::new(market_key(market_data, 264), false),
+            AccountMeta::new(user[0], false),
+            AccountMeta::new(user[1], false),
+            // Anchor reads the program id as an absent optional account: neither oracle, nor an
+            // open orders admin, is set on the preset markets.
+            AccountMeta::new_readonly(PROGRAM_ID, false),
+            AccountMeta::new_readonly(PROGRAM_ID, false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
+            AccountMeta::new_readonly(solana_sdk_ids::system_program::id(), false),
+            AccountMeta::new_readonly(PROGRAM_ID, false),
+        ],
+        data,
+    }
+}
+
+/// The deployed OpenBook program, given the live SOL/USDC market with and without the custom
+/// template's expiry override: it takes the order on the live market and refuses it as expired on
+/// the overridden one, so the override is what the program reads.
+#[tokio::test]
+async fn the_deployed_program_refuses_orders_on_an_expired_market() {
+    let (_, market_address) = PRESETS[0];
+    let market = Pubkey::from_str_const(market_address);
+    let program = fetch_accounts(&[&PROGRAM_ID.to_string()]).await.remove(0);
+    // An upgradeable program's account holds its ProgramData address after a 4-byte tag; the ELF
+    // starts 45 bytes into the ProgramData account, past the loader's header.
+    let programdata = Pubkey::new_from_array(program.data[4..36].try_into().unwrap());
+
+    let market_account = fetch_accounts(&[market_address]).await.remove(0);
+    // The book sides, event heap and vaults. The market authority is a PDA that only signs for the
+    // vaults and holds no account, so there is nothing to fetch for it.
+    let linked: Vec<String> = [200, 232, 264, 640, 680]
+        .iter()
+        .map(|offset| market_key(&market_account.data, *offset).to_string())
+        .collect();
+    let mut addresses = vec![programdata.to_string()];
+    addresses.extend(linked.iter().cloned());
+    let addresses: Vec<&str> = addresses.iter().map(String::as_str).collect();
+    let mut accounts = fetch_accounts(&addresses).await;
+    let elf = accounts.remove(0).data[45..].to_vec();
+
+    let registry = TemplateRegistry::new();
+    let template = registry.get("openbook-v2-market-custom").unwrap();
+    let signer = Keypair::new();
+    let user = [Pubkey::new_unique(), Pubkey::new_unique()];
+
+    let run = |market_data: Vec<u8>| -> Result<(), TransactionError> {
+        let (mut svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        svm.inner.set_sysvar(&Clock {
+            unix_timestamp: now,
+            ..svm.inner.get_sysvar::<Clock>()
+        });
+        svm.inner.svm.add_program(PROGRAM_ID, &elf).unwrap();
+        svm.set_account(
+            &market,
+            Account {
+                data: market_data,
+                ..market_account.clone()
+            },
+        )
+        .unwrap();
+        for (address, account) in linked.iter().zip(&accounts) {
+            svm.set_account(&Pubkey::from_str_const(address), account.clone())
+                .unwrap();
+        }
+        let base_mint = market_key(&market_account.data, 576);
+        let quote_mint = market_key(&market_account.data, 608);
+        svm.set_account(&user[0], token_account(base_mint, signer.pubkey(), 0))
+            .unwrap();
+        svm.set_account(
+            &user[1],
+            token_account(quote_mint, signer.pubkey(), 100_000_000),
+        )
+        .unwrap();
+        svm.inner.airdrop(&signer.pubkey(), 1_000_000_000).unwrap();
+
+        let transaction = Transaction::new_signed_with_payer(
+            &[take_order(
+                signer.pubkey(),
+                market,
+                &market_account.data,
+                user,
+            )],
+            Some(&signer.pubkey()),
+            &[&signer],
+            svm.latest_blockhash(),
+        );
+        svm.send_transaction(transaction.into(), false, true)
+            .map(|_| ())
+            .map_err(|failed| failed.err)
+    };
+
+    run(market_account.data.clone())
+        .unwrap_or_else(|e| panic!("the live market should take the order, got {e:?}"));
+
+    let expired = SurfnetSvm::default()
+        .0
+        .get_forged_account_data(
+            &market,
+            &market_account.data,
+            template.idl(),
+            &HashMap::from([("time_expiry".to_string(), serde_json::json!(-1))]),
+        )
+        .unwrap();
+    assert_eq!(
+        run(expired),
+        Err(TransactionError::InstructionError(
+            0,
+            InstructionError::Custom(MARKET_HAS_EXPIRED)
+        )),
+        "the deployed program should refuse the order as MarketHasExpired"
+    );
 }
