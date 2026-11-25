@@ -1,0 +1,12 @@
+[
+  "Cargo.toml",
+  "crates/bench/Cargo.toml",
+  "crates/cli/Cargo.toml",
+  "crates/core/Cargo.toml",
+  "crates/db/Cargo.toml",
+  "crates/mcp/Cargo.toml",
+  "crates/sdk/Cargo.toml",
+  "crates/sdk-node/Cargo.toml",
+  "crates/studio/Cargo.toml",
+  "crates/types/Cargo.toml"
+]

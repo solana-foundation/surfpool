@@ -21,3 +21,6 @@ crates/types/bindings/
 
 # surfpool-bench output
 bench-results/
+
+# Local repository settings audit; includes administrator rollout notes.
+/docs/security/admin-gaps.md
