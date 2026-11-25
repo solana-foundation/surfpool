@@ -722,7 +722,6 @@ impl StartSimnet {
             block_production_mode: self.svm.block_production_mode.clone(),
             airdrop_addresses,
             airdrop_token_amount: self.accounts.airdrop_token_amount,
-            expiry: None,
             offline_mode: self.network.offline,
             instruction_profiling_enabled: !self.observability.disable_instruction_profiling,
             max_profiles: self.observability.max_profiles,
