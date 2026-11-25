@@ -45,6 +45,11 @@ GitHub release, attaches the binaries, publishes the release, and pushes Docker
 images. `release_crates.yaml` and `release_sdk_node_npm.yml` see the new version
 on `main` and wait for approval in the `release` environment before publishing.
 
+The npm workflow publishes a stable version only from the push that changed it.
+If that run fails, re-run its failed jobs, or run **Publish SDK Node Package**
+manually on the release tag (e.g. `v1.8.0`). Packages that already published
+are skipped.
+
 To force a specific version, add a `Release-As: X.Y.Z` footer to a commit on `main`.
 
 ## Files
