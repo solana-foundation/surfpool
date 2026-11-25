@@ -1,0 +1,103 @@
+# Sensitive paths automatically request owner review to help flag changes for inspection.
+# Keep the owner singular: GitHub accepts any one owner listed on a matching rule.
+# The security checker supports basename globs and literal directory/root paths.
+
+# CI, policy, dependency resolution, and toolchains.
+/.github/ @MicaiahReid
+/.cargo/ @MicaiahReid
+Cargo.toml @MicaiahReid
+Cargo.lock @MicaiahReid
+package.json @MicaiahReid
+package-lock.json @MicaiahReid
+npm-shrinkwrap.json @MicaiahReid
+pnpm-lock.yaml @MicaiahReid
+pnpm-workspace.yaml @MicaiahReid
+yarn.lock @MicaiahReid
+bun.lock* @MicaiahReid
+.npmrc @MicaiahReid
+.yarnrc* @MicaiahReid
+requirements*.txt @MicaiahReid
+pyproject.toml @MicaiahReid
+poetry.lock @MicaiahReid
+uv.lock @MicaiahReid
+Pipfile* @MicaiahReid
+setup.py @MicaiahReid
+setup.cfg @MicaiahReid
+go.mod @MicaiahReid
+go.sum @MicaiahReid
+rust-toolchain* @MicaiahReid
+/deny.toml @MicaiahReid
+
+# Build, install, code generation, and release entry points.
+*.sh @MicaiahReid
+*.bash @MicaiahReid
+*.ps1 @MicaiahReid
+*.bat @MicaiahReid
+*.cmd @MicaiahReid
+build.rs @MicaiahReid
+Makefile* @MicaiahReid
+makefile* @MicaiahReid
+GNUmakefile @MicaiahReid
+Justfile @MicaiahReid
+justfile @MicaiahReid
+Dockerfile* @MicaiahReid
+*.Dockerfile @MicaiahReid
+scripts/ @MicaiahReid
+/crates/core/src/scenarios/protocols/raydium/v4/generate-markets.js @MicaiahReid
+/crates/core/src/scenarios/protocols/pyth/v2/generate-price-feeds.js @MicaiahReid
+
+# Public interfaces, network, signing, storage, filesystem, and process execution.
+/crates/cli/src/ @MicaiahReid
+/crates/core/src/rpc/ @MicaiahReid
+/crates/core/src/surfnet/ @MicaiahReid
+/crates/core/src/runloops/ @MicaiahReid
+/crates/core/src/storage/ @MicaiahReid
+/crates/core/src/telemetry.rs @MicaiahReid
+/crates/core/src/lib.rs @MicaiahReid
+/crates/core/src/types.rs @MicaiahReid
+/crates/core/src/error.rs @MicaiahReid
+/crates/core/src/scenarios/ @MicaiahReid
+/crates/db/src/ @MicaiahReid
+/crates/mcp/src/ @MicaiahReid
+/crates/sdk/src/ @MicaiahReid
+/crates/sdk-node/src/ @MicaiahReid
+/crates/sdk-node/surfpool-sdk/ @MicaiahReid
+/crates/studio/src/ @MicaiahReid
+/crates/types/src/ @MicaiahReid
+/crates/bench/src/main.rs @MicaiahReid
+/crates/bench/src/server.rs @MicaiahReid
+/crates/bench/src/results.rs @MicaiahReid
+/crates/bench/src/workloads/ @MicaiahReid
+auth/ @MicaiahReid
+crypto/ @MicaiahReid
+
+# Fixtures, generated payloads, minified code, and binary formats.
+tests/ @MicaiahReid
+__tests__/ @MicaiahReid
+fixtures/ @MicaiahReid
+testdata/ @MicaiahReid
+__fixtures__/ @MicaiahReid
+assets/ @MicaiahReid
+snapshots/ @MicaiahReid
+*.min.* @MicaiahReid
+*.snap @MicaiahReid
+*.bin @MicaiahReid
+*.so @MicaiahReid
+*.dylib @MicaiahReid
+*.dll @MicaiahReid
+*.exe @MicaiahReid
+*.node @MicaiahReid
+*.wasm @MicaiahReid
+*.zip @MicaiahReid
+*.gz @MicaiahReid
+*.tar @MicaiahReid
+*.png @MicaiahReid
+*.jpg @MicaiahReid
+*.jpeg @MicaiahReid
+*.gif @MicaiahReid
+*.ico @MicaiahReid
+*.pdf @MicaiahReid
+
+# Review-policy documentation and local artifact exclusions.
+/doc/security-review.md @MicaiahReid
+/.gitignore @MicaiahReid

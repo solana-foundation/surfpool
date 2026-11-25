@@ -1,0 +1,85 @@
+name: PR security
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  sensitive-changes:
+    name: Sensitive changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # Findings and tool failures are advisory; incomplete analysis stays visible.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        id: checkout
+        continue-on-error: true
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Fetch PR objects
+        id: fetch
+        continue-on-error: true
+        env:
+          PR_NUMBER: ${{ github.event.number }}
+        run: git fetch --no-tags origin "refs/pull/$PR_NUMBER/head"
+      # Initial adoption has no base checker and needs full manual review.
+      - name: Bootstrap initial policy adoption
+        id: bootstrap
+        continue-on-error: true
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ ! -f .github/security/check-pr.mjs ]; then
+            echo "::notice::Initial policy adoption: manually review the checker and CODEOWNERS before merging."
+            mkdir -p .github/security
+            git show "$HEAD_SHA:.github/security/check-pr.mjs" > .github/security/check-pr.mjs
+            git show "$HEAD_SHA:.github/CODEOWNERS" > .github/CODEOWNERS
+            git show "$HEAD_SHA:.github/security/workspace-manifests.json" > .github/security/workspace-manifests.json
+          fi
+      - name: Report sensitive paths, lockfiles, and payloads
+        id: scan
+        continue-on-error: true
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: node .github/security/check-pr.mjs "$BASE_SHA" "$HEAD_SHA"
+      - name: Report incomplete analysis
+        if: >-
+          always() && (steps.checkout.outcome != 'success' ||
+          steps.fetch.outcome != 'success' || steps.bootstrap.outcome != 'success' ||
+          steps.scan.outcome != 'success')
+        run: |
+          echo "::warning::Sensitive-change analysis did not complete. See job logs."
+          echo "## Sensitive-change analysis incomplete" >> "$GITHUB_STEP_SUMMARY"
+          echo "No clean result is available. Inspect job logs and retry the workflow." >> "$GITHUB_STEP_SUMMARY"
+
+  dependency-review:
+    name: Dependency review
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        id: checkout
+        continue-on-error: true
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+      - uses: actions/dependency-review-action@2031cfc080254a8a887f58cffee85186f0e49e48 # v4.9.0
+        id: dependencies
+        continue-on-error: true
+        with:
+          warn-only: true
+          comment-summary-in-pr: never
+          show-openssf-scorecard: false
+          base-ref: ${{ github.event.pull_request.base.sha }}
+          head-ref: ${{ github.event.pull_request.head.sha }}
+      - name: Report incomplete analysis
+        if: always() && (steps.checkout.outcome != 'success' || steps.dependencies.outcome != 'success')
+        run: |
+          echo "::warning::Dependency review did not complete. See job logs."
+          echo "## Dependency review incomplete" >> "$GITHUB_STEP_SUMMARY"
+          echo "No clean result is available. Inspect job logs and retry the workflow." >> "$GITHUB_STEP_SUMMARY"
