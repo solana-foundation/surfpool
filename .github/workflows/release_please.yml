@@ -22,6 +22,9 @@ jobs:
     name: Release Please
     if: github.event.repository.fork == false
     runs-on: ubuntu-latest
+    # Holds RELEASE_PLEASE_TOKEN. Restrict this environment to `main` so a
+    # workflow pushed on another branch cannot read the token.
+    environment: release-please
     permissions:
       contents: write
       issues: write
@@ -30,7 +33,7 @@ jobs:
       release_created: ${{ steps.release.outputs.release_created }}
       tag_name: ${{ steps.release.outputs.tag_name }}
     steps:
-      - uses: googleapis/release-please-action@v5
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         id: release
         with:
           # PRs opened with GITHUB_TOKEN do not trigger CI. Set this secret
@@ -48,7 +51,6 @@ jobs:
     uses: ./.github/workflows/release_cli.yaml
     with:
       tag: ${{ needs.release_please.outputs.tag_name }}
-    secrets: inherit
 
   image:
     name: Docker Image
@@ -59,4 +61,6 @@ jobs:
     uses: ./.github/workflows/release_image.yml
     with:
       tag: ${{ needs.release_please.outputs.tag_name }}
-    secrets: inherit
+    secrets:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}

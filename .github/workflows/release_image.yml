@@ -23,6 +23,11 @@ on:
         required: false
         type: string
         default: ""
+    secrets:
+      DOCKERHUB_USERNAME:
+        required: true
+      DOCKERHUB_TOKEN:
+        required: true
 
 env:
   REGISTRY: docker.io

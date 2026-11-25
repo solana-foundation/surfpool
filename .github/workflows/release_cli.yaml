@@ -374,4 +374,6 @@ jobs:
       tag: edge
       ref: ${{ github.sha }}
       version: ${{ needs.version.outputs.version }}
-    secrets: inherit
+    secrets:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
