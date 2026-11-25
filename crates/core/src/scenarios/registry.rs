@@ -532,6 +532,7 @@ mod tests {
     use surfpool_types::{AccountAddress, PdaSeed};
 
     use super::*;
+    use crate::surfnet::svm::SurfnetSvm;
 
     #[test]
     fn collection_llm_context_leads_every_template_context() {
@@ -799,6 +800,31 @@ templates:
     }
 
     #[test]
+    fn pump_pool_virtual_quote_reserves_takes_the_pool_by_address() {
+        let registry = TemplateRegistry::new();
+        let template = registry.get("pump-amm-pool-state").expect("template");
+        assert!(!template.raw_layout);
+        assert_eq!(template.address, AccountAddress::Pubkey(String::new()));
+
+        let property = template
+            .properties
+            .iter()
+            .find(|p| p.path == "virtual_quote_reserves")
+            .expect("pump-amm-pool-state writes virtual_quote_reserves");
+        assert_eq!(property.offset, None);
+        assert_eq!(property.encoding, None);
+        assert_eq!(
+            Some(property),
+            registry
+                .get("pump-amm-canonical-pool")
+                .expect("template")
+                .properties
+                .iter()
+                .find(|p| p.path == "virtual_quote_reserves")
+        );
+    }
+
+    #[test]
     fn pump_pool_address_needs_every_seed_to_resolve() {
         let registry = TemplateRegistry::new();
         let template = registry.get("pump-amm-canonical-pool").expect("template");
@@ -808,6 +834,62 @@ templates:
             None,
             "a missing base mint must not derive a shorter address"
         );
+    }
+
+    /// The bundled `Pool` type is 287 bytes with `virtual_quote_reserves` as an i128 at bytes
+    /// 245..261. An IDL write decodes the whole type, so it fails on a shorter pool.
+    #[test]
+    fn pump_virtual_quote_reserves_writes_only_bytes_245_to_261() {
+        const POOL_IDL_LEN: usize = 287;
+        let registry = TemplateRegistry::new();
+        let template = registry.get("pump-amm-canonical-pool").expect("template");
+        let idl = template.idl.as_ref().expect("IDL");
+        let values = HashMap::from([
+            (
+                "virtual_quote_reserves".to_string(),
+                serde_json::json!("-170141183460469231731687303715884105728"),
+            ),
+            (
+                "base_mint".to_string(),
+                serde_json::json!("7LSsEoJGhLeZzGvDofTdNg7M3JttxQqGWNLo6vWMpump"),
+            ),
+        ]);
+        let (account_values, ..) = account_data_values(
+            &OverrideInstance::new(template.id.clone(), 0, template.address.clone())
+                .with_values(values),
+            Some(template),
+        );
+        assert_eq!(
+            account_values.keys().collect::<Vec<_>>(),
+            ["virtual_quote_reserves"]
+        );
+
+        let mut pool: Vec<u8> = (0..300).map(|i| i as u8).collect();
+        for bool_offset in [243, 244, 269, 270] {
+            pool[bool_offset] = 1;
+        }
+        let forged = [
+            &pool[..8],
+            &SurfnetSvm::get_forged_idl_type_data(&pool[8..], idl, "Pool", &account_values)
+                .unwrap(),
+        ]
+        .concat();
+        assert_eq!(forged.len(), pool.len());
+        assert_eq!(forged[..245], pool[..245]);
+        assert_eq!(forged[245..261], i128::MIN.to_le_bytes());
+        assert_eq!(forged[261..], pool[261..]);
+
+        for len in [211, 243, 244, 245, 260, 261, 270, 271, POOL_IDL_LEN - 1] {
+            let error =
+                SurfnetSvm::get_forged_idl_type_data(&pool[8..len], idl, "Pool", &account_values)
+                    .unwrap_err();
+            assert!(
+                error.to_string().contains("Failed to deserialize"),
+                "{len}: {error}"
+            );
+        }
+        SurfnetSvm::get_forged_idl_type_data(&pool[8..POOL_IDL_LEN], idl, "Pool", &account_values)
+            .expect("a pool as long as its IDL type");
     }
 
     #[test]
