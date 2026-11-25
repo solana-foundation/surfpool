@@ -58,7 +58,6 @@ use surfpool_types::{
     KeyedProfileResult, ProfileResult, RpcProfileResultConfig, RunbookExecutionStatusReport,
     SimnetCommand, SimnetEventsTx, StartupError, SurfnetStartupStatus, SurfnetStartupTask,
     TransactionConfirmationStatus, TransactionStatusEvent, UiKeyedProfileResult, UuidOrSignature,
-    VersionedIdl,
 };
 use tokio::sync::RwLock;
 use txtx_addon_kit::indexmap::IndexSet;
@@ -2323,13 +2322,16 @@ impl SurfnetSvmLocker {
                             None,
                         )
                     }
-                    Err(FailedTransactionMetadata { err, meta }) => ProfileResult::new(
-                        pre_execution_capture_cursor,
-                        BTreeMap::new(),
-                        meta.compute_units_consumed,
-                        Some(meta.logs),
-                        Some(err.to_string()),
-                    ),
+                    Err(FailedTransactionMetadata { err, meta }) => {
+                        let error_message = svm_reader.describe_transaction_error(&err, &meta.logs);
+                        ProfileResult::new(
+                            pre_execution_capture_cursor,
+                            BTreeMap::new(),
+                            meta.compute_units_consumed,
+                            Some(meta.logs),
+                            Some(error_message),
+                        )
+                    }
                 }
             });
 
@@ -2365,12 +2367,14 @@ impl SurfnetSvmLocker {
 
         let cus = meta.compute_units_consumed;
         let log_messages = meta.logs.clone();
-        let err_string = err.to_string();
+        let err_string = self.with_svm_reader(|svm_reader| {
+            svm_reader.describe_transaction_error(&err, &log_messages)
+        });
 
         if do_propagate {
             let meta = convert_transaction_metadata_from_canonical(&meta);
             let simnet_events_tx = self.simnet_events_tx();
-            simnet_events_tx.error(format!("Transaction simulation failed: {}", err));
+            simnet_events_tx.error(format!("Transaction simulation failed: {}", err_string));
 
             self.with_svm_writer(|svm_writer| {
                 svm_writer.notify_signature_subscribers(
@@ -2415,7 +2419,7 @@ impl SurfnetSvmLocker {
 
         let cus = meta.compute_units_consumed;
         let log_messages = meta.logs.clone();
-        let err_string = err.to_string();
+        let err_string = svm_writer.describe_transaction_error(&err, &log_messages);
         let signature = meta.signature;
 
         let accounts_after = pubkeys_from_message
@@ -2454,7 +2458,7 @@ impl SurfnetSvmLocker {
             let meta_canonical = convert_transaction_metadata_from_canonical(&meta);
             svm_writer
                 .simnet_events_tx
-                .error(format!("Transaction execution failed: {}", err));
+                .error(format!("Transaction execution failed: {}", err_string));
             let _ = status_tx.try_send(TransactionStatusEvent::ExecutionFailure((
                 err.clone(),
                 meta_canonical.clone(),
@@ -3618,22 +3622,7 @@ impl SurfnetSvmLocker {
     }
 
     pub fn get_idl(&self, address: &Pubkey, slot: Option<Slot>) -> Option<Idl> {
-        self.with_svm_reader(|svm_reader| {
-            let query_slot = slot.unwrap_or_else(|| svm_reader.get_latest_absolute_slot());
-            // IDLs are stored sorted by slot descending, so the first one that passes the filter is the latest
-            svm_reader
-                .registered_idls
-                .get(&address.to_string())
-                .ok()
-                .flatten()
-                .and_then(|idl_versions| {
-                    idl_versions
-                        .iter()
-                        .filter(|VersionedIdl(s, _)| *s <= query_slot)
-                        .max()
-                        .map(|VersionedIdl(_, idl)| idl.clone())
-                })
-        })
+        self.with_svm_reader(|svm_reader| svm_reader.get_idl(address, slot))
     }
 
     /// Forges account data by decoding with IDL, applying overrides, and re-encoding.
