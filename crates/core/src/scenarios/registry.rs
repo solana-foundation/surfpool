@@ -76,9 +76,6 @@ pub const HUMIDIFI_VAULT_OVERRIDES_CONTENT: &str =
 pub const HUMIDIFI_KEEP_ALIVE_CONTENT: &str =
     include_str!("./protocols/humidifi/v8/keep-alive.yaml");
 
-pub const DRIFT_V2_IDL_CONTENT: &str = include_str!("./protocols/drift/v2/idl.json");
-pub const DRIFT_V2_OVERRIDES_CONTENT: &str = include_str!("./protocols/drift/v2/overrides.yaml");
-
 pub const WHIRLPOOL_IDL_CONTENT: &str = include_str!("./protocols/whirlpool/idl.json");
 pub const WHIRLPOOL_OVERRIDES_CONTENT: &str = include_str!("./protocols/whirlpool/overrides.yaml");
 
@@ -159,7 +156,6 @@ impl TemplateRegistry {
         default.load_humidifi_overrides();
         default.load_solfi_overrides();
         default.load_bisonfi_overrides();
-        default.load_drift_overrides();
         default.load_whirlpool_overrides();
         default.load_spl_token_overrides();
         default.load_pump_overrides();
@@ -350,10 +346,6 @@ impl TemplateRegistry {
         self.load_raw_layout_overrides(HUMIDIFI_MARKET_OVERRIDES_CONTENT, "humidifi-market");
         self.load_raw_layout_overrides(HUMIDIFI_VAULT_OVERRIDES_CONTENT, "humidifi-vault");
         self.load_keep_alive(None, HUMIDIFI_KEEP_ALIVE_CONTENT, "humidifi");
-    }
-
-    pub fn load_drift_overrides(&mut self) {
-        self.load_protocol_overrides(DRIFT_V2_IDL_CONTENT, DRIFT_V2_OVERRIDES_CONTENT, "drift");
     }
 
     pub fn load_whirlpool_overrides(&mut self) {
@@ -896,14 +888,14 @@ templates:
     fn test_registry_loads_all_protocols() {
         let registry = TemplateRegistry::new();
 
-        // Pyth (1) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Drift (4) + Meteora (2)
+        // Pyth (1) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Meteora (2)
         // + Kamino (Lend 17, Scope 3, Farms 5, Swap 2, Vault 5, Liquidity 4 = 36)
         // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + GoonFi (4) + HumidiFi (3)
-        // + SolFi (4) + BisonFi (3) + Phoenix Eternal (19) = 95
+        // + SolFi (4) + BisonFi (3) + Phoenix Eternal (19) = 91
         assert_eq!(
             registry.count(),
-            95,
-            "Registry should load 95 templates total"
+            91,
+            "Registry should load 91 templates total"
         );
 
         assert!(registry.contains("pyth-price-feed-v2"));
@@ -952,11 +944,6 @@ templates:
         assert!(registry.contains("kamino-liquidity-strategy-balances"));
         assert!(registry.contains("kamino-liquidity-strategy-rewards"));
         assert!(registry.contains("kamino-liquidity-strategy-guards"));
-
-        assert!(registry.contains("drift-perp-market"));
-        assert!(registry.contains("drift-spot-market"));
-        assert!(registry.contains("drift-user-state"));
-        assert!(registry.contains("drift-global-state"));
 
         assert!(registry.contains("whirlpool-sol-usdc"));
         assert!(registry.contains("whirlpool-sol-usdt"));
@@ -1683,7 +1670,6 @@ templates: []
         assert!(ids.contains(&"kamino-lending-market-risk".to_string()));
         assert!(ids.contains(&"kamino-scope-price".to_string()));
         assert!(ids.contains(&"kamino-farms-user-rewards".to_string()));
-        assert!(ids.contains(&"drift-perp-market".to_string()));
         assert!(ids.contains(&"whirlpool-sol-usdc".to_string()));
         assert!(ids.contains(&"whirlpool-sol-usdt".to_string()));
         assert!(ids.contains(&"whirlpool-msol-sol".to_string()));

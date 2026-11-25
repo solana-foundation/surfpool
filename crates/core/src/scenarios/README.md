@@ -17,7 +17,6 @@ Protocols that are natively supported by Surfpool will have their IDLs included 
 - **Jupiter v6** - DEX aggregator with TokenLedger manipulation template
 - **Switchboard On-Demand** - On-demand oracle with QuoteAccount override template
 - **Kamino** – Lending (v1.27.0), Scope oracle, Farms, Swap/LIMO, Earn vaults and Liquidity, across six programs. See [protocols/kamino/README.md](./protocols/kamino/README.md)
-- **Drift v2** - Perp and spot markets, user state, and global state
 - **BisonFi v3** – Proprietary market maker with price, depth and spread templates; its quote and market tick are kept alive. See [protocols/bisonfi/README.md](./protocols/bisonfi/README.md)
 - **Pump v1** - Bonding curve launchpad with curve reserve and global config override templates
 - **Phoenix Eternal** - Perpetuals venue with trader collateral, mark price, maintenance margin, market fee, withdraw limit, trader capability, stop-loss trigger and delegated permission templates. See [protocols/phoenix-eternal/README.md](./protocols/phoenix-eternal/README.md)
