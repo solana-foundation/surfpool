@@ -1,6 +1,14 @@
 name: Publish SDK Node Package
 
+# On a push to main that changes package.json's version (a merged release PR),
+# publishes that version. On any other push, when the NPM_EDGE_ENABLED
+# repository variable is "true", publishes an edge build under the `edge`
+# dist-tag. A manual run publishes whichever packages of the checked-out
+# version are missing from npm.
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
     inputs:
       dry_run:
@@ -21,15 +29,16 @@ jobs:
     name: Prepare Release
     runs-on: ubuntu-latest
     outputs:
+      mode: ${{ steps.package.outputs.mode }}
+      dist_tag: ${{ steps.package.outputs.dist_tag }}
       version: ${{ steps.package.outputs.version }}
-      publish_root: ${{ steps.package.outputs.publish_root }}
-      publish_darwin_x64: ${{ steps.package.outputs.publish_darwin_x64 }}
-      publish_darwin_arm64: ${{ steps.package.outputs.publish_darwin_arm64 }}
-      publish_linux_x64_gnu: ${{ steps.package.outputs.publish_linux_x64_gnu }}
       should_publish: ${{ steps.package.outputs.should_publish }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          filter: tree:0
 
       - name: Set up Node
         uses: actions/setup-node@v4
@@ -46,31 +55,59 @@ jobs:
         id: package
         working-directory: crates/sdk-node
         shell: bash
+        env:
+          EDGE_ENABLED: ${{ github.event_name == 'push' && vars.NPM_EDGE_ENABLED == 'true' }}
+          IS_PUSH: ${{ github.event_name == 'push' }}
+          BEFORE_SHA: ${{ github.event.before }}
         run: |
           VERSION=$(node -p "require('./package.json').version")
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          SHOULD_PUBLISH=false
 
-          for ENTRY in \
-            "@solana/surfpool publish_root" \
-            "@solana/surfpool-darwin-x64 publish_darwin_x64" \
-            "@solana/surfpool-darwin-arm64 publish_darwin_arm64" \
-            "@solana/surfpool-linux-x64-gnu publish_linux_x64_gnu"
+          UNPUBLISHED=false
+          for PACKAGE_NAME in \
+            @solana/surfpool \
+            @solana/surfpool-darwin-x64 \
+            @solana/surfpool-darwin-arm64 \
+            @solana/surfpool-linux-x64-gnu
           do
-            PACKAGE_NAME="${ENTRY% *}"
-            OUTPUT_NAME="${ENTRY#* }"
-
             if npm view "${PACKAGE_NAME}@${VERSION}" version --registry=https://registry.npmjs.org >/dev/null 2>&1; then
-              echo "${OUTPUT_NAME}=false" >> "$GITHUB_OUTPUT"
               echo "${PACKAGE_NAME}@${VERSION} is already published"
             else
-              echo "${OUTPUT_NAME}=true" >> "$GITHUB_OUTPUT"
-              echo "${PACKAGE_NAME}@${VERSION} is ready to publish"
-              SHOULD_PUBLISH=true
+              echo "${PACKAGE_NAME}@${VERSION} is not published"
+              UNPUBLISHED=true
             fi
           done
 
-          echo "should_publish=${SHOULD_PUBLISH}" >> "$GITHUB_OUTPUT"
+          # A later merge can land while the release publish waits for approval;
+          # it must not publish its own code under the release version.
+          BUMPED=true
+          if [[ "$IS_PUSH" == "true" ]]; then
+            PREVIOUS=$(git show "${BEFORE_SHA}:crates/sdk-node/package.json" 2>/dev/null \
+              | node -p "JSON.parse(require('fs').readFileSync(0, 'utf8')).version" 2>/dev/null || true)
+            [[ -n "$PREVIOUS" && "$PREVIOUS" != "$VERSION" ]] || BUMPED=false
+          fi
+
+          if [[ "$UNPUBLISHED" == "true" && "$BUMPED" == "true" ]]; then
+            MODE=stable
+            DIST_TAG=latest
+          else
+            if [[ "$UNPUBLISHED" == "true" ]]; then
+              echo "::warning::${VERSION} is not fully published, but this push did not set it. Run this workflow on tag v${VERSION} to publish it."
+            fi
+            if [[ "$EDGE_ENABLED" == "true" ]]; then
+              MODE=edge
+              DIST_TAG=edge
+              VERSION="$(../../.github/scripts/edge-version.sh)"
+            else
+              MODE=none
+              DIST_TAG=latest
+            fi
+          fi
+
+          echo "::notice::npm publish mode: $MODE ($VERSION)"
+          echo "mode=${MODE}" >> "$GITHUB_OUTPUT"
+          echo "dist_tag=${DIST_TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "should_publish=$([[ "$MODE" != none ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
 
   build_artifacts:
     name: Build (${{ matrix.name }})
@@ -119,6 +156,11 @@ jobs:
           node-version: 24.22.1
           cache: npm
           cache-dependency-path: crates/sdk-node/package-lock.json
+
+      # Runs after the cache steps so their keys hash the committed lockfiles.
+      - name: Stamp edge version
+        if: needs.prepare_release.outputs.mode == 'edge'
+        run: node .github/scripts/set-version.js "${{ needs.prepare_release.outputs.version }}"
 
       - name: Install npm dependencies
         working-directory: crates/sdk-node
@@ -202,7 +244,14 @@ jobs:
       - build_artifacts
     if: needs.prepare_release.outputs.should_publish == 'true'
     runs-on: ubuntu-latest
-    environment: release
+    # `release` requires a reviewer; edge builds publish on every merge, so they
+    # use an environment without one.
+    environment: ${{ needs.prepare_release.outputs.mode == 'edge' && 'edge' || 'release' }}
+    # Serializes edge publishes so the "is edge already newer?" check below
+    # cannot race another run's publish.
+    concurrency:
+      group: npm-publish-${{ needs.prepare_release.outputs.mode }}
+      cancel-in-progress: false
     permissions:
       contents: read
       id-token: write
@@ -228,6 +277,10 @@ jobs:
         run: |
           npm install -g npm@^11.10.0
           npm --version
+
+      - name: Stamp edge version
+        if: needs.prepare_release.outputs.mode == 'edge'
+        run: node .github/scripts/set-version.js "${{ needs.prepare_release.outputs.version }}"
 
       - name: Install publish tooling
         working-directory: crates/sdk-node
@@ -272,42 +325,39 @@ jobs:
           cd ../darwin-arm64 && NPM_CONFIG_CACHE=$(mktemp -d) npm pack --dry-run
           cd ../linux-x64-gnu && NPM_CONFIG_CACHE=$(mktemp -d) npm pack --dry-run
 
-      - name: Publish darwin-x64 package
-        if: inputs.dry_run != true && needs.prepare_release.outputs.publish_darwin_x64 == 'true'
-        working-directory: crates/sdk-node/npm/darwin-x64
-        run: npm publish --access public --provenance
-
-      - name: Publish darwin-arm64 package
-        if: inputs.dry_run != true && needs.prepare_release.outputs.publish_darwin_arm64 == 'true'
-        working-directory: crates/sdk-node/npm/darwin-arm64
-        run: npm publish --access public --provenance
-
-      - name: Publish linux-x64-gnu package
-        if: inputs.dry_run != true && needs.prepare_release.outputs.publish_linux_x64_gnu == 'true'
-        working-directory: crates/sdk-node/npm/linux-x64-gnu
-        run: npm publish --access public --provenance
-
-      - name: Dry run darwin-x64 publish
-        if: inputs.dry_run == true && needs.prepare_release.outputs.publish_darwin_x64 == 'true'
-        working-directory: crates/sdk-node/npm/darwin-x64
-        run: npm publish --dry-run --access public
-
-      - name: Dry run darwin-arm64 publish
-        if: inputs.dry_run == true && needs.prepare_release.outputs.publish_darwin_arm64 == 'true'
-        working-directory: crates/sdk-node/npm/darwin-arm64
-        run: npm publish --dry-run --access public
-
-      - name: Dry run linux-x64-gnu publish
-        if: inputs.dry_run == true && needs.prepare_release.outputs.publish_linux_x64_gnu == 'true'
-        working-directory: crates/sdk-node/npm/linux-x64-gnu
-        run: npm publish --dry-run --access public
-
-      - name: Publish root package
-        if: inputs.dry_run != true && needs.prepare_release.outputs.publish_root == 'true'
+      # Checks each package right before publishing, so re-running a partly
+      # failed publish finishes the remaining packages instead of failing on
+      # the ones already out.
+      - name: Publish packages
         working-directory: crates/sdk-node
-        run: npm publish --access public --provenance
+        env:
+          MODE: ${{ needs.prepare_release.outputs.mode }}
+          DIST_TAG: ${{ needs.prepare_release.outputs.dist_tag }}
+          DRY_RUN: ${{ inputs.dry_run == true }}
+        run: |
+          set -euo pipefail
+          VERSION=$(node -p "require('./package.json').version")
 
-      - name: Dry run root publish
-        if: inputs.dry_run == true && needs.prepare_release.outputs.publish_root == 'true'
-        working-directory: crates/sdk-node
-        run: npm publish --dry-run --access public
+          # Edge versions end in the commit count on main, so a larger number is
+          # a newer commit. An older run finishing late must not move `edge` back.
+          if [[ "$MODE" == "edge" ]]; then
+            CURRENT=$(npm view @solana/surfpool dist-tags.edge 2>/dev/null || true)
+            if [[ "$CURRENT" =~ -edge\.([0-9]+)$ ]] && (( BASH_REMATCH[1] >= ${VERSION##*-edge.} )); then
+              echo "::notice::Skipping ${VERSION}: edge already points at ${CURRENT}"
+              exit 0
+            fi
+          fi
+
+          # Platform packages first; the root package's optionalDependencies pin them.
+          for DIR in npm/darwin-x64 npm/darwin-arm64 npm/linux-x64-gnu .; do
+            NAME=$(node -p "require('./${DIR}/package.json').name")
+            if npm view "${NAME}@${VERSION}" version >/dev/null 2>&1; then
+              echo "${NAME}@${VERSION} is already published, skipping"
+              continue
+            fi
+            if [[ "$DRY_RUN" == "true" ]]; then
+              (cd "$DIR" && npm publish --dry-run --access public --tag "$DIST_TAG")
+            else
+              (cd "$DIR" && npm publish --access public --provenance --tag "$DIST_TAG")
+            fi
+          done

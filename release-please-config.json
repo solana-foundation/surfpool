@@ -1,0 +1,48 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "include-component-in-tag": false,
+  "include-v-in-tag": true,
+  "pull-request-title-pattern": "chore(release): publish v${version}",
+  "pull-request-header": "Merging this PR cuts the release. Binaries, Docker images, crates and the npm package publish from the merge commit.",
+  "draft": true,
+  "force-tag-creation": true,
+  "packages": {
+    ".": {
+      "release-type": "simple",
+      "package-name": "surfpool",
+      "changelog-path": "CHANGELOG.md",
+      "extra-files": [
+        {
+          "type": "toml",
+          "path": "Cargo.toml",
+          "jsonpath": "$.workspace.package.version"
+        },
+        {
+          "type": "toml",
+          "path": "Cargo.toml",
+          "jsonpath": "$.workspace.dependencies[surfpool-core,surfpool-db,surfpool-mcp,surfpool-sdk,surfpool-types].version"
+        },
+        {
+          "type": "toml",
+          "path": "Cargo.lock",
+          "jsonpath": "$.package[?(@.name.value == 'surfpool-bench' || @.name.value == 'surfpool-cli' || @.name.value == 'surfpool-core' || @.name.value == 'surfpool-db' || @.name.value == 'surfpool-mcp' || @.name.value == 'surfpool-sdk' || @.name.value == 'surfpool-sdk-node' || @.name.value == 'surfpool-types')].version"
+        },
+        {
+          "type": "json",
+          "path": "crates/sdk-node/package.json",
+          "jsonpath": "$.version"
+        },
+        {
+          "type": "json",
+          "path": "crates/sdk-node/package-lock.json",
+          "jsonpath": "$.version"
+        },
+        {
+          "type": "json",
+          "path": "crates/sdk-node/package-lock.json",
+          "jsonpath": "$.packages[''].version"
+        }
+      ]
+    }
+  }
+}

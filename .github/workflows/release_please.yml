@@ -1,0 +1,66 @@
+name: Release Please
+
+# Keeps the release PR up to date with every merge to main. Merging that PR
+# makes release-please tag the merge commit and open a draft GitHub release;
+# the jobs below attach binaries, publish the release, and push Docker images.
+# Crates and the npm package publish from their own workflows when they see
+# the new version on main.
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-please
+  cancel-in-progress: false
+
+jobs:
+  release_please:
+    name: Release Please
+    if: github.event.repository.fork == false
+    runs-on: ubuntu-latest
+    # RELEASE_PLEASE_TOKEN is an environment secret rather than a repository
+    # secret, so only jobs that may deploy to this environment can read it.
+    environment: release-please
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        id: release
+        with:
+          # GITHUB_TOKEN works, but a release PR it opens does not trigger CI;
+          # PRs opened with RELEASE_PLEASE_TOKEN do.
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || github.token }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  binaries:
+    name: Binaries
+    needs: release_please
+    if: needs.release_please.outputs.release_created == 'true'
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release_cli.yaml
+    with:
+      tag: ${{ needs.release_please.outputs.tag_name }}
+
+  image:
+    name: Docker Image
+    needs:
+      - release_please
+      - binaries
+    if: needs.release_please.outputs.release_created == 'true'
+    uses: ./.github/workflows/release_image.yml
+    with:
+      tag: ${{ needs.release_please.outputs.tag_name }}
+    secrets:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}

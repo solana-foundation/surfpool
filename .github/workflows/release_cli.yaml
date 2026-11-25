@@ -7,54 +7,73 @@ on:
       - supervised
       - feat/surfpool-studio
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      tag:
+        description: "Draft release tag created by release-please (e.g. v1.8.0); its binaries are attached and the release is published"
+        required: true
+        type: string
 
 env:
   AWS_REGION: us-east-1
   S3_BUCKET: txtx-public
 
 concurrency:
-  group: ${{ github.workflow }} @ ${{ github.event.pull_request.head.label || github.head_ref || github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }} @ ${{ inputs.tag || github.event.pull_request.head.label || github.head_ref || github.ref }}
+  # A newer merge supersedes an in-flight edge build, but a stable release build
+  # must always finish.
+  cancel-in-progress: ${{ !inputs.tag }}
 
 permissions:
   contents: read
 
 jobs:
-  get_release_info:
-    name: Get Release Info
+  version:
+    name: Resolve Version
     if: github.event.repository.fork == false
     runs-on: ubuntu-latest
     outputs:
-      tag: ${{ steps.new_release_tag.outputs.TAG }}
+      channel: ${{ steps.resolve.outputs.channel }}
+      version: ${{ steps.resolve.outputs.version }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Get latest release
-        if: startsWith(github.ref, 'refs/heads/main')
-        id: release
-        uses: pozetroninc/github-action-get-latest-release@master
         with:
-          repository: ${{ github.repository }}
-          excludes: prerelease, draft
+          ref: ${{ inputs.tag || github.sha }}
+          fetch-depth: 0
+          filter: tree:0
 
-      - name: Determine if release build
-        if: startsWith(github.ref, 'refs/heads/main')
-        id: new_release_tag
+      # stable: called by release_please.yml for a new release tag.
+      # edge: any other push to main; published as the rolling `edge` prerelease.
+      # none:   other branches and manual runs; build only.
+      - name: Resolve channel and version
+        id: resolve
         env:
-          LATEST_RELEASE: ${{ steps.release.outputs.release }}
+          TAG: ${{ inputs.tag }}
         run: |
-          CARGO_VERSION=v$(grep "version" Cargo.toml | head -n 1 | cut -d\" -f2)
-          if [[ "${CARGO_VERSION}" != "${LATEST_RELEASE}" ]]; then
-            echo "::set-output name=TAG::${CARGO_VERSION}"
-            echo "::warning::Will create release for version: ${CARGO_VERSION}"
+          set -euo pipefail
+          BASE="$(jq -r '."."' .release-please-manifest.json)"
+          if [[ -n "$TAG" ]]; then
+            if [[ "$TAG" != "v$BASE" ]]; then
+              echo "::error::Tag $TAG does not match manifest version $BASE"
+              exit 1
+            fi
+            CHANNEL=stable
+            VERSION="$BASE"
+          elif [[ "$GITHUB_EVENT_NAME" == "push" && "$GITHUB_REF" == "refs/heads/main" ]]; then
+            CHANNEL=edge
+            VERSION="$(.github/scripts/edge-version.sh)"
           else
-            echo "::warning::Will not create a release"
+            CHANNEL=none
+            VERSION="$BASE"
           fi
+          echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "::notice::Building $CHANNEL $VERSION"
 
   dist_surfpool:
     name: Build Surfpool Distributions
-    if: github.event.repository.fork == false
+    needs: version
     runs-on: ${{ matrix.os }}
     outputs:
       LINUX_X64_SHA: ${{ steps.linux_x64_sha.outputs.LINUX_X64_SHA }}
@@ -92,6 +111,8 @@ jobs:
       # pre-build for all OS
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.sha }}
 
       # set up rust for all envs
       - name: Install Rust toolchain
@@ -199,6 +220,13 @@ jobs:
         if: matrix.os == 'ubuntu-22.04'
         run: sudo apt-get update && sudo apt-get install -y libudev-dev
 
+      # Runs after the cache step so the cache key still hashes the committed
+      # Cargo.lock rather than a per-commit edge version.
+      - name: Stamp edge version
+        if: needs.version.outputs.channel == 'edge'
+        shell: bash
+        run: node .github/scripts/set-version.js "${{ needs.version.outputs.version }}"
+
       - name: Build - Cargo (Windows)
         if: matrix.os == 'windows-latest'
         run: cargo build --release --locked --target ${{ matrix.target }} --features supervisor_ui --features version_check
@@ -258,124 +286,42 @@ jobs:
           name: surfpool-${{ env.SHORT_TARGET_NAME }}
           path: surfpool-${{ env.SHORT_TARGET_NAME }}.tar.gz
 
-  build-image-amd64:
-    name: Build Docker Image (amd64)
-    runs-on: ubuntu-latest
-    needs: get_release_info
-    if: startsWith(github.ref, 'refs/heads/main') && needs.get_release_info.outputs.tag != ''
-    permissions:
-      contents: read
-    env:
-      REGISTRY: docker.io
-      IMAGE_NAME: surfpool/surfpool
-    outputs:
-      digest: ${{ steps.build.outputs.digest }}
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-      - name: Build and push by digest
-        id: build
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          platforms: linux/amd64
-          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=buildkit-amd64
-          cache-to: type=gha,scope=buildkit-amd64,mode=max
-
-  build-image-arm64:
-    name: Build Docker Image (arm64)
-    runs-on: ubuntu-24.04-arm
-    needs: get_release_info
-    if: startsWith(github.ref, 'refs/heads/main') && needs.get_release_info.outputs.tag != ''
-    permissions:
-      contents: read
-    env:
-      REGISTRY: docker.io
-      IMAGE_NAME: surfpool/surfpool
-    outputs:
-      digest: ${{ steps.build.outputs.digest }}
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-      - name: Build and push by digest
-        id: build
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          platforms: linux/arm64
-          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=buildkit-arm64
-          cache-to: type=gha,scope=buildkit-arm64,mode=max
-
-  merge-image-manifest:
-    name: Merge Docker Manifest
-    runs-on: ubuntu-latest
+  publish_stable:
+    name: Publish Release
     needs:
-      - get_release_info
-      - build-image-amd64
-      - build-image-arm64
-    if: startsWith(github.ref, 'refs/heads/main') && needs.get_release_info.outputs.tag != ''
-    permissions:
-      contents: read
-    env:
-      REGISTRY: docker.io
-      IMAGE_NAME: surfpool/surfpool
-    steps:
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-      - name: Generate Docker tags
-        id: tags
-        run: |
-          VERSION="${{ needs.get_release_info.outputs.tag }}"
-          VERSION="${VERSION#v}"
-          MAJOR="${VERSION%%.*}"
-          MINOR="${VERSION%.*}"
-          echo "tags<<EOF" >> $GITHUB_OUTPUT
-          echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${VERSION}" >> $GITHUB_OUTPUT
-          echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${MINOR}" >> $GITHUB_OUTPUT
-          echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${MAJOR}" >> $GITHUB_OUTPUT
-          echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
-      - name: Create multi-arch manifest
-        run: |
-          AMD64_DIGEST="${{ needs.build-image-amd64.outputs.digest }}"
-          ARM64_DIGEST="${{ needs.build-image-arm64.outputs.digest }}"
-          while IFS= read -r TAG; do
-            [ -z "$TAG" ] && continue
-            docker buildx imagetools create --tag "$TAG" \
-              "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${AMD64_DIGEST}" \
-              "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${ARM64_DIGEST}"
-          done <<< "${{ steps.tags.outputs.tags }}"
-
-  release:
-    name: Release
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/heads/main') && needs.get_release_info.outputs.tag != ''
-    needs:
+      - version
       - dist_surfpool
-      - get_release_info
+    if: needs.version.outputs.channel == 'stable'
+    runs-on: ubuntu-latest
     permissions:
-      actions: write
+      contents: write
+    steps:
+      - name: Download pre-built dists
+        uses: actions/download-artifact@v4
+        with:
+          pattern: surfpool-*
+          merge-multiple: true
+
+      # release-please leaves the release as a draft so /releases/latest (used
+      # by install.sh and `surfpool update`) never points at a release without
+      # binaries.
+      - name: Attach binaries and publish the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" surfpool-*.tar.gz --clobber --repo "$GITHUB_REPOSITORY"
+          gh release edit "$TAG" --draft=false --latest --repo "$GITHUB_REPOSITORY"
+
+  publish_edge:
+    name: Publish Edge
+    needs:
+      - version
+      - dist_surfpool
+    if: needs.version.outputs.channel == 'edge'
+    runs-on: ubuntu-latest
+    permissions:
       contents: write
     steps:
       - name: Checkout
@@ -385,15 +331,49 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           pattern: surfpool-*
+          merge-multiple: true
 
-      - name: Tag and Release
-        uses: ncipollo/release-action@v1
-        with:
-          artifacts: "**/*.tar.gz,**/*.msi"
-          tag: ${{ needs.get_release_info.outputs.tag }}
-          commit: ${{ env.GITHUB_SHA }}
-
-      - name: Pack artifacts
+      # One rolling prerelease, edited in place: recreating it on every merge
+      # would notify everyone watching the repo's releases.
+      - name: Update rolling edge release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
         run: |
-          tar -czvf surfpool-linux-x64.tar.gz surfpool-linux-x64
-          tar -czvf surfpool-darwin-arm64.tar.gz surfpool-darwin-arm64
+          set -euo pipefail
+          git tag -f edge "$GITHUB_SHA"
+          git push -f origin refs/tags/edge
+          NOTES=$(cat <<NOTES_EOF
+          Rolling prerelease rebuilt from every merge to \`main\`. Not covered by semver; use a tagged release for anything you depend on.
+
+          **Version:** \`$VERSION\`
+          **Commit:** $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/commit/$GITHUB_SHA
+
+          Install:
+
+          \`\`\`console
+          curl -sL https://run.surfpool.run/ | VERSION=edge bash
+          \`\`\`
+
+          Docker: \`docker pull surfpool/surfpool:edge\`
+          NOTES_EOF
+          )
+          if gh release view edge >/dev/null 2>&1; then
+            gh release edit edge --prerelease --latest=false --title "Edge $VERSION" --notes "$NOTES"
+          else
+            gh release create edge --prerelease --latest=false --verify-tag --title "Edge $VERSION" --notes "$NOTES"
+          fi
+          gh release upload edge surfpool-*.tar.gz --clobber
+
+  image_edge:
+    name: Edge Docker Image
+    needs: version
+    if: needs.version.outputs.channel == 'edge'
+    uses: ./.github/workflows/release_image.yml
+    with:
+      tag: edge
+      ref: ${{ github.sha }}
+      version: ${{ needs.version.outputs.version }}
+    secrets:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
