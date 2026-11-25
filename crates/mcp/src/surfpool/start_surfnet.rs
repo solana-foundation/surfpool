@@ -61,6 +61,8 @@ pub fn generate_command(rpc_port: u16, ws_port: u16) -> Command {
     cmd.arg("start");
     cmd.arg("--port").arg(format!("{}", rpc_port));
     cmd.arg("--ws-port").arg(format!("{}", ws_port));
+    // Surfnets started here run side by side, so none can claim the default TPU port.
+    cmd.arg("--tpu-quic-port").arg("0");
     cmd.arg("--no-deploy");
     cmd
 }

@@ -82,6 +82,7 @@ solana-signature = { workspace = true, features = ["rand"] }
 solana-signer = { workspace = true }
 solana-slot-hashes = { workspace = true }
 solana-system-interface = { workspace = true }
+solana-tls-utils = { workspace = true }
 solana-sysvar = { workspace = true }
 solana-sysvar-id = { workspace = true }
 solana-transaction = { workspace = true }
@@ -116,6 +117,7 @@ opentelemetry-prometheus = { version = "0.33", default-features = false, optiona
 prometheus = { version = "0.14", default-features = false, optional = true }
 axum = { version = "0.8", default-features = false, features = ["tokio", "http1"], optional = true }
 phoenix-rise-accounts = { workspace = true }
+quinn = { workspace = true }
 
 [dev-dependencies]
 libsecp256k1 = "0.7.2"
@@ -127,6 +129,8 @@ solana-program-runtime = { workspace = true }
 solana-pubsub-client = { workspace = true }
 solana-secp256k1-program = { version = "3.0", default-features = false, features = ["bincode"] }
 solana-secp256r1-program = "3.0"
+solana-tpu-client-next = { workspace = true }
+tokio-util = { workspace = true }
 tempfile = { workspace = true }
 spl-token-metadata-interface = { workspace = true }
 

@@ -249,6 +249,14 @@ pub struct StartNetworkOptions {
         value_name = "PORT"
     )]
     pub ws_port: u16,
+    /// Bind the TPU QUIC server to this UDP port.
+    #[arg(
+        long = "tpu-quic-port",
+        default_value_t = DEFAULT_TPU_QUIC_PORT,
+        value_name = "PORT",
+        long_help = "Bind the TPU QUIC server to this UDP port. Clients that send transactions straight to the leader, such as `solana program deploy`, find it through getClusterNodes. Use 0 to let the OS pick a free port.\n\nExample: surfpool start --tpu-quic-port 9004"
+    )]
+    pub tpu_quic_port: u16,
     /// Bind RPC, WebSocket, and Studio services to this host.
     #[arg(
         long = "host",
@@ -651,7 +659,7 @@ impl StartSimnet {
             ws_port: self.network.ws_port,
             gossip_port: DEFAULT_GOSSIP_PORT,
             tpu_port: DEFAULT_TPU_PORT,
-            tpu_quic_port: DEFAULT_TPU_QUIC_PORT,
+            tpu_quic_port: self.network.tpu_quic_port,
             cheatcode_lock: self.svm.cheatcode_lock(),
         }
     }

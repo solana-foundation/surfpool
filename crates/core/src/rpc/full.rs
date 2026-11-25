@@ -5912,7 +5912,8 @@ mod tests {
 
     #[test]
     fn test_get_cluster_nodes() {
-        let setup = TestSetup::new(SurfpoolFullRpc);
+        let mut setup = TestSetup::new(SurfpoolFullRpc);
+        setup.context.rpc_config.tpu_quic_port = 8004;
 
         let cluster_nodes = setup.rpc.get_cluster_nodes(Some(setup.context)).unwrap();
 

@@ -1799,6 +1799,18 @@ impl SurfnetSvmLocker {
         self.with_svm_writer(|svm_writer| svm_writer.mark_transaction_pending(signature));
     }
 
+    /// Marks `signature` pending and returns `true`, unless `max_pending`
+    /// transactions are already queued or executing.
+    pub(crate) fn try_mark_transaction_pending(
+        &self,
+        signature: Signature,
+        max_pending: usize,
+    ) -> bool {
+        self.with_svm_writer(|svm_writer| {
+            svm_writer.try_mark_transaction_pending(signature, max_pending)
+        })
+    }
+
     pub(crate) fn mark_transaction_complete(&self, signature: &Signature) {
         self.with_svm_writer(|svm_writer| svm_writer.mark_transaction_complete(signature));
     }
