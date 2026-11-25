@@ -1988,13 +1988,32 @@ impl Full for SurfpoolFullRpc {
             let loaded_addresses = svm_locker
                 .get_loaded_addresses(&remote_ctx, &tx.message)
                 .await?;
-            let transaction_pubkeys = svm_locker.get_pubkeys_from_message(
+            let mut pubkeys_to_load = svm_locker.get_pubkeys_from_message(
                 &tx.message,
                 loaded_addresses.as_ref().map(|l| l.all_loaded_addresses()),
             );
+            // Agave answers a requested account the transaction does not write from the bank, so
+            // the requested accounts are loaded too: a forked surfnet fetches them like the
+            // transaction's own.
+            let observed_pubkeys: Vec<Option<Pubkey>> = config
+                .accounts
+                .as_ref()
+                .map(|accounts| {
+                    accounts
+                        .addresses
+                        .iter()
+                        .map(|address| Pubkey::from_str(address).ok())
+                        .collect()
+                })
+                .unwrap_or_default();
+            for pubkey in observed_pubkeys.iter().flatten() {
+                if !pubkeys_to_load.contains(pubkey) {
+                    pubkeys_to_load.push(*pubkey);
+                }
+            }
 
             svm_locker
-                .get_multiple_accounts(&remote_ctx, &transaction_pubkeys, None)
+                .get_multiple_accounts(&remote_ctx, &pubkeys_to_load, None)
                 .await?;
 
             // Convert TransactionLoadedAddresses to LoadedAddresses before it gets consumed
@@ -2002,7 +2021,7 @@ impl Full for SurfpoolFullRpc {
 
             // Like Agave's simulation bank: the context slot, the replacement blockhash and the
             // simulated state come from one guard, taken once the accounts are loaded.
-            let (read, replacement_blockhash, tx_message, simulation) = svm_locker
+            let (read, replacement_blockhash, tx_message, simulation, observed_state) = svm_locker
                 .with_svm_reader(|svm_reader| {
                     let read = svm_reader.read_slot(config.commitment, config.min_context_slot)?;
                     let replacement_blockhash = config.replace_recent_blockhash.then(|| {
@@ -2017,11 +2036,21 @@ impl Full for SurfpoolFullRpc {
                     // Clone the message before moving the transaction for result formatting
                     let tx_message = tx.message.clone();
                     let simulation = svm_reader.simulate_transaction(tx, config.sig_verify);
+                    // The simulation writes nothing back, so this is also the post-simulation
+                    // state of every requested account the transaction does not write.
+                    let mut observed_state = Vec::with_capacity(observed_pubkeys.len());
+                    for pubkey in observed_pubkeys.iter() {
+                        observed_state.push(match pubkey {
+                            Some(pubkey) => svm_reader.get_account(pubkey)?,
+                            None => None,
+                        });
+                    }
                     Ok::<_, jsonrpc_core::Error>((
                         read,
                         replacement_blockhash,
                         tx_message,
                         simulation,
+                        observed_state,
                     ))
                 })?;
             let loaded_accounts_data_size = match &simulation {
@@ -2033,7 +2062,8 @@ impl Full for SurfpoolFullRpc {
                     let mut accounts = None;
                     if let Some(observed_accounts) = config.accounts {
                         let mut ui_accounts = vec![];
-                        for observed_pubkey in observed_accounts.addresses.iter() {
+                        for (idx, observed_pubkey) in observed_accounts.addresses.iter().enumerate()
+                        {
                             let mut ui_account = None;
                             for (updated_pubkey, account) in tx_info.post_accounts.iter() {
                                 if observed_pubkey.eq(&updated_pubkey.to_string()) {
@@ -2048,6 +2078,22 @@ impl Full for SurfpoolFullRpc {
                                             .account,
                                     );
                                 }
+                            }
+                            // post_accounts holds only the accounts the transaction writes.
+                            if ui_account.is_none()
+                                && let (Some(pubkey), Some(account)) =
+                                    (observed_pubkeys[idx], observed_state[idx].as_ref())
+                            {
+                                ui_account = Some(
+                                    svm_locker
+                                        .account_to_rpc_keyed_account(
+                                            &pubkey,
+                                            account,
+                                            &RpcAccountInfoConfig::default(),
+                                            None,
+                                        )
+                                        .account,
+                                );
                             }
                             ui_accounts.push(ui_account);
                         }
@@ -3932,6 +3978,261 @@ mod tests {
                 space: Some(0),
             })]),
             "Wrong account content"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn simulate_transaction_returns_requested_accounts_it_does_not_write_as_agave_does() {
+        let payer = Keypair::new();
+        let pk = Pubkey::new_unique();
+        let lamports = LAMPORTS_PER_SOL;
+        let setup = TestSetup::new_with_serial_vm_executor(SurfpoolFullRpc);
+        let recent_blockhash = setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm_reader| svm_reader.latest_blockhash());
+
+        let _ = setup
+            .rpc
+            .request_airdrop(
+                Some(setup.context.clone()),
+                payer.pubkey().to_string(),
+                2 * lamports,
+                None,
+            )
+            .unwrap();
+
+        let tx = build_legacy_transaction(
+            &payer.pubkey(),
+            &[&payer.insecure_clone()],
+            &[system_instruction::transfer(&payer.pubkey(), &pk, lamports)],
+            &recent_blockhash,
+        );
+
+        // pk is written; the System program is named by the transaction but only read; the Clock
+        // sysvar is not named at all. Agave returns all three.
+        let simulation_res = setup
+            .rpc
+            .simulate_transaction(
+                Some(setup.context),
+                bs58::encode(wincode::serialize(&tx).unwrap()).into_string(),
+                Some(RpcSimulateTransactionConfig {
+                    sig_verify: true,
+                    replace_recent_blockhash: false,
+                    commitment: Some(CommitmentConfig::finalized()),
+                    encoding: None,
+                    accounts: Some(RpcSimulateTransactionAccountsConfig {
+                        encoding: None,
+                        addresses: vec![
+                            pk.to_string(),
+                            system_program::id().to_string(),
+                            solana_sdk_ids::sysvar::clock::ID.to_string(),
+                        ],
+                    }),
+                    min_context_slot: None,
+                    inner_instructions: false,
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            simulation_res.value.err, None,
+            "Unexpected simulation error"
+        );
+        let accounts = simulation_res
+            .value
+            .accounts
+            .expect("accounts were requested");
+        assert_eq!(accounts.len(), 3);
+        assert_eq!(
+            accounts[0].as_ref().map(|a| a.lamports),
+            Some(lamports),
+            "the written account's post-simulation state"
+        );
+        let system = accounts[1]
+            .as_ref()
+            .expect("a read-only account the transaction names");
+        assert!(system.executable);
+        assert_eq!(
+            system.owner,
+            solana_sdk_ids::native_loader::id().to_string()
+        );
+        let clock = accounts[2]
+            .as_ref()
+            .expect("an account the transaction does not name");
+        assert_eq!(clock.owner, solana_sdk_ids::sysvar::id().to_string());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn simulate_transaction_fetches_requested_accounts_from_the_datasource() {
+        // An account only the datasource holds, which the transaction does not name: a forked
+        // surfnet must fetch it before it can answer it.
+        let remote_pk = Pubkey::new_unique();
+        let remote_owner = Pubkey::new_unique();
+        let remote_data = b"held by the datasource only".to_vec();
+        let asked_for: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(vec![]));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test datasource should bind");
+        let address = listener
+            .local_addr()
+            .expect("test datasource should have an address");
+        let datasource = {
+            let asked_for = asked_for.clone();
+            let remote_pk = remote_pk.to_string();
+            let account = serde_json::json!({
+                "lamports": 4242,
+                "data": [BASE64_STANDARD.encode(&remote_data), "base64"],
+                "owner": remote_owner.to_string(),
+                "executable": false,
+                "rentEpoch": 0,
+                "space": remote_data.len(),
+            });
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut stream, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let mut buf = vec![];
+                    let mut chunk = [0; 4096];
+                    let body = loop {
+                        let n = stream.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            break None;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        let text = String::from_utf8_lossy(&buf).to_string();
+                        if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                            let len = head
+                                .lines()
+                                .find_map(|l| {
+                                    l.to_ascii_lowercase()
+                                        .strip_prefix("content-length:")
+                                        .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                                })
+                                .unwrap_or(0);
+                            if body.len() >= len {
+                                break Some(body[..len].to_string());
+                            }
+                        }
+                    };
+                    let Some(body) = body else { continue };
+                    let request: serde_json::Value =
+                        serde_json::from_str(&body).expect("the datasource gets JSON-RPC");
+                    let result = if request["method"] == "getMultipleAccounts" {
+                        let keys: Vec<String> = request["params"][0]
+                            .as_array()
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|k| k.as_str().map(str::to_string))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        asked_for.lock().unwrap().extend(keys.iter().cloned());
+                        let value: Vec<serde_json::Value> = keys
+                            .iter()
+                            .map(|k| {
+                                if *k == remote_pk {
+                                    account.clone()
+                                } else {
+                                    serde_json::Value::Null
+                                }
+                            })
+                            .collect();
+                        serde_json::json!({"context": {"slot": 1}, "value": value})
+                    } else {
+                        serde_json::Value::Null
+                    };
+                    let response = serde_json::json!({
+                        "jsonrpc": "2.0", "id": request["id"], "result": result,
+                    })
+                    .to_string();
+                    let _ = stream
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                                response.len(),
+                                response
+                            )
+                            .as_bytes(),
+                        )
+                        .await;
+                }
+            })
+        };
+
+        let payer = Keypair::new();
+        let pk = Pubkey::new_unique();
+        let lamports = LAMPORTS_PER_SOL;
+        let mut setup = TestSetup::new_with_serial_vm_executor(SurfpoolFullRpc);
+        let recent_blockhash = setup
+            .context
+            .svm_locker
+            .with_svm_reader(|svm_reader| svm_reader.latest_blockhash());
+        // Both transaction accounts exist locally, so the datasource is asked only for remote_pk.
+        for key in [payer.pubkey(), pk] {
+            let _ = setup
+                .rpc
+                .request_airdrop(
+                    Some(setup.context.clone()),
+                    key.to_string(),
+                    2 * lamports,
+                    None,
+                )
+                .unwrap();
+        }
+        setup.context.remote_rpc_client =
+            Some(SurfnetRemoteClient::new(format!("http://{address}")));
+
+        let tx = build_legacy_transaction(
+            &payer.pubkey(),
+            &[&payer.insecure_clone()],
+            &[system_instruction::transfer(&payer.pubkey(), &pk, lamports)],
+            &recent_blockhash,
+        );
+        let simulation_res = setup
+            .rpc
+            .simulate_transaction(
+                Some(setup.context),
+                bs58::encode(wincode::serialize(&tx).unwrap()).into_string(),
+                Some(RpcSimulateTransactionConfig {
+                    sig_verify: true,
+                    commitment: Some(CommitmentConfig::confirmed()),
+                    accounts: Some(RpcSimulateTransactionAccountsConfig {
+                        encoding: None,
+                        addresses: vec![remote_pk.to_string()],
+                    }),
+                    ..RpcSimulateTransactionConfig::default()
+                }),
+            )
+            .await
+            .unwrap();
+        datasource.abort();
+
+        assert_eq!(
+            simulation_res.value.err, None,
+            "Unexpected simulation error"
+        );
+        assert!(
+            asked_for.lock().unwrap().contains(&remote_pk.to_string()),
+            "the datasource was never asked for the requested account"
+        );
+        assert_eq!(
+            simulation_res.value.accounts,
+            Some(vec![Some(UiAccount {
+                lamports: 4242,
+                data: UiAccountData::Binary(
+                    BASE64_STANDARD.encode(&remote_data),
+                    UiAccountEncoding::Base64
+                ),
+                owner: remote_owner.to_string(),
+                executable: false,
+                rent_epoch: 0,
+                space: Some(remote_data.len() as u64),
+            })]),
+            "the requested account as the datasource holds it"
         );
     }
 
