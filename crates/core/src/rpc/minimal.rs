@@ -609,6 +609,7 @@ impl Minimal for SurfpoolMinimalRpc {
                 inner: account_update,
                 ..
             } = svm_locker.get_account(&remote_ctx, &pubkey, None).await?;
+            let read = svm_locker.read_slot_covering(read, &[pubkey]);
 
             let balance = match &account_update {
                 GetAccountResult::FoundAccount(_, account, _)

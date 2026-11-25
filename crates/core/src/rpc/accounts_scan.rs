@@ -503,6 +503,7 @@ impl AccountsScan for SurfpoolAccountsScanRpc {
                 )
                 .await?
                 .inner;
+            let read = svm_locker.read_slot_covering_every_account(read);
 
             if config.with_context.unwrap_or(false) {
                 Ok(OptionalContext::Context(read.respond(program_accounts)))
@@ -533,6 +534,7 @@ impl AccountsScan for SurfpoolAccountsScanRpc {
                 inner: largest_accounts,
                 ..
             } = svm_locker.get_largest_accounts(&remote_ctx, config).await?;
+            let read = svm_locker.read_slot_covering_every_account(read);
 
             Ok(read.respond(largest_accounts))
         })
@@ -550,8 +552,9 @@ impl AccountsScan for SurfpoolAccountsScanRpc {
 
         Box::pin(async move {
             svm_locker.with_svm_reader(|svm_reader| {
-                let read =
-                    svm_reader.read_slot(config.as_ref().and_then(|c| c.commitment), None)?;
+                let read = svm_reader
+                    .read_slot(config.as_ref().and_then(|c| c.commitment), None)?
+                    .covering_every_account(svm_reader);
 
                 // Check if we should exclude non-circulating accounts list
                 let exclude_accounts = config
@@ -601,6 +604,7 @@ impl AccountsScan for SurfpoolAccountsScanRpc {
             } = svm_locker
                 .get_token_largest_accounts(&remote_ctx, &mint)
                 .await?;
+            let read = svm_locker.read_slot_covering_every_account(read);
 
             Ok(read.respond(largest_accounts))
         })
@@ -642,6 +646,7 @@ impl AccountsScan for SurfpoolAccountsScanRpc {
                     &config,
                 )
                 .await?;
+            let read = svm_locker.read_slot_covering_every_account(read);
 
             Ok(read.respond(token_accounts))
         })
@@ -680,6 +685,7 @@ impl AccountsScan for SurfpoolAccountsScanRpc {
             } = svm_locker
                 .get_token_accounts_by_delegate(&remote_ctx, delegate, &filter, &config)
                 .await?;
+            let read = svm_locker.read_slot_covering_every_account(read);
 
             Ok(read.respond(keyed_accounts))
         })

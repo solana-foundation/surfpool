@@ -4641,9 +4641,6 @@ fn boot_simnet_with_features(
     test_type: TestType,
     feature_config: SvmFeatureConfig,
 ) -> Result<BootedSimnet, RunloopError> {
-    let bind_host = "127.0.0.1";
-    let bind_port = get_free_port().map_err(RunloopError::NoFreePort)?;
-    let ws_port = get_free_port().map_err(RunloopError::NoFreePort)?;
     let slot_time = slot_time.unwrap_or(DEFAULT_SLOT_TIME_MS);
     let config = SurfpoolConfig {
         simnets: vec![SimnetConfig {
@@ -4654,9 +4651,10 @@ fn boot_simnet_with_features(
             ..SimnetConfig::default()
         }],
         rpc: RpcConfig {
-            bind_host: bind_host.to_string(),
-            bind_port,
-            ws_port,
+            bind_host: "127.0.0.1".to_string(),
+            // These tests use in-process handles, so the servers can claim free ports when they bind.
+            bind_port: 0,
+            ws_port: 0,
             gossip_port: 0,
             tpu_port: 0,
             tpu_quic_port: 0,
