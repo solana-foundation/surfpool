@@ -1673,18 +1673,7 @@ impl Full for SurfpoolFullRpc {
                     .get_transaction(&remote_client, &signature, get_default_transaction_config())
                     .await?;
 
-                let mut status = res.map_some_transaction_status();
-                if let Some(confirmation_status) =
-                    status.as_ref().and_then(|s| s.confirmation_status.as_ref())
-                {
-                    if confirmation_status.eq(&TransactionConfirmationStatus::Processed) {
-                        // If the transaction is only processed, we cannot be sure it won't be dropped
-                        // before being confirmed. So we return None in this case to match the behavior
-                        // of a real Solana node.
-                        status = None;
-                    }
-                }
-                responses.push(status);
+                responses.push(res.map_some_transaction_status());
             }
             Ok(read.respond(responses))
         })
@@ -3353,11 +3342,20 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert_eq!(
-                res.value.iter().flatten().collect::<Vec<_>>().len(),
-                0,
-                "processed transactions should not be returning values"
-            );
+            assert_eq!(res.value.len(), valid_txs + invalid_txs);
+            for (i, status) in res.value.iter().enumerate() {
+                let status = status
+                    .as_ref()
+                    .expect("processed transactions should return a status");
+                assert_eq!(status.slot, current_slot);
+                assert_eq!(status.confirmations, Some(0));
+                assert_eq!(
+                    status.confirmation_status,
+                    Some(solana_transaction_status::TransactionConfirmationStatus::Processed)
+                );
+                // The unsigned transactions are executed too, and fail.
+                assert_eq!(status.status.is_ok(), i < valid_txs);
+            }
         }
 
         // confirm a block to move transactions to confirmed status
