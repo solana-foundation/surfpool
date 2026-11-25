@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795615140832,
+  "lastUpdate": 1795617936229,
   "repoUrl": "https://github.com/solana-foundation/surfpool",
   "entries": {
     "surfpool throughput": [
@@ -119,6 +119,66 @@ window.BENCHMARK_DATA = {
             "name": "send_tx_no_profiling/tps_confirmed",
             "value": 2268.4226965693606,
             "range": "2178.5..2311.0",
+            "unit": "tx/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "aryansputta@gmail.com",
+            "name": "Aryan Putta",
+            "username": "aryanputta"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "e9fb8ff46d4aa2b98bf599abfba56aae490fd17c",
+          "message": "fix(mcp): reject overflowing token balance amounts (#919)",
+          "timestamp": "2026-11-25T09:41:02-05:00",
+          "tree_id": "e2ecc1b116c9cee9f61de6a6b127ad1b6cb1f7f5",
+          "url": "https://github.com/solana-foundation/surfpool/commit/e9fb8ff46d4aa2b98bf599abfba56aae490fd17c"
+        },
+        "date": 1795617935217,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "gpa/rps",
+            "value": 99.3,
+            "range": "98.9..99.6",
+            "unit": "req/s"
+          },
+          {
+            "name": "reads/rps",
+            "value": 64047.1,
+            "range": "63708.3..64287.3",
+            "unit": "req/s"
+          },
+          {
+            "name": "send_tx_default/send_rate",
+            "value": 2321,
+            "range": "2290.2..2341.3",
+            "unit": "tx/s"
+          },
+          {
+            "name": "send_tx_default/tps_confirmed",
+            "value": 2259.790881380066,
+            "range": "2233.7..2283.4",
+            "unit": "tx/s"
+          },
+          {
+            "name": "send_tx_no_profiling/send_rate",
+            "value": 2330.1,
+            "range": "2303.1..2383.8",
+            "unit": "tx/s"
+          },
+          {
+            "name": "send_tx_no_profiling/tps_confirmed",
+            "value": 2272.66566245659,
+            "range": "2244.9..2334.8",
             "unit": "tx/s"
           }
         ]
