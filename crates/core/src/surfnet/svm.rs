@@ -518,6 +518,8 @@ pub struct SurfnetSvm {
     /// Keeping this next to `transactions` lets readers atomically distinguish a genuinely
     /// unknown signature from one that is waiting in the runloop queue.
     pending_transaction_signatures: HashMap<Signature, usize>,
+    /// Sum of the counts in `pending_transaction_signatures`.
+    pending_transaction_count: usize,
     pub jito_bundles: Box<dyn Storage<String, Vec<String>>>,
     pub transactions_queued_for_confirmation: VecDeque<(
         VersionedTransaction,
@@ -786,6 +788,21 @@ impl SurfnetSvm {
             .pending_transaction_signatures
             .entry(signature)
             .or_default() += 1;
+        self.pending_transaction_count += 1;
+    }
+
+    /// Marks `signature` pending and returns `true`, unless `max_pending`
+    /// transactions are already queued or executing.
+    pub(crate) fn try_mark_transaction_pending(
+        &mut self,
+        signature: Signature,
+        max_pending: usize,
+    ) -> bool {
+        if self.pending_transaction_count >= max_pending {
+            return false;
+        }
+        self.mark_transaction_pending(signature);
+        true
     }
 
     pub(crate) fn mark_transaction_complete(&mut self, signature: &Signature) {
@@ -794,6 +811,7 @@ impl SurfnetSvm {
         };
 
         *pending_count -= 1;
+        self.pending_transaction_count -= 1;
         if *pending_count == 0 {
             self.pending_transaction_signatures.remove(signature);
         }
@@ -873,6 +891,7 @@ impl SurfnetSvm {
             transactions: OverlayStorage::wrap(self.transactions.clone_box()),
             // Profiling sandboxes do not consume the live transaction command queue.
             pending_transaction_signatures: HashMap::new(),
+            pending_transaction_count: 0,
             jito_bundles: OverlayStorage::wrap(self.jito_bundles.clone_box()),
             profile_tag_map: OverlayStorage::wrap(self.profile_tag_map.clone_box()),
             simulated_transaction_profiles: OverlayStorage::wrap(
@@ -1349,6 +1368,7 @@ impl SurfnetSvm {
             blocks: blocks_db,
             transactions: transactions_db,
             pending_transaction_signatures: HashMap::new(),
+            pending_transaction_count: 0,
             jito_bundles: jito_bundles_db,
             perf_samples: VecDeque::new(),
             transactions_processed,

@@ -36,6 +36,9 @@ const ALPN_TPU_PROTOCOL_ID: &[u8] = b"solana-tpu";
 const MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Transactions a single connection may have in flight at once.
 const MAX_CONCURRENT_STREAMS: u32 = 512;
+/// Transactions, from any ingress, that may wait in or run on the runloop
+/// before the TPU drops new arrivals.
+const MAX_PENDING_TRANSACTIONS: usize = 10_000;
 
 /// A running TPU QUIC server.
 pub(crate) struct TpuQuicServer {
@@ -165,7 +168,8 @@ struct TpuIngress {
 
 impl TpuIngress {
     /// Queues a wire transaction for execution. A transaction that doesn't
-    /// decode or sanitize is dropped, as a validator would.
+    /// decode or sanitize is dropped, as a validator would, and so is any
+    /// transaction that arrives while the runloop is saturated.
     fn submit(&self, wire_transaction: &[u8]) {
         let transaction = match decode_wire_transaction(wire_transaction) {
             Ok(transaction) => transaction,
@@ -177,7 +181,14 @@ impl TpuIngress {
         let signature = transaction.signatures()[0];
         // TPU senders learn the outcome from signature statuses, so nothing reads this channel.
         let (status_tx, _) = bounded(1);
-        self.svm_locker.mark_transaction_pending(signature);
+        // A busy leader drops what it can't buffer, and TPU senders retry on their own.
+        if !self
+            .svm_locker
+            .try_mark_transaction_pending(signature, MAX_PENDING_TRANSACTIONS)
+        {
+            debug!("Dropping TPU transaction {signature}: the runloop is saturated");
+            return;
+        }
         if self
             .simnet_commands_tx
             .send(SimnetCommand::ProcessTransaction(
