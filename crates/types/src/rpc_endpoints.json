@@ -769,24 +769,58 @@
               "description": "Optional tag for the transaction to group profiling results."
             },
             {
-              "name": "encoding",
-              "type": "string",
-              "description": "Optional encoding for returned account data (e.g., 'base64', 'jsonParsed')."
+              "name": "config",
+              "type": "object",
+              "description": "Optional account encoding and profile depth ('transaction' or 'instruction').",
+              "schema": {
+                "encoding": "string",
+                "depth": "string"
+              }
             }
           ],
-          "returns": "A `RpcResponse<ProfileResult>` containing the estimation details."
+          "returns": "A context and a keyed transaction profile."
         },
         {
-          "method": "surfnet_getProfileResults",
+          "method": "surfnet_getProfileResultsByTag",
           "description": "Retrieves all profiling results for a given tag.",
           "params": [
             {
               "name": "tag",
               "type": "string",
               "description": "The tag to retrieve profiling results for."
+            },
+            {
+              "name": "config",
+              "type": "object",
+              "description": "Optional account encoding and profile depth ('transaction' or 'instruction').",
+              "schema": {
+                "encoding": "string",
+                "depth": "string"
+              }
             }
           ],
-          "returns": "A `RpcResponse<Vec<ProfileResult>>` containing the profiling results."
+          "returns": "A context and a list of keyed profiles, or a null value if the tag was not found."
+        },
+        {
+          "method": "surfnet_getTransactionProfile",
+          "description": "Retrieves a single transaction profile by signature or simulation UUID.",
+          "params": [
+            {
+              "name": "signature_or_uuid",
+              "type": "string",
+              "description": "A base58 transaction signature or a profile UUID."
+            },
+            {
+              "name": "config",
+              "type": "object",
+              "description": "Optional account encoding and profile depth ('transaction' or 'instruction').",
+              "schema": {
+                "encoding": "string",
+                "depth": "string"
+              }
+            }
+          ],
+          "returns": "A context and a keyed profile, or a null value if the profile was not found."
         },
         {
           "method": "surfnet_writeProgram",
