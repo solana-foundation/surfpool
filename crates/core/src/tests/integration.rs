@@ -4691,6 +4691,96 @@ fn boot_simnet_with_features(
     })
 }
 
+// Regression: `solana program deploy` from Agave 4.5 sends its buffer writes with
+// `tpu-client-next`, which looks the leader's TPU QUIC socket up with `getClusterNodes`, follows
+// slots with `slotsUpdatesSubscribe` and never falls back to `sendTransaction`. Surfpool
+// advertised the socket without listening on it, so the writes vanished and the deploy ended in
+// "Blockhash expired". It also never sent a `completed` slot update, which the client waits for
+// before it shuts down.
+#[tokio::test(flavor = "multi_thread")]
+async fn tpu_client_lands_a_transaction_and_shuts_down() {
+    use solana_tpu_client_next::{
+        ClientBuilder, node_address_service::LeaderTpuCacheServiceConfig,
+        websocket_node_address_service::WebsocketNodeAddressService,
+    };
+    use tokio_util::sync::CancellationToken;
+
+    let payer = Keypair::new();
+    let bind_host = "127.0.0.1";
+    let bind_port = get_free_port().unwrap();
+    let ws_port = get_free_port().unwrap();
+    let config = SurfpoolConfig {
+        simnets: vec![SimnetConfig {
+            slot_time: 50,
+            offline_mode: true,
+            remote_rpc_url: None,
+            airdrop_addresses: vec![payer.pubkey()],
+            airdrop_token_amount: LAMPORTS_PER_SOL,
+            ..SimnetConfig::default()
+        }],
+        rpc: RpcConfig {
+            bind_host: bind_host.to_string(),
+            bind_port,
+            ws_port,
+            ..RpcConfig::default()
+        },
+        ..SurfpoolConfig::default()
+    };
+    let (surfnet_svm, simnet_events_rx, geyser_events_rx) = TestType::no_db().initialize_svm();
+    let (simnet_commands_tx, simnet_commands_rx) = unbounded();
+    let _runloop = spawn_runloop(
+        SurfnetSvmLocker::new(surfnet_svm),
+        config,
+        (simnet_commands_tx, simnet_commands_rx),
+        geyser_events_rx,
+    )
+    .expect("the runloop should start");
+    wait_for_ready(&simnet_events_rx).expect("the surfnet should start");
+
+    let rpc_client = Arc::new(RpcClient::new(format!("http://{bind_host}:{bind_port}")));
+    let cancel = CancellationToken::new();
+    let leader_updater = WebsocketNodeAddressService::run(
+        rpc_client.clone(),
+        format!("ws://{bind_host}:{ws_port}"),
+        LeaderTpuCacheServiceConfig::default(),
+        cancel.child_token(),
+    )
+    .await
+    .expect("the leader's TPU socket should be discoverable");
+    let (transaction_sender, tpu_client) = ClientBuilder::new(Box::new(leader_updater))
+        .cancel_token(cancel.child_token())
+        .bind_socket(std::net::UdpSocket::bind("127.0.0.1:0").unwrap())
+        .build()
+        .unwrap();
+
+    let recipient = Pubkey::new_unique();
+    let transaction = Transaction::new_signed_with_payer(
+        &[transfer(&payer.pubkey(), &recipient, LAMPORTS_PER_SOL / 2)],
+        Some(&payer.pubkey()),
+        &[&payer],
+        rpc_client.get_latest_blockhash().await.unwrap(),
+    );
+    transaction_sender
+        .send_transaction(bincode::serialize(&transaction).unwrap())
+        .await
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while rpc_client.get_balance(&recipient).await.unwrap() != LAMPORTS_PER_SOL / 2 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the transaction sent over TPU never landed"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    drop(transaction_sender);
+    tokio::time::timeout(Duration::from_secs(10), tpu_client.shutdown())
+        .await
+        .expect("the TPU client should shut down")
+        .unwrap();
+}
+
 // Regression #814: transaction-mode follow-up blocks must return to the
 // command queue, so a transaction submitted during finalization is processed
 // before the first transaction completes its full finalization window.
@@ -8842,6 +8932,7 @@ async fn test_ws_slots_updates_subscribe_manual_advancement(test_type: TestType)
     // observe the per-block lifecycle variants. Root timing is covered separately
     // by the feature-dependent finalization test.
     let mut saw_created_bank = false;
+    let mut saw_completed = false;
     let mut saw_frozen = false;
     let mut saw_optimistic_confirmation = false;
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -8853,14 +8944,19 @@ async fn test_ws_slots_updates_subscribe_manual_advancement(test_type: TestType)
         };
         match event.as_ref() {
             SlotUpdate::CreatedBank { .. } => saw_created_bank = true,
+            SlotUpdate::Completed { .. } => saw_completed = true,
             SlotUpdate::Frozen { .. } => saw_frozen = true,
             SlotUpdate::OptimisticConfirmation { .. } => saw_optimistic_confirmation = true,
             _ => {}
         }
-        if saw_created_bank && saw_frozen && saw_optimistic_confirmation {
+        if saw_created_bank && saw_completed && saw_frozen && saw_optimistic_confirmation {
             break;
         }
     }
+
+    // TPU clients follow the leader schedule with this one, and Agave 4.5's
+    // `solana program deploy` hangs on shutdown until one arrives.
+    assert!(saw_completed, "Should observe Completed slot update event");
 
     assert!(
         saw_created_bank,

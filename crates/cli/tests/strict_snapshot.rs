@@ -54,6 +54,8 @@ fn strict_snapshot_offline_missing_account_fails_startup() {
                 &ports[0].to_string(),
                 "--ws-port",
                 &ports[1].to_string(),
+                "--tpu-quic-port",
+                "0",
                 "--studio-port",
                 &ports[2].to_string(),
             ])

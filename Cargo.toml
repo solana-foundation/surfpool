@@ -97,6 +97,8 @@ notify = { version = "8.0.0", default-features = false }
 npm_rs = "1.0.0"
 once_cell = { version = "1.19.0", default-features = false }
 phoenix-rise-accounts = "0.6.15"
+# The quinn fork Agave's TPU clients are built against.
+quinn = { package = "anza-quinn", version = "=0.11.11-rustsec20260339" }
 ratatui = { version = "0.30.2", features = [
     "crossterm",
 ], default-features = false }
@@ -151,9 +153,11 @@ solana-signature = { version = "~3.5.2", default-features = false, features = [
 ] }
 solana-signer = { version = "3.0.1", default-features = false }
 solana-slot-hashes = { version = "~3.2.0", default-features = false }
+solana-tls-utils = { version = "4.3.2", default-features = false, features = ["agave-unstable-api"] }
 solana-system-interface = { version = "3.3.0", default-features = false }
 solana-sysvar = { version = "~4.2.0", default-features = false, features = ["bincode", "wincode"] }
 solana-sysvar-id = { version = "3.1", default-features = false }
+solana-tpu-client-next = { version = "4.3.2", default-features = false, features = ["agave-unstable-api", "websocket-node-address-service"] }
 solana-transaction = { version = "4.2.0", default-features = false, features = ["serde", "wincode"] }
 solana-transaction-context = { version = "4.3.2", default-features = false }
 solana-transaction-error = { version = "~3.4.0", default-features = false }
@@ -173,6 +177,7 @@ test-case = "^3.3.1"
 ts-rs = { version = "=12.0.1" }
 thiserror = "2.0"
 tokio = { version = "1.43.0", default-features = false }
+tokio-util = { version = "0.7.20", default-features = false }
 tokio-tungstenite = { version = "=0.20.1", default-features = false }
 toml = { version = "0.8.23", default-features = false }
 tracing = { version = "0.1.41", default-features = false }

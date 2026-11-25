@@ -3265,29 +3265,6 @@ impl SurfnetSvm {
         let total_transactions = self.latest_epoch_info.transaction_count.unwrap_or(0);
         self.latest_epoch_info.transaction_count = Some(total_transactions + num_transactions);
 
-        // Emit `slotsUpdatesNotification` events for the lifecycle transition
-        // we just completed:
-        //   * `Frozen`     – the slot that was just closed (`slot`) is now
-        //                    immutable; surface its execution stats.
-        // Surfpool's execution model has no gossip layer, so the
-        // `FirstShredReceived` / `Completed` / `Dead` variants documented by
-        // Solana are intentionally not produced here.
-        // Surfpool executes transactions sequentially in a single entry per
-        // block, unlike real Solana where a block can contain multiple entries
-        // (parallel execution batches). As a result `max_transactions_per_entry`
-        // equals the total transaction count for the slot.
-        const SURFPOOL_ENTRIES_PER_BLOCK: u64 = 1;
-        self.notify_slots_updates_subscribers(SlotUpdate::Frozen {
-            slot,
-            timestamp: slots_update_ts,
-            stats: SlotTransactionStats {
-                num_transaction_entries: SURFPOOL_ENTRIES_PER_BLOCK,
-                num_successful_transactions,
-                num_failed_transactions,
-                max_transactions_per_entry: num_transactions,
-            },
-        });
-
         // Agave writes SlotHistory and RecentBlockhashes as it freezes a block. Yellowstone
         // publishes a block only once it has seen them, along with the slot's Clock and SlotHashes.
         let mut slot_history = self.inner.get_sysvar::<SlotHistory>();
@@ -3317,6 +3294,31 @@ impl SurfnetSvm {
         self.geyser_events_tx
             .send(GeyserEvent::NotifyEntry(entry_info))
             .ok();
+
+        // The slot's last shred follows its last entry: a leader hands Geyser each entry before
+        // it shreds it. Completed carries no parent, as in Agave. Clients that send to the
+        // leader's TPU follow the leader schedule with this status. Agave announces
+        // `FirstShredReceived` only for shreds that arrive from other nodes, never for a slot the
+        // node leads itself, and Surfpool leads every slot. It never abandons one either, so
+        // `Dead` is not produced.
+        self.emit_slot_status(slot, None, GeyserSlotStatus::Completed, slots_update_ts);
+
+        // The slot is now immutable; surface its execution stats to `slotsUpdatesSubscribe`.
+        // Surfpool executes transactions sequentially in a single entry per
+        // block, unlike real Solana where a block can contain multiple entries
+        // (parallel execution batches). As a result `max_transactions_per_entry`
+        // equals the total transaction count for the slot.
+        const SURFPOOL_ENTRIES_PER_BLOCK: u64 = 1;
+        self.notify_slots_updates_subscribers(SlotUpdate::Frozen {
+            slot,
+            timestamp: slots_update_ts,
+            stats: SlotTransactionStats {
+                num_transaction_entries: SURFPOOL_ENTRIES_PER_BLOCK,
+                num_successful_transactions,
+                num_failed_transactions,
+                max_transactions_per_entry: num_transactions,
+            },
+        });
 
         // Notify geyser plugins of block metadata
         let block_metadata = GeyserBlockMetadata {
@@ -4705,6 +4707,7 @@ impl SurfnetSvm {
                 Some(SlotUpdate::OptimisticConfirmation { slot, timestamp })
             }
             GeyserSlotStatus::Rooted => Some(SlotUpdate::Root { slot, timestamp }),
+            GeyserSlotStatus::Completed => Some(SlotUpdate::Completed { slot, timestamp }),
         };
         self.geyser_events_tx
             .send(GeyserEvent::UpdateSlotStatus {
@@ -7963,9 +7966,9 @@ mod tests {
         let produced: Vec<Slot> = blocks.iter().map(|block| block.slot).collect();
         assert_eq!(roots, produced[..roots.len()]);
         assert!(roots.contains(&last_block) && roots.contains(&landing));
-        // Around the jump, Geyser hears each block's entry, then its metadata, Processed and
-        // Confirmed; the landing announced on the last block before content can reach it; each
-        // block rooted once, with its parent; and nothing for a skipped slot.
+        // Around the jump, Geyser hears each block's entry, then Completed, its metadata,
+        // Processed and Confirmed; the landing announced on the last block before content can
+        // reach it; each block rooted once, with its parent; and nothing for a skipped slot.
         let lifecycle: Vec<_> = events
             .iter()
             .filter_map(|event| match event {
@@ -7986,6 +7989,7 @@ mod tests {
         let expected = [
             (last, "CreatedBank", Some(before)),
             (last, "Entry", None),
+            (last, "Completed", None),
             (last, "BlockMeta", None),
             (last, "Processed", Some(before)),
             (last, "Confirmed", None),
@@ -7993,6 +7997,7 @@ mod tests {
             (last + 50, "CreatedBank", Some(last)),
             (landing, "CreatedBank", Some(last)),
             (landing, "Entry", None),
+            (landing, "Completed", None),
             (landing, "BlockMeta", None),
             (landing, "Processed", Some(last)),
             (landing, "Confirmed", None),
