@@ -184,3 +184,14 @@ test('lockfile drift and encoded payload findings do not fail the CLI', () => {
   assert.match(run.stdout, /lockfile changed without its owning manifest/);
   assert.match(run.stdout, /large encoded token/);
 });
+
+test('replacing a binary fixture with text scans new payloads and sensitive APIs', () => {
+  const path = 'crates/core/src/tests/assets/replaced.txt';
+  write(path, Buffer.from([0, 1, 2]));
+  base = commit();
+  write(path, 'reqwest::get(url);\n' + 'a'.repeat(300) + '\n');
+  const result = check();
+  assert.ok(result.sensitive.get(path).has('sensitive API primitive'));
+  assert.ok(result.findings.some(finding =>
+    finding.path === path && finding.line === 2 && finding.reason.includes('large encoded token')));
+});

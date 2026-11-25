@@ -58,7 +58,8 @@ function owned(path, policy) {
 
 /** Yield head line numbers and added text for a changed path. */
 function* addedLines(base, head, path) {
-  const diff = git('diff', '--no-ext-diff', '--no-textconv', '--unified=0', '--no-renames', base, head, '--', path).toString('utf8');
+  // The base blob may be binary even when the head blob is inspectable text.
+  const diff = git('diff', '--text', '--no-ext-diff', '--no-textconv', '--unified=0', '--no-renames', base, head, '--', path).toString('utf8');
   let number;
   for (const line of diff.split('\n')) {
     const hunk = line.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
