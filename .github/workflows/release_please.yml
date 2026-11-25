@@ -22,8 +22,8 @@ jobs:
     name: Release Please
     if: github.event.repository.fork == false
     runs-on: ubuntu-latest
-    # Holds RELEASE_PLEASE_TOKEN. Restrict this environment to `main` so a
-    # workflow pushed on another branch cannot read the token.
+    # RELEASE_PLEASE_TOKEN is an environment secret rather than a repository
+    # secret, so only jobs that may deploy to this environment can read it.
     environment: release-please
     permissions:
       contents: write
@@ -36,8 +36,8 @@ jobs:
       - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         id: release
         with:
-          # PRs opened with GITHUB_TOKEN do not trigger CI. Set this secret
-          # (GitHub App or fine-grained PAT) to get checks on the release PR.
+          # GITHUB_TOKEN works, but a release PR it opens does not trigger CI;
+          # PRs opened with RELEASE_PLEASE_TOKEN do.
           token: ${{ secrets.RELEASE_PLEASE_TOKEN || github.token }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json

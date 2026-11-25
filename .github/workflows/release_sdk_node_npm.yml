@@ -3,8 +3,8 @@ name: Publish SDK Node Package
 # On a push to main that changes package.json's version (a merged release PR),
 # publishes that version. On any other push, when the NPM_EDGE_ENABLED
 # repository variable is "true", publishes an edge build under the `edge`
-# dist-tag. To retry a stable publish, run this workflow manually on the
-# release tag (e.g. v1.8.0).
+# dist-tag. A manual run publishes whichever packages of the checked-out
+# version are missing from npm.
 on:
   push:
     branches:
