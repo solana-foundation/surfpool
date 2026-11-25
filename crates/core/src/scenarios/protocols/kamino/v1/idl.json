@@ -2,7 +2,7 @@
   "address": "KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD",
   "metadata": {
     "name": "kamino_lending",
-    "version": "1.23.0",
+    "version": "1.27.0",
     "spec": "0.1.0"
   },
   "instructions": [],
@@ -399,10 +399,13 @@
             "name": "UpdateReserveEmergencyMode"
           },
           {
-            "name": "UpdateRewardsAmountPerSlot"
+            "name": "UpdateRewardsAmountPerAccrualUnit"
           },
           {
             "name": "UpdateReservePermissionedOps"
+          },
+          {
+            "name": "UpdateInterestRateBasis"
           }
         ]
       }
@@ -625,6 +628,12 @@
           },
           {
             "name": "UpdateReserveRewardsMaxAprBps"
+          },
+          {
+            "name": "UpdateDisableNonceBlock"
+          },
+          {
+            "name": "UpdateMinObligationOrderExecutionValue"
           }
         ]
       }
@@ -673,13 +682,22 @@
             "type": "u8"
           },
           {
-            "name": "placeholder",
+            "name": "alignment_padding",
             "type": {
               "array": [
                 "u8",
-                6
+                2
               ]
             }
+          },
+          {
+            "name": "timestamp",
+            "docs": [
+              "Wall-clock timestamp (seconds) of the last update.",
+              "",
+              "Note: `u32` is used here only because of space constraints."
+            ],
+            "type": "u32"
           }
         ]
       }
@@ -741,9 +759,9 @@
       "docs": [
         "A borrow order.",
         "",
-        "When the [Obligation::borrow_order] is populated (i.e. non-zeroed) on an Obligation, then the",
-        "permissionless \"fill\" operations may borrow liquidity to the owner according to this",
-        "specification."
+        "When a borrow order entry on an Obligation (see [Obligation::get_borrow_order()]) is populated",
+        "(i.e. non-zeroed), then the permissionless \"fill\" operations may borrow liquidity to the owner",
+        "according to this specification."
       ],
       "type": {
         "kind": "struct",
@@ -947,16 +965,17 @@
             "type": "u8"
           },
           {
-            "name": "alignment_padding",
+            "name": "fixed_term_rollover_window_duration_days",
             "docs": [
-              "Internal alignment padding (free to reuse)."
+              "An optional override of the [LendingMarket::fixed_term_rollover_window_duration_seconds],",
+              "expressed in *days*.",
+              "",
+              "When zeroed, the market's configured value is used. Also, this setting is effective only",
+              "when the fixed-term rollover mode is enabled on the market level.",
+              "In other words: this field cannot be used to enable or disable the fixed-term rollover, only",
+              "to customize its window duration."
             ],
-            "type": {
-              "array": [
-                "u8",
-                1
-              ]
-            }
+            "type": "u8"
           },
           {
             "name": "max_borrow_rate_bps",
@@ -1319,6 +1338,9 @@
           },
           {
             "name": "MigrationToFixedEnabled"
+          },
+          {
+            "name": "FixedTermRolloverWindowDurationDays"
           }
         ]
       }
@@ -1481,6 +1503,17 @@
             "type": "u8"
           },
           {
+            "name": "interest_rate_basis",
+            "docs": [
+              "Selects how the time-related settings are interpreted:",
+              "- [Self::borrow_rate_curve] + [Self::host_fixed_interest_rate_bps] (when accruing interest),",
+              "- [Self::rewards_amount_per_accrual_unit] (when accruing rewards).",
+              "",
+              "See the docs of the actual type, [InterestRateBasis]."
+            ],
+            "type": "u8"
+          },
+          {
             "name": "reserved1",
             "docs": [
               "Past reserved space - feel free to reuse."
@@ -1488,7 +1521,7 @@
             "type": {
               "array": [
                 "u8",
-                4
+                3
               ]
             }
           },
@@ -1739,9 +1772,11 @@
             "type": "u64"
           },
           {
-            "name": "rewards_amount_per_slot",
+            "name": "rewards_amount_per_accrual_unit",
             "docs": [
-              "Rewards distributed per slot to depositors. Drained from",
+              "Rewards distributed per accrual unit to depositors. The unit follows",
+              "[Self::interest_rate_basis]: per slot for `Legacy`, per second for `TrueApr` (i.e. a",
+              "basis migration must rescale this value by the real slot rate). Drained from",
               "[ReserveLiquidity::rewards_amount_available] into",
               "[ReserveLiquidity::total_available_amount] at each refresh, capped by the",
               "market-level [LendingMarket::reserve_rewards_max_apr_bps]. `0` disables.",
@@ -1963,7 +1998,8 @@
               "",
               "Tokens are deposited via `topup_reserve_rewards` and increase this counter (without",
               "touching [Self::total_available_amount]). On every `refresh_reserve`, up to",
-              "`rewards_amount_per_slot * slots_elapsed` tokens are moved from this counter into",
+              "`rewards_amount_per_accrual_unit * elapsed_units` tokens (units per the reserve's",
+              "interest rate basis) are moved from this counter into",
               "[Self::total_available_amount], inflating the cToken exchange rate, capped by the",
               "market-level `reserve_rewards_max_apr_bps` cap."
             ],
@@ -2700,7 +2736,7 @@
           {
             "name": "obligation_order_execution_enabled",
             "docs": [
-              "Whether the obligation orders should be evaluated during liquidations."
+              "Whether execution of obligation orders is enabled."
             ],
             "type": "u8"
           },
@@ -2826,21 +2862,29 @@
             "type": "u8"
           },
           {
-            "name": "padding2",
-            "type": {
-              "array": [
-                "u8",
-                1
-              ]
-            }
+            "name": "disable_nonce_block",
+            "docs": [
+              "When non-zero, ongoing-admin instructions targeting this market are allowed to be part of",
+              "a durable (nonce-based) transaction. Defaults to 0 \u2014 any `advance_nonce_account` ix found",
+              "in the transaction causes admin ix to fail with `TransactionIncludesNonceInstruction`.",
+              "Intended for markets administrated via MPC wallets that require durable nonces.",
+              "",
+              "Note: this flag only covers ongoing admin ix on an existing market. Bootstrap-only ix",
+              "(`init_lending_market`) and global-config ix",
+              "(`init_global_config`, `update_global_config`, `update_global_config_admin`) remain",
+              "unconditionally blocked."
+            ],
+            "type": "u8"
           },
           {
             "name": "reserve_rewards_max_apr_bps",
             "docs": [
               "Maximum APR (in basis points; `FULL_BPS = 10_000` = 100%) at which reserves on this market",
-              "may distribute their `rewards_amount_per_slot`. `0` disables rewards on this market",
+              "may distribute their `rewards_amount_per_accrual_unit`. `0` disables rewards on this market",
               "entirely (`topup_reserve_rewards` is rejected). Bounded by `FULL_BPS` (100% APR) when set.",
-              "See [ReserveConfig::rewards_amount_per_slot] for the depositor-cap interaction."
+              "The APR is interpreted per each reserve's interest rate basis: a true wall-clock APR for",
+              "`TrueApr` reserves, a nominal slot-year APR for `Legacy` ones.",
+              "See [ReserveConfig::rewards_amount_per_accrual_unit] for the depositor-cap interaction."
             ],
             "type": "u16"
           },
@@ -2930,11 +2974,20 @@
             "type": "u64"
           },
           {
+            "name": "min_obligation_order_execution_value",
+            "docs": [
+              "Minimum value that can be moved (borrowed for lever-up, or repaid for deleverage) in a single",
+              "`execute_obligation_order()` call, in full units of the quote currency (e.g. `2` means \"$2\",",
+              "not \"2 lamports of USDC\")."
+            ],
+            "type": "u64"
+          },
+          {
             "name": "padding1",
             "type": {
               "array": [
                 "u64",
-                153
+                152
               ]
             }
           }
@@ -3170,10 +3223,19 @@
             }
           },
           {
-            "name": "borrow_order",
+            "name": "head_borrow_order",
             "docs": [
-              "Owner-defined, permissionlessly-executed borrow order applicable to this obligation.",
-              "Non-zeroed only on a newly-initialized fixed-rate, fixed-term obligation."
+              "The first of the owner-defined, permissionlessly-executed borrow order applicable to this",
+              "obligation.",
+              "",
+              "## Why \"head\"?",
+              "",
+              "We started with a single BO, and later needed to add support for having multiple BOs (while",
+              "the next field was already added and released). Hence, the entire array of BOs is split",
+              "between this singular field and [Self::tail_borrow_orders]. We explicitly renamed this one",
+              "to \"head_...\" so that all usages are aware of the split - in fact, the callers should use",
+              "the public [Self::get_borrow_order()] / [Self::get_borrow_order_mut()] for uniform access",
+              "to the abstract \"array of BOs\"."
             ],
             "type": {
               "defined": {
@@ -3190,11 +3252,27 @@
             "type": "pubkey"
           },
           {
+            "name": "tail_borrow_orders",
+            "docs": [
+              "The tail of the BOs array (see [Self::head_borrow_order])."
+            ],
+            "type": {
+              "array": [
+                {
+                  "defined": {
+                    "name": "BorrowOrder"
+                  }
+                },
+                2
+              ]
+            }
+          },
+          {
             "name": "padding3",
             "type": {
               "array": [
                 "u64",
-                69
+                29
               ]
             }
           }

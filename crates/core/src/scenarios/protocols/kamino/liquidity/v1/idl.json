@@ -629,6 +629,18 @@
                 "name": "DriftDirection"
               }
             }
+          },
+          {
+            "name": "enforce_initial_drift_direction",
+            "type": "u8"
+          },
+          {
+            "name": "max_ticks_per_rebalance",
+            "type": "u32"
+          },
+          {
+            "name": "max_ticks_per_epoch",
+            "type": "u32"
           }
         ]
       }
@@ -699,6 +711,14 @@
             "type": {
               "defined": {
                 "name": "RebalanceAutodriftStep"
+              }
+            }
+          },
+          {
+            "name": "epoch_cap_anchor",
+            "type": {
+              "defined": {
+                "name": "RebalanceAutodriftEpochCapAnchor"
               }
             }
           }
@@ -1081,7 +1101,7 @@
             "name": "DeprecatedTreasuryFeeVaults"
           },
           {
-            "name": "AdminAuthority"
+            "name": "DeprecatedAdminAuthority"
           },
           {
             "name": "BlockEmergencySwap"
@@ -1120,10 +1140,49 @@
             "name": "MaxDeviationFromRefPriceOnInvestBps"
           },
           {
-            "name": "InvestCooldownSlots"
+            "name": "InvestCooldownSeconds"
           },
           {
             "name": "MinInvestTriggerValueUsd"
+          },
+          {
+            "name": "PendingAdminAuthority"
+          },
+          {
+            "name": "CapMaxDeviationFromRefPriceOnInvestBps"
+          },
+          {
+            "name": "CapMaxPriceDeviationBps"
+          },
+          {
+            "name": "EmergencyCouncil"
+          },
+          {
+            "name": "UnfreezeAuthority"
+          },
+          {
+            "name": "DepositMaxPoolPriceOracleDeviationBps"
+          },
+          {
+            "name": "MaxInvestBpsPerOperation"
+          },
+          {
+            "name": "MaxInvestUsdPerOperation"
+          },
+          {
+            "name": "MaxPoolDeviationFromTwapBps"
+          },
+          {
+            "name": "RefPriceMaxTtlSeconds"
+          },
+          {
+            "name": "MaxDeviationFromSnapshotPriceBps"
+          },
+          {
+            "name": "CapMaxDeviationFromSnapshotPriceBps"
+          },
+          {
+            "name": "MinRefPriceAgeSeconds"
           }
         ]
       }
@@ -1291,6 +1350,27 @@
           },
           {
             "name": "UpdateMaxDeviationFromRefPriceOnInvestBps"
+          },
+          {
+            "name": "UpdatePendingRange"
+          },
+          {
+            "name": "ResetPendingRange"
+          },
+          {
+            "name": "UpdateStrategyEmergencyMode"
+          },
+          {
+            "name": "UpdateDepositMaxPoolPriceOracleDeviationBps"
+          },
+          {
+            "name": "UpdateRewardDiscountBps"
+          },
+          {
+            "name": "UpdateMaxPoolDeviationFromTwapBps"
+          },
+          {
+            "name": "UpdateMaxDeviationFromSnapshotPriceBps"
           }
         ]
       }
@@ -2939,11 +3019,15 @@
             "type": "u8"
           },
           {
+            "name": "emergency_mode",
+            "type": "u8"
+          },
+          {
             "name": "padding1",
             "type": {
               "array": [
                 "u8",
-                5
+                4
               ]
             }
           },
@@ -3018,15 +3102,50 @@
             "type": "u32"
           },
           {
-            "name": "padding3",
+            "name": "max_pool_deviation_from_twap_bps",
             "type": "u32"
           },
           {
-            "name": "last_invest_slot",
+            "name": "last_invest_timestamp",
+            "docs": [
+              "Unix timestamp (seconds) of the last invest. 0 means never invested."
+            ],
             "type": "u64"
           },
           {
-            "name": "padding4",
+            "name": "pending_new_tick_lower_index",
+            "type": "i32"
+          },
+          {
+            "name": "pending_new_tick_upper_index",
+            "type": "i32"
+          },
+          {
+            "name": "deposit_max_pool_price_oracle_deviation_bps",
+            "type": "u64"
+          },
+          {
+            "name": "reward_discount_bps",
+            "type": "u64"
+          },
+          {
+            "name": "ref_tick_index_price",
+            "docs": [
+              "A tick index (Meteora: bin id), not a price: the snapshot written by",
+              "set_ref_tick_index_price. Invest converts it to the pool price it encodes and uses",
+              "that price as the reference the current pool price must stay close to."
+            ],
+            "type": "i32"
+          },
+          {
+            "name": "max_deviation_from_snapshot_price_bps",
+            "type": "u32"
+          },
+          {
+            "name": "ref_tick_index_price_timestamp",
+            "docs": [
+              "Unix timestamp (seconds) of the last ref_tick_index_price snapshot. 0 means never set."
+            ],
             "type": "u64"
           },
           {
@@ -3034,7 +3153,7 @@
             "type": {
               "array": [
                 "u128",
-                12
+                10
               ]
             }
           },
@@ -3193,7 +3312,10 @@
             "type": "u32"
           },
           {
-            "name": "invest_cooldown_slots",
+            "name": "invest_cooldown_seconds",
+            "docs": [
+              "Minimum seconds between invests per strategy. 0 disables the cooldown."
+            ],
             "type": "u64"
           },
           {
@@ -3201,11 +3323,88 @@
             "type": "u64"
           },
           {
+            "name": "pending_admin",
+            "type": "pubkey"
+          },
+          {
+            "name": "cap_max_deviation_from_ref_price_on_invest_bps",
+            "type": "u32"
+          },
+          {
+            "name": "cap_max_price_deviation_bps",
+            "type": "u32"
+          },
+          {
+            "name": "emergency_council",
+            "type": "pubkey"
+          },
+          {
+            "name": "unfreeze_authority",
+            "docs": [
+              "Counterpart of `emergency_council`: may only unset emergency/block flags (never set",
+              "them). Expected to be a multisig with a lower signature threshold than the admin",
+              "multisig, for faster recovery."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "deposit_max_pool_price_oracle_deviation_bps",
+            "type": "u64"
+          },
+          {
+            "name": "max_pool_deviation_from_twap_bps",
+            "type": "u32"
+          },
+          {
+            "name": "padding2",
+            "type": "u32"
+          },
+          {
+            "name": "max_invest_bps_per_operation",
+            "docs": [
+              "Optional per-invest BPS cap over total strategy value. 0 means unset."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "max_invest_usd_per_operation",
+            "docs": [
+              "Optional per-invest USD cap, using USD_DECIMALS_PRECISION decimals. 0 means unset."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "ref_price_max_ttl_seconds",
+            "docs": [
+              "Seconds TTL for the stored strategy ref_tick_index_price snapshot. 0 disables invest-time",
+              "snapshot checks so existing strategies keep their current behavior."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "max_deviation_from_snapshot_price_bps",
+            "type": "u32"
+          },
+          {
+            "name": "cap_max_deviation_from_snapshot_price_bps",
+            "type": "u32"
+          },
+          {
+            "name": "min_ref_price_age_seconds",
+            "docs": [
+              "Minimum age in seconds for the stored strategy ref_tick_index_price snapshot on invest.",
+              "0 disables the check. The setter caps the value at 60 seconds and enforces min age <=",
+              "ref_price_max_ttl_seconds / 2 while that TTL is nonzero. A TTL of 0 disables all snapshot",
+              "checks, so a nonzero min age retained from before the TTL was zeroed is ignored."
+            ],
+            "type": "u64"
+          },
+          {
             "name": "padding",
             "type": {
               "array": [
                 "u64",
-                1968
+                1948
               ]
             }
           }
@@ -3268,6 +3467,22 @@
                 64
               ]
             }
+          }
+        ]
+      }
+    },
+    {
+      "name": "RebalanceAutodriftEpochCapAnchor",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "epoch",
+            "type": "u64"
+          },
+          {
+            "name": "strat_mid_tick",
+            "type": "i32"
           }
         ]
       }

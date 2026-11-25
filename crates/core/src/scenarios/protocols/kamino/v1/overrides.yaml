@@ -1,5 +1,5 @@
 protocol: kamino
-version: v1.23.0
+version: v1.27.0
 account_type: Reserve
 idl_file_path: idl.json
 
@@ -262,7 +262,7 @@ templates:
     description: Override Kamino Reserve reward emissions
     idl_account_name: Reserve
     properties:
-      - "config.rewards_amount_per_slot"
+      - "config.rewards_amount_per_accrual_unit"
       - "liquidity.rewards_amount_available"
     address:
       type: pubkey
@@ -271,13 +271,15 @@ templates:
       templates for those.
 
       HOW TO USE THIS TEMPLATE:
-      1. Set config.rewards_amount_per_slot to the emission rate (smallest unit per slot, ~4
-         slots per second)
+      1. Set config.rewards_amount_per_accrual_unit to the emission rate, in the mint's smallest
+         unit. The unit of time is one second when the reserve's config.interest_rate_basis is 1,
+         and one slot (~4 slots per second) when it is 0
       2. Raise liquidity.rewards_amount_available too, or emissions stop when the budget empties
       3. Check reserve_rewards_max_apr_bps on kamino-lending-market-risk is not capping you
 
-      EXAMPLE - "emit 1 USDC per second to depositors" (6 decimals, ~4 slots/sec):
-      config.rewards_amount_per_slot: 250000
+      EXAMPLE - "emit 1 USDC per second to depositors" (6 decimals, interest_rate_basis 1; use
+      250000 when it is 0):
+      config.rewards_amount_per_accrual_unit: 1000000
       liquidity.rewards_amount_available: 1000000000
 
   - id: kamino-reserve-debt-term
