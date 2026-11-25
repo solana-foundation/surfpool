@@ -181,20 +181,15 @@ pub(crate) fn unload_plugin_by_name(
 fn check_port_availability(addr: SocketAddr, server_type: &str) -> Result<(), String> {
     match std::net::TcpListener::bind(addr) {
         Ok(_listener) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-            let msg = format!(
-                "{} port {} is already in use. Try --port or --ws-port to use a different port.",
-                server_type,
-                addr.port()
-            );
-            eprintln!("Error: {}", msg);
-            Err(msg)
-        }
-        Err(e) => {
-            let msg = format!("Failed to bind {} server to {}: {}", server_type, addr, e);
-            eprintln!("Error: {}", msg);
-            Err(msg)
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => Err(format!(
+            "{} port {} is already in use. Try --port or --ws-port to use a different port.",
+            server_type,
+            addr.port()
+        )),
+        Err(e) => Err(format!(
+            "Failed to bind {} server to {}: {}",
+            server_type, addr, e
+        )),
     }
 }
 
