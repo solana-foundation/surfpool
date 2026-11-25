@@ -1,0 +1,249 @@
+protocol: GoonFi
+version: v2
+account_type: MarketState
+
+raw_layout: true
+
+tags:
+  - pmm
+  - prop-amm
+  - swap
+
+keep_alive:
+  - template: goonfi-quote-publication
+    address: { type: input, value: oracle }
+    values: { last_update_slot: $slot-1 }
+
+llm_context: |
+  FINDING THE MARKET WHEN THE USER NAMES A PAIR OR STUDIO DOES NOT LIST IT:
+  1. Resolve both token symbols with get_token_address, both calls at once.
+  2. Make three getProgramAccounts calls at once, each with two positional params: the program
+     id string "goonuddtQRrWqqn5nFyczVKaie28f3kDkHWkHtURSLE", then the config object
+     {"encoding":"base58","dataSlice":{"offset":208,"length":32},"filters":[
+     {"memcmp":{"offset":0,"bytes":"99nuWqpQZwP"}},{"memcmp":{"offset":80,"bytes":"<base mint>"}},
+     {"memcmp":{"offset":112,"bytes":"<quote mint>"}}]}.
+     The second call uses dataSlice {"offset":144,"length":32} and the third
+     {"offset":176,"length":32}. Offset 0 is the market tag. Each result's pubkey is a market
+     for the pair. Its data is the market's oracle in the first call, its base vault in the
+     second and its quote vault in the third.
+  3. No result means a mistyped mint, a symbol get_token_address maps to another token, or no
+     market for the pair. Copy both mints again exactly and repeat once; if there is still no
+     result, ask the user for the mints or the market address instead of saying none exists.
+  4. Always check the vaults, even for a single result, and before create_scenario: call
+     getMultipleAccounts with encoding "jsonParsed" on the vaults from the second and third
+     calls, never on the oracles from the first. Each vault comes back as a parsed spl-token
+     account with a tokenAmount; raw bytes mean an oracle was passed. The base vault pays buys
+     and the quote vault pays sells. Keep the market whose base vault holds the most tokens; a
+     pair can also have stopped markets. If both of its vaults hold almost nothing, say the
+     market looks stopped instead of preparing it; if one does, say which direction cannot fill.
+  5. Put the market in the override's account as {"pubkey":"<market>"} and set fetchBeforeUse
+     as described below. A market address the user gives is used as is; read its vaults with
+     getAccountInfo, encoding "base58" and dataSlice {"offset":144,"length":32} and
+     {"offset":176,"length":32}, and check them as in step 4. The market address is never an
+     override value.
+
+templates:
+  - id: goonfi-reference-band
+    name: Override Reference Band
+    description: Move the market's reference prices that bound the oracle quote
+    idl_account_name: MarketState
+    address:
+      type: pubkey
+    properties:
+      - path: reference_price_a_x1e6
+        offset: 1712
+        encoding: u64
+        label: Reference price A
+        description: Sell reference (quote per base times 10^6); sells reject while the bid is above it.
+      - path: reference_price_b_x1e6
+        offset: 1720
+        encoding: u64
+        label: Reference price B
+        description: Buy reference (quote per base times 10^6); buys reject while the ask is below it.
+      - path: oracle
+        type: input
+        value_type: pubkey
+        label: Market oracle
+        description: >-
+          The oracle of this market, stored at market bytes 208..240. Surfpool keeps it current
+          while the scenario is registered; it is not written to the market.
+    llm_context: |
+      PRECONDITION - MOVE THE BAND WITH THE PRICE. GoonFi checks the oracle quote against these two
+      reference prices before it fills, and each has a fixed role, within a small per-market
+      tolerance. A sell whose oracle bid sits above reference A, or a buy whose oracle ask sits
+      below reference B, rejects with custom error 0x24 (36). Every goonfi-price move needs this
+      template on the same market, scaled by the same factor, in the same scenario.
+
+      SET THE ORACLE INPUT. Put the market's oracle (market bytes 208..240) in `oracle`. While the
+      scenario is registered, Surfpool republishes that oracle every slot as GoonFi's maker does on
+      mainnet, so a stale quote never hides this change.
+
+      UNIT: quote per base times 10^6, the same scale as the oracle and independent of mint
+      decimals. SOL at 99.74 USDC is 99740000.
+
+      CONVERSION:
+        reference_price_x1e6 = human_price * 10^6
+
+      Set both anchors to the target price, or scale both by the same factor as the oracle. Each
+      fill moves its own anchor: a sell sets A to the bid it filled at, a buy sets B to the ask. A
+      price move made after swaps therefore meets the anchors those swaps left, so apply this
+      template again in the same slot as that price move.
+
+      Set fetchBeforeUse: true to pull the account from upstream first; false only for a later override
+      that builds on state an earlier override in the same scenario prepared. The market's oracle is
+      at market bytes 208..240; its vaults are at 144..176 (base) and 176..208 (quote).
+
+      ONE-SIDED BLOCK: leave the band untouched and raise only the bid above A to block sells, or
+      lower only the ask below B to block buys. The other direction keeps filling.
+
+      EXAMPLE - "SOL is worth $150" on the selected SOL/USDC market, paired with goonfi-price:
+        reference_price_a_x1e6: 150000000
+        reference_price_b_x1e6: 150000000
+
+  - id: goonfi-size-impact
+    name: Override Price by Trade Size
+    description: Change how much worse GoonFi fills larger trades in each direction
+    idl_account_name: MarketState
+    address:
+      type: pubkey
+    properties:
+      - path: sell_penalty_0
+        offset: 240
+        encoding: u64
+        label: Sale penalty at size 1
+        description: Millionths taken off a sale at the market's first sale size (base atoms, u64 at market byte 1472); 10000 is 1%, 0 removes the point.
+      - path: sell_penalty_1
+        offset: 248
+        encoding: u64
+        label: Sale penalty at size 2
+        description: Millionths taken off a sale at the market's second sale size (base atoms at byte 1480); interpolated linearly in between.
+      - path: sell_penalty_2
+        offset: 256
+        encoding: u64
+        label: Sale penalty at size 3
+        description: Millionths taken off a sale at the market's third sale size (base atoms at byte 1488); interpolated linearly in between.
+      - path: sell_penalty_3
+        offset: 264
+        encoding: u64
+        label: Sale penalty at size 4
+        description: Millionths taken off a sale at the market's fourth sale size (base atoms at byte 1496); interpolated linearly in between.
+      - path: sell_penalty_4
+        offset: 272
+        encoding: u64
+        label: Sale penalty at size 5
+        description: Millionths taken off a sale at the market's fifth sale size (base atoms at byte 1504); interpolated linearly in between.
+      - path: sell_penalty_5
+        offset: 280
+        encoding: u64
+        label: Sale penalty at size 6
+        description: Millionths taken off a sale at the market's sixth sale size (base atoms at byte 1512); interpolated linearly in between.
+      - path: sell_penalty_6
+        offset: 288
+        encoding: u64
+        label: Sale penalty at size 7
+        description: Millionths taken off a sale at the market's seventh sale size (base atoms at byte 1520); interpolated linearly in between.
+      - path: sell_penalty_7
+        offset: 296
+        encoding: u64
+        label: Sale penalty at size 8
+        description: Millionths taken off a sale at the market's eighth sale size (base atoms at byte 1528); interpolated linearly in between.
+      - path: sell_penalty_8
+        offset: 304
+        encoding: u64
+        label: Sale penalty at size 9
+        description: Millionths taken off a sale at the market's ninth sale size (base atoms at byte 1536); interpolated linearly in between.
+      - path: sell_penalty_9
+        offset: 312
+        encoding: u64
+        label: Sale penalty at size 10
+        description: Millionths taken off a sale at the market's tenth sale size (base atoms at byte 1544); interpolated linearly in between.
+      - path: buy_penalty_0
+        offset: 320
+        encoding: u64
+        label: Purchase penalty at size 1
+        description: Millionths taken off a purchase at the market's first purchase size (quote atoms, u64 at market byte 1552); 10000 is 1%, 0 removes the point.
+      - path: buy_penalty_1
+        offset: 328
+        encoding: u64
+        label: Purchase penalty at size 2
+        description: Millionths taken off a purchase at the market's second purchase size (quote atoms at byte 1560); interpolated linearly in between.
+      - path: buy_penalty_2
+        offset: 336
+        encoding: u64
+        label: Purchase penalty at size 3
+        description: Millionths taken off a purchase at the market's third purchase size (quote atoms at byte 1568); interpolated linearly in between.
+      - path: buy_penalty_3
+        offset: 344
+        encoding: u64
+        label: Purchase penalty at size 4
+        description: Millionths taken off a purchase at the market's fourth purchase size (quote atoms at byte 1576); interpolated linearly in between.
+      - path: buy_penalty_4
+        offset: 352
+        encoding: u64
+        label: Purchase penalty at size 5
+        description: Millionths taken off a purchase at the market's fifth purchase size (quote atoms at byte 1584); interpolated linearly in between.
+      - path: buy_penalty_5
+        offset: 360
+        encoding: u64
+        label: Purchase penalty at size 6
+        description: Millionths taken off a purchase at the market's sixth purchase size (quote atoms at byte 1592); interpolated linearly in between.
+      - path: buy_penalty_6
+        offset: 368
+        encoding: u64
+        label: Purchase penalty at size 7
+        description: Millionths taken off a purchase at the market's seventh purchase size (quote atoms at byte 1600); interpolated linearly in between.
+      - path: buy_penalty_7
+        offset: 376
+        encoding: u64
+        label: Purchase penalty at size 8
+        description: Millionths taken off a purchase at the market's eighth purchase size (quote atoms at byte 1608); interpolated linearly in between.
+      - path: buy_penalty_8
+        offset: 384
+        encoding: u64
+        label: Purchase penalty at size 9
+        description: Millionths taken off a purchase at the market's ninth purchase size (quote atoms at byte 1616); interpolated linearly in between.
+      - path: buy_penalty_9
+        offset: 392
+        encoding: u64
+        label: Purchase penalty at size 10
+        description: Millionths taken off a purchase at the market's tenth purchase size (quote atoms at byte 1624); interpolated linearly in between.
+      - path: oracle
+        type: input
+        value_type: pubkey
+        label: Market oracle
+        description: >-
+          The oracle of this market, stored at market bytes 208..240. Surfpool keeps it current
+          while the scenario is registered; it is not written to the market.
+    llm_context: |
+      WHAT IT CHANGES: GoonFi takes a size penalty off every fill. Each direction has ten size
+      points and a penalty for each. The penalty is in millionths of the price: 10000 makes the fill
+      1% worse. Between two size points the penalty is interpolated linearly, and a trade smaller
+      than the first point pays the first point's penalty. Sales are sized in base atoms, purchases
+      in quote atoms.
+
+      The size points are the market's own and this template leaves them unchanged: sale sizes are
+      the u64 values at market bytes 1472 + 8*i and purchase sizes at 1552 + 8*i, for i = 0..9,
+      increasing. Before choosing values, read them and the current penalties (sale at 240 + 8*i,
+      purchase at 320 + 8*i) with getAccountInfo, encoding "base64", on the market.
+
+      RULES:
+      - Only the penalties you set are written; the others keep the market's values.
+      - 0 removes a point and the curve interpolates across it. When all ten penalties of a
+        direction are 0, every swap in that direction rejects with custom error 0xd (13).
+      - Penalties do not have to increase with size.
+      - The penalty does not move the oracle quote, so the reference band is unaffected.
+
+      SET THE ORACLE INPUT. Put the market's oracle (market bytes 208..240) in `oracle`. While the
+      scenario is registered, Surfpool republishes that oracle every slot as GoonFi's maker does on
+      mainnet, so a stale quote never hides this change.
+
+      Set fetchBeforeUse: true to pull the account from upstream first; false only for a later override
+      that builds on state an earlier override in the same scenario prepared, such as a
+      goonfi-reference-band move applied to the same market.
+
+      EXAMPLES:
+        "Trade size does not matter on sales": set sell_penalty_0 through sell_penalty_9 to the
+        same value, for example the market's current sell_penalty_1.
+        "Large trades get much worse": double sell_penalty_5 through sell_penalty_9 and
+        buy_penalty_5 through buy_penalty_9.
+        "Every fill is 1% worse": set all twenty penalties to 10000.

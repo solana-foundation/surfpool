@@ -1,0 +1,52 @@
+protocol: BisonFi
+version: v3
+
+# What BisonFi's maker and the block builders write every slot on mainnet. Every template in
+# overrides.yaml imports both, so a registered scenario keeps its pool quoting.
+raw_layout: true
+
+templates:
+  - id: bisonfi-quote-publication
+    name: Quote publication
+    description: The maker republishing a pool's quote
+    idl_account_name: PoolStat
+    address:
+      type: pubkey
+    properties:
+      - path: last_update_slot
+        offset: 72
+        encoding: u64
+        description: >-
+          Slot the quote was published in. A quote more than two slots old pays nothing.
+      - path: publication_ns
+        offset: 88
+        encoding: u64
+        description: >-
+          Unix nanoseconds the quote was published at. The program grades the quote's age against
+          the market tick to the millisecond.
+      - path: last_rebuild_slot
+        offset: 688
+        encoding: u64
+        description: >-
+          Slot the program last rebuilt the book in. The first swap of a later slot refills the
+          working book from the configured one, as after a real publication.
+
+  - id: bisonfi-market-tick
+    name: Market tick
+    description: The block builders' clock that BisonFi and Tessera read
+    address:
+      type: pubkey
+    properties:
+      - path: slot
+        offset: 40
+        encoding: u64
+        description: Slot of the tick. A swap requires it to be the Clock's slot.
+      - path: first_timestamp_ns
+        offset: 48
+        encoding: u64
+        description: Unix nanoseconds of the tick's first timestamp.
+      - path: timestamp_ns
+        offset: 56
+        encoding: u64
+        description: >-
+          Unix nanoseconds of the tick. A swap requires it within one second of the Clock.

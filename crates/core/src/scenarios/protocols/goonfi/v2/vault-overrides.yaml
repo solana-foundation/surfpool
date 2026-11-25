@@ -1,0 +1,90 @@
+protocol: GoonFi
+version: v2
+account_type: TokenAccount
+
+raw_layout: true
+
+tags:
+  - pmm
+  - vault
+  - inventory
+
+keep_alive:
+  - template: goonfi-quote-publication
+    address: { type: input, value: oracle }
+    values: { last_update_slot: $slot-1 }
+
+templates:
+  - id: goonfi-vault-balance
+    name: Override Vault Balance
+    description: Change one GoonFi vault's inventory or make its payout direction unfillable
+    idl_account_name: TokenAccount
+    address:
+      type: pubkey
+    properties:
+      - path: amount
+        offset: 64
+        encoding: u64
+        label: Vault token balance
+        description: Raw token amount in the mint's smallest unit.
+      - path: oracle
+        type: input
+        value_type: pubkey
+        label: Market oracle
+        description: >-
+          The oracle of this vault's market, stored at market bytes 208..240. Surfpool keeps it current
+          while the scenario is registered; it is not written to the vault.
+    llm_context: |
+      FINDING THE MARKET WHEN THE USER NAMES A PAIR OR STUDIO DOES NOT LIST IT:
+      1. Resolve both token symbols with get_token_address, both calls at once.
+      2. Make three getProgramAccounts calls at once, each with two positional params: the program
+         id string "goonuddtQRrWqqn5nFyczVKaie28f3kDkHWkHtURSLE", then the config object
+         {"encoding":"base58","dataSlice":{"offset":208,"length":32},"filters":[
+         {"memcmp":{"offset":0,"bytes":"99nuWqpQZwP"}},{"memcmp":{"offset":80,"bytes":"<base mint>"}},
+         {"memcmp":{"offset":112,"bytes":"<quote mint>"}}]}.
+         The second call uses dataSlice {"offset":144,"length":32} and the third
+         {"offset":176,"length":32}. Offset 0 is the market tag. Each result's pubkey is a market
+         for the pair. Its data is the market's oracle in the first call, its base vault in the
+         second and its quote vault in the third.
+      3. No result means a mistyped mint, a symbol get_token_address maps to another token, or no
+         market for the pair. Copy both mints again exactly and repeat once; if there is still no
+         result, ask the user for the mints or the market address instead of saying none exists.
+      4. Always check the vaults, even for a single result, and before create_scenario: call
+         getMultipleAccounts with encoding "jsonParsed" on the vaults from the second and third
+         calls, never on the oracles from the first. Each vault comes back as a parsed spl-token
+         account with a tokenAmount; raw bytes mean an oracle was passed. The base vault pays buys
+         and the quote vault pays sells. Keep the market whose base vault holds the most tokens; a
+         pair can also have stopped markets. If both of its vaults hold almost nothing, say the
+         market looks stopped instead of preparing it; if one does, say which direction cannot fill.
+      5. Read the vault that pays out with getAccountInfo on the market, encoding "base58" and
+         dataSlice {"offset":144,"length":32} for the base vault or {"offset":176,"length":32} for
+         the quote vault; the returned data is the vault address. A market address the user gives
+         starts here.
+      6. Put the vault in the override's account as {"pubkey":"<vault>"} and set fetchBeforeUse as
+         described below. The vault address is never an override value.
+
+      PRECONDITION - SELECT A VAULT FROM THE MARKET. The base vault is stored at market bytes
+      144..176 and the quote vault at 176..208. Do not apply this to the market or oracle account.
+
+      Apply this to the actual base or quote SPL-token vault referenced by the GoonFi market. The
+      base vault pays buys (quote in, base out); the quote vault pays sells (base in, quote out).
+      Lowering a payout vault below the requested output makes the token transfer fail with the SPL
+      Token program's custom error 0x1 (insufficient funds).
+      The opposite direction keeps filling.
+
+      SET THE ORACLE INPUT. Put the market's oracle (market bytes 208..240) in `oracle`. While the
+      scenario is registered, Surfpool republishes that oracle every slot as GoonFi's maker does on
+      mainnet, so a stale quote never hides this inventory change.
+
+      UNIT: the mint's smallest unit. 25 USDC is 25000000; 0.5 SOL is 500000000. get_token_address
+      returns each mint's decimals.
+
+      Set fetchBeforeUse: true to pull the account from upstream first; false only for a later override
+      that builds on state an earlier override in the same scenario prepared.
+
+      Apply this override once before the swap being tested. Do not schedule repeated vault resets
+      across swaps: that can manufacture or erase inventory by undoing transaction-owned balance
+      changes.
+
+      LOWER FOR STRESS TESTS. Raising a wrapped-SOL vault amount without matching lamports can create
+      an impossible token account, so lowering is the safe default.

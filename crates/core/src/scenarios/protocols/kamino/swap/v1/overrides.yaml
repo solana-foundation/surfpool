@@ -1,5 +1,5 @@
 protocol: kamino-swap
-version: v0.1.0
+version: v0.2.0
 account_type: Order
 idl_file_path: idl.json
 

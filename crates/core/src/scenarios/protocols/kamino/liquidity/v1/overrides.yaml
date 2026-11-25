@@ -27,9 +27,9 @@ templates:
       - path: position_timestamp
         label: Position opened
         description: "When the current position was opened (unix seconds). Example: 1780000000"
-      - path: last_invest_slot
-        label: Last invest slot
-        description: "Slot at which the strategy last deployed idle funds into the pool. Example: 370000000"
+      - path: last_invest_timestamp
+        label: Last invest time
+        description: "When the strategy last deployed idle funds into the pool (unix seconds). Example: 1780000000"
     address:
       type: pubkey
     llm_context: |

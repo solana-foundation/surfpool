@@ -1037,6 +1037,9 @@ pub struct YamlOverrideTemplateCollection {
     /// Protocol-specific constants shared by all templates in this collection
     #[serde(default)]
     pub constants: HashMap<String, YamlConstantDefinition>,
+    /// LLM context shared by all templates in this collection, placed before each template's own
+    #[serde(default)]
+    pub llm_context: Option<String>,
     /// Selects offset-and-encoding writes for programs with no usable IDL.
     #[serde(default)]
     pub raw_layout: bool,
@@ -1096,6 +1099,19 @@ pub enum RawEncoding {
         count: usize,
         stride: usize,
     },
+    /// An unsigned 64-bit value written to `count` slots, `stride` bytes apart.
+    U64Strided {
+        count: usize,
+        stride: usize,
+    },
+    /// A logical unsigned 64-bit value XORed with `mask` before being written.
+    U64Xor {
+        mask: u64,
+    },
+    /// A logical signed 64-bit value XORed with `mask` before being written.
+    I64Xor {
+        mask: u64,
+    },
     /// A base58 pubkey, written as 32 bytes.
     Bytes32,
     /// The slot the override materializes at, plus the supplied signed offset. `lead` is used only
@@ -1103,6 +1119,11 @@ pub enum RawEncoding {
     /// A negative offset before slot zero saturates at zero, while positive overflow is rejected.
     Slot {
         lead: i64,
+    },
+    /// A relative slot XORed with `mask` before being written.
+    SlotXor {
+        lead: i64,
+        mask: u64,
     },
 }
 
@@ -1113,7 +1134,13 @@ impl RawEncoding {
             RawEncoding::U8 => 1,
             RawEncoding::U16 => 2,
             RawEncoding::U32 | RawEncoding::I32 | RawEncoding::I32Strided { .. } => 4,
-            RawEncoding::U64 | RawEncoding::I64 | RawEncoding::Slot { .. } => 8,
+            RawEncoding::U64
+            | RawEncoding::U64Strided { .. }
+            | RawEncoding::U64Xor { .. }
+            | RawEncoding::I64
+            | RawEncoding::I64Xor { .. }
+            | RawEncoding::Slot { .. }
+            | RawEncoding::SlotXor { .. } => 8,
             RawEncoding::U128 | RawEncoding::I128 => 16,
             RawEncoding::Bytes32 => 32,
         }
@@ -1125,7 +1152,8 @@ impl RawEncoding {
     /// encodings with the same loop instead of special-casing one of them.
     pub fn placements(&self) -> (usize, usize) {
         match self {
-            RawEncoding::I32Strided { count, stride } => (*count, *stride),
+            RawEncoding::I32Strided { count, stride }
+            | RawEncoding::U64Strided { count, stride } => (*count, *stride),
             other => (1, other.width()),
         }
     }
@@ -1162,10 +1190,26 @@ impl RawEncoding {
             RawEncoding::U8 => int!(u8, "u8"),
             RawEncoding::U16 => int!(u16, "u16"),
             RawEncoding::U32 => int!(u32, "u32"),
-            RawEncoding::U64 => int!(u64, "u64"),
+            RawEncoding::U64 | RawEncoding::U64Strided { .. } => int!(u64, "u64"),
+            RawEncoding::U64Xor { mask } => {
+                let d = digits("u64")?;
+                (d.parse::<u64>()
+                    .map_err(|e| format!("invalid u64: '{d}': {e}"))?
+                    ^ mask)
+                    .to_le_bytes()
+                    .to_vec()
+            }
             RawEncoding::U128 => int!(u128, "u128"),
             RawEncoding::I32 | RawEncoding::I32Strided { .. } => int!(i32, "i32"),
             RawEncoding::I64 => int!(i64, "i64"),
+            RawEncoding::I64Xor { mask } => {
+                let d = digits("i64")?;
+                ((d.parse::<i64>()
+                    .map_err(|e| format!("invalid i64: '{d}': {e}"))? as u64)
+                    ^ mask)
+                    .to_le_bytes()
+                    .to_vec()
+            }
             RawEncoding::I128 => int!(i128, "i128"),
             RawEncoding::Bytes32 => {
                 let text = value
@@ -1185,16 +1229,33 @@ impl RawEncoding {
                             .map_err(|e| format!("invalid slot lead: '{d}': {e}"))?
                     }
                 };
-                let slot = if lead >= 0 {
-                    target_slot.checked_add(lead as u64).ok_or_else(|| {
-                        format!("slot {target_slot} plus lead {lead} exceeds u64::MAX")
-                    })?
-                } else {
-                    target_slot.saturating_sub(lead.unsigned_abs())
-                };
+                let slot = slot_with_lead(target_slot, lead)?;
                 slot.to_le_bytes().to_vec()
             }
+            RawEncoding::SlotXor { lead, mask } => {
+                let lead = match value {
+                    serde_json::Value::Null => *lead,
+                    _ => {
+                        let d = digits("slot lead")?;
+                        d.parse::<i64>()
+                            .map_err(|e| format!("invalid slot lead: '{d}': {e}"))?
+                    }
+                };
+                (slot_with_lead(target_slot, lead)? ^ mask)
+                    .to_le_bytes()
+                    .to_vec()
+            }
         })
+    }
+}
+
+fn slot_with_lead(target_slot: Slot, lead: i64) -> Result<Slot, String> {
+    if lead >= 0 {
+        target_slot
+            .checked_add(lead as u64)
+            .ok_or_else(|| format!("slot {target_slot} plus lead {lead} exceeds u64::MAX"))
+    } else {
+        Ok(target_slot.saturating_sub(lead.unsigned_abs()))
     }
 }
 
@@ -1506,6 +1567,10 @@ impl YamlOverrideTemplateCollection {
                 let account_type = entry
                     .idl_account_name
                     .unwrap_or_else(|| default_account_type.clone());
+                let llm_context = match (&self.llm_context, entry.llm_context) {
+                    (Some(shared), Some(own)) => Some(format!("{}\n\n{own}", shared.trim_end())),
+                    (shared, own) => own.or_else(|| shared.clone()),
+                };
                 let properties =
                     describe_properties_from_idl(entry.properties, idl.as_ref(), &account_type)
                         .map_err(|e| format!("template '{}': {e}", entry.id))?;
@@ -1520,7 +1585,7 @@ impl YamlOverrideTemplateCollection {
                     account_type,
                     constants: constants.clone(),
                     tags: self.tags.clone(),
-                    llm_context: entry.llm_context,
+                    llm_context,
                     raw_layout: self.raw_layout,
                     keep_alive: entry
                         .keep_alive
@@ -2165,6 +2230,72 @@ templates:
     }
 
     #[test]
+    fn raw_encoding_handles_xored_u64_and_slot_fields() {
+        use super::RawEncoding;
+
+        let mask = 0x44dd_2288_77ee_1166;
+        let logical = 9_997_556_206u64;
+        let bytes = RawEncoding::U64Xor { mask }
+            .encode(&json!(logical), 0)
+            .expect("XOR-obfuscated u64");
+        assert_eq!(
+            u64::from_le_bytes(bytes.try_into().unwrap()),
+            logical ^ mask
+        );
+
+        let exponent_mask = 0x990f_f033_cc55_aaff;
+        let bytes = RawEncoding::I64Xor {
+            mask: exponent_mask,
+        }
+        .encode(&json!(-10), 0)
+        .expect("XOR-obfuscated i64");
+        assert_eq!(
+            u64::from_le_bytes(bytes.try_into().unwrap()) ^ exponent_mask,
+            (-10i64) as u64
+        );
+
+        let slot_mask = 0x9966_33cc_00ff_aa55;
+        let bytes = RawEncoding::SlotXor {
+            lead: 200,
+            mask: slot_mask,
+        }
+        .encode(&json!(null), 443_367_679)
+        .expect("XOR-obfuscated relative slot");
+        assert_eq!(
+            u64::from_le_bytes(bytes.try_into().unwrap()) ^ slot_mask,
+            443_367_879
+        );
+
+        let bytes = RawEncoding::SlotXor {
+            lead: 0,
+            mask: slot_mask,
+        }
+        .encode(&json!(-500), 10)
+        .expect("negative lead clamps before XOR");
+        assert_eq!(u64::from_le_bytes(bytes.try_into().unwrap()) ^ slot_mask, 0);
+
+        let large_slot = i64::MAX as u64 + 42;
+        let bytes = RawEncoding::SlotXor {
+            lead: 0,
+            mask: slot_mask,
+        }
+        .encode(&json!(0), large_slot)
+        .expect("large u64 slot must not truncate");
+        assert_eq!(
+            u64::from_le_bytes(bytes.try_into().unwrap()) ^ slot_mask,
+            large_slot
+        );
+
+        let err = RawEncoding::SlotXor {
+            lead: 0,
+            mask: slot_mask,
+        }
+        .encode(&json!(1), u64::MAX)
+        .expect_err("an XOR slot must not wrap past u64::MAX");
+        assert!(err.contains("exceeds u64::MAX"), "unexpected error: {err}");
+    }
+
+    #[test]
     fn raw_layout_rejects_writes_past_the_end_of_the_account() {
         use super::RawEncoding;
 
@@ -2224,6 +2355,43 @@ templates:
                     *b, 0,
                     "byte {i} lies between strided slots and must not change"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn u64_strided_writes_every_slot_and_nothing_between() {
+        use super::{Property, RawEncoding};
+        let mut property = Property::field("values".to_string());
+        property.offset = Some(8);
+        property.encoding = Some(RawEncoding::U64Strided {
+            count: 4,
+            stride: 16,
+        });
+        let template = raw_template(vec![property]);
+
+        let original = vec![0xa5; 80];
+        let out = template
+            .materialize_raw_layout(
+                &original,
+                &HashMap::from([("values".to_string(), json!(50_000))]),
+                0,
+            )
+            .expect("strided write");
+
+        let expected_bytes = 50_000u64.to_le_bytes();
+        let expected_indices: std::collections::BTreeSet<_> = (0..4)
+            .flat_map(|i| {
+                let at = 8 + i * 16;
+                at..at + 8
+            })
+            .collect();
+        for i in 0..out.len() {
+            if expected_indices.contains(&i) {
+                let at = 8 + ((i - 8) / 16) * 16;
+                assert_eq!(out[i], expected_bytes[i - at]);
+            } else {
+                assert_eq!(out[i], original[i], "unexpected write at byte {i}");
             }
         }
     }

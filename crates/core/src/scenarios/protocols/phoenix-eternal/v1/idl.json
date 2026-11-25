@@ -6070,6 +6070,177 @@
       "args": []
     },
     {
+      "name": "SyncLockedDeposit",
+      "docs": [
+        "Copies the parent's remaining locked-deposit notional onto a child (isolated margin) account. Permissionless; loads the active trader buffer so hot accounts are synced."
+      ],
+      "discriminator": [
+        150,
+        49,
+        106,
+        164,
+        252,
+        38,
+        240,
+        255
+      ],
+      "accounts": [
+        {
+          "name": "phoenixProgram",
+          "docs": [
+            "Phoenix Eternal program id; logged to assert the correct executable is invoked."
+          ]
+        },
+        {
+          "name": "phoenixLogAuthority",
+          "docs": [
+            "Phoenix log authority PDA used for emitting on-chain market events."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  111,
+                  103
+                ]
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                206,
+                112,
+                214,
+                251,
+                86,
+                142,
+                67,
+                235,
+                252,
+                150,
+                74,
+                144,
+                21,
+                108,
+                59,
+                233,
+                86,
+                59,
+                8,
+                23,
+                6,
+                124,
+                171,
+                105,
+                78,
+                188,
+                131,
+                239,
+                221,
+                179,
+                126,
+                134
+              ]
+            }
+          }
+        },
+        {
+          "name": "globalConfiguration",
+          "docs": [
+            "Global configuration PDA."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  103,
+                  108,
+                  111,
+                  98,
+                  97,
+                  108
+                ]
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                206,
+                112,
+                214,
+                251,
+                86,
+                142,
+                67,
+                235,
+                252,
+                150,
+                74,
+                144,
+                21,
+                108,
+                59,
+                233,
+                86,
+                59,
+                8,
+                23,
+                6,
+                124,
+                171,
+                105,
+                78,
+                188,
+                131,
+                239,
+                221,
+                179,
+                126,
+                134
+              ]
+            }
+          }
+        },
+        {
+          "name": "traderWallet",
+          "docs": [
+            "Trader wallet owning both accounts."
+          ]
+        },
+        {
+          "name": "parentTraderAccount",
+          "docs": [
+            "Parent (cross margin) trader account whose remaining lock is copied."
+          ]
+        },
+        {
+          "name": "childTraderAccount",
+          "writable": true,
+          "docs": [
+            "Child (isolated margin) trader account receiving the snapshot."
+          ]
+        },
+        {
+          "name": "globalTraderIndex",
+          "writable": true,
+          "docs": [
+            "Global trader index account."
+          ]
+        },
+        {
+          "name": "activeTraderBuffer",
+          "writable": true,
+          "docs": [
+            "Active trader buffer account."
+          ]
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "TransferCollateral",
       "docs": [
         "Transfers collateral between two trader accounts owned by the same wallet."
@@ -6647,7 +6818,8 @@
     {
       "name": "UncrossCrank",
       "docs": [
-        "Cranks the orderbook to uncross any crossed orders."
+        "Cranks the orderbook to uncross any crossed orders.",
+        "Returns a fixed 128-byte little-endian UncrossCrankReturn after event logging. Version 1: flags bit 0 indicates bestBidTicks is present, bit 1 indicates bestAskTicks is present; absent sides are zero. Includes post-crank mark/index prices and their update slots, matching Hawkeye price semantics. Padding and reserved words are zero; future flags may assign optional reserved fields. Readers validate magic/version and ignore unknown flags and reserved words. A bounded crank may leave a crossed BBO."
       ],
       "discriminator": [
         196,
@@ -6816,6 +6988,11 @@
           ]
         }
       ],
+      "returns": {
+        "defined": {
+          "name": "UncrossCrankReturn"
+        }
+      },
       "args": [
         {
           "name": "params",
@@ -21789,6 +21966,362 @@
           }
         }
       ]
+    },
+    {
+      "name": "UpdateTraderPreferenceBits",
+      "docs": [
+        "Updates per-account trader preferences. The trader wallet, risk authority, or a trader-management delegate may update any preference. The trader position authority or a wallet-rooted position-authority delegate may update only collateral sweep."
+      ],
+      "discriminator": [
+        3,
+        249,
+        117,
+        158,
+        237,
+        31,
+        90,
+        153
+      ],
+      "accounts": [
+        {
+          "name": "phoenixProgram",
+          "docs": [
+            "Phoenix Eternal program id; logged to assert the correct executable is invoked."
+          ]
+        },
+        {
+          "name": "phoenixLogAuthority",
+          "docs": [
+            "Phoenix log authority PDA used for emitting on-chain market events."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  111,
+                  103
+                ]
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                206,
+                112,
+                214,
+                251,
+                86,
+                142,
+                67,
+                235,
+                252,
+                150,
+                74,
+                144,
+                21,
+                108,
+                59,
+                233,
+                86,
+                59,
+                8,
+                23,
+                6,
+                124,
+                171,
+                105,
+                78,
+                188,
+                131,
+                239,
+                221,
+                179,
+                126,
+                134
+              ]
+            }
+          }
+        },
+        {
+          "name": "globalConfiguration",
+          "docs": [
+            "Global configuration PDA."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  103,
+                  108,
+                  111,
+                  98,
+                  97,
+                  108
+                ]
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                206,
+                112,
+                214,
+                251,
+                86,
+                142,
+                67,
+                235,
+                252,
+                150,
+                74,
+                144,
+                21,
+                108,
+                59,
+                233,
+                86,
+                59,
+                8,
+                23,
+                6,
+                124,
+                171,
+                105,
+                78,
+                188,
+                131,
+                239,
+                221,
+                179,
+                126,
+                134
+              ]
+            }
+          }
+        },
+        {
+          "name": "signer",
+          "signer": true,
+          "docs": [
+            "Trader wallet, risk authority, trader-management delegate, trader position authority, or wallet-rooted position-authority delegate."
+          ]
+        },
+        {
+          "name": "maybePermissionAccount",
+          "writable": true,
+          "docs": [
+            "Trader-management permission account for a delegated risk signer, or wallet-rooted position-authority permission account; otherwise a placeholder account."
+          ]
+        },
+        {
+          "name": "traderAccount",
+          "writable": true,
+          "docs": [
+            "Trader account whose preference bits are updated."
+          ]
+        }
+      ],
+      "args": [
+        {
+          "name": "params",
+          "type": {
+            "defined": {
+              "name": "UpdateTraderPreferenceBitsParams"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "WithdrawToTargetLeverage",
+      "docs": [
+        "Transfers collateral above the target leverage from an isolated child trader account to its cross-margin parent."
+      ],
+      "discriminator": [
+        159,
+        170,
+        28,
+        190,
+        26,
+        189,
+        30,
+        154
+      ],
+      "accounts": [
+        {
+          "name": "phoenixProgram",
+          "docs": [
+            "Phoenix Eternal program id; logged to assert the correct executable is invoked."
+          ]
+        },
+        {
+          "name": "phoenixLogAuthority",
+          "docs": [
+            "Phoenix log authority PDA used for emitting on-chain market events."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  111,
+                  103
+                ]
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                206,
+                112,
+                214,
+                251,
+                86,
+                142,
+                67,
+                235,
+                252,
+                150,
+                74,
+                144,
+                21,
+                108,
+                59,
+                233,
+                86,
+                59,
+                8,
+                23,
+                6,
+                124,
+                171,
+                105,
+                78,
+                188,
+                131,
+                239,
+                221,
+                179,
+                126,
+                134
+              ]
+            }
+          }
+        },
+        {
+          "name": "globalConfiguration",
+          "docs": [
+            "Global configuration PDA."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  103,
+                  108,
+                  111,
+                  98,
+                  97,
+                  108
+                ]
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                206,
+                112,
+                214,
+                251,
+                86,
+                142,
+                67,
+                235,
+                252,
+                150,
+                74,
+                144,
+                21,
+                108,
+                59,
+                233,
+                86,
+                59,
+                8,
+                23,
+                6,
+                124,
+                171,
+                105,
+                78,
+                188,
+                131,
+                239,
+                221,
+                179,
+                126,
+                134
+              ]
+            }
+          }
+        },
+        {
+          "name": "traderWallet",
+          "signer": true,
+          "docs": [
+            "Trader wallet or position authority of the child account."
+          ]
+        },
+        {
+          "name": "srcTraderAccount",
+          "writable": true,
+          "docs": [
+            "Isolated child trader account."
+          ]
+        },
+        {
+          "name": "dstTraderAccount",
+          "writable": true,
+          "docs": [
+            "Cross-margin parent trader account."
+          ]
+        },
+        {
+          "name": "perpAssetMap",
+          "docs": [
+            "Perp asset map for margin calculations."
+          ]
+        },
+        {
+          "name": "globalTraderIndex",
+          "writable": true,
+          "docs": [
+            "Global trader index account."
+          ]
+        },
+        {
+          "name": "activeTraderBuffer",
+          "writable": true,
+          "docs": [
+            "Active trader buffer account."
+          ]
+        }
+      ],
+      "args": [
+        {
+          "name": "params",
+          "type": {
+            "defined": {
+              "name": "WithdrawToTargetLeverageInstruction"
+            }
+          }
+        }
+      ]
     }
   ],
   "accounts": [
@@ -24774,6 +25307,18 @@
       }
     },
     {
+      "name": "WithdrawToTargetLeverageInstruction",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "targetLeverageBps",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
       "name": "TransferCollateralChildToParentInstruction",
       "type": {
         "kind": "struct",
@@ -24781,6 +25326,68 @@
           {
             "name": "amount",
             "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "UncrossCrankReturn",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "magic",
+            "type": "u64"
+          },
+          {
+            "name": "version",
+            "type": "u16"
+          },
+          {
+            "name": "flags",
+            "type": "u8"
+          },
+          {
+            "name": "padding",
+            "type": {
+              "array": [
+                "u8",
+                5
+              ]
+            }
+          },
+          {
+            "name": "bestBidTicks",
+            "type": "u64"
+          },
+          {
+            "name": "bestAskTicks",
+            "type": "u64"
+          },
+          {
+            "name": "markPriceTicks",
+            "type": "u64"
+          },
+          {
+            "name": "indexPriceTicks",
+            "type": "u64"
+          },
+          {
+            "name": "markPriceLastUpdatedSlot",
+            "type": "u64"
+          },
+          {
+            "name": "indexPriceLastUpdatedSlot",
+            "type": "u64"
+          },
+          {
+            "name": "reserved",
+            "type": {
+              "array": [
+                "u64",
+                8
+              ]
+            }
           }
         ]
       }
@@ -25158,9 +25765,9 @@
       }
     },
     {
-      "name": "SignedQuoteLotsPerBaseLotUpcasted",
+      "name": "SignedQuoteLotSecondsPerBaseLotUpcasted",
       "docs": [
-        "Upcasted signed quote lots per base lot wrapper."
+        "Upcasted signed quote lots per base lot integrated over seconds."
       ],
       "type": {
         "kind": "struct",
@@ -25228,6 +25835,36 @@
           {
             "name": "inner",
             "type": "u32"
+          }
+        ]
+      }
+    },
+    {
+      "name": "HundredthBasisPointsU16",
+      "docs": [
+        "Hundredths of a basis point (1_000_000 = 100%), u16 backed."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "inner",
+            "type": "u16"
+          }
+        ]
+      }
+    },
+    {
+      "name": "FundingDivisor",
+      "docs": [
+        "Divisor applied to funding after the clamp band; zero is treated as one."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "inner",
+            "type": "u8"
           }
         ]
       }
@@ -26452,6 +27089,24 @@
                 }
               }
             ]
+          },
+          {
+            "name": "TraderPreferenceBits",
+            "kind": "struct",
+            "fields": [
+              {
+                "name": "trader",
+                "type": "pubkey"
+              },
+              {
+                "name": "previous",
+                "type": "u32"
+              },
+              {
+                "name": "new",
+                "type": "u32"
+              }
+            ]
           }
         ]
       }
@@ -26487,6 +27142,25 @@
           },
           {
             "name": "Cash",
+            "kind": "struct",
+            "fields": [
+              {
+                "name": "amount",
+                "type": "u64"
+              },
+              {
+                "name": "padding0",
+                "type": {
+                  "array": [
+                    "u8",
+                    128
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "name": "LockedDeposit",
             "kind": "struct",
             "fields": [
               {
@@ -26756,6 +27430,50 @@
           {
             "name": "newStatusBits",
             "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "LockedDepositChangedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "trader",
+            "type": "pubkey"
+          },
+          {
+            "name": "previousLockedUsdc",
+            "type": {
+              "defined": {
+                "name": "QuoteLots"
+              }
+            }
+          },
+          {
+            "name": "previousConsumed",
+            "type": {
+              "defined": {
+                "name": "QuoteLots"
+              }
+            }
+          },
+          {
+            "name": "newLockedUsdc",
+            "type": {
+              "defined": {
+                "name": "QuoteLots"
+              }
+            }
+          },
+          {
+            "name": "newConsumed",
+            "type": {
+              "defined": {
+                "name": "QuoteLots"
+              }
+            }
           }
         ]
       }
@@ -27748,6 +28466,45 @@
                 "type": {
                   "defined": {
                     "name": "SpotAssetPriceUpdatedEvent"
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "name": "LockedDepositChanged",
+            "fields": [
+              {
+                "name": "value",
+                "type": {
+                  "defined": {
+                    "name": "LockedDepositChangedEvent"
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "name": "FundingParametersUpdatedWithClamp",
+            "fields": [
+              {
+                "name": "value",
+                "type": {
+                  "defined": {
+                    "name": "FundingParametersUpdatedWithClampEvent"
+                  }
+                }
+              }
+            ]
+          },
+          {
+            "name": "TraderPreferenceBitsUpdated",
+            "fields": [
+              {
+                "name": "value",
+                "type": {
+                  "defined": {
+                    "name": "TraderPreferenceBitsUpdatedEvent"
                   }
                 }
               }
@@ -29921,6 +30678,82 @@
       }
     },
     {
+      "name": "FundingParametersUpdatedWithClampEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "symbol",
+            "type": {
+              "defined": {
+                "name": "Symbol"
+              }
+            }
+          },
+          {
+            "name": "newFundingIntervalSeconds",
+            "type": {
+              "option": {
+                "defined": {
+                  "name": "FundingRateUnitInSeconds"
+                }
+              }
+            }
+          },
+          {
+            "name": "newFundingPeriodSeconds",
+            "type": {
+              "option": {
+                "defined": {
+                  "name": "FundingRateUnitInSeconds"
+                }
+              }
+            }
+          },
+          {
+            "name": "newMaxFundingRate",
+            "type": {
+              "option": {
+                "defined": {
+                  "name": "SignedQuoteLotsPerBaseLot"
+                }
+              }
+            }
+          },
+          {
+            "name": "newFundingClampCenter",
+            "type": {
+              "option": {
+                "defined": {
+                  "name": "HundredthBasisPointsU16"
+                }
+              }
+            }
+          },
+          {
+            "name": "newFundingClampBandRadius",
+            "type": {
+              "option": {
+                "defined": {
+                  "name": "HundredthBasisPointsU16"
+                }
+              }
+            }
+          },
+          {
+            "name": "newFundingDivisor",
+            "type": {
+              "option": {
+                "defined": {
+                  "name": "FundingDivisor"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
       "name": "FeesClaimedEvent",
       "type": {
         "kind": "struct",
@@ -30092,7 +30925,7 @@
             "type": {
               "option": {
                 "defined": {
-                  "name": "SignedQuoteLotsPerBaseLotUpcasted"
+                  "name": "SignedQuoteLotSecondsPerBaseLotUpcasted"
                 }
               }
             }
@@ -30854,7 +31687,8 @@
     {
       "name": "UpsertEscrowRequestParams",
       "docs": [
-        "Borsh payload for upserting an escrow request."
+        "Borsh payload for upserting an escrow request.",
+        "May be followed by an optional `lastValidSlot: option<u64>`. When present and set, the resulting request expires after that slot; otherwise an existing request keeps its last valid slot and a new request has no expiration."
       ],
       "type": {
         "kind": "struct",
@@ -31642,6 +32476,36 @@
               "option": {
                 "defined": {
                   "name": "SignedQuoteLotsPerBaseLot"
+                }
+              }
+            }
+          },
+          {
+            "name": "fundingClampCenter",
+            "type": {
+              "option": {
+                "defined": {
+                  "name": "HundredthBasisPointsU16"
+                }
+              }
+            }
+          },
+          {
+            "name": "fundingClampBandRadius",
+            "type": {
+              "option": {
+                "defined": {
+                  "name": "HundredthBasisPointsU16"
+                }
+              }
+            }
+          },
+          {
+            "name": "fundingDivisor",
+            "type": {
+              "option": {
+                "defined": {
+                  "name": "FundingDivisor"
                 }
               }
             }
@@ -32989,6 +33853,88 @@
           }
         ]
       }
+    },
+    {
+      "name": "TraderPreferenceToggle",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "target",
+            "type": {
+              "defined": {
+                "name": "TraderPreferenceToggleTarget"
+              }
+            }
+          },
+          {
+            "name": "set",
+            "type": "bool"
+          }
+        ]
+      }
+    },
+    {
+      "name": "TraderPreferenceToggleTarget",
+      "docs": [
+        "Trader preference selected for update. Variant tags match the backing trader-header bit indices."
+      ],
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "CollateralSweep"
+          },
+          {
+            "name": "PositionAuthoritySwap"
+          }
+        ]
+      }
+    },
+    {
+      "name": "TraderPreferenceBitsUpdatedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "trader",
+            "type": "pubkey"
+          },
+          {
+            "name": "authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "oldPreferenceBits",
+            "type": "u32"
+          },
+          {
+            "name": "newPreferenceBits",
+            "type": "u32"
+          }
+        ]
+      }
+    },
+    {
+      "name": "UpdateTraderPreferenceBitsParams",
+      "docs": [
+        "Borsh payload for updating one or more per-account trader preferences."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "toggles",
+            "type": {
+              "vec": {
+                "defined": {
+                  "name": "TraderPreferenceToggle"
+                }
+              }
+            }
+          }
+        ]
+      }
     }
   ],
   "events": [
@@ -33720,7 +34666,1243 @@
       "discriminator": [
         72
       ]
+    },
+    {
+      "name": "LockedDepositChangedEvent",
+      "docs": [
+        "MarketEvent::LockedDepositChanged Borsh variant 73.",
+        "Payload type: LockedDepositChangedEvent."
+      ],
+      "discriminator": [
+        73
+      ]
+    },
+    {
+      "name": "FundingParametersUpdatedWithClampEvent",
+      "docs": [
+        "MarketEvent::FundingParametersUpdatedWithClamp Borsh variant 74.",
+        "Payload type: FundingParametersUpdatedWithClampEvent."
+      ],
+      "discriminator": [
+        74
+      ]
+    },
+    {
+      "name": "TraderPreferenceBitsUpdatedEvent",
+      "docs": [
+        "MarketEvent::TraderPreferenceBitsUpdated Borsh variant 75.",
+        "Payload type: TraderPreferenceBitsUpdatedEvent."
+      ],
+      "discriminator": [
+        75
+      ]
     }
   ],
-  "errors": []
+  "errors": [
+    {
+      "code": 257,
+      "name": "AccountKeyMismatch",
+      "msg": "Account is not the expected address"
+    },
+    {
+      "code": 258,
+      "name": "AccountPdaMismatch",
+      "msg": "Account is not the expected program-derived address"
+    },
+    {
+      "code": 259,
+      "name": "AccountOwnerMismatch",
+      "msg": "Account is not owned by the expected program"
+    },
+    {
+      "code": 260,
+      "name": "AccountNotWritable",
+      "msg": "Account must be writable"
+    },
+    {
+      "code": 262,
+      "name": "AccountNotInitialized",
+      "msg": "Account is not initialized"
+    },
+    {
+      "code": 263,
+      "name": "AccountDuplicate",
+      "msg": "Accounts must be distinct"
+    },
+    {
+      "code": 264,
+      "name": "AccountNotSame",
+      "msg": "Accounts must be the same account"
+    },
+    {
+      "code": 265,
+      "name": "AccountMintMismatch",
+      "msg": "Token account has the wrong mint"
+    },
+    {
+      "code": 266,
+      "name": "AccountArenaOutOfOrder",
+      "msg": "Arena accounts are out of order"
+    },
+    {
+      "code": 267,
+      "name": "AccountReservedAddress",
+      "msg": "Account must not be a program-reserved address"
+    },
+    {
+      "code": 268,
+      "name": "AccountArenaCapacityExhausted",
+      "msg": "Arena accounts have no room for the required nodes"
+    },
+    {
+      "code": 269,
+      "name": "AccountTokenOwnerMismatch",
+      "msg": "Token account is not owned by the expected authority"
+    },
+    {
+      "code": 270,
+      "name": "AccountMintAuthorityMismatch",
+      "msg": "Mint authority is not the expected account"
+    },
+    {
+      "code": 271,
+      "name": "AccountNotExecutable",
+      "msg": "Program account is not executable"
+    },
+    {
+      "code": 4097,
+      "name": "AuthPositionAuthoritySwapDisabled",
+      "msg": "Swaps signed by the position authority are disabled for this trader"
+    },
+    {
+      "code": 4098,
+      "name": "AuthDelegatedMarketActivationDenied",
+      "msg": "Delegated permission cannot activate a market"
+    },
+    {
+      "code": 4099,
+      "name": "AuthPermissionAuthorityMismatch",
+      "msg": "Permission account was granted by a different authority"
+    },
+    {
+      "code": 4103,
+      "name": "AuthPermissionUserMismatch",
+      "msg": "Permission account was granted to a different user"
+    },
+    {
+      "code": 8193,
+      "name": "ExchangeStateDisallowsAction",
+      "msg": "Exchange state does not allow this action"
+    },
+    {
+      "code": 8194,
+      "name": "ExchangeNativeSolCollateralDisabled",
+      "msg": "Native SOL collateral is disabled"
+    },
+    {
+      "code": 8195,
+      "name": "ExchangeSpotCollateralDisabled",
+      "msg": "Spot collateral is disabled"
+    },
+    {
+      "code": 8197,
+      "name": "ExchangeActiveTraderCapacityReached",
+      "msg": "Exchange has reached its maximum number of active traders"
+    },
+    {
+      "code": 8198,
+      "name": "ExchangeInvariantViolated",
+      "msg": "Internal consistency check failed"
+    },
+    {
+      "code": 8199,
+      "name": "ExchangeInvalidFeeConfiguration",
+      "msg": "Combined maker and taker fees are negative or out of range (taker: <taker_fee_micro> micro, maker: <maker_fee_micro> micro)"
+    },
+    {
+      "code": 8200,
+      "name": "ExchangeArenaNotEmpty",
+      "msg": "Arena account must be empty before it is removed"
+    },
+    {
+      "code": 8201,
+      "name": "ExchangeVaultBalanceInsufficient",
+      "msg": "Global vault balance cannot cover this withdrawal"
+    },
+    {
+      "code": 8449,
+      "name": "MarketStateDisallowsAction",
+      "msg": "Market state does not allow this action"
+    },
+    {
+      "code": 8450,
+      "name": "MarketInvalidAssetId",
+      "msg": "No listed market has asset id <asset_id>"
+    },
+    {
+      "code": 8451,
+      "name": "MarketInvalidTraderPosition",
+      "msg": "Trader position cannot be settled"
+    },
+    {
+      "code": 8452,
+      "name": "MarketInvalidPositionDirection",
+      "msg": "Position direction does not match the settlement"
+    },
+    {
+      "code": 8453,
+      "name": "MarketNoPositionToSettle",
+      "msg": "No position to settle"
+    },
+    {
+      "code": 8454,
+      "name": "MarketFinalizedMarkPriceNotSet",
+      "msg": "Market has no finalized mark price"
+    },
+    {
+      "code": 8456,
+      "name": "MarketTraderUnderwaterAfterSettlement",
+      "msg": "Trader would be underwater after settlement"
+    },
+    {
+      "code": 8457,
+      "name": "MarketUnknownAssetSymbol",
+      "msg": "No market exists for this asset symbol"
+    },
+    {
+      "code": 8459,
+      "name": "MarketNotEmpty",
+      "msg": "Market still has open interest, resting orders, active splines, or positions"
+    },
+    {
+      "code": 8460,
+      "name": "MarketLinkedSpotAssetExists",
+      "msg": "A spot asset is still linked to this market"
+    },
+    {
+      "code": 8461,
+      "name": "MarketLinkedSpotAssetHasLtv",
+      "msg": "A linked spot asset still has nonzero LTV"
+    },
+    {
+      "code": 8462,
+      "name": "MarketOpenInterestUpdateFailed",
+      "msg": "Market open interest could not be updated"
+    },
+    {
+      "code": 8463,
+      "name": "MarketInvalidTickSize",
+      "msg": "Market tick size is zero or out of range"
+    },
+    {
+      "code": 12289,
+      "name": "OracleMarkPriceUnavailable",
+      "msg": "Mark price of market <asset_id> is unavailable or stale for <risk_action> (last updated at slot <mark_price_slot>)"
+    },
+    {
+      "code": 12291,
+      "name": "OracleSlotsFull",
+      "msg": "Market already has the maximum number of oracles"
+    },
+    {
+      "code": 12292,
+      "name": "OracleUpdateOutOfOrder",
+      "msg": "Oracle update is older than the oracle's last accepted update"
+    },
+    {
+      "code": 12293,
+      "name": "OracleIndexPriceUnavailable",
+      "msg": "Market has no last known index price"
+    },
+    {
+      "code": 12294,
+      "name": "OracleSpotPriceUnavailable",
+      "msg": "Spot collateral price is unavailable or stale"
+    },
+    {
+      "code": 12295,
+      "name": "OracleSpotAssetNotFound",
+      "msg": "No spot asset at the given index"
+    },
+    {
+      "code": 12296,
+      "name": "OracleSpotAssetSymbolMismatch",
+      "msg": "Price update symbol does not match the spot asset"
+    },
+    {
+      "code": 12297,
+      "name": "OracleSpotAssetPricedByPerpMarket",
+      "msg": "Spot asset is priced through its linked perp market"
+    },
+    {
+      "code": 12298,
+      "name": "OracleLinkedPerpAssetMissing",
+      "msg": "Spot asset's linked perp market was not supplied for pricing"
+    },
+    {
+      "code": 12299,
+      "name": "OracleUnexpectedLinkedPerpAsset",
+      "msg": "Spot asset is priced through its own oracle, not a perp market"
+    },
+    {
+      "code": 12300,
+      "name": "OracleSpotIncompatibleDecimals",
+      "msg": "Spot base lot is not a whole number of native units that fits a u64"
+    },
+    {
+      "code": 12301,
+      "name": "OracleDivergenceRadiusOutOfRange",
+      "msg": "Oracle divergence radius exceeds 10000 basis points"
+    },
+    {
+      "code": 12302,
+      "name": "OracleDivergenceMedianUnavailable",
+      "msg": "No oracle window was evaluated for the divergence median"
+    },
+    {
+      "code": 12303,
+      "name": "OracleIndexOutOfRange",
+      "msg": "Oracle index is out of range"
+    },
+    {
+      "code": 12304,
+      "name": "OracleSpotPriceExponentUnset",
+      "msg": "Spot asset has no pinned price exponent"
+    },
+    {
+      "code": 12305,
+      "name": "OracleQuorumUnavailable",
+      "msg": "Too few fresh, non-divergent oracle prices to form a quorum"
+    },
+    {
+      "code": 16385,
+      "name": "TraderCapabilityDenied",
+      "msg": "Trader is not permitted to perform this action"
+    },
+    {
+      "code": 16386,
+      "name": "TraderNotInitialized",
+      "msg": "Trader account is not initialized"
+    },
+    {
+      "code": 16387,
+      "name": "TraderNoPosition",
+      "msg": "Trader has no position in market <asset_id>"
+    },
+    {
+      "code": 16388,
+      "name": "TraderMaxPositionsReached",
+      "msg": "Trader has reached its maximum number of positions"
+    },
+    {
+      "code": 16390,
+      "name": "TraderIsolatedMarketRequiresIsolatedSubaccount",
+      "msg": "Isolated-only market <asset_id> requires an isolated subaccount"
+    },
+    {
+      "code": 16391,
+      "name": "TraderIsolatedMarketRequiresSinglePositionAccount",
+      "msg": "Isolated-only markets require a subaccount limited to one position"
+    },
+    {
+      "code": 16392,
+      "name": "TraderIsolatedSubaccountMarketConflict",
+      "msg": "Isolated subaccount already holds a position in another market"
+    },
+    {
+      "code": 16393,
+      "name": "TraderLockedDepositRequiresCrossMargin",
+      "msg": "Locked deposits can only be credited to a cross-margin entry"
+    },
+    {
+      "code": 16394,
+      "name": "TraderCrossMarginRequiresMultiplePositions",
+      "msg": "Cross-margin trader must allow more than one position"
+    },
+    {
+      "code": 16395,
+      "name": "TraderPdaIndexOutOfRange",
+      "msg": "Trader PDA index exceeds the maximum subaccount count"
+    },
+    {
+      "code": 16396,
+      "name": "TraderAccountNotEmpty",
+      "msg": "Trader must be cold with no collateral, positions, splines, or pending withdrawal"
+    },
+    {
+      "code": 16397,
+      "name": "TraderAccountExcessLamports",
+      "msg": "Trader account holds lamports above its rent-exempt minimum"
+    },
+    {
+      "code": 16398,
+      "name": "TraderReservedCapabilityBitsSet",
+      "msg": "Reserved capability bits set: 0x<bits>"
+    },
+    {
+      "code": 16400,
+      "name": "TraderNotFound",
+      "msg": "Trader was not found among the loaded traders"
+    },
+    {
+      "code": 16401,
+      "name": "TraderIndexNotFound",
+      "msg": "No active trader at index <index>"
+    },
+    {
+      "code": 16404,
+      "name": "TraderCollateralOutOfRange",
+      "msg": "Trader collateral of <collateral> quote lots cannot absorb a change of <change> quote lots"
+    },
+    {
+      "code": 16405,
+      "name": "TraderLocationWithoutTrader",
+      "msg": "Trader location does not resolve to a loaded trader"
+    },
+    {
+      "code": 16406,
+      "name": "TraderAccountMapFull",
+      "msg": "Trader account has no free entry for a new position or balance"
+    },
+    {
+      "code": 16407,
+      "name": "TraderActiveBufferFull",
+      "msg": "Active trader buffer has no free entry"
+    },
+    {
+      "code": 16408,
+      "name": "TraderIndexInsertFailed",
+      "msg": "Trader could not be inserted into the active trader index"
+    },
+    {
+      "code": 16409,
+      "name": "TraderNoLockedDepositSlot",
+      "msg": "Trader has no free entry for a locked deposit; ReallocTrader adds one"
+    },
+    {
+      "code": 16410,
+      "name": "TraderViewIncomplete",
+      "msg": "Traders view is missing required field <field>"
+    },
+    {
+      "code": 16411,
+      "name": "TraderPdaIndexMismatch",
+      "msg": "Trader accounts have different PDA indexes"
+    },
+    {
+      "code": 16412,
+      "name": "TraderParentNotCrossMargin",
+      "msg": "Parent trader account must be the cross-margin subaccount"
+    },
+    {
+      "code": 16413,
+      "name": "TraderInitParamsIncomplete",
+      "msg": "Trader initialization is missing required field <field>"
+    },
+    {
+      "code": 16414,
+      "name": "TraderZeroMaxPositions",
+      "msg": "Trader must allow at least one perp position"
+    },
+    {
+      "code": 16415,
+      "name": "TraderViewSourceConflict",
+      "msg": "Traders view was given both a loaded <field> and its raw data"
+    },
+    {
+      "code": 16416,
+      "name": "TraderActivityStateInconsistent",
+      "msg": "Trader's hot/cold flag disagrees with the active trader index"
+    },
+    {
+      "code": 16417,
+      "name": "TraderNotSelected",
+      "msg": "Trader is not the selected trader account"
+    },
+    {
+      "code": 20481,
+      "name": "MarginInsufficient",
+      "msg": "Insufficient margin"
+    },
+    {
+      "code": 20482,
+      "name": "MarginInvalidStateChange",
+      "msg": "Change would worsen the account's margin state"
+    },
+    {
+      "code": 20483,
+      "name": "MarginInvalidPartialPositionSize",
+      "msg": "Partial size exceeds or opposes the trader's position"
+    },
+    {
+      "code": 20484,
+      "name": "MarginInsufficientCollateral",
+      "msg": "Insufficient withdrawable collateral: requested <required> quote lots, available <available> quote lots"
+    },
+    {
+      "code": 20485,
+      "name": "MarginFillLossOnBothSides",
+      "msg": "Limit order fill loss is nonzero on both sides (bid: <bid_fill_loss> quote lots, ask: <ask_fill_loss> quote lots)"
+    },
+    {
+      "code": 20486,
+      "name": "MarginLockedDepositReserveInsufficient",
+      "msg": "Locked deposit requires <required> quote lots of withdrawal capacity, available <available> quote lots"
+    },
+    {
+      "code": 24577,
+      "name": "OrderPostOnlyCross",
+      "msg": "PostOnly order would cross the book and was rejected (client order id: <client_order_id>)"
+    },
+    {
+      "code": 24578,
+      "name": "OrderIocMinimumNotMet",
+      "msg": "IOC order does not meet minimum requirements. Min base: <min_base> base lots, Min quote: <min_quote> quote lots, Filled base: <filled_base> base lots, Filled quote: <filled_quote> quote lots"
+    },
+    {
+      "code": 24579,
+      "name": "OrderTooManyLimitOrders",
+      "msg": "Trader has too many limit orders on market <asset_id> (client order id: <client_order_id>)"
+    },
+    {
+      "code": 24580,
+      "name": "OrderReduceOnlyViolation",
+      "msg": "Order violates reduce-only restrictions"
+    },
+    {
+      "code": 24581,
+      "name": "OrderOpenInterestCapExceeded",
+      "msg": "Order would exceed the market open-interest cap"
+    },
+    {
+      "code": 24582,
+      "name": "OrderPriceOutsideAllowedBand",
+      "msg": "Order price is outside the allowed band"
+    },
+    {
+      "code": 24583,
+      "name": "OrderInvalidExpiry",
+      "msg": "TiF invalid, last valid slot (<last_valid_slot>) vs. current slot (<current_slot>)"
+    },
+    {
+      "code": 24584,
+      "name": "OrderInvalidPacket",
+      "msg": "Invalid order parameters"
+    },
+    {
+      "code": 24585,
+      "name": "OrderSelfTradeAbort",
+      "msg": "Order would trade against your own resting order"
+    },
+    {
+      "code": 24586,
+      "name": "OrderBookFull",
+      "msg": "Order book is full and the order cannot evict a resting order"
+    },
+    {
+      "code": 24587,
+      "name": "OrderNotFound",
+      "msg": "Order <order_id> not found"
+    },
+    {
+      "code": 24588,
+      "name": "OrderReduceOnlyIncreaseExposure",
+      "msg": "Reduce-only order would increase exposure (position: <position> base lots, order: <order> base lots, order side: <order_side>)"
+    },
+    {
+      "code": 24589,
+      "name": "OrderOutsideExecutionPriceBand",
+      "msg": "Order price of <price> ticks is outside the execution band of <min_price> to <max_price> ticks"
+    },
+    {
+      "code": 24590,
+      "name": "OrderAfterHoursBBOOutsideBand",
+      "msg": "After-hours best bid or offer is outside the band (best bid: <best_bid>, best ask: <best_ask>)"
+    },
+    {
+      "code": 24591,
+      "name": "OrderZeroPrice",
+      "msg": "Order price must be nonzero"
+    },
+    {
+      "code": 24592,
+      "name": "OrderZeroSize",
+      "msg": "Order size must be nonzero"
+    },
+    {
+      "code": 24593,
+      "name": "OrderMarketUninitialized",
+      "msg": "Order book is uninitialized (order sequence number is 0)"
+    },
+    {
+      "code": 24594,
+      "name": "OrderCountNotLoaded",
+      "msg": "Resting order count for the <side> side is not loaded"
+    },
+    {
+      "code": 24595,
+      "name": "OrderPointerNotFound",
+      "msg": "No resting order at book node <index>"
+    },
+    {
+      "code": 24596,
+      "name": "OrderTraderOrderListTooLong",
+      "msg": "A trader's <side> order list on market <asset_id> is longer than the per-trader order limit"
+    },
+    {
+      "code": 24597,
+      "name": "OrderBookInsertFailed",
+      "msg": "Order <order_id> could not be inserted into the book"
+    },
+    {
+      "code": 24598,
+      "name": "OrderBookRemoveFailed",
+      "msg": "Order <order_id> could not be removed from the book"
+    },
+    {
+      "code": 24599,
+      "name": "OrderBookEmpty",
+      "msg": "Order book has no resting order to evict"
+    },
+    {
+      "code": 24601,
+      "name": "OrderTraderPositionNotFound",
+      "msg": "No trader position for <trader_position_id>"
+    },
+    {
+      "code": 24602,
+      "name": "OrderRestingOrderIncomplete",
+      "msg": "Resting order is missing required field <field>"
+    },
+    {
+      "code": 24603,
+      "name": "OrderEngineViewIncomplete",
+      "msg": "Matching engine view is missing required field <field>"
+    },
+    {
+      "code": 24604,
+      "name": "OrderEngineBuilderIncomplete",
+      "msg": "Matching engine is missing required field <field>"
+    },
+    {
+      "code": 24605,
+      "name": "OrderPostOnlyOpenInterestChanged",
+      "msg": "Post-only order changed open interest"
+    },
+    {
+      "code": 24606,
+      "name": "OrderOpenInterestChangeTooLarge",
+      "msg": "Open interest change exceeds the matched size"
+    },
+    {
+      "code": 24607,
+      "name": "OrderBackstopReduceOnlyRequired",
+      "msg": "Backstop-liquidatable traders may only place reduce-only orders"
+    },
+    {
+      "code": 24833,
+      "name": "SplineCannotPlaceOrder",
+      "msg": "Spline traders cannot place limit or stop-loss orders"
+    },
+    {
+      "code": 24834,
+      "name": "SplineReduceOnlyRequired",
+      "msg": "Spline traders may only place reduce-only orders on markets without an active spline"
+    },
+    {
+      "code": 24835,
+      "name": "SplineNotRegistered",
+      "msg": "Trader has no active spline on this market"
+    },
+    {
+      "code": 24836,
+      "name": "SplineAlreadyRegistered",
+      "msg": "Trader already has an active spline on this market"
+    },
+    {
+      "code": 24837,
+      "name": "SplineIsolatedOnlyLimit",
+      "msg": "Isolated-only markets allow a spline only for traders with no other active spline"
+    },
+    {
+      "code": 24838,
+      "name": "SplineTraderHasOtherMarketExposure",
+      "msg": "First spline requires no positions or open orders on other markets"
+    },
+    {
+      "code": 24839,
+      "name": "SplineTraderHasOpenOrders",
+      "msg": "Spline trader must have no open orders on this market"
+    },
+    {
+      "code": 24840,
+      "name": "SplineNotFoundAtIndex",
+      "msg": "No spline at index <index>"
+    },
+    {
+      "code": 24841,
+      "name": "SplineMaxPositionSizeIncomplete",
+      "msg": "Spline has a max position size without bid and ask limits"
+    },
+    {
+      "code": 24842,
+      "name": "SplineStaleUpdateSlot",
+      "msg": "Update slot <slot> is older than the stored update slot <stored>"
+    },
+    {
+      "code": 24843,
+      "name": "SplineStalePriceSequenceNumber",
+      "msg": "Price sequence number <sequence_number> is not greater than the stored <stored>"
+    },
+    {
+      "code": 24844,
+      "name": "SplineStaleParameterSequenceNumber",
+      "msg": "Parameter sequence number <sequence_number> is not greater than the stored <stored>"
+    },
+    {
+      "code": 24845,
+      "name": "SplineMarketMismatch",
+      "msg": "Spline collection is for a different market"
+    },
+    {
+      "code": 28673,
+      "name": "StopLossTriggerNotMet",
+      "msg": "Stop-loss trigger condition is not met"
+    },
+    {
+      "code": 28674,
+      "name": "StopLossNoPosition",
+      "msg": "A stop loss requires an open position"
+    },
+    {
+      "code": 28675,
+      "name": "StopLossPositionDirectionMismatch",
+      "msg": "Stop loss order direction must oppose the position"
+    },
+    {
+      "code": 28676,
+      "name": "StopLossCapabilityCheckFailed",
+      "msg": "The trader is not permitted to place this stop loss"
+    },
+    {
+      "code": 28677,
+      "name": "StopLossCannotPlaceMarketOrder",
+      "msg": "The trader cannot place market orders for this stop loss"
+    },
+    {
+      "code": 28678,
+      "name": "StopLossCannotPlaceLimitOrder",
+      "msg": "The trader cannot place limit orders for this stop loss"
+    },
+    {
+      "code": 28679,
+      "name": "StopLossOrderPacketConversion",
+      "msg": "The stop loss could not be converted into an order"
+    },
+    {
+      "code": 28680,
+      "name": "StopLossTraderCapabilityBlocked",
+      "msg": "Trader capability blocks this stop loss execution"
+    },
+    {
+      "code": 28681,
+      "name": "StopLossPositionSequenceInvalidated",
+      "msg": "The position changed since the stop loss was placed"
+    },
+    {
+      "code": 28682,
+      "name": "StopLossSplineTraderNotAllowed",
+      "msg": "Spline traders cannot execute stop losses"
+    },
+    {
+      "code": 28683,
+      "name": "StopLossBackstopLiquidatable",
+      "msg": "The trader is backstop liquidatable and cannot place orders"
+    },
+    {
+      "code": 28684,
+      "name": "StopLossMarginValidationFailed",
+      "msg": "The stop loss failed margin validation"
+    },
+    {
+      "code": 28685,
+      "name": "StopLossTooManyConditionalOrders",
+      "msg": "The trader has too many open conditional orders"
+    },
+    {
+      "code": 28686,
+      "name": "StopLossConditionalOrderStateInvalid",
+      "msg": "Conditional order state is inconsistent with its resting order"
+    },
+    {
+      "code": 28687,
+      "name": "StopLossConditionalOrderSizeBelowRemaining",
+      "msg": "Conditional order max size is below its resting order's remaining size"
+    },
+    {
+      "code": 28688,
+      "name": "StopLossAssetMismatch",
+      "msg": "Stop-loss account is for a different market"
+    },
+    {
+      "code": 28689,
+      "name": "StopLossTraderMismatch",
+      "msg": "Stop-loss account belongs to a different trader"
+    },
+    {
+      "code": 28690,
+      "name": "StopLossFunderMismatch",
+      "msg": "Stop-loss account was funded by a different account"
+    },
+    {
+      "code": 28691,
+      "name": "StopLossConditionalOrdersTraderMismatch",
+      "msg": "Conditional orders account belongs to a different trader"
+    },
+    {
+      "code": 28929,
+      "name": "LiquidationPositionNotLiquidatable",
+      "msg": "Position is not liquidatable, effective collateral <effective_collateral> quote lots"
+    },
+    {
+      "code": 28930,
+      "name": "LiquidationSizeTooLarge",
+      "msg": "Liquidation size exceeds the maximum allowed"
+    },
+    {
+      "code": 28931,
+      "name": "LiquidationInsufficientLiquidity",
+      "msg": "Insufficient liquidity for liquidation"
+    },
+    {
+      "code": 28932,
+      "name": "LiquidationLiquidateeHealthDecreased",
+      "msg": "Liquidation would decrease the trader's health (<reason>; <previous_risk_state> -> <post_risk_state>)"
+    },
+    {
+      "code": 28933,
+      "name": "LiquidationLiquidateeUnderwater",
+      "msg": "Trader is already underwater"
+    },
+    {
+      "code": 28934,
+      "name": "LiquidationLiquidateeBecameUnderwater",
+      "msg": "Trader would be underwater after liquidation"
+    },
+    {
+      "code": 28935,
+      "name": "LiquidationHasRiskIncreasingLimitOrders",
+      "msg": "Risk-increasing limit orders must be cancelled before liquidation"
+    },
+    {
+      "code": 28936,
+      "name": "LiquidationCollateralNotLiquidatable",
+      "msg": "Trader's collateral is not liquidatable"
+    },
+    {
+      "code": 28937,
+      "name": "LiquidationLiquidateeHasOpenLimitOrders",
+      "msg": "Liquidatee must have no open limit orders"
+    },
+    {
+      "code": 28938,
+      "name": "LiquidationUnnettedOrderCancelFailed",
+      "msg": "Could not cancel resting orders left un-netted by the liquidation"
+    },
+    {
+      "code": 28939,
+      "name": "LiquidationLiquidatorUnhealthyAfterTransfer",
+      "msg": "Liquidator would not meet initial margin after the transfer"
+    },
+    {
+      "code": 28940,
+      "name": "LiquidationNoTransferFeeTier",
+      "msg": "Market <asset_id> has no liquidation transfer fee tier"
+    },
+    {
+      "code": 28941,
+      "name": "LiquidationDepositBelowMinimum",
+      "msg": "Liquidator deposit is below the discounted oracle liquidation price"
+    },
+    {
+      "code": 28942,
+      "name": "LiquidationDepositAboveCeiling",
+      "msg": "Liquidator deposit exceeds the permitted liquidation ceiling"
+    },
+    {
+      "code": 29185,
+      "name": "ClosePositionsAtLossTraderNotHighRisk",
+      "msg": "At-loss trader is not high risk"
+    },
+    {
+      "code": 29186,
+      "name": "ClosePositionsAtLossTraderUnderwater",
+      "msg": "At-loss trader is underwater"
+    },
+    {
+      "code": 29187,
+      "name": "ClosePositionsInProfitTraderUnderwater",
+      "msg": "In-profit trader is underwater"
+    },
+    {
+      "code": 29188,
+      "name": "ClosePositionsUnexpectedPositionSizesAfterClose",
+      "msg": "Unexpected position sizes after close"
+    },
+    {
+      "code": 29189,
+      "name": "ClosePositionsUnexpectedPNLAfterClose",
+      "msg": "Unexpected PnL after close"
+    },
+    {
+      "code": 29190,
+      "name": "ClosePositionsInProfitTraderAtLoss",
+      "msg": "In-profit trader is at a loss"
+    },
+    {
+      "code": 29191,
+      "name": "ClosePositionsInvalidClosePriceParams",
+      "msg": "Invalid close price parameters"
+    },
+    {
+      "code": 29192,
+      "name": "ClosePositionsInvalidInProfitPositionDirection",
+      "msg": "Invalid in-profit position direction"
+    },
+    {
+      "code": 29193,
+      "name": "ClosePositionsInvalidMarginStateChange",
+      "msg": "Close worsens a trader's margin state"
+    },
+    {
+      "code": 29195,
+      "name": "ClosePositionsUnmatchedPositionSizes",
+      "msg": "Position is smaller than the requested close size"
+    },
+    {
+      "code": 29196,
+      "name": "ClosePositionsInvalidEntryPrice",
+      "msg": "Invalid entry price"
+    },
+    {
+      "code": 29197,
+      "name": "ClosePositionsTooMuchProfit",
+      "msg": "Close realizes more profit than allowed"
+    },
+    {
+      "code": 36865,
+      "name": "CollateralInsufficient",
+      "msg": "Insufficient collateral balance"
+    },
+    {
+      "code": 36866,
+      "name": "CollateralNegativeBalance",
+      "msg": "Collateral balance is negative"
+    },
+    {
+      "code": 36867,
+      "name": "CollateralSpotIndexArrayPositionOutOfRange",
+      "msg": "Spot asset array position <array_position> is out of range"
+    },
+    {
+      "code": 36868,
+      "name": "CollateralSpotIndexMetadataOutOfRange",
+      "msg": "Spot asset metadata index <spot_metadata_index> is out of range"
+    },
+    {
+      "code": 36869,
+      "name": "CollateralNotSpotAssetIndex",
+      "msg": "Asset index <index> is not a spot asset index"
+    },
+    {
+      "code": 36870,
+      "name": "CollateralSpotIndexReservedBitsSet",
+      "msg": "Spot asset index <index> has reserved bits set"
+    },
+    {
+      "code": 36871,
+      "name": "CollateralSpotIndexExceedsU32",
+      "msg": "Spot asset index <value> does not fit in a u32"
+    },
+    {
+      "code": 36872,
+      "name": "CollateralInvalidLiquidationDiscountConfig",
+      "msg": "Spot asset liquidation size or discount bounds are invalid"
+    },
+    {
+      "code": 36873,
+      "name": "CollateralInvalidMarginDiscountConfig",
+      "msg": "Spot asset global balance cap or margin discount bounds are invalid"
+    },
+    {
+      "code": 36874,
+      "name": "CollateralTotalBalanceUnderflow",
+      "msg": "Spot asset total balance is below the debited amount"
+    },
+    {
+      "code": 36875,
+      "name": "CollateralPerTraderBalanceCapExceeded",
+      "msg": "Collateral asset <asset_id> balance of <balance> native units exceeds the per-trader cap of <cap> native units"
+    },
+    {
+      "code": 37121,
+      "name": "WithdrawNoPendingRequest",
+      "msg": "Trader has no pending withdrawal request"
+    },
+    {
+      "code": 37122,
+      "name": "WithdrawPendingRequestExists",
+      "msg": "Trader has a pending queued withdrawal"
+    },
+    {
+      "code": 37123,
+      "name": "WithdrawDepositCooldownActive",
+      "msg": "Deposit cooldown has not elapsed"
+    },
+    {
+      "code": 37124,
+      "name": "WithdrawRequestTooLarge",
+      "msg": "Withdrawal amount exceeds the maximum allowed"
+    },
+    {
+      "code": 37125,
+      "name": "WithdrawQueueFull",
+      "msg": "Withdraw queue is full"
+    },
+    {
+      "code": 37126,
+      "name": "WithdrawInsufficientBudget",
+      "msg": "Insufficient withdrawal budget available"
+    },
+    {
+      "code": 37127,
+      "name": "WithdrawInvalidTransition",
+      "msg": "Withdrawal request cannot move from <from> to <to>"
+    },
+    {
+      "code": 37128,
+      "name": "WithdrawRequestTerminal",
+      "msg": "Withdrawal request is already in a terminal state"
+    },
+    {
+      "code": 37129,
+      "name": "WithdrawQueueEmpty",
+      "msg": "Withdraw queue has no request to process"
+    },
+    {
+      "code": 37130,
+      "name": "WithdrawQueueStateInconsistent",
+      "msg": "Withdraw queue could not remove the trader's request at node <node_index>"
+    },
+    {
+      "code": 37131,
+      "name": "WithdrawQueuedAmountUnderflow",
+      "msg": "Withdraw queue total of <current> quote lots is below the trader's queued amount of <amount> quote lots"
+    },
+    {
+      "code": 37132,
+      "name": "WithdrawQueueNodeNull",
+      "msg": "Withdraw queue node pointer is null"
+    },
+    {
+      "code": 37133,
+      "name": "WithdrawQueueNodeOutOfBounds",
+      "msg": "Withdraw queue node <node_index> exceeds capacity of <capacity> nodes"
+    },
+    {
+      "code": 37134,
+      "name": "WithdrawQueueNodeNotAllocated",
+      "msg": "Withdraw queue node <node_index> is not allocated"
+    },
+    {
+      "code": 37135,
+      "name": "WithdrawQueueNodeWrongTrader",
+      "msg": "Withdraw queue node <node_index> belongs to a different trader"
+    },
+    {
+      "code": 37136,
+      "name": "WithdrawWouldQueue",
+      "msg": "Withdrawal cannot be processed immediately: the withdraw queue is not empty or the withdrawal budget is exhausted"
+    },
+    {
+      "code": 37377,
+      "name": "EscrowRequestNotFound",
+      "msg": "Escrow request not found"
+    },
+    {
+      "code": 37378,
+      "name": "EscrowRequestNotUpsertable",
+      "msg": "Only requests with one transfer action and three no-op actions can be updated"
+    },
+    {
+      "code": 37379,
+      "name": "EscrowFull",
+      "msg": "Escrow has no free request slots"
+    },
+    {
+      "code": 37380,
+      "name": "EscrowRequestAlreadyExists",
+      "msg": "Sender already has a request in this escrow"
+    },
+    {
+      "code": 37381,
+      "name": "EscrowRequestAlreadyCancelled",
+      "msg": "Escrow request is already cancelled"
+    },
+    {
+      "code": 37382,
+      "name": "EscrowSenderMismatch",
+      "msg": "Sender wallet does not match the escrow request's sender"
+    },
+    {
+      "code": 37383,
+      "name": "EscrowSenderTraderMismatch",
+      "msg": "Sender trader account does not match the escrow request"
+    },
+    {
+      "code": 37384,
+      "name": "EscrowReceiverTraderMismatch",
+      "msg": "Receiver trader account does not match the escrow request"
+    },
+    {
+      "code": 37385,
+      "name": "EscrowSenderCapabilityDenied",
+      "msg": "Escrow sender lacks the <capability> capability"
+    },
+    {
+      "code": 37386,
+      "name": "EscrowReceiverCapabilityDenied",
+      "msg": "Escrow receiver lacks the <capability> capability"
+    },
+    {
+      "code": 61441,
+      "name": "AdminInvalidExchangeStatusBits",
+      "msg": "Proposed exchange status bits are not a valid combination"
+    },
+    {
+      "code": 61442,
+      "name": "AdminExchangeStatusMustRemainInitialized",
+      "msg": "Exchange status must keep the initialized flag set"
+    },
+    {
+      "code": 61443,
+      "name": "AdminPerpAssetMapFull",
+      "msg": "Perp asset map has no free slot for a new asset"
+    },
+    {
+      "code": 61444,
+      "name": "AdminTooManyOracles",
+      "msg": "Market config lists more oracles than allowed"
+    },
+    {
+      "code": 61445,
+      "name": "AdminMarketAlreadyExists",
+      "msg": "A market with this symbol already exists"
+    },
+    {
+      "code": 61446,
+      "name": "AdminInvalidBaseLotDecimals",
+      "msg": "Base lot decimals must be between -9 and 9"
+    },
+    {
+      "code": 61447,
+      "name": "AdminWithdrawFeeTooHigh",
+      "msg": "Withdrawal fee exceeds the maximum allowed"
+    },
+    {
+      "code": 61448,
+      "name": "AdminNativeSolPerpAssetNotLinked",
+      "msg": "Native SOL configuration has no linked perp asset"
+    },
+    {
+      "code": 61449,
+      "name": "AdminNotCommodityMarket",
+      "msg": "Market is not a commodity market"
+    },
+    {
+      "code": 61450,
+      "name": "AdminInvalidMarketStatusTransition",
+      "msg": "Market status cannot change to the requested status"
+    },
+    {
+      "code": 61451,
+      "name": "AdminLeverageTierUpperBoundZero",
+      "msg": "Leverage tier upper_bound_size cannot be zero"
+    },
+    {
+      "code": 61452,
+      "name": "AdminLeverageTierMaxLeverageZero",
+      "msg": "Leverage tier max_leverage cannot be zero"
+    },
+    {
+      "code": 61453,
+      "name": "AdminLeverageTierUpperBoundOutOfBounds",
+      "msg": "Leverage tier upper_bound_size is out of bounds"
+    },
+    {
+      "code": 61454,
+      "name": "AdminLeverageTierUpperBoundsNotIncreasing",
+      "msg": "Leverage tiers must have strictly increasing upper_bound_size"
+    },
+    {
+      "code": 61455,
+      "name": "AdminLeverageTierMaxLeverageIncreasing",
+      "msg": "Leverage tiers must have non-increasing max_leverage"
+    },
+    {
+      "code": 61456,
+      "name": "AdminLeverageTierRiskFactorDecreasing",
+      "msg": "Leverage tiers must have non-decreasing limit_order_risk_factor"
+    },
+    {
+      "code": 61457,
+      "name": "AdminSpotSymbolAlreadyRegistered",
+      "msg": "A spot asset with this symbol is already registered"
+    },
+    {
+      "code": 61458,
+      "name": "AdminSpotMintAlreadyRegistered",
+      "msg": "A spot asset with this mint is already registered"
+    },
+    {
+      "code": 61459,
+      "name": "AdminSpotIncompatibleDecimals",
+      "msg": "Linked perp base lot is not a whole number of the mint's native units"
+    },
+    {
+      "code": 61460,
+      "name": "AdminSpotPerpAlreadyLinked",
+      "msg": "Another spot asset already links this perp market"
+    },
+    {
+      "code": 61461,
+      "name": "AdminSpotLinkedPerpAssetClosed",
+      "msg": "A closed market may only back spot collateral with zero LTV"
+    },
+    {
+      "code": 61462,
+      "name": "AdminInvalidSpotConfiguration",
+      "msg": "Spot collateral configuration is invalid"
+    },
+    {
+      "code": 61463,
+      "name": "AdminSpotLinkedPerpAssetMissing",
+      "msg": "Linked perp asset <perp_asset_id> does not exist"
+    },
+    {
+      "code": 61464,
+      "name": "AdminSpotRegistryInconsistent",
+      "msg": "Spot asset registry contradicts its invariants"
+    },
+    {
+      "code": 61465,
+      "name": "AdminInvalidCollateralMintDecimals",
+      "msg": "Canonical token mint does not have the collateral decimals"
+    },
+    {
+      "code": 61466,
+      "name": "AdminPerpAssetMapIndexMismatch",
+      "msg": "Perp asset map did not insert the new asset at its next free index"
+    }
+  ]
 }

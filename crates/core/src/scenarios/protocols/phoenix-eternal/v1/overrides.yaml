@@ -309,7 +309,8 @@ templates:
   - id: phoenix-market-funding
     name: Phoenix Market Funding
     description: >-
-      Set one market's funding interval, funding period and maximum funding rate.
+      Set one market's funding interval, funding period, maximum funding rate, clamp band and
+      divisor.
     idl_account_name: PerpAssetMap
     properties:
       - path: symbol
@@ -335,6 +336,27 @@ templates:
         label: Max funding rate (quote lots per base lot)
         description: >-
           Signed; leave empty to keep the current value
+      - path: fundingClampCenter
+        type: input
+        value_type: string
+        label: Funding clamp center (hundredths of a bp)
+        description: >-
+          Funding rate charged while the average premium is inside the clamp band, 100 = 1 bp;
+          leave empty to keep the current value
+      - path: fundingClampBandRadius
+        type: input
+        value_type: string
+        label: Funding clamp band radius (hundredths of a bp)
+        description: >-
+          Half-width of the band around the clamp center, 0 turns the clamp off; leave empty to
+          keep the current value
+      - path: fundingDivisor
+        type: input
+        value_type: string
+        label: Funding divisor
+        description: >-
+          Funding after the clamp band is divided by this, 0 counts as 1; leave empty to keep the
+          current value
     llm_context: |
       Every field is optional: one left out keeps its current value. Pass values as decimal strings.
       Leave fetchBeforeUse false: a refetch puts every market's prices and factors back to

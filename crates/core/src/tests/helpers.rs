@@ -5,7 +5,12 @@ use crossbeam_channel::{Receiver, Sender};
 use solana_account::Account;
 use solana_clock::Clock;
 use solana_epoch_info::EpochInfo;
+use solana_hash::Hash;
+use solana_keypair::Keypair;
+use solana_message::{Message, VersionedMessage};
 use solana_pubkey::Pubkey;
+use solana_signer::Signer;
+use solana_system_interface::instruction::transfer;
 use solana_transaction::versioned::VersionedTransaction;
 use surfpool_types::{
     AccountAddress, CheatcodeConfig, Idl, OverrideInstance, RpcConfig, SimnetCommand, SimnetEvent,
@@ -21,6 +26,16 @@ use crate::{
     },
 };
 
+/// Returns the byte indices whose values differ between two buffers.
+pub(super) fn diff_indices(left: &[u8], right: &[u8]) -> Vec<usize> {
+    left.iter()
+        .zip(right.iter())
+        .enumerate()
+        .filter(|(_, (left, right))| left != right)
+        .map(|(index, _)| index)
+        .collect()
+}
+
 pub fn get_free_port() -> Result<u16, String> {
     let listener =
         TcpListener::bind("127.0.0.1:0").map_err(|e| format!("Failed to bind to port 0: {}", e))?;
@@ -30,6 +45,32 @@ pub fn get_free_port() -> Result<u16, String> {
         .port();
     drop(listener);
     Ok(port)
+}
+
+/// What Agave's `sanitize_transaction` answers for either of [`unsanitary_transactions`].
+pub const UNSANITARY_TRANSACTION_ERROR: &str =
+    "invalid transaction: Transaction failed to sanitize accounts offsets correctly";
+
+/// Transactions that deserialize but that Agave refuses at sanitization: a signed transfer whose
+/// instruction names an account index its message does not carry, and a transfer stripped of
+/// its signatures.
+pub fn unsanitary_transactions(
+    payer: &Keypair,
+    recent_blockhash: Hash,
+) -> [VersionedTransaction; 2] {
+    let mut message = Message::new_with_blockhash(
+        &[transfer(&payer.pubkey(), &Pubkey::new_unique(), 1)],
+        Some(&payer.pubkey()),
+        &recent_blockhash,
+    );
+    let unsigned = VersionedTransaction {
+        signatures: vec![],
+        message: VersionedMessage::Legacy(message.clone()),
+    };
+    message.instructions[0].accounts[1] = 42;
+    let unknown_account =
+        VersionedTransaction::try_new(VersionedMessage::Legacy(message), &[payer]).unwrap();
+    [unknown_account, unsigned]
 }
 
 /// Minimal JSON-RPC stand-in that answers every request with one canned `result` body, so

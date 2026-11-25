@@ -91,13 +91,22 @@
             "type": "u8"
           },
           {
-            "name": "placeholder",
+            "name": "alignment_padding",
             "type": {
               "array": [
                 "u8",
-                6
+                2
               ]
             }
+          },
+          {
+            "name": "timestamp",
+            "docs": [
+              "Wall-clock timestamp (seconds) of the last update.",
+              "",
+              "Note: `u32` is used here only because of space constraints."
+            ],
+            "type": "u32"
           }
         ]
       }
@@ -243,6 +252,17 @@
             "type": "u8"
           },
           {
+            "name": "interest_rate_basis",
+            "docs": [
+              "Selects how the time-related settings are interpreted:",
+              "- [Self::borrow_rate_curve] + [Self::host_fixed_interest_rate_bps] (when accruing interest),",
+              "- [Self::rewards_amount_per_accrual_unit] (when accruing rewards).",
+              "",
+              "See the docs of the actual type, [InterestRateBasis]."
+            ],
+            "type": "u8"
+          },
+          {
             "name": "reserved1",
             "docs": [
               "Past reserved space - feel free to reuse."
@@ -250,7 +270,7 @@
             "type": {
               "array": [
                 "u8",
-                4
+                3
               ]
             }
           },
@@ -501,9 +521,11 @@
             "type": "u64"
           },
           {
-            "name": "rewards_amount_per_slot",
+            "name": "rewards_amount_per_accrual_unit",
             "docs": [
-              "Rewards distributed per slot to depositors. Drained from",
+              "Rewards distributed per accrual unit to depositors. The unit follows",
+              "[Self::interest_rate_basis]: per slot for `Legacy`, per second for `TrueApr` (i.e. a",
+              "basis migration must rescale this value by the real slot rate). Drained from",
               "[ReserveLiquidity::rewards_amount_available] into",
               "[ReserveLiquidity::total_available_amount] at each refresh, capped by the",
               "market-level [LendingMarket::reserve_rewards_max_apr_bps]. `0` disables.",
@@ -711,7 +733,8 @@
               "",
               "Tokens are deposited via `topup_reserve_rewards` and increase this counter (without",
               "touching [Self::total_available_amount]). On every `refresh_reserve`, up to",
-              "`rewards_amount_per_slot * slots_elapsed` tokens are moved from this counter into",
+              "`rewards_amount_per_accrual_unit * elapsed_units` tokens (units per the reserve's",
+              "interest rate basis) are moved from this counter into",
               "[Self::total_available_amount], inflating the cToken exchange rate, capped by the",
               "market-level `reserve_rewards_max_apr_bps` cap."
             ],
@@ -1127,6 +1150,9 @@
           },
           {
             "name": "DepositCap"
+          },
+          {
+            "name": "PermissioningAuthority"
           }
         ]
       }
@@ -1164,11 +1190,34 @@
             "type": "u64"
           },
           {
+            "name": "reserve_type",
+            "docs": [
+              "should match the ReserveType enum."
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "allocation_priority",
+            "docs": [
+              "as the priority is higher it means that is more important to have and keep the liquidity in that allocation. Specifically for the current use cases, a conditional allocation can use as source only a reserve with lower or equal priority."
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "padding0",
+            "type": {
+              "array": [
+                "u8",
+                6
+              ]
+            }
+          },
+          {
             "name": "config_padding",
             "type": {
               "array": [
                 "u64",
-                126
+                125
               ]
             }
           },
@@ -1185,11 +1234,20 @@
             "type": "u128"
           },
           {
+            "name": "klend_queued_ctokens",
+            "docs": [
+              "The ctokens that are still locked in the reserve's Klend queued collateral vault.",
+              "",
+              "These ctokens still earn yield for the vault and are included in [Self::ctoken_allocation]."
+            ],
+            "type": "u64"
+          },
+          {
             "name": "state_padding",
             "type": {
               "array": [
                 "u64",
-                128
+                127
               ]
             }
           }
@@ -1253,6 +1311,12 @@
             "name": "MinWithdrawalPenaltyBPS",
             "fields": [
               "u64"
+            ]
+          },
+          {
+            "name": "ConditionalLiquidityEnabled",
+            "fields": [
+              "u8"
             ]
           }
         ]
@@ -1418,11 +1482,15 @@
             "type": "u64"
           },
           {
+            "name": "conditional_liquidity_enabled",
+            "type": "u8"
+          },
+          {
             "name": "padding",
             "type": {
               "array": [
                 "u8",
-                944
+                943
               ]
             }
           }
@@ -1678,11 +1746,27 @@
             }
           },
           {
+            "name": "permissioning_authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "withdraw_ticket_rent_budget",
+            "docs": [
+              "The amount of native SOL (in lamports) held by the [Self::base_vault_authority] for Klend's",
+              "withdraw ticket rent purposes."
+            ],
+            "type": "u64"
+          },
+          {
             "name": "padding3",
+            "type": "u64"
+          },
+          {
+            "name": "padding4",
             "type": {
               "array": [
                 "u128",
-                232
+                229
               ]
             }
           }

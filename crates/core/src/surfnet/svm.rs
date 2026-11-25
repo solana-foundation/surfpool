@@ -101,7 +101,7 @@ use super::{
 };
 use crate::{
     error::{AirdropError, SurfpoolError, SurfpoolResult},
-    helpers::time_travel::clock_for_slot,
+    helpers::time_travel::{clock_for_slot, timestamp_seconds},
     rpc::utils::convert_transaction_metadata_from_canonical,
     scenarios::{
         TemplateRegistry, account_data_values,
@@ -3222,8 +3222,8 @@ impl SurfnetSvm {
 
         let num_transactions = confirmed_signatures.len() as u64;
         let num_successful_transactions = num_transactions.saturating_sub(num_failed_transactions);
-        let block_time = (self.updated_at + self.block_time_lag()) as i64 / 1_000;
-        self.updated_at += self.slot_time;
+        let block_time = timestamp_seconds(self.updated_at.saturating_add(self.block_time_lag()));
+        self.updated_at = self.updated_at.saturating_add(self.slot_time);
 
         // Only store blocks that have transactions (sparse block storage)
         // Empty blocks can be reconstructed on-the-fly from their slot and the chain tip
@@ -3352,11 +3352,11 @@ impl SurfnetSvm {
             .is_active(&agave_feature_set::alpenglow::id())
             && epoch_schedule.get_epoch(slot.saturating_sub(1)) != closed.epoch
         {
-            closed.epoch_start_timestamp = self.updated_at as i64 / 1_000;
+            closed.epoch_start_timestamp = timestamp_seconds(self.updated_at);
         }
         let clock = clock_for_slot(
             self.latest_epoch_info.absolute_slot,
-            self.updated_at as i64 / 1_000,
+            timestamp_seconds(self.updated_at),
             Some(&closed),
             &epoch_schedule,
         );
@@ -7895,6 +7895,20 @@ mod tests {
         assert_eq!(*pubkey, clock::ID);
         let streamed: Clock = bincode::deserialize(&account.data).unwrap();
         assert_eq!(streamed.slot, landing);
+    }
+
+    #[test]
+    fn clock_stays_positive_when_milliseconds_exceed_i64_max() {
+        let (mut svm, _events_rx, _geyser_rx) = SurfnetSvm::default();
+        svm.updated_at = i64::MAX as u64 + 1_200;
+
+        for _ in 0..3 {
+            svm.confirm_current_block().unwrap();
+        }
+
+        let clock = svm.inner.get_sysvar::<Clock>();
+        assert!(clock.unix_timestamp > 0);
+        assert_eq!(clock.unix_timestamp, (svm.updated_at / 1_000) as i64);
     }
 
     /// A forward time travel skips the slots it jumps, as a leader's missed slots are: the

@@ -17,11 +17,17 @@ Protocols that are natively supported by Surfpool will have their IDLs included 
 - **Chainlink** - Data feeds of the Store program, with a template for a feed's latest round. See [protocols/chainlink/README.md](./protocols/chainlink/README.md)
 - **Jupiter v6** - DEX aggregator with TokenLedger manipulation template
 - **Switchboard On-Demand** - On-demand oracle with QuoteAccount override template
-- **Kamino** – Lending (v1.23.0), Scope oracle, Farms, Swap/LIMO, Earn vaults and Liquidity, across six programs. See [protocols/kamino/README.md](./protocols/kamino/README.md)
+- **Kamino** – Lending (v1.27.0), Scope oracle, Farms, Swap/LIMO, Earn vaults and Liquidity, across six programs. See [protocols/kamino/README.md](./protocols/kamino/README.md)
 - **Drift v2** - Perp and spot markets, user state, and global state
+- **BisonFi v3** – Proprietary market maker with price, depth and spread templates; its quote and market tick are kept alive. See [protocols/bisonfi/README.md](./protocols/bisonfi/README.md)
 - **Pump v1** - Bonding curve launchpad with curve reserve and global config override templates
 - **Phoenix Eternal** - Perpetuals venue with trader collateral, mark price, maintenance margin, market fee, withdraw limit, trader capability, stop-loss trigger and delegated permission templates. See [protocols/phoenix-eternal/README.md](./protocols/phoenix-eternal/README.md)
 - **PumpSwap v1** - Constant-product AMM with pool state and global config override templates, including canonical pool derivation for migrated pump.fun coins
+- **GoonFi V2** - Proprietary market maker (no published IDL), with price, reference-band, size-impact and vault-inventory templates; its oracle is kept alive and callers choose the market, oracle or vault account. See [protocols/goonfi/v2/README.md](./protocols/goonfi/v2/README.md)
+- **HumidiFi v8** - Proprietary market maker (no published IDL), with price, spread and vault-inventory templates; its quote is kept alive. Callers choose the market or vault account. See [protocols/humidifi/v8/README.md](./protocols/humidifi/v8/README.md)
+ - **SolFi v2** – Proprietary market maker (no published IDL, not Anchor), with price, size-impact,
+   swap-pressure and vault-inventory templates; its oracle is kept alive. See
+   [protocols/solfi/v2/README.md](./protocols/solfi/v2/README.md)
 
 For custom protocols, an IDL can be registered at runtime using the [`surfnet_registerIdl`](https://docs.surfpool.run/rpc/cheatcodes#surfnet-registeridl) RPC cheatcode.
 
@@ -44,13 +50,15 @@ fields a protocol's own off-chain actor would every slot.
 `surfnet_timeTravel` produces only the next slot before it jumps, so overrides scheduled in the slots
 it skips are never applied; step one slot at a time to play a scenario under a paused clock.
 
-### Kamino integration tests
+### On-chain integration tests
 
-Byte-level Kamino coverage lives in `crates/core/src/tests/kamino/`. Those tests fetch the real
-accounts from mainnet, so they need a network connection and are compiled only behind a feature:
+Byte-level Kamino and BisonFi coverage lives in `crates/core/src/tests/kamino/` and
+`crates/core/src/tests/bisonfi/`. These tests fetch real accounts from mainnet, so they need a
+network connection and are compiled only behind a feature:
 
 ```
 cargo test -p surfpool-core --features integration-tests kamino
+cargo test -p surfpool-core --features integration-tests bisonfi
 ```
 
 Set `SURFPOOL_TEST_RPC_URL` to use a private endpoint instead of the public one. The default test

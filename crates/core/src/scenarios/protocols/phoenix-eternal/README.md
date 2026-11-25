@@ -108,7 +108,7 @@ with `includeOwnedAccounts: true`) or restart the surfnet, and play again.
 | `phoenix-market-cancel-risk-factor`   | The resting-order factor, the ceiling for the maintenance factor.                                      | risk authority               |
 | `phoenix-market-max-liquidation-size` | The most base lots one liquidation may close.                                                          | risk authority               |
 | `phoenix-market-open-interest-cap`    | The most open interest the market accepts.                                                             | risk authority               |
-| `phoenix-market-funding`              | Funding interval, period and maximum rate.                                                             | market authority             |
+| `phoenix-market-funding`              | Funding interval, period, maximum rate, clamp band and divisor.                                        | market authority             |
 | `phoenix-market-fees`                 | Default taker and maker fees.                                                                          | market authority             |
 | `phoenix-market-status`               | Active, PostOnly, Paused or Closed.                                                                    | market authority             |
 | `phoenix-exchange-status`             | The exchange-wide active, gated and maintenance flags.                                                 | root authority               |
@@ -241,7 +241,14 @@ while the surfnet's clock runs, so a keeper finds the same quotes long after Pla
 | `... is below its high-risk margin ...`                       | The collateral target is below the trader's high-risk margin; a liquidation can leave it underwater and fail.                    |
 | `the ... book stayed crossed after ... uncross cranks`        | `phoenix-market-uncross` left the book crossed after its cranks. Try a smaller move.                                              |
 | `InvalidAccountData` before any program log                   | The order book and the trader index were copied from mainnet at different moments; see the known limitation.                      |
-| `Cannot get mark price, staleness or validity check failed`   | No Phoenix scenario was played on this surfnet, so the oracle readings aged past the stale thresholds. Play any Phoenix scenario. |
+| `Mark price of market N is unavailable or stale`              | No Phoenix scenario was played on this surfnet, so the oracle readings aged past the stale thresholds. Play any Phoenix scenario. |
+
+## The bundled IDL
+
+The `Trader` type in the IDL Phoenix publishes has one field `maxPositions: u64`. The program keeps
+two `u32` values in those 8 bytes: the position limit, then the trader's preference bits. The
+bundled `Trader` has them as `maxPositions: u32` and `traderPreferenceBits: u32`, so a write of one
+leaves the other.
 
 ## Tests against mainnet
 

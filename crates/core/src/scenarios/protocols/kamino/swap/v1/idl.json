@@ -2,7 +2,7 @@
   "address": "LiMoM9rMhrdYrfzUCxQppvxCSG1FcrUK9G8uLq4A1GF",
   "metadata": {
     "name": "limo",
-    "version": "0.1.0",
+    "version": "0.2.0",
     "spec": "0.1.0"
   },
   "instructions": [],
@@ -49,119 +49,11 @@
   ],
   "types": [
     {
-      "name": "OrderStatus",
-      "type": {
-        "kind": "enum",
-        "variants": [
-          {
-            "name": "Active"
-          },
-          {
-            "name": "Filled"
-          },
-          {
-            "name": "Cancelled"
-          }
-        ]
-      }
-    },
-    {
-      "name": "OrderType",
-      "type": {
-        "kind": "enum",
-        "variants": [
-          {
-            "name": "Vanilla"
-          }
-        ]
-      }
-    },
-    {
-      "name": "UpdateGlobalConfigMode",
-      "type": {
-        "kind": "enum",
-        "variants": [
-          {
-            "name": "UpdateEmergencyMode"
-          },
-          {
-            "name": "UpdateFlashTakeOrderBlocked"
-          },
-          {
-            "name": "UpdateBlockNewOrders"
-          },
-          {
-            "name": "UpdateBlockOrderTaking"
-          },
-          {
-            "name": "UpdateHostFeeBps"
-          },
-          {
-            "name": "UpdateAdminAuthorityCached"
-          },
-          {
-            "name": "UpdateOrderTakingPermissionless"
-          },
-          {
-            "name": "UpdateOrderCloseDelaySeconds"
-          },
-          {
-            "name": "UpdateTxnFeeCost"
-          },
-          {
-            "name": "UpdateAtaCreationCost"
-          }
-        ]
-      }
-    },
-    {
-      "name": "UpdateGlobalConfigValue",
-      "type": {
-        "kind": "enum",
-        "variants": [
-          {
-            "name": "Bool",
-            "fields": [
-              "bool"
-            ]
-          },
-          {
-            "name": "U16",
-            "fields": [
-              "u16"
-            ]
-          },
-          {
-            "name": "U64",
-            "fields": [
-              "u64"
-            ]
-          },
-          {
-            "name": "Pubkey",
-            "fields": [
-              "pubkey"
-            ]
-          }
-        ]
-      }
-    },
-    {
-      "name": "UpdateOrderMode",
-      "type": {
-        "kind": "enum",
-        "variants": [
-          {
-            "name": "UpdatePermissionless"
-          },
-          {
-            "name": "UpdateCounterparty"
-          }
-        ]
-      }
-    },
-    {
       "name": "Order",
+      "serialization": "bytemuck",
+      "repr": {
+        "kind": "c"
+      },
       "type": {
         "kind": "struct",
         "fields": [
@@ -284,11 +176,19 @@
             "type": "pubkey"
           },
           {
+            "name": "fee_paid",
+            "docs": [
+              "Lamports the maker deposited at create_order (ata_creation_cost + txn_fee_cost).",
+              "Held on this account and refunded to the maker via `close = maker` at close."
+            ],
+            "type": "u64"
+          },
+          {
             "name": "padding",
             "type": {
               "array": [
                 "u64",
-                15
+                14
               ]
             }
           }
@@ -297,6 +197,10 @@
     },
     {
       "name": "UserSwapBalancesState",
+      "serialization": "bytemuck",
+      "repr": {
+        "kind": "c"
+      },
       "type": {
         "kind": "struct",
         "fields": [
@@ -317,6 +221,10 @@
     },
     {
       "name": "GlobalConfig",
+      "serialization": "bytemuck",
+      "repr": {
+        "kind": "c"
+      },
       "type": {
         "kind": "struct",
         "fields": [
@@ -341,11 +249,20 @@
             "type": "u16"
           },
           {
+            "name": "rfq_venues_blocked",
+            "docs": [
+              "Bitmask of disabled RFQ venues. `0` (default) means every venue is",
+              "enabled. Bit 0 (`RFQ_VENUE_KRFQ_DISABLED`) disables krfq, bit 1",
+              "(`RFQ_VENUE_PER_DISABLED`) disables Express Relay (PER)."
+            ],
+            "type": "u8"
+          },
+          {
             "name": "padding0",
             "type": {
               "array": [
                 "u8",
-                2
+                1
               ]
             }
           },
@@ -457,6 +374,10 @@
           },
           {
             "name": "on_event_output_amount_filled",
+            "docs": [
+              "The amount of output token filled when this event was emitted - used",
+              "for volume calculations"
+            ],
             "type": "u64"
           },
           {

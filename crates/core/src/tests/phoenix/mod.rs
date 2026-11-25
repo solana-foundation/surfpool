@@ -168,10 +168,8 @@ async fn scenario_keeps_the_trader_usable_as_the_clock_moves_on() {
     unplayed.with_svm_writer(|svm| svm.inner.set_sysvar(&later(&graph)));
     let refused = try_hawkeye_margin(&unplayed, &graph)
         .expect_err("with no Phoenix scenario played, the aged readings are refused");
-    assert!(
-        refused.contains("staleness or validity check failed"),
-        "{refused}"
-    );
+    // Hawkeye's OracleMarkPriceUnavailable; its message has been reworded, its code has not.
+    assert!(refused.contains("Custom(12289)"), "{refused}");
 
     let (locker, graph) = phoenix_behavior_locker().await;
     // Any Phoenix override keeps the markets usable; this one leaves SOL's fees as they are.
@@ -742,72 +740,81 @@ async fn an_oracle_price_override_moves_the_oracles_and_leaves_the_book() {
 }
 
 /// A move leaves the resting bids above the new price crossed, and one uncross crank matches at most
-/// 64 of them, so `phoenix-market-uncross` cranks until the book is uncrossed.
+/// 64 of them, so `phoenix-market-uncross` cranks until the book is uncrossed. The test rests its own
+/// bids, so it holds however few the mainnet book has.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_move_past_more_resting_bids_than_one_crank_matches_uncrosses_the_book() {
     let (locker, graph) = phoenix_behavior_locker().await;
     let remote = Some((client(), CommitmentConfig::confirmed()));
-    for (symbol, orderbook, spline) in graph.markets.clone() {
-        let bids: Vec<u64> = Orderbook::try_from_account_bytes(&graph.account(&orderbook).data)
+    let (symbol, orderbook, spline) = graph.markets[0].clone();
+    let maker = LocalTrader::create(&locker, 10_000).await.unwrap();
+    for _ in 0..81 {
+        maker
+            .place_limit_order(&locker, &symbol, 10, 1)
+            .await
+            .unwrap();
+    }
+    let bids_from = |price: u64| {
+        let book = locker
+            .with_svm_reader(|svm| svm.get_account(&orderbook))
+            .unwrap()
+            .unwrap();
+        Orderbook::try_from_account_bytes(&book.data)
+            .unwrap()
+            .bid_orders()
+            .filter(|bid| bid.price_in_ticks().as_inner() >= price)
+            .count()
+    };
+    let mut bids: Vec<u64> = {
+        let book = locker
+            .with_svm_reader(|svm| svm.get_account(&orderbook))
+            .unwrap()
+            .unwrap();
+        Orderbook::try_from_account_bytes(&book.data)
             .unwrap()
             .bid_orders()
             .map(|bid| bid.price_in_ticks().as_inner())
-            .collect();
-        // Just below the 81st best bid, at least 81 resting bids cross the re-centred splines.
-        let Some(target) = bids.get(80).map(|price| price - 1) else {
-            continue;
-        };
-        let writes = {
-            let mut svm = locker.0.write().await;
-            move_market(&mut svm, &remote, &symbol, target)
-                .await
-                .unwrap_or_else(|e| panic!("{symbol}: {e}"))
-        };
-        apply(&locker, writes).await;
-        let moved = hawkeye_bbo_for_market(&graph, &locker, orderbook, spline);
-        assert!(
-            moved.crossed(),
-            "{symbol}: the move alone leaves the bids above {target} crossed: {moved:?}"
-        );
-        let bids_from = |price: u64| {
-            let book = locker
-                .with_svm_reader(|svm| svm.get_account(&orderbook))
-                .unwrap()
-                .unwrap();
-            Orderbook::try_from_account_bytes(&book.data)
-                .unwrap()
-                .bid_orders()
-                .filter(|bid| bid.price_in_ticks().as_inner() >= price)
-                .count()
-        };
-        // Bids between the target and the makers' new ask are not crossed and stay.
-        let crossed = bids_from(moved.best_ask_ticks);
-        if crossed <= 64 {
-            continue;
-        }
+            .collect()
+    };
+    bids.sort_unstable_by(|a, b| b.cmp(a));
+    // 2% below the 81st best bid, so the re-centred splines ask below at least 81 resting bids.
+    let target = bids[80] * 98 / 100;
 
-        let writes = {
-            let mut svm = locker.0.write().await;
-            uncross_market(&mut svm, &remote, &symbol)
-                .await
-                .unwrap_or_else(|e| panic!("{symbol}: {e}"))
-        };
-        apply(&locker, writes).await;
-        let after = hawkeye_bbo_for_market(&graph, &locker, orderbook, spline);
-        assert!(
-            after.best_bid_ticks < after.best_ask_ticks,
-            "{symbol}: the book is uncrossed at {target} ticks: {after:?}"
-        );
-        let matched = crossed - bids_from(moved.best_ask_ticks);
-        assert!(
-            matched > 64,
-            "{symbol}: the cranks matched {matched} of the {crossed} crossed bids, more than one crank does"
-        );
-        return;
-    }
-    panic!(
-        "no eligible mainnet candidate: no book of {:?} leaves more than 64 bids crossed",
-        graph.markets
+    let writes = {
+        let mut svm = locker.0.write().await;
+        move_market(&mut svm, &remote, &symbol, target)
+            .await
+            .unwrap_or_else(|e| panic!("{symbol}: {e}"))
+    };
+    apply(&locker, writes).await;
+    let moved = hawkeye_bbo_for_market(&graph, &locker, orderbook, spline);
+    assert!(
+        moved.crossed(),
+        "{symbol}: the move alone leaves the bids above {target} crossed: {moved:?}"
+    );
+    // Bids between the target and the makers' new ask are not crossed and stay.
+    let crossed = bids_from(moved.best_ask_ticks);
+    assert!(
+        crossed > 64,
+        "{symbol}: {crossed} bids rest at or above the new ask, more than one crank matches: {moved:?}"
+    );
+
+    let writes = {
+        let mut svm = locker.0.write().await;
+        uncross_market(&mut svm, &remote, &symbol)
+            .await
+            .unwrap_or_else(|e| panic!("{symbol}: {e}"))
+    };
+    apply(&locker, writes).await;
+    let after = hawkeye_bbo_for_market(&graph, &locker, orderbook, spline);
+    assert!(
+        after.best_bid_ticks < after.best_ask_ticks,
+        "{symbol}: the book is uncrossed at {target} ticks: {after:?}"
+    );
+    let matched = crossed - bids_from(moved.best_ask_ticks);
+    assert!(
+        matched > 64,
+        "{symbol}: the cranks matched {matched} of the {crossed} crossed bids, more than one crank does"
     );
 }
 
@@ -1232,6 +1239,33 @@ async fn market_and_exchange_configuration_reaches_the_accounts_phoenix_reads() 
         before.funding_accumulator().funding_period_seconds,
         "a funding field left out keeps its value"
     );
+
+    let mut clamp = sol("fundingClampCenter", "150".to_string());
+    clamp.push(("fundingClampBandRadius", "25".to_string()));
+    clamp.push(("fundingDivisor", "3".to_string()));
+    configure(
+        &locker,
+        "phoenix-market-funding",
+        graph.perp_asset_map,
+        &clamp,
+    )
+    .await
+    .unwrap();
+    let funding = *sol_metadata(&locker, &graph).funding_accumulator();
+    // Phoenix keeps the divisor, clamp center and clamp band radius right after `flags`, in the
+    // bytes this release of the accounts crate still calls padding.
+    let bytes = bytemuck::bytes_of(&funding);
+    let options = &bytes[bytes.len() - 15..];
+    assert_eq!(
+        (
+            options[0],
+            u16::from_le_bytes([options[1], options[2]]),
+            u16::from_le_bytes([options[3], options[4]]),
+        ),
+        (3, 150, 25),
+        "the divisor, clamp center and clamp band radius Phoenix reads"
+    );
+    assert_eq!(funding.max_funding_rate.as_inner(), max_rate);
 
     configure(
         &locker,
@@ -2458,4 +2492,53 @@ async fn trader_configuration_reaches_what_phoenix_reads() {
         ),
         (2, 3)
     );
+}
+
+/// Phoenix keeps a trader's position limit and its preference bits as two `u32` side by side, in the
+/// 8 bytes the published IDL's `Trader` gives to one `maxPositions: u64`.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_preference_bits_phoenix_sets_sit_beside_the_position_limit() {
+    let graph = phoenix_mainnet_graph().await;
+    let locker = phoenix_surfnet(&graph).await;
+    // Registered with `maxPositions` 32.
+    let trader = LocalTrader::create(&locker, 1_000).await.unwrap();
+    let limit_and_bits = || {
+        let account = locker
+            .with_svm_reader(|svm| svm.get_account(&trader.account))
+            .unwrap()
+            .unwrap();
+        account.data[112..120].to_vec()
+    };
+    assert_eq!(limit_and_bits()[..4], [32, 0, 0, 0]);
+
+    // A preference turned off sets its bit: CollateralSweep is bit 0, PositionAuthoritySwap bit 1.
+    for (set, expected) in [
+        (false, [32, 0, 0, 0, 3, 0, 0, 0]),
+        (true, [32, 0, 0, 0, 0, 0, 0, 0]),
+    ] {
+        let toggles = ["CollateralSweep", "PositionAuthoritySwap"]
+            .map(|target| serde_json::json!({ "target": { target: null }, "set": set }));
+        let update = phoenix_instruction(
+            "UpdateTraderPreferenceBits",
+            &[
+                ("phoenixProgram", PHOENIX_PROGRAM_ID),
+                ("phoenixLogAuthority", log_authority()),
+                ("globalConfiguration", PHOENIX_GLOBAL_CONFIG),
+                ("signer", trader.wallet),
+                ("maybePermissionAccount", trader.wallet),
+                ("traderAccount", trader.account),
+            ],
+            &serde_json::json!({ "params": { "toggles": toggles } }),
+        )
+        .unwrap();
+        let writes = locker
+            .with_svm_reader(|svm| run_instructions(svm, &[update]))
+            .unwrap();
+        apply(&locker, writes).await;
+        assert_eq!(
+            limit_and_bits(),
+            expected,
+            "both preferences set to {set}: the limit stays 32 and only the next four bytes change"
+        );
+    }
 }
