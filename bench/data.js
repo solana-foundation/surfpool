@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795630948196,
+  "lastUpdate": 1795636521489,
   "repoUrl": "https://github.com/solana-foundation/surfpool",
   "entries": {
     "surfpool throughput": [
@@ -239,6 +239,66 @@ window.BENCHMARK_DATA = {
             "name": "send_tx_no_profiling/tps_confirmed",
             "value": 2264.591562978848,
             "range": "2264.2..2311.4",
+            "unit": "tx/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "micaiahreid@gmail.com",
+            "name": "Micaiah Reid",
+            "username": "MicaiahReid"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "f864286cc80378dd64b32f4e4b6b7b96de625b9c",
+          "message": "fix: serve TPU QUIC so `solana program deploy` works with Agave 4.5 (#971)",
+          "timestamp": "2026-11-25T14:50:45-05:00",
+          "tree_id": "2f5cfb29b2f24a6048e0de14c53e633cea728237",
+          "url": "https://github.com/solana-foundation/surfpool/commit/f864286cc80378dd64b32f4e4b6b7b96de625b9c"
+        },
+        "date": 1795636520539,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "gpa/rps",
+            "value": 99,
+            "range": "98.4..100.1",
+            "unit": "req/s"
+          },
+          {
+            "name": "reads/rps",
+            "value": 64531.3,
+            "range": "64231.3..65557.2",
+            "unit": "req/s"
+          },
+          {
+            "name": "send_tx_default/send_rate",
+            "value": 2253.8,
+            "range": "2251.2..2284.5",
+            "unit": "tx/s"
+          },
+          {
+            "name": "send_tx_default/tps_confirmed",
+            "value": 2203.3370030257515,
+            "range": "2202.2..2223.3",
+            "unit": "tx/s"
+          },
+          {
+            "name": "send_tx_no_profiling/send_rate",
+            "value": 2333.2,
+            "range": "2266.0..2344.4",
+            "unit": "tx/s"
+          },
+          {
+            "name": "send_tx_no_profiling/tps_confirmed",
+            "value": 2274.977830747146,
+            "range": "2204.5..2284.7",
             "unit": "tx/s"
           }
         ]
