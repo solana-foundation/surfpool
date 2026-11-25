@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1795617936229,
+  "lastUpdate": 1795630948196,
   "repoUrl": "https://github.com/solana-foundation/surfpool",
   "entries": {
     "surfpool throughput": [
@@ -179,6 +179,66 @@ window.BENCHMARK_DATA = {
             "name": "send_tx_no_profiling/tps_confirmed",
             "value": 2272.66566245659,
             "range": "2244.9..2334.8",
+            "unit": "tx/s"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "oscurocalma@gmail.com",
+            "name": "failfmi",
+            "username": "failfmi"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "c66e8dff9c00b0d66c26fb0d5fe1809acdaa9b15",
+          "message": "chore(scenarios): remove Drift v2 templates (#972)\n\nSigned-off-by: failfmi <oscurocalma@gmail.com>",
+          "timestamp": "2026-11-25T13:17:52-05:00",
+          "tree_id": "92d1196d3f06f1bda3872be6b338c82ba1f0177b",
+          "url": "https://github.com/solana-foundation/surfpool/commit/c66e8dff9c00b0d66c26fb0d5fe1809acdaa9b15"
+        },
+        "date": 1795630947236,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "gpa/rps",
+            "value": 98.8,
+            "range": "98.4..100.5",
+            "unit": "req/s"
+          },
+          {
+            "name": "reads/rps",
+            "value": 65037.3,
+            "range": "64993.8..65195.6",
+            "unit": "req/s"
+          },
+          {
+            "name": "send_tx_default/send_rate",
+            "value": 2329.8,
+            "range": "2231.9..2361.7",
+            "unit": "tx/s"
+          },
+          {
+            "name": "send_tx_default/tps_confirmed",
+            "value": 2276.176311814814,
+            "range": "2168.4..2310.0",
+            "unit": "tx/s"
+          },
+          {
+            "name": "send_tx_no_profiling/send_rate",
+            "value": 2322.9,
+            "range": "2314.1..2370.6",
+            "unit": "tx/s"
+          },
+          {
+            "name": "send_tx_no_profiling/tps_confirmed",
+            "value": 2264.591562978848,
+            "range": "2264.2..2311.4",
             "unit": "tx/s"
           }
         ]
