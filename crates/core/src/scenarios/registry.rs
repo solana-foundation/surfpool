@@ -11,6 +11,10 @@ use surfpool_types::{
 pub const PYTH_V2_IDL_CONTENT: &str = include_str!("./protocols/pyth/v2/idl.json");
 pub const PYTH_V2_OVERRIDES_CONTENT: &str = include_str!("./protocols/pyth/v2/overrides.yaml");
 
+pub const CHAINLINK_V1_IDL_CONTENT: &str = include_str!("./protocols/chainlink/v1/idl.json");
+pub const CHAINLINK_V1_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/chainlink/v1/overrides.yaml");
+
 pub const JUPITER_V6_IDL_CONTENT: &str = include_str!("./protocols/jupiter/v6/idl.json");
 pub const JUPITER_V6_OVERRIDES_CONTENT: &str =
     include_str!("./protocols/jupiter/v6/overrides.yaml");
@@ -148,6 +152,7 @@ impl TemplateRegistry {
     pub fn new() -> Self {
         let mut default = Self::default();
         default.load_pyth_overrides();
+        default.load_chainlink_overrides();
         default.load_jupiter_overrides();
         default.load_raydium_overrides();
         default.load_meteora_overrides();
@@ -258,6 +263,14 @@ impl TemplateRegistry {
 
     pub fn load_pyth_overrides(&mut self) {
         self.load_protocol_overrides(PYTH_V2_IDL_CONTENT, PYTH_V2_OVERRIDES_CONTENT, "pyth");
+    }
+
+    pub fn load_chainlink_overrides(&mut self) {
+        self.load_protocol_overrides(
+            CHAINLINK_V1_IDL_CONTENT,
+            CHAINLINK_V1_OVERRIDES_CONTENT,
+            "chainlink",
+        );
     }
 
     pub fn load_jupiter_overrides(&mut self) {
@@ -888,17 +901,19 @@ templates:
     fn test_registry_loads_all_protocols() {
         let registry = TemplateRegistry::new();
 
-        // Pyth (1) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Meteora (2)
-        // + Kamino (Lend 17, Scope 3, Farms 5, Swap 2, Vault 5, Liquidity 4 = 36)
+        // Pyth (1) + Chainlink (1) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4)
+        // + Meteora (2) + Kamino (Lend 17, Scope 3, Farms 5, Swap 2, Vault 5, Liquidity 4 = 36)
         // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + GoonFi (4) + HumidiFi (3)
-        // + SolFi (4) + BisonFi (3) + Phoenix Eternal (19) = 91
+        // + SolFi (4) + BisonFi (3) + Phoenix Eternal (19) = 92
         assert_eq!(
             registry.count(),
-            91,
-            "Registry should load 91 templates total"
+            92,
+            "Registry should load 92 templates total"
         );
 
         assert!(registry.contains("pyth-price-feed-v2"));
+
+        assert!(registry.contains("chainlink-data-feed"));
 
         assert!(registry.contains("jupiter-token-ledger-override"));
 
@@ -1469,6 +1484,13 @@ templates: []
         let pyth_templates = registry.by_protocol("Pyth");
         assert_eq!(pyth_templates.len(), 1, "Should have 1 Pyth template");
 
+        let chainlink_templates = registry.by_protocol("Chainlink");
+        assert_eq!(
+            chainlink_templates.len(),
+            1,
+            "Should have 1 Chainlink template"
+        );
+
         let jupiter_templates = registry.by_protocol("Jupiter");
         assert_eq!(jupiter_templates.len(), 1, "Should have 1 Jupiter template");
 
@@ -1588,8 +1610,8 @@ templates: []
         let oracle_templates = registry.by_tags(&[vec!["oracle".to_string()]].concat());
         assert_eq!(
             oracle_templates.len(),
-            6,
-            "Should find 6 oracle templates (Pyth + 3 Kamino Scope + 1 GoonFi + 1 SolFi)"
+            7,
+            "Should find 7 oracle templates (Pyth + Chainlink + 3 Kamino Scope + 1 GoonFi + 1 SolFi)"
         );
 
         let rewards_templates = registry.by_tags(&[vec!["rewards".to_string()]].concat());
@@ -1661,6 +1683,7 @@ templates: []
         assert!(ids.contains(&"raydium-amm-custom".to_string()));
         assert!(ids.contains(&"jupiter-token-ledger-override".to_string()));
         assert!(ids.contains(&"pyth-price-feed-v2".to_string()));
+        assert!(ids.contains(&"chainlink-data-feed".to_string()));
         assert!(ids.contains(&"meteora-dlmm-sol-usdc".to_string()));
         assert!(ids.contains(&"kamino-reserve-state".to_string()));
         assert!(ids.contains(&"kamino-reserve-config".to_string()));
@@ -1880,6 +1903,55 @@ templates: []
             direct_pda, expected_address,
             "Direct PDA derivation should match expected SOL/USD address"
         );
+    }
+
+    #[test]
+    fn test_chainlink_data_feed_writes_the_round_the_sdk_reads() {
+        let registry = TemplateRegistry::new();
+        let template = registry.get("chainlink-data-feed").unwrap();
+        assert_eq!(
+            template.idl().address,
+            "HEvSKofvBgfaexv23kMabbYqxasxU3mQ4ibBMEmJWHny"
+        );
+        assert_eq!(
+            template.address,
+            AccountAddress::Pubkey(String::new()),
+            "the feed must be chosen by the caller"
+        );
+
+        // chainlink_solana::v2::read_feed_v2 reads one 48-byte round after the 8-byte
+        // discriminator and the 192-byte header: slot at 200, timestamp at 208, answer at 216.
+        // The forged data below starts after the discriminator, so its offsets are 8 lower.
+        let header = vec![0xAB; 192];
+        let values = HashMap::from([
+            ("live.slot".to_string(), serde_json::json!(312_000_000u64)),
+            (
+                "live.timestamp".to_string(),
+                serde_json::json!(1_761_630_000u32),
+            ),
+            (
+                "live.answer".to_string(),
+                serde_json::json!("12500000000000000000"),
+            ),
+        ]);
+        let forged = crate::surfnet::svm::SurfnetSvm::get_forged_idl_type_data(
+            &[header.clone(), vec![0; 48]].concat(),
+            template.idl(),
+            "Transmissions",
+            &values,
+        )
+        .unwrap();
+
+        assert_eq!(forged.len(), 240);
+        assert_eq!(&forged[..192], header.as_slice(), "header bytes changed");
+        assert_eq!(&forged[192..200], &312_000_000u64.to_le_bytes());
+        assert_eq!(&forged[200..204], &1_761_630_000u32.to_le_bytes());
+        assert_eq!(&forged[204..208], &[0; 4]);
+        assert_eq!(
+            &forged[208..224],
+            &12_500_000_000_000_000_000i128.to_le_bytes()
+        );
+        assert_eq!(&forged[224..240], &[0; 16]);
     }
 
     #[test]
