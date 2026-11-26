@@ -61,6 +61,8 @@ use crate::{
     },
 };
 
+mod tpu;
+
 /// Returns the geyser bank ID for `slot`.
 ///
 /// Surfpool runs a single fork with exactly one bank per slot, so the slot
@@ -200,7 +202,7 @@ fn check_port_availability(addr: SocketAddr, server_type: &str) -> Result<(), St
 
 pub async fn start_local_surfnet_runloop(
     svm_locker: SurfnetSvmLocker,
-    config: SurfpoolConfig,
+    mut config: SurfpoolConfig,
     simnet_commands_tx: Sender<SimnetCommand>,
     simnet_commands_rx: Receiver<SimnetCommand>,
     geyser_events_rx: Receiver<GeyserEvent>,
@@ -298,13 +300,27 @@ pub async fn start_local_surfnet_runloop(
         svm.announce_open_slot();
     });
 
-    let (_rpc_handle, _ws_handle, shutdown_rpc_servers) = start_rpc_servers_runloop(
+    let tpu_server = start_tpu_quic_server(&config.rpc, &simnet_commands_tx, &svm_locker)?;
+    // Before the RPC servers start: `getClusterNodes` advertises the port TPU actually bound.
+    config.rpc.tpu_quic_port = tpu_server.local_addr().port();
+
+    let (_rpc_handle, _ws_handle, shutdown_rpc_servers) = match start_rpc_servers_runloop(
         &config,
         &simnet_commands_tx,
         svm_locker.clone(),
         &remote_rpc_client,
         plugin_commands_tx,
-    )?;
+    ) {
+        Ok(started) => started,
+        Err(e) => {
+            tpu_server.close();
+            return Err(e.into());
+        }
+    };
+    let shutdown_rpc_servers: Box<dyn FnOnce() + Send> = Box::new(move || {
+        shutdown_rpc_servers();
+        tpu_server.close();
+    });
 
     let simnet_config = simnet.clone();
 
@@ -988,10 +1004,17 @@ fn start_geyser_runloop(
                             crate::surfnet::GeyserSlotStatus::Processed => SlotStatus::Processed,
                             crate::surfnet::GeyserSlotStatus::Confirmed => SlotStatus::Confirmed,
                             crate::surfnet::GeyserSlotStatus::Rooted => SlotStatus::Rooted,
+                            crate::surfnet::GeyserSlotStatus::Completed => SlotStatus::Completed,
                         };
 
                         for plugin in managed_plugins.iter().map(|p| &*p.plugin) {
-                            if let Err(e) = plugin.update_bank_status(slot, parent, &slot_status, bank_id_for_slot(slot)) {
+                            // Agave reports a completed slot without a bank: the status is about
+                            // the slot's shreds.
+                            let result = match slot_status {
+                                SlotStatus::Completed => plugin.update_slot_status(slot, parent, &slot_status),
+                                _ => plugin.update_bank_status(slot, parent, &slot_status, bank_id_for_slot(slot)),
+                            };
+                            if let Err(e) = result {
                                 simnet_events_tx.error(format!("Failed to update slot status in Geyser plugin: {:?}", e));
                             }
                         }
@@ -1211,6 +1234,29 @@ fn spawn_rpc_server_thread<S: RpcServer>(
         .map_err(|_| format!("Failed to receive {} server startup result", server_kind))??;
 
     Ok((handle, close_handle))
+}
+
+/// Starts the TPU QUIC server on the configured host and TPU QUIC port.
+fn start_tpu_quic_server(
+    rpc_config: &surfpool_types::RpcConfig,
+    simnet_commands_tx: &Sender<SimnetCommand>,
+    svm_locker: &SurfnetSvmLocker,
+) -> Result<tpu::TpuQuicServer, String> {
+    let addr: SocketAddr = format!("{}:{}", rpc_config.bind_host, rpc_config.tpu_quic_port)
+        .parse()
+        .map_err(|e: std::net::AddrParseError| e.to_string())?;
+    tpu::start_tpu_quic_runloop(addr, svm_locker.clone(), simnet_commands_tx.clone()).map_err(|e| {
+        let msg = if e.kind() == std::io::ErrorKind::AddrInUse {
+            format!(
+                "TPU QUIC port {} is already in use. Try --tpu-quic-port to use a different port.",
+                addr.port()
+            )
+        } else {
+            format!("Failed to start TPU QUIC server on {addr}: {e}")
+        };
+        eprintln!("Error: {msg}");
+        msg
+    })
 }
 
 /// The HTTP and WebSocket server threads, and the closure that closes

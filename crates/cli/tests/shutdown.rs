@@ -55,6 +55,7 @@ impl Surfpool {
             ])
             .args(["--port", &ports[0].to_string()])
             .args(["--ws-port", &ports[1].to_string()])
+            .args(["--tpu-quic-port", "0"])
             .args(["--studio-port", &ports[2].to_string()])
             .args(["--airdrop", &snapshot_key(u32::MAX)])
             .arg("-k")

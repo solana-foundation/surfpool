@@ -55,6 +55,8 @@ pub enum GeyserSlotStatus {
     Rooted,
     /// Slot has been confirmed
     Confirmed,
+    /// Slot has all of its shreds
+    Completed,
 }
 
 /// Block metadata for geyser plugin notifications.

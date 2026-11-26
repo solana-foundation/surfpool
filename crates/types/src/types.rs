@@ -995,6 +995,8 @@ pub struct RpcConfig {
     pub ws_port: u16,
     pub gossip_port: u16,
     pub tpu_port: u16,
+    /// Port the TPU QUIC server binds, and `getClusterNodes` advertises. With
+    /// `0` the OS picks a free port.
     pub tpu_quic_port: u16,
     /// Cheatcodes locked before the RPC server accepts its first request, as
     /// if by `surfnet_disableCheatcode` with `{"lockout": true}`.
@@ -1019,7 +1021,9 @@ impl Default for RpcConfig {
             ws_port: DEFAULT_WS_PORT,
             gossip_port: DEFAULT_GOSSIP_PORT,
             tpu_port: DEFAULT_TPU_PORT,
-            tpu_quic_port: DEFAULT_TPU_QUIC_PORT,
+            // Embedders run surfnets side by side, and clients find the port through
+            // `getClusterNodes`.
+            tpu_quic_port: 0,
             cheatcode_lock: None,
         }
     }

@@ -11010,6 +11010,7 @@ dependencies = [
  "solana-measure",
  "solana-packet",
  "solana-pubkey 4.3.0",
+ "solana-pubsub-client",
  "solana-rpc-client",
  "solana-rpc-client-api",
  "solana-streamer",
@@ -11017,6 +11018,7 @@ dependencies = [
  "solana-tls-utils",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-stream",
  "tokio-util 0.7.20",
 ]
 
@@ -11896,7 +11898,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "surfpool-bench"
-version = "1.7.0"
+version = "1.8.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -11922,7 +11924,7 @@ dependencies = [
 
 [[package]]
 name = "surfpool-cli"
-version = "1.7.0"
+version = "1.8.0"
 dependencies = [
  "actix-cors",
  "actix-web",
@@ -11988,12 +11990,13 @@ dependencies = [
 
 [[package]]
 name = "surfpool-core"
-version = "1.7.0"
+version = "1.8.0"
 dependencies = [
  "agave-feature-set",
  "agave-geyser-plugin-interface",
  "agave-reserved-account-keys",
  "anchor-lang-idl",
+ "anza-quinn",
  "async-trait",
  "axum",
  "base64 0.22.1",
@@ -12077,6 +12080,8 @@ dependencies = [
  "solana-system-interface 3.3.0",
  "solana-sysvar 4.2.0",
  "solana-sysvar-id 3.1.0",
+ "solana-tls-utils",
+ "solana-tpu-client-next",
  "solana-transaction 4.3.0",
  "solana-transaction-context",
  "solana-transaction-error 3.4.0",
@@ -12095,6 +12100,7 @@ dependencies = [
  "test-case",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-util 0.7.20",
  "txtx-addon-kit",
  "txtx-addon-network-svm",
  "txtx-addon-network-svm-types",
@@ -12104,7 +12110,7 @@ dependencies = [
 
 [[package]]
 name = "surfpool-db"
-version = "1.7.0"
+version = "1.8.0"
 dependencies = [
  "diesel",
  "diesel-dynamic-schema",
@@ -12117,7 +12123,7 @@ dependencies = [
 
 [[package]]
 name = "surfpool-mcp"
-version = "1.7.0"
+version = "1.8.0"
 dependencies = [
  "bs58",
  "crossbeam-channel",
@@ -12140,7 +12146,7 @@ dependencies = [
 
 [[package]]
 name = "surfpool-sdk"
-version = "1.7.0"
+version = "1.8.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -12177,7 +12183,7 @@ dependencies = [
 
 [[package]]
 name = "surfpool-sdk-node"
-version = "1.7.0"
+version = "1.8.0"
 dependencies = [
  "hiro-system-kit",
  "log 0.4.33",
@@ -12218,7 +12224,7 @@ dependencies = [
 
 [[package]]
 name = "surfpool-types"
-version = "1.7.0"
+version = "1.8.0"
 dependencies = [
  "agave-feature-set",
  "anchor-lang-idl",

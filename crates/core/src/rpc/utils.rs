@@ -131,7 +131,8 @@ const MAX_BASE64_SIZE: usize = 5464; // Golden, bump if MAX_TRANSACTION_SIZE cha
 /// Highest transaction version supported by this Surfpool release.
 pub const MAX_SUPPORTED_TRANSACTION_VERSION: u8 = 1;
 
-fn wire_size_limit(wire_output: &[u8]) -> usize {
+/// The largest wire size allowed for a transaction of the version `wire_output` starts with.
+pub(crate) fn wire_size_limit(wire_output: &[u8]) -> usize {
     // V1 messages and transactions both start with the V1 message prefix. Legacy and V0
     // transactions start with their short-vec signature count instead.
     if wire_output.first().copied() == Some(V1_PREFIX) {
