@@ -11,10 +11,12 @@
 //!
 //! The bundled IDL was converted from OpenBook's legacy Anchor IDL, so these guard what the
 //! conversion could get wrong: discriminators, field order and sizes against the live layout. The
-//! last test runs the deployed program against an overridden market.
+//! last tests run the deployed program against accounts a registered scenario has overridden.
 
 use std::{collections::HashMap, ops::Range};
 
+use crossbeam_channel::Receiver;
+use litesvm::types::FailedTransactionMetadata;
 use solana_account::Account;
 use solana_clock::Clock;
 use solana_commitment_config::CommitmentConfig;
@@ -25,10 +27,11 @@ use solana_pubkey::Pubkey;
 use solana_signer::Signer;
 use solana_transaction::Transaction;
 use solana_transaction_error::TransactionError;
+use surfpool_types::{AccountAddress, OverrideInstance, Scenario, SimnetEvent};
 
 use crate::{
     scenarios::TemplateRegistry,
-    surfnet::{GetAccountResult, remote::SurfnetRemoteClient, svm::SurfnetSvm},
+    surfnet::{GetAccountResult, GeyserEvent, remote::SurfnetRemoteClient, svm::SurfnetSvm},
     tests::helpers::diff_indices,
 };
 
@@ -58,6 +61,7 @@ const OPEN_ORDERS_LEN: usize = 1264;
 // Market field offsets, discriminator included.
 const TIME_EXPIRY: Range<usize> = 48..56;
 const MAX_STALENESS_SLOTS: Range<usize> = 368..376;
+const QUOTE_LOT_SIZE: Range<usize> = 448..456;
 const MAKER_FEE: Range<usize> = 480..488;
 const TAKER_FEE: Range<usize> = 488..496;
 const FEES_AVAILABLE: Range<usize> = 536..544;
@@ -65,6 +69,8 @@ const BASE_DEPOSIT_TOTAL: Range<usize> = 672..680;
 const QUOTE_DEPOSIT_TOTAL: Range<usize> = 712..720;
 
 // OpenOrdersAccount field offsets: `position` starts at 144.
+const OWNER: Range<usize> = 8..40;
+const OPEN_ORDERS_MARKET: Range<usize> = 40..72;
 const BIDS_BASE_LOTS: Range<usize> = 144..152;
 const ASKS_BASE_LOTS: Range<usize> = 152..160;
 const BASE_FREE_NATIVE: Range<usize> = 160..168;
@@ -420,38 +426,73 @@ fn take_order(
     }
 }
 
-/// The deployed OpenBook program, given the live SOL/USDC market with and without the custom
-/// template's expiry override: it takes the order on the live market and refuses it as expired on
-/// the overridden one, so the override is what the program reads.
-#[tokio::test]
-async fn the_deployed_program_refuses_orders_on_an_expired_market() {
-    let market_address = SOL_USDC;
-    let market = Pubkey::from_str_const(market_address);
-    let program = fetch_accounts(&[&PROGRAM_ID.to_string()]).await.remove(0);
-    // An upgradeable program's account holds its ProgramData address after a 4-byte tag; the ELF
-    // starts 45 bytes into the ProgramData account, past the loader's header.
-    let programdata = Pubkey::new_from_array(program.data[4..36].try_into().unwrap());
+/// `cancel_all_orders` on `open_orders`: every order, either side.
+fn cancel_all_orders(
+    signer: Pubkey,
+    open_orders: Pubkey,
+    market: Pubkey,
+    market_data: &[u8],
+) -> Instruction {
+    // cancel_all_orders' discriminator, then side_option None and limit.
+    let mut data = vec![196, 83, 243, 171, 17, 100, 160, 143, 0];
+    data.push(u8::MAX);
 
-    let market_account = fetch_accounts(&[market_address]).await.remove(0);
-    // The book sides, event heap and vaults. The market authority is a PDA that only signs for the
-    // vaults and holds no account, so there is nothing to fetch for it.
-    let linked: Vec<String> = [200, 232, 264, 640, 680]
-        .iter()
-        .map(|offset| market_key(&market_account.data, *offset).to_string())
-        .collect();
-    let mut addresses = vec![programdata.to_string()];
-    addresses.extend(linked.iter().cloned());
-    let addresses: Vec<&str> = addresses.iter().map(String::as_str).collect();
-    let mut accounts = fetch_accounts(&addresses).await;
-    let elf = accounts.remove(0).data[45..].to_vec();
+    Instruction {
+        program_id: PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new_readonly(signer, true),
+            AccountMeta::new(open_orders, false),
+            AccountMeta::new_readonly(market, false),
+            AccountMeta::new(market_key(market_data, 200), false),
+            AccountMeta::new(market_key(market_data, 232), false),
+        ],
+        data,
+    }
+}
 
-    let registry = TemplateRegistry::new();
-    let template = registry.get("openbook-v2-market-custom").unwrap();
-    let signer = Keypair::new();
-    let user = [Pubkey::new_unique(), Pubkey::new_unique()];
+/// The deployed OpenBook program and the live SOL/USDC market, fetched once and loaded into as many
+/// fresh surfnets as a test needs.
+struct Deployed {
+    elf: Vec<u8>,
+    market: Pubkey,
+    market_account: Account,
+    /// The book sides, event heap and vaults. The market authority is a PDA that only signs for
+    /// the vaults and holds no account, so there is nothing to fetch for it.
+    linked: Vec<(Pubkey, Account)>,
+}
 
-    let run = |market_data: Vec<u8>| -> Result<(), TransactionError> {
-        let (mut svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
+impl Deployed {
+    async fn fetch() -> Self {
+        let program = fetch_accounts(&[&PROGRAM_ID.to_string()]).await.remove(0);
+        // An upgradeable program's account holds its ProgramData address after a 4-byte tag; the
+        // ELF starts 45 bytes into the ProgramData account, past the loader's header.
+        let programdata = Pubkey::new_from_array(program.data[4..36].try_into().unwrap());
+
+        let market_account = fetch_accounts(&[SOL_USDC]).await.remove(0);
+        let linked: Vec<Pubkey> = [200, 232, 264, 640, 680]
+            .iter()
+            .map(|offset| market_key(&market_account.data, *offset))
+            .collect();
+        let addresses: Vec<String> = std::iter::once(programdata)
+            .chain(linked.iter().copied())
+            .map(|address| address.to_string())
+            .collect();
+        let addresses: Vec<&str> = addresses.iter().map(String::as_str).collect();
+        let mut accounts = fetch_accounts(&addresses).await;
+        let elf = accounts.remove(0).data[45..].to_vec();
+
+        Self {
+            elf,
+            market: Pubkey::from_str_const(SOL_USDC),
+            market_account,
+            linked: linked.into_iter().zip(accounts).collect(),
+        }
+    }
+
+    /// A surfnet running the deployed program over the live market, with its Clock at the wall
+    /// clock so the market's registration time is in the past.
+    fn surfnet(&self) -> (SurfnetSvm, Receiver<SimnetEvent>, Receiver<GeyserEvent>) {
+        let (mut svm, simnet_events_rx, geyser_events_rx) = SurfnetSvm::default();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -460,21 +501,87 @@ async fn the_deployed_program_refuses_orders_on_an_expired_market() {
             unix_timestamp: now,
             ..svm.inner.get_sysvar::<Clock>()
         });
-        svm.inner.svm.add_program(PROGRAM_ID, &elf).unwrap();
-        svm.set_account(
-            &market,
-            Account {
-                data: market_data,
-                ..market_account.clone()
-            },
-        )
-        .unwrap();
-        for (address, account) in linked.iter().zip(&accounts) {
-            svm.set_account(&Pubkey::from_str_const(address), account.clone())
-                .unwrap();
+        svm.inner.svm.add_program(PROGRAM_ID, &self.elf).unwrap();
+        svm.set_account(&self.market, self.market_account.clone())
+            .unwrap();
+        for (address, account) in &self.linked {
+            svm.set_account(address, account.clone()).unwrap();
         }
-        let base_mint = market_key(&market_account.data, 576);
-        let quote_mint = market_key(&market_account.data, 608);
+        (svm, simnet_events_rx, geyser_events_rx)
+    }
+}
+
+/// An override of `template_id` on `address`, played at the scenario's first slot.
+fn override_of(
+    template_id: &str,
+    address: Pubkey,
+    values: &[(&str, serde_json::Value)],
+) -> OverrideInstance {
+    OverrideInstance::new(
+        template_id.to_string(),
+        0,
+        AccountAddress::Pubkey(address.to_string()),
+    )
+    .with_values(
+        values
+            .iter()
+            .map(|(path, value)| (path.to_string(), value.clone()))
+            .collect(),
+    )
+}
+
+/// Registers `overrides` as one scenario and materializes it, the path a scenario registered over
+/// RPC takes, so the template and the scheduler are what write the accounts.
+async fn play(svm: &mut SurfnetSvm, overrides: Vec<OverrideInstance>) {
+    let slot = svm.latest_epoch_info.absolute_slot;
+    let mut scenario = Scenario::new("OpenBook v2".to_string(), String::new());
+    for instance in overrides {
+        scenario.add_override(instance);
+    }
+    svm.register_scenario(scenario, Some(slot))
+        .expect("register the scenario");
+    svm.materialize_overrides_for_slot(&None, slot)
+        .await
+        .expect("materialize the scenario");
+}
+
+fn send(
+    svm: &mut SurfnetSvm,
+    signer: &Keypair,
+    instruction: Instruction,
+) -> Result<(), Box<FailedTransactionMetadata>> {
+    let transaction = Transaction::new_signed_with_payer(
+        &[instruction],
+        Some(&signer.pubkey()),
+        &[signer],
+        svm.latest_blockhash(),
+    );
+    svm.send_transaction(transaction.into(), false, true)
+        .map(|_| ())
+        .map_err(Box::new)
+}
+
+fn account_data(svm: &SurfnetSvm, address: &Pubkey) -> Vec<u8> {
+    svm.inner
+        .get_account(address)
+        .unwrap()
+        .unwrap_or_else(|| panic!("{address} is not in the surfnet"))
+        .data
+}
+
+/// The deployed OpenBook program takes an order on the live SOL/USDC market, and refuses it as
+/// `MarketHasExpired` once a scenario plays the market template's expiry override, so the
+/// override is what the program reads.
+#[tokio::test]
+async fn the_deployed_program_refuses_orders_on_an_expired_market() {
+    let deployed = Deployed::fetch().await;
+    let market_data = &deployed.market_account.data;
+    let signer = Keypair::new();
+    let user = [Pubkey::new_unique(), Pubkey::new_unique()];
+
+    let order = |svm: &mut SurfnetSvm| -> Result<(), TransactionError> {
+        let base_mint = market_key(market_data, 576);
+        let quote_mint = market_key(market_data, 608);
         svm.set_account(&user[0], token_account(base_mint, signer.pubkey(), 0))
             .unwrap();
         svm.set_account(
@@ -483,41 +590,164 @@ async fn the_deployed_program_refuses_orders_on_an_expired_market() {
         )
         .unwrap();
         svm.inner.airdrop(&signer.pubkey(), 1_000_000_000).unwrap();
-
-        let transaction = Transaction::new_signed_with_payer(
-            &[take_order(
-                signer.pubkey(),
-                market,
-                &market_account.data,
-                user,
-            )],
-            Some(&signer.pubkey()),
-            &[&signer],
-            svm.latest_blockhash(),
-        );
-        svm.send_transaction(transaction.into(), false, true)
-            .map(|_| ())
-            .map_err(|failed| failed.err)
+        send(
+            svm,
+            &signer,
+            take_order(signer.pubkey(), deployed.market, market_data, user),
+        )
+        .map_err(|failed| failed.err)
     };
 
-    run(market_account.data.clone())
-        .unwrap_or_else(|e| panic!("the live market should take the order, got {e:?}"));
+    let (mut svm, _simnet_events_rx, _geyser_events_rx) = deployed.surfnet();
+    order(&mut svm).unwrap_or_else(|e| panic!("the live market should take the order, got {e:?}"));
 
-    let expired = SurfnetSvm::default()
-        .0
-        .get_forged_account_data(
-            &market,
-            &market_account.data,
-            template.idl(),
-            &HashMap::from([("time_expiry".to_string(), serde_json::json!(-1))]),
-        )
-        .unwrap();
+    let (mut svm, _simnet_events_rx, _geyser_events_rx) = deployed.surfnet();
+    play(
+        &mut svm,
+        vec![override_of(
+            "openbook-v2-market-custom",
+            deployed.market,
+            &[("time_expiry", serde_json::json!(-1))],
+        )],
+    )
+    .await;
+    let expired = account_data(&svm, &deployed.market);
+    assert_only_fields_changed(&expired, market_data, &[TIME_EXPIRY]);
+    assert_eq!(read_i64(&expired, TIME_EXPIRY), -1);
     assert_eq!(
-        run(expired),
+        order(&mut svm),
         Err(TransactionError::InstructionError(
             0,
             InstructionError::Custom(MARKET_HAS_EXPIRED)
         )),
         "the deployed program should refuse the order as MarketHasExpired"
+    );
+}
+
+/// The maker fee a bid locks is released at the market's current rate when the bid is cancelled.
+/// The live open orders account's bid rested at a `maker_fee` of 0, so raising the fee through
+/// the market template makes the deployed program's release underflow and panic; also raising the
+/// account's `locked_maker_fees` through the open orders template to cover the new rate lets the
+/// cancel through again. The README's fee recipe describes both.
+#[tokio::test]
+async fn raising_the_maker_fee_makes_resting_bids_uncancellable() {
+    const RAISED_MAKER_FEE: i64 = 1000;
+    /// An open orders account holds at most 24 orders.
+    const MAX_OPEN_ORDERS: u64 = 24;
+
+    let deployed = Deployed::fetch().await;
+    let market_data = &deployed.market_account.data;
+    let open_orders = Pubkey::from_str_const(OPEN_ORDERS);
+    let mut open_orders_account = fetch_accounts(&[OPEN_ORDERS]).await.remove(0);
+    let position = &open_orders_account.data;
+    assert_eq!(
+        &position[OPEN_ORDERS_MARKET],
+        deployed.market.as_ref(),
+        "{OPEN_ORDERS} is not on the SOL/USDC market"
+    );
+    let bids_base_lots = read_i64(position, BIDS_BASE_LOTS);
+    assert!(
+        bids_base_lots > 0,
+        "{OPEN_ORDERS} has no resting bid any more; the test needs another open orders account"
+    );
+    assert_eq!(
+        (
+            read_i64(market_data, MAKER_FEE),
+            read_u64(position, LOCKED_MAKER_FEES)
+        ),
+        (0, 0),
+        "the live bid should have rested at a maker fee of 0, so it locked no fee"
+    );
+    let raised_fee = override_of(
+        "openbook-v2-market-custom",
+        deployed.market,
+        &[("maker_fee", serde_json::json!(RAISED_MAKER_FEE))],
+    );
+    // What the raised rate charges on the account's bids, rounded up once per order.
+    let fee_at_raised_rate = (read_i64(position, BIDS_QUOTE_LOTS)
+        * read_i64(market_data, QUOTE_LOT_SIZE)
+        * RAISED_MAKER_FEE) as u64
+        / 1_000_000
+        + MAX_OPEN_ORDERS;
+
+    // cancel_all_orders needs the owner's signature: the test's signer stands in for the owner.
+    let signer = Keypair::new();
+    open_orders_account.data[OWNER].copy_from_slice(signer.pubkey().as_ref());
+    let cancel = cancel_all_orders(signer.pubkey(), open_orders, deployed.market, market_data);
+    let surfnet = || {
+        let (mut svm, simnet_events_rx, geyser_events_rx) = deployed.surfnet();
+        svm.set_account(&open_orders, open_orders_account.clone())
+            .unwrap();
+        svm.inner.airdrop(&signer.pubkey(), 1_000_000_000).unwrap();
+        (svm, simnet_events_rx, geyser_events_rx)
+    };
+
+    // At the live fee the cancel goes through and takes the bid off the book. Checking the lots
+    // matters: cancel_all_orders skips an order it cannot find on the book without failing.
+    let (mut svm, _simnet_events_rx, _geyser_events_rx) = surfnet();
+    send(&mut svm, &signer, cancel.clone())
+        .unwrap_or_else(|failed| panic!("the live bid should cancel, got {:?}", failed.err));
+    assert_eq!(
+        read_i64(&account_data(&svm, &open_orders), BIDS_BASE_LOTS),
+        0,
+        "the cancel should take the bid off the book"
+    );
+
+    // With the fee raised by the market template, the same cancel panics.
+    let (mut svm, _simnet_events_rx, _geyser_events_rx) = surfnet();
+    play(&mut svm, vec![raised_fee.clone()]).await;
+    assert_eq!(
+        read_i64(&account_data(&svm, &deployed.market), MAKER_FEE),
+        RAISED_MAKER_FEE
+    );
+    let failed = send(&mut svm, &signer, cancel.clone())
+        .expect_err("the cancel should fail once the maker fee is raised");
+    assert_eq!(
+        failed.err,
+        TransactionError::InstructionError(0, InstructionError::ProgramFailedToComplete),
+        "the deployed program should panic"
+    );
+    assert!(
+        failed
+            .meta
+            .logs
+            .iter()
+            .any(|log| log.contains("attempt to subtract with overflow")),
+        "the panic should be the locked maker fee underflowing, got {:#?}",
+        failed.meta.logs
+    );
+    assert_eq!(
+        read_i64(&account_data(&svm, &open_orders), BIDS_BASE_LOTS),
+        bids_base_lots,
+        "the failed cancel leaves the bid on the book"
+    );
+
+    // Raising the locked fee by the open orders template as well lets the cancel through.
+    let (mut svm, _simnet_events_rx, _geyser_events_rx) = surfnet();
+    play(
+        &mut svm,
+        vec![
+            raised_fee,
+            override_of(
+                "openbook-v2-open-orders",
+                open_orders,
+                &[(
+                    "position.locked_maker_fees",
+                    serde_json::json!(fee_at_raised_rate),
+                )],
+            ),
+        ],
+    )
+    .await;
+    send(&mut svm, &signer, cancel).unwrap_or_else(|failed| {
+        panic!(
+            "the cancel should go through once the locked fee covers the raised rate, got {:?}",
+            failed.err
+        )
+    });
+    assert_eq!(
+        read_i64(&account_data(&svm, &open_orders), BIDS_BASE_LOTS),
+        0,
+        "the cancel should take the bid off the book"
     );
 }

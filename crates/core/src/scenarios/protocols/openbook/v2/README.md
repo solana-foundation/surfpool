@@ -107,10 +107,15 @@ has shipped. The `Market` and `OpenOrdersAccount` layouts are the same in both.
 # Testing
 
 `crates/core/src/tests/openbook/` fetches five busy markets and a live open orders account from
-mainnet, checks that they round-trip through the bundled IDL unchanged, and checks that overrides
-change only their target bytes. Its last test runs the deployed program: it takes an order on the
-live SOL/USDC market, and refuses the same order as `MarketHasExpired` once `time_expiry` is
-overridden to `-1`:
+mainnet, checks that they round-trip through the bundled IDL unchanged, and checks that writing
+every template field changes only its target bytes. Its last two tests run the deployed program
+against accounts a registered scenario has overridden, through `register_scenario` and the
+materializer as a scenario sent over RPC would be:
+
+- it takes an order on the live SOL/USDC market, and refuses the same order as `MarketHasExpired`
+  once `time_expiry` is overridden to `-1`;
+- it cancels a live resting bid, panics on the same cancel once `maker_fee` is raised, and lets it
+  through again once `position.locked_maker_fees` is raised to cover the new rate.
 
 ```
 cargo test -p surfpool-core --features integration-tests openbook
