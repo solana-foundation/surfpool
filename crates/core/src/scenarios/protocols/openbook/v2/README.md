@@ -78,8 +78,10 @@ of the taker fee, so it must not exceed the taker fee in size.
 
 # The bundled IDL
 
-OpenBook publishes its IDL in the legacy (pre Anchor 0.30) format, which Surfpool cannot read.
-`idl.json` is that IDL converted, with nothing added or removed:
+`idl.json` is the IDL the deployed program publishes on chain, in its Anchor IDL account
+`6HsCgDXQq6JZ7VsgHzmB6hqpTh7ZZhqQRktDru9TXn9L` (the one [idl.solana.com](https://idl.solana.com)
+serves for the program). That IDL is in the legacy (pre Anchor 0.30) format, which Surfpool cannot
+read, so `idl.json` is it converted, with nothing added or removed:
 
 ```
 anchor idl convert openbook_v2.json -p opnb2LAfJYbRMAHHvqjCwQxanZn7ReEHp1k81EohpZb -o idl.json
@@ -87,13 +89,18 @@ anchor idl convert openbook_v2.json -p opnb2LAfJYbRMAHHvqjCwQxanZn7ReEHp1k81Eohp
 
 | | |
 |---|---|
-| Source | [`idl/openbook_v2.json`](https://github.com/openbook-dex/openbook-v2/blob/f3e17421e675b083b584867594bf3cf4f675d156/idl/openbook_v2.json) at `f3e1742` (v0.2.10) |
-| Source SHA-256 | `a7da6ea7433682b61b23a08a66d63665b0d0631434eeabe335ea32b3c111ee80` |
+| Source | Anchor IDL account `6HsCgDXQq6JZ7VsgHzmB6hqpTh7ZZhqQRktDru9TXn9L`, read at slot 474646726 (2026-11-27) |
+| Source SHA-256 | `d949b2bc4fc649ce4da4b2734f7625f02ac0497d08467556809059483fbf782f` (the decompressed JSON) |
 | Converter | Anchor CLI 1.2.2 |
-| `idl.json` SHA-256 | `9df8ab9d4f15053a2871648f6457897ce8600544b029eb82ceac542dce0185ff` |
+| `idl.json` SHA-256 | `2930b90ed8fad10ca09156f1b43d6c1ac82688c730d1666aa86c0262e79a4176` |
 
 The legacy IDL has no program address or discriminators. `-p` sets the address, and the converter
 derives each discriminator from the account's name, as Anchor does.
+
+The IDL in OpenBook's repository is newer than the deployed program: it adds the `FillOrKill` order
+type and the `WouldExecutePartially` error (6043) from
+[openbook-v2#231](https://github.com/openbook-dex/openbook-v2/pull/231), which no program upgrade
+has shipped. The `Market` and `OpenOrdersAccount` layouts are the same in both.
 
 # Testing
 

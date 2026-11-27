@@ -2168,11 +2168,6 @@
       "code": 6042,
       "name": "NonEmptyOpenOrdersPosition",
       "msg": "Cannot close a non-empty open orders account"
-    },
-    {
-      "code": 6043,
-      "name": "WouldExecutePartially",
-      "msg": "Fill-Or-Kill order would generate a partial execution"
     }
   ],
   "types": [
@@ -3133,9 +3128,6 @@
           },
           {
             "name": "PostOnlySlide"
-          },
-          {
-            "name": "FillOrKill"
           }
         ]
       }
@@ -3267,15 +3259,6 @@
               },
               {
                 "name": "peg_limit",
-                "type": "i64"
-              }
-            ]
-          },
-          {
-            "name": "FillOrKill",
-            "fields": [
-              {
-                "name": "price_lots",
                 "type": "i64"
               }
             ]
