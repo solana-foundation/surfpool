@@ -882,7 +882,7 @@ pub struct ExecuteRunbook {
     )]
     #[cfg(feature = "supervisor_ui")]
     pub network_binding_port: u16,
-    /// Set the port for hosting the web UI
+    /// Set the IP address for hosting the web UI
     #[arg(
         long = "ip",
         short = 'i',
