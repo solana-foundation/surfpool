@@ -63,6 +63,21 @@ pruned, settled and closed. This is what a frontend or keeper has to handle when
 Set `taker_fee` (always `>= 0`) and `maker_fee`. A negative `maker_fee` pays makers a rebate out
 of the taker fee, so it must not exceed the taker fee in size.
 
+**Raising `maker_fee` breaks bids that are already resting.** When a bid rests, the program locks
+its maker fee at the rate of the moment in the owner's `position.locked_maker_fees`. Cancelling the
+bid later releases the fee at the market's *current* rate
+([`cancel_order`](https://github.com/openbook-dex/openbook-v2/blob/796a470033bc556c1d1a1f76709394fc50c63bf7/programs/openbook-v2/src/state/open_orders_account.rs#L325-L339)),
+so once the rate is higher than when the bid was placed, the subtraction underflows and the
+program panics with `attempt to subtract with overflow`. `cancel_order` and `cancel_all_orders` on
+those bids then always fail. A fill of such a bid makes the same subtraction when the fill event
+is consumed. Lowering `maker_fee`, or setting it to `0` or below, is safe: the cancel releases less
+than was locked.
+
+To raise it anyway, either raise it before the bids you test are placed, or also raise
+`position.locked_maker_fees` on each affected open orders account (with `openbook-v2-open-orders`)
+to at least the fee the new rate charges on its bids: `bids_quote_lots × quote_lot_size ×
+maker_fee / 10^6`, plus one for each open bid to cover rounding up.
+
 # The bundled IDL
 
 `idl.json` is the IDL the deployed program publishes on chain, in its Anchor IDL account
