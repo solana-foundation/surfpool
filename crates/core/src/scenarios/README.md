@@ -23,6 +23,7 @@ Protocols that are natively supported by Surfpool will have their IDLs included 
 - **PumpSwap v1** - Constant-product AMM with pool state and global config override templates, including canonical pool derivation for migrated pump.fun coins
 - **GoonFi V2** - Proprietary market maker (no published IDL), with price, reference-band, size-impact and vault-inventory templates; its oracle is kept alive and callers choose the market, oracle or vault account. See [protocols/goonfi/v2/README.md](./protocols/goonfi/v2/README.md)
 - **HumidiFi v8** - Proprietary market maker (no published IDL), with price, spread and vault-inventory templates; its quote is kept alive. Callers choose the market or vault account. See [protocols/humidifi/v8/README.md](./protocols/humidifi/v8/README.md)
+- **OpenBook v2** - Central limit order book with a market fee, expiry and deposit template and an open orders position template; callers choose the market or open orders account. See [protocols/openbook/v2/README.md](./protocols/openbook/v2/README.md)
  - **SolFi v2** – Proprietary market maker (no published IDL, not Anchor), with price, size-impact,
    swap-pressure and vault-inventory templates; its oracle is kept alive. See
    [protocols/solfi/v2/README.md](./protocols/solfi/v2/README.md)
@@ -50,13 +51,14 @@ it skips are never applied; step one slot at a time to play a scenario under a p
 
 ### On-chain integration tests
 
-Byte-level Kamino and BisonFi coverage lives in `crates/core/src/tests/kamino/` and
-`crates/core/src/tests/bisonfi/`. These tests fetch real accounts from mainnet, so they need a
-network connection and are compiled only behind a feature:
+Byte-level Kamino, BisonFi and OpenBook v2 coverage lives in `crates/core/src/tests/kamino/`,
+`crates/core/src/tests/bisonfi/` and `crates/core/src/tests/openbook/`. These tests fetch real
+accounts from mainnet, so they need a network connection and are compiled only behind a feature:
 
 ```
 cargo test -p surfpool-core --features integration-tests kamino
 cargo test -p surfpool-core --features integration-tests bisonfi
+cargo test -p surfpool-core --features integration-tests openbook
 ```
 
 Set `SURFPOOL_TEST_RPC_URL` to use a private endpoint instead of the public one. The default test

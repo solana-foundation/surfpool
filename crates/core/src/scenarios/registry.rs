@@ -94,6 +94,10 @@ pub const PHOENIX_ETERNAL_IDL_CONTENT: &str =
 pub const PHOENIX_ETERNAL_OVERRIDES_CONTENT: &str =
     include_str!("./protocols/phoenix-eternal/v1/overrides.yaml");
 
+pub const OPENBOOK_V2_IDL_CONTENT: &str = include_str!("./protocols/openbook/v2/idl.json");
+pub const OPENBOOK_V2_OVERRIDES_CONTENT: &str =
+    include_str!("./protocols/openbook/v2/overrides.yaml");
+
 /// Registry for managing override templates loaded from YAML files
 #[derive(Clone, Debug, Default)]
 pub struct TemplateRegistry {
@@ -160,6 +164,7 @@ impl TemplateRegistry {
         default.load_spl_token_overrides();
         default.load_pump_overrides();
         default.load_phoenix_overrides();
+        default.load_openbook_overrides();
         if let Err(e) = default.check_keep_alive_imports() {
             panic!("unable to load the override templates: {e}");
         }
@@ -378,6 +383,14 @@ impl TemplateRegistry {
             PHOENIX_ETERNAL_IDL_CONTENT,
             PHOENIX_ETERNAL_OVERRIDES_CONTENT,
             "phoenix-eternal",
+        );
+    }
+
+    pub fn load_openbook_overrides(&mut self) {
+        self.load_protocol_overrides(
+            OPENBOOK_V2_IDL_CONTENT,
+            OPENBOOK_V2_OVERRIDES_CONTENT,
+            "openbook",
         );
     }
 
@@ -891,11 +904,11 @@ templates:
         // Pyth (1) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Meteora (2)
         // + Kamino (Lend 17, Scope 3, Farms 5, Swap 2, Vault 5, Liquidity 4 = 36)
         // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + GoonFi (4) + HumidiFi (3)
-        // + SolFi (4) + BisonFi (3) + Phoenix Eternal (19) = 91
+        // + SolFi (4) + BisonFi (3) + Phoenix Eternal (19) + OpenBook v2 (2) = 93
         assert_eq!(
             registry.count(),
-            91,
-            "Registry should load 91 templates total"
+            93,
+            "Registry should load 93 templates total"
         );
 
         assert!(registry.contains("pyth-price-feed-v2"));
@@ -1016,6 +1029,9 @@ templates:
         assert!(registry.contains("phoenix-market-move"));
         assert!(registry.contains("phoenix-oracle-price"));
         assert!(registry.contains("phoenix-trader-collateral"));
+
+        assert!(registry.contains("openbook-v2-market-custom"));
+        assert!(registry.contains("openbook-v2-open-orders"));
     }
 
     #[test]
@@ -1579,6 +1595,22 @@ templates: []
             19,
             "Should have 19 Phoenix Eternal templates"
         );
+
+        let openbook_templates = registry.by_protocol("OpenBook");
+        assert_eq!(
+            openbook_templates.len(),
+            2,
+            "Should have 2 OpenBook v2 templates (custom market + open orders)"
+        );
+        let openbook_accounts: BTreeSet<&str> = openbook_templates
+            .iter()
+            .map(|t| t.account_type.as_str())
+            .collect();
+        assert_eq!(
+            openbook_accounts,
+            BTreeSet::from(["Market", "OpenOrdersAccount"]),
+            "OpenBook v2 templates cover the Market and OpenOrdersAccount accounts"
+        );
     }
 
     #[test]
@@ -1615,7 +1647,7 @@ templates: []
     }
 
     #[test]
-    fn test_clock_sensitive_tag_marks_pyth_and_every_phoenix_template() {
+    fn test_clock_sensitive_tag_marks_pyth_and_every_phoenix_and_openbook_template() {
         let registry = TemplateRegistry::new();
         let tagged: Vec<&str> = registry
             .by_tags(&["clock-sensitive".to_string()])
@@ -1628,9 +1660,17 @@ templates: []
             !phoenix.is_empty(),
             "the Phoenix Eternal templates are registered"
         );
-        for template in std::iter::once("pyth-price-feed-v2")
-            .chain(phoenix.iter().map(|template| template.id.as_str()))
-        {
+        let openbook = registry.by_protocol("OpenBook");
+        assert!(
+            !openbook.is_empty(),
+            "the OpenBook v2 templates are registered"
+        );
+        for template in std::iter::once("pyth-price-feed-v2").chain(
+            phoenix
+                .iter()
+                .chain(openbook.iter())
+                .map(|template| template.id.as_str()),
+        ) {
             assert!(
                 tagged.contains(&template),
                 "{template} must be clock-sensitive"
@@ -1676,6 +1716,8 @@ templates: []
         assert!(ids.contains(&"whirlpool-orca-usdc".to_string()));
         assert!(ids.contains(&"whirlpool-popcat-sol".to_string()));
         assert!(ids.contains(&"whirlpool-custom".to_string()));
+        assert!(ids.contains(&"openbook-v2-market-custom".to_string()));
+        assert!(ids.contains(&"openbook-v2-open-orders".to_string()));
     }
 
     #[test]
@@ -2179,6 +2221,54 @@ templates: []
         assert_eq!(
             template.address,
             AccountAddress::Pubkey("3t4JZcueEzTbVP6kLxXrL3VpWx45jDer4eqysweBchNH".to_string())
+        );
+    }
+
+    /// OpenBook v2 markets are permissionless, so a pair has many: both templates take the account
+    /// from the caller, and the market template offers the oracle staleness window.
+    #[test]
+    fn test_openbook_v2_templates_take_the_account_from_the_caller() {
+        let registry = TemplateRegistry::new();
+
+        for (id, account_type) in [
+            ("openbook-v2-market-custom", "Market"),
+            ("openbook-v2-open-orders", "OpenOrdersAccount"),
+        ] {
+            let template = registry
+                .get(id)
+                .unwrap_or_else(|| panic!("template {} should exist", id));
+            assert_eq!(
+                template.account_type, account_type,
+                "{} should target a {}",
+                id, account_type
+            );
+            assert_eq!(
+                template.address,
+                AccountAddress::Pubkey(String::new()),
+                "{} should let the caller pick the account",
+                id
+            );
+        }
+
+        let market_paths: Vec<&str> = registry
+            .get("openbook-v2-market-custom")
+            .unwrap()
+            .properties
+            .iter()
+            .map(|p| p.path.as_str())
+            .collect();
+        assert_eq!(
+            market_paths,
+            [
+                "maker_fee",
+                "taker_fee",
+                "time_expiry",
+                "base_deposit_total",
+                "quote_deposit_total",
+                "fees_available",
+                "oracle_config.max_staleness_slots",
+            ],
+            "the market template's fields"
         );
     }
 
