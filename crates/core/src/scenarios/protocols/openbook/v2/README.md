@@ -114,8 +114,9 @@ materializer as a scenario sent over RPC would be:
 
 - it takes an order on the live SOL/USDC market, and refuses the same order as `MarketHasExpired`
   once `time_expiry` is overridden to `-1`;
-- it cancels a live resting bid, panics on the same cancel once `maker_fee` is raised, and lets it
-  through again once `position.locked_maker_fees` is raised to cover the new rate.
+- it rests its own bid on the live SOL/USDC market at a `maker_fee` of 0 and cancels it, panics on
+  the same cancel once `maker_fee` is raised, and lets it through again once
+  `position.locked_maker_fees` is raised to cover the new rate.
 
 ```
 cargo test -p surfpool-core --features integration-tests openbook

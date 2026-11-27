@@ -69,7 +69,6 @@ const BASE_DEPOSIT_TOTAL: Range<usize> = 672..680;
 const QUOTE_DEPOSIT_TOTAL: Range<usize> = 712..720;
 
 // OpenOrdersAccount field offsets: `position` starts at 144.
-const OWNER: Range<usize> = 8..40;
 const OPEN_ORDERS_MARKET: Range<usize> = 40..72;
 const BIDS_BASE_LOTS: Range<usize> = 144..152;
 const ASKS_BASE_LOTS: Range<usize> = 152..160;
@@ -624,69 +623,173 @@ async fn the_deployed_program_refuses_orders_on_an_expired_market() {
     );
 }
 
+/// `create_open_orders_indexer` then `create_open_orders_account` for `owner` on `market`, and the
+/// open orders account's address: the owner's first, so its seed counter is 1.
+fn create_open_orders(owner: Pubkey, market: Pubkey) -> ([Instruction; 2], Pubkey) {
+    let (indexer, _) =
+        Pubkey::find_program_address(&[b"OpenOrdersIndexer", owner.as_ref()], &PROGRAM_ID);
+    let (open_orders, _) = Pubkey::find_program_address(
+        &[b"OpenOrders", owner.as_ref(), &1u32.to_le_bytes()],
+        &PROGRAM_ID,
+    );
+
+    let create_indexer = Instruction {
+        program_id: PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(owner, true),
+            AccountMeta::new_readonly(owner, true),
+            AccountMeta::new(indexer, false),
+            AccountMeta::new_readonly(solana_sdk_ids::system_program::id(), false),
+        ],
+        data: vec![64, 64, 153, 255, 217, 71, 249, 133],
+    };
+
+    // create_open_orders_account's discriminator, then the account's name as a Borsh string.
+    let name = b"surfpool";
+    let mut data = vec![204, 181, 175, 222, 40, 125, 188, 71];
+    data.extend_from_slice(&(name.len() as u32).to_le_bytes());
+    data.extend_from_slice(name);
+    let create_account = Instruction {
+        program_id: PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(owner, true),
+            AccountMeta::new_readonly(owner, true),
+            // No delegate: Anchor reads the program id as an absent optional account.
+            AccountMeta::new_readonly(PROGRAM_ID, false),
+            AccountMeta::new(indexer, false),
+            AccountMeta::new(open_orders, false),
+            AccountMeta::new_readonly(market, false),
+            AccountMeta::new_readonly(solana_sdk_ids::system_program::id(), false),
+        ],
+        data,
+    };
+
+    ([create_indexer, create_account], open_orders)
+}
+
+/// A post-only bid of `base_lots` at `price_lots` on `market`, paid from `user_quote`.
+fn post_only_bid(
+    signer: Pubkey,
+    open_orders: Pubkey,
+    market: Pubkey,
+    market_data: &[u8],
+    user_quote: Pubkey,
+    price_lots: i64,
+    base_lots: i64,
+) -> Instruction {
+    // place_order's discriminator, then PlaceOrderArgs: side Bid, price_lots, max_base_lots,
+    // max_quote_lots_including_fees, client_order_id, order_type PostOnly, expiry_timestamp
+    // (0 = none), self_trade_behavior DecrementTake, limit.
+    let mut data = vec![51, 194, 155, 175, 109, 130, 96, 106, 0];
+    data.extend_from_slice(&price_lots.to_le_bytes());
+    data.extend_from_slice(&base_lots.to_le_bytes());
+    data.extend_from_slice(&(2 * price_lots * base_lots).to_le_bytes());
+    data.extend_from_slice(&1u64.to_le_bytes());
+    data.push(2);
+    data.extend_from_slice(&0u64.to_le_bytes());
+    data.extend_from_slice(&[0, 10]);
+
+    Instruction {
+        program_id: PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new_readonly(signer, true),
+            AccountMeta::new(open_orders, false),
+            // Anchor reads the program id as an absent optional account: the SOL/USDC market has
+            // no open orders admin and no oracles.
+            AccountMeta::new_readonly(PROGRAM_ID, false),
+            AccountMeta::new(user_quote, false),
+            AccountMeta::new(market, false),
+            AccountMeta::new(market_key(market_data, 200), false),
+            AccountMeta::new(market_key(market_data, 232), false),
+            AccountMeta::new(market_key(market_data, 264), false),
+            AccountMeta::new(market_key(market_data, 680), false),
+            AccountMeta::new_readonly(PROGRAM_ID, false),
+            AccountMeta::new_readonly(PROGRAM_ID, false),
+            AccountMeta::new_readonly(spl_token_interface::id(), false),
+        ],
+        data,
+    }
+}
+
 /// The maker fee a bid locks is released at the market's current rate when the bid is cancelled.
-/// The live open orders account's bid rested at a `maker_fee` of 0, so raising the fee through
-/// the market template makes the deployed program's release underflow and panic; also raising the
-/// account's `locked_maker_fees` through the open orders template to cover the new rate lets the
-/// cancel through again. The README's fee recipe describes both.
+/// The test rests its own bid on the live SOL/USDC market at a `maker_fee` of 0, so it does not
+/// depend on anyone's live order or on the live fee. Raising the fee through the market template
+/// then makes the deployed program's release underflow and panic; also raising the account's
+/// `locked_maker_fees` through the open orders template to cover the new rate lets the cancel
+/// through again. The README's fee recipe describes both.
 #[tokio::test]
 async fn raising_the_maker_fee_makes_resting_bids_uncancellable() {
     const RAISED_MAKER_FEE: i64 = 1000;
-    /// An open orders account holds at most 24 orders.
-    const MAX_OPEN_ORDERS: u64 = 24;
+    /// 1 USDC per SOL on the SOL/USDC market: far below the book, so the post-only bid rests.
+    const BID_PRICE_LOTS: i64 = 100;
+    const BID_BASE_LOTS: i64 = 1000;
 
     let deployed = Deployed::fetch().await;
     let market_data = &deployed.market_account.data;
-    let open_orders = Pubkey::from_str_const(OPEN_ORDERS);
-    let mut open_orders_account = fetch_accounts(&[OPEN_ORDERS]).await.remove(0);
-    let position = &open_orders_account.data;
-    assert_eq!(
-        &position[OPEN_ORDERS_MARKET],
-        deployed.market.as_ref(),
-        "{OPEN_ORDERS} is not on the SOL/USDC market"
-    );
-    let bids_base_lots = read_i64(position, BIDS_BASE_LOTS);
-    assert!(
-        bids_base_lots > 0,
-        "{OPEN_ORDERS} has no resting bid any more; the test needs another open orders account"
-    );
-    assert_eq!(
-        (
-            read_i64(market_data, MAKER_FEE),
-            read_u64(position, LOCKED_MAKER_FEES)
-        ),
-        (0, 0),
-        "the live bid should have rested at a maker fee of 0, so it locked no fee"
-    );
-    let raised_fee = override_of(
-        "openbook-v2-market-custom",
-        deployed.market,
-        &[("maker_fee", serde_json::json!(RAISED_MAKER_FEE))],
-    );
-    // What the raised rate charges on the account's bids, rounded up once per order.
-    let fee_at_raised_rate = (read_i64(position, BIDS_QUOTE_LOTS)
-        * read_i64(market_data, QUOTE_LOT_SIZE)
-        * RAISED_MAKER_FEE) as u64
-        / 1_000_000
-        + MAX_OPEN_ORDERS;
-
-    // cancel_all_orders needs the owner's signature: the test's signer stands in for the owner.
     let signer = Keypair::new();
-    open_orders_account.data[OWNER].copy_from_slice(signer.pubkey().as_ref());
+    let user_quote = Pubkey::new_unique();
+    let (create, open_orders) = create_open_orders(signer.pubkey(), deployed.market);
+    let fee = |maker_fee: i64| {
+        override_of(
+            "openbook-v2-market-custom",
+            deployed.market,
+            &[("maker_fee", serde_json::json!(maker_fee))],
+        )
+    };
     let cancel = cancel_all_orders(signer.pubkey(), open_orders, deployed.market, market_data);
-    let surfnet = || {
+
+    // A surfnet where the signer's own bid rests on the book at a maker fee of 0, so it locked no
+    // fee. Each case below starts from it.
+    let with_resting_bid = async || {
         let (mut svm, simnet_events_rx, geyser_events_rx) = deployed.surfnet();
-        svm.set_account(&open_orders, open_orders_account.clone())
-            .unwrap();
         svm.inner.airdrop(&signer.pubkey(), 1_000_000_000).unwrap();
+        svm.set_account(
+            &user_quote,
+            token_account(market_key(market_data, 608), signer.pubkey(), 1_000_000_000),
+        )
+        .unwrap();
+        play(&mut svm, vec![fee(0)]).await;
+        for instruction in create.iter().cloned().chain([post_only_bid(
+            signer.pubkey(),
+            open_orders,
+            deployed.market,
+            market_data,
+            user_quote,
+            BID_PRICE_LOTS,
+            BID_BASE_LOTS,
+        )]) {
+            send(&mut svm, &signer, instruction).unwrap_or_else(|failed| {
+                panic!(
+                    "setting up the resting bid failed: {:?}\n{:#?}",
+                    failed.err, failed.meta.logs
+                )
+            });
+        }
+        let position = account_data(&svm, &open_orders);
+        assert_eq!(&position[OPEN_ORDERS_MARKET], deployed.market.as_ref());
+        assert_eq!(
+            (
+                read_i64(&position, BIDS_BASE_LOTS),
+                read_u64(&position, LOCKED_MAKER_FEES)
+            ),
+            (BID_BASE_LOTS, 0),
+            "the bid should rest on the book, locking no fee at a maker fee of 0"
+        );
         (svm, simnet_events_rx, geyser_events_rx)
     };
+    // What the raised rate charges on the bid when it is cancelled, rounded up as the program does.
+    let fee_at_raised_rate = (BID_BASE_LOTS as u64
+        * BID_PRICE_LOTS as u64
+        * read_u64(market_data, QUOTE_LOT_SIZE)
+        * RAISED_MAKER_FEE as u64)
+        .div_ceil(1_000_000);
 
-    // At the live fee the cancel goes through and takes the bid off the book. Checking the lots
-    // matters: cancel_all_orders skips an order it cannot find on the book without failing.
-    let (mut svm, _simnet_events_rx, _geyser_events_rx) = surfnet();
+    // At the fee the bid was placed at, the cancel goes through and takes it off the book.
+    // Checking the lots matters: cancel_all_orders skips an order it cannot find on the book
+    // without failing.
+    let (mut svm, _simnet_events_rx, _geyser_events_rx) = with_resting_bid().await;
     send(&mut svm, &signer, cancel.clone())
-        .unwrap_or_else(|failed| panic!("the live bid should cancel, got {:?}", failed.err));
+        .unwrap_or_else(|failed| panic!("the bid should cancel, got {:?}", failed.err));
     assert_eq!(
         read_i64(&account_data(&svm, &open_orders), BIDS_BASE_LOTS),
         0,
@@ -694,8 +797,8 @@ async fn raising_the_maker_fee_makes_resting_bids_uncancellable() {
     );
 
     // With the fee raised by the market template, the same cancel panics.
-    let (mut svm, _simnet_events_rx, _geyser_events_rx) = surfnet();
-    play(&mut svm, vec![raised_fee.clone()]).await;
+    let (mut svm, _simnet_events_rx, _geyser_events_rx) = with_resting_bid().await;
+    play(&mut svm, vec![fee(RAISED_MAKER_FEE)]).await;
     assert_eq!(
         read_i64(&account_data(&svm, &deployed.market), MAKER_FEE),
         RAISED_MAKER_FEE
@@ -718,16 +821,16 @@ async fn raising_the_maker_fee_makes_resting_bids_uncancellable() {
     );
     assert_eq!(
         read_i64(&account_data(&svm, &open_orders), BIDS_BASE_LOTS),
-        bids_base_lots,
+        BID_BASE_LOTS,
         "the failed cancel leaves the bid on the book"
     );
 
-    // Raising the locked fee by the open orders template as well lets the cancel through.
-    let (mut svm, _simnet_events_rx, _geyser_events_rx) = surfnet();
+    // Raising the locked fee by exactly what the raised rate charges lets the cancel through.
+    let (mut svm, _simnet_events_rx, _geyser_events_rx) = with_resting_bid().await;
     play(
         &mut svm,
         vec![
-            raised_fee,
+            fee(RAISED_MAKER_FEE),
             override_of(
                 "openbook-v2-open-orders",
                 open_orders,
@@ -745,9 +848,13 @@ async fn raising_the_maker_fee_makes_resting_bids_uncancellable() {
             failed.err
         )
     });
+    let position = account_data(&svm, &open_orders);
     assert_eq!(
-        read_i64(&account_data(&svm, &open_orders), BIDS_BASE_LOTS),
-        0,
-        "the cancel should take the bid off the book"
+        (
+            read_i64(&position, BIDS_BASE_LOTS),
+            read_u64(&position, LOCKED_MAKER_FEES)
+        ),
+        (0, 0),
+        "the cancel should take the bid off the book and release exactly the locked fee"
     );
 }
