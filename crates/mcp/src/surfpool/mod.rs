@@ -207,10 +207,7 @@ pub struct CallSurfnetRpcParams {
     )]
     pub surfnet_port: u16,
     #[schemars(
-        description = "The RPC method name to call,for example: 'sendTransaction', 'simulateTransaction', 'getAccountInfo', 'getBalance', 'getTokenAccountBalance', 'getTokenSupply', 'getProgramAccounts', 'getTokenAccountsByOwner', 'getSlot',
-        'getEpochInfo', 'requestAirdrop', 'surfnet_setAccount', 'getHealth', 'getTokenAccountsByOwner', 'getTokenAccountsByDelegate',
-        'getTokenAccountsByDelegateAndMint', 'getTokenAccountsByDelegateAndMintAndOwner', 'getTokenAccountsByDelegateAndMintAndOwnerAndProgramId', 'getTokenAccountsByDelegateAndMintAndOwnerAndProgramIdAndOwner', surfnet_getProfileResults, etc.
-        A list of all the RPC methods available can be found at str:///rpc_endpoints"
+        description = "The RPC method name to call, for example: 'sendTransaction', 'simulateTransaction', 'getAccountInfo', 'getBalance', 'getTokenAccountBalance', 'getTokenSupply', 'getProgramAccounts', 'getTokenAccountsByOwner', 'getTokenAccountsByDelegate', 'getSlot', 'getEpochInfo', 'getHealth', 'requestAirdrop', 'surfnet_setAccount', 'surfnet_setTokenAccount', 'surfnet_getProfileResultsByTag'. The full list of available RPC methods is in the resource str:///rpc_endpoints"
     )]
     pub method: String,
     #[schemars(
