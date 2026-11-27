@@ -58,12 +58,19 @@ const OPEN_ORDERS_LEN: usize = 1264;
 // Market field offsets, discriminator included.
 const TIME_EXPIRY: Range<usize> = 48..56;
 const MAX_STALENESS_SLOTS: Range<usize> = 368..376;
+const MAKER_FEE: Range<usize> = 480..488;
 const TAKER_FEE: Range<usize> = 488..496;
+const FEES_AVAILABLE: Range<usize> = 536..544;
+const BASE_DEPOSIT_TOTAL: Range<usize> = 672..680;
 const QUOTE_DEPOSIT_TOTAL: Range<usize> = 712..720;
 
 // OpenOrdersAccount field offsets: `position` starts at 144.
+const BIDS_BASE_LOTS: Range<usize> = 144..152;
+const ASKS_BASE_LOTS: Range<usize> = 152..160;
 const BASE_FREE_NATIVE: Range<usize> = 160..168;
 const QUOTE_FREE_NATIVE: Range<usize> = 168..176;
+const LOCKED_MAKER_FEES: Range<usize> = 176..184;
+const BIDS_QUOTE_LOTS: Range<usize> = 232..240;
 
 /// The account data of [`fetch_accounts`].
 async fn fetch(addresses: &[&str]) -> Vec<Vec<u8>> {
@@ -108,13 +115,20 @@ fn read_u64(data: &[u8], range: Range<usize>) -> u64 {
     u64::from_le_bytes(data[range].try_into().unwrap())
 }
 
-/// Every byte that changed must belong to one of the target fields.
+/// Every target field must have changed, and every byte that changed must belong to one of them.
 fn assert_only_fields_changed(forged: &[u8], original: &[u8], fields: &[Range<usize>]) {
     assert_eq!(
         forged.len(),
         original.len(),
         "the override changed the size"
     );
+    for field in fields {
+        assert_ne!(
+            forged[field.clone()],
+            original[field.clone()],
+            "the override left the field at {field:?} unchanged"
+        );
+    }
     let stray: Vec<usize> = diff_indices(forged, original)
         .into_iter()
         .filter(|i| !fields.iter().any(|field| field.contains(i)))
@@ -182,8 +196,7 @@ async fn real_mainnet_accounts_round_trip_unchanged() {
     }
 }
 
-/// Expiry, fees, deposits and oracle staleness (every field the custom template offers), written
-/// into the live SOL/USDC market.
+/// Every field the market template offers, written into the live SOL/USDC market.
 #[tokio::test]
 async fn market_override_touches_only_target_fields() {
     let data = fetch(&[SOL_USDC]).await.remove(0);
@@ -192,43 +205,71 @@ async fn market_override_touches_only_target_fields() {
     let registry = TemplateRegistry::new();
     let template = registry.get("openbook-v2-market-custom").unwrap();
 
+    // Offset from the live values, so each write changes its field whatever the market holds.
+    let base_deposit_total = read_u64(&data, BASE_DEPOSIT_TOTAL) + 987_654_321;
+    let quote_deposit_total = read_u64(&data, QUOTE_DEPOSIT_TOTAL) + 123_456_789;
+    let fees_available = read_u64(&data, FEES_AVAILABLE) + 55_555;
+    let values = [
+        ("maker_fee", serde_json::json!(-77), MAKER_FEE),
+        ("taker_fee", serde_json::json!(4242), TAKER_FEE),
+        ("time_expiry", serde_json::json!(-1), TIME_EXPIRY),
+        (
+            "base_deposit_total",
+            serde_json::json!(base_deposit_total),
+            BASE_DEPOSIT_TOTAL,
+        ),
+        (
+            "quote_deposit_total",
+            serde_json::json!(quote_deposit_total),
+            QUOTE_DEPOSIT_TOTAL,
+        ),
+        (
+            "fees_available",
+            serde_json::json!(fees_available),
+            FEES_AVAILABLE,
+        ),
+        (
+            "oracle_config.max_staleness_slots",
+            serde_json::json!(77),
+            MAX_STALENESS_SLOTS,
+        ),
+    ];
+    let template_paths: Vec<&str> = template
+        .properties
+        .iter()
+        .map(|p| p.path.as_str())
+        .collect();
+    let written: Vec<&str> = values.iter().map(|(path, _, _)| *path).collect();
+    assert_eq!(
+        written, template_paths,
+        "the test writes every template field"
+    );
+
     let forged = surfnet_svm
         .get_forged_account_data(
             &Pubkey::new_unique(),
             &data,
             template.idl(),
-            &HashMap::from([
-                ("time_expiry".to_string(), serde_json::json!(-1)),
-                ("taker_fee".to_string(), serde_json::json!(4242)),
-                (
-                    "quote_deposit_total".to_string(),
-                    serde_json::json!(123_456_789u64),
-                ),
-                (
-                    "oracle_config.max_staleness_slots".to_string(),
-                    serde_json::json!(77),
-                ),
-            ]),
+            &values
+                .iter()
+                .map(|(path, value, _)| (path.to_string(), value.clone()))
+                .collect(),
         )
         .expect("override on the live SOL/USDC market");
 
-    assert_only_fields_changed(
-        &forged,
-        &data,
-        &[
-            TIME_EXPIRY,
-            TAKER_FEE,
-            QUOTE_DEPOSIT_TOTAL,
-            MAX_STALENESS_SLOTS,
-        ],
-    );
-    assert_eq!(read_i64(&forged, TIME_EXPIRY), -1, "the market is expired");
+    let fields: Vec<Range<usize>> = values.iter().map(|(_, _, field)| field.clone()).collect();
+    assert_only_fields_changed(&forged, &data, &fields);
+    assert_eq!(read_i64(&forged, MAKER_FEE), -77);
     assert_eq!(read_i64(&forged, TAKER_FEE), 4242);
-    assert_eq!(read_u64(&forged, QUOTE_DEPOSIT_TOTAL), 123_456_789);
+    assert_eq!(read_i64(&forged, TIME_EXPIRY), -1, "the market is expired");
+    assert_eq!(read_u64(&forged, BASE_DEPOSIT_TOTAL), base_deposit_total);
+    assert_eq!(read_u64(&forged, QUOTE_DEPOSIT_TOTAL), quote_deposit_total);
+    assert_eq!(read_u64(&forged, FEES_AVAILABLE), fees_available);
     assert_eq!(read_i64(&forged, MAX_STALENESS_SLOTS), 77);
 }
 
-/// Free balances inside the nested `position`, written into a live open orders account.
+/// Every field the open orders template offers, inside the nested `position`, written into a live
+/// open orders account.
 #[tokio::test]
 async fn open_orders_override_touches_only_target_fields() {
     let data = fetch(&[OPEN_ORDERS]).await.remove(0);
@@ -239,27 +280,73 @@ async fn open_orders_override_touches_only_target_fields() {
 
     let base_free = read_u64(&data, BASE_FREE_NATIVE) + 1_000_000_000;
     let quote_free = read_u64(&data, QUOTE_FREE_NATIVE) + 5_000_000;
+    let bids_base_lots = read_i64(&data, BIDS_BASE_LOTS) + 7;
+    let bids_quote_lots = read_i64(&data, BIDS_QUOTE_LOTS) + 13;
+    let asks_base_lots = read_i64(&data, ASKS_BASE_LOTS) + 11;
+    let locked_maker_fees = read_u64(&data, LOCKED_MAKER_FEES) + 17;
+    let values = [
+        (
+            "position.base_free_native",
+            serde_json::json!(base_free),
+            BASE_FREE_NATIVE,
+        ),
+        (
+            "position.quote_free_native",
+            serde_json::json!(quote_free),
+            QUOTE_FREE_NATIVE,
+        ),
+        (
+            "position.bids_base_lots",
+            serde_json::json!(bids_base_lots),
+            BIDS_BASE_LOTS,
+        ),
+        (
+            "position.bids_quote_lots",
+            serde_json::json!(bids_quote_lots),
+            BIDS_QUOTE_LOTS,
+        ),
+        (
+            "position.asks_base_lots",
+            serde_json::json!(asks_base_lots),
+            ASKS_BASE_LOTS,
+        ),
+        (
+            "position.locked_maker_fees",
+            serde_json::json!(locked_maker_fees),
+            LOCKED_MAKER_FEES,
+        ),
+    ];
+    let template_paths: Vec<&str> = template
+        .properties
+        .iter()
+        .map(|p| p.path.as_str())
+        .collect();
+    let written: Vec<&str> = values.iter().map(|(path, _, _)| *path).collect();
+    assert_eq!(
+        written, template_paths,
+        "the test writes every template field"
+    );
+
     let forged = surfnet_svm
         .get_forged_account_data(
             &Pubkey::new_unique(),
             &data,
             template.idl(),
-            &HashMap::from([
-                (
-                    "position.base_free_native".to_string(),
-                    serde_json::json!(base_free),
-                ),
-                (
-                    "position.quote_free_native".to_string(),
-                    serde_json::json!(quote_free),
-                ),
-            ]),
+            &values
+                .iter()
+                .map(|(path, value, _)| (path.to_string(), value.clone()))
+                .collect(),
         )
         .expect("override on the live open orders account");
 
-    assert_only_fields_changed(&forged, &data, &[BASE_FREE_NATIVE, QUOTE_FREE_NATIVE]);
+    let fields: Vec<Range<usize>> = values.iter().map(|(_, _, field)| field.clone()).collect();
+    assert_only_fields_changed(&forged, &data, &fields);
     assert_eq!(read_u64(&forged, BASE_FREE_NATIVE), base_free);
     assert_eq!(read_u64(&forged, QUOTE_FREE_NATIVE), quote_free);
+    assert_eq!(read_i64(&forged, BIDS_BASE_LOTS), bids_base_lots);
+    assert_eq!(read_i64(&forged, BIDS_QUOTE_LOTS), bids_quote_lots);
+    assert_eq!(read_i64(&forged, ASKS_BASE_LOTS), asks_base_lots);
+    assert_eq!(read_u64(&forged, LOCKED_MAKER_FEES), locked_maker_fees);
 }
 
 const PROGRAM_ID: Pubkey = Pubkey::from_str_const("opnb2LAfJYbRMAHHvqjCwQxanZn7ReEHp1k81EohpZb");
