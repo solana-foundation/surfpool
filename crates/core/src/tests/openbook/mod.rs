@@ -35,29 +35,16 @@ use crate::{
 const RPC_URL_ENV: &str = "SURFPOOL_TEST_RPC_URL";
 const DEFAULT_RPC_URL: &str = "https://api.mainnet-beta.solana.com";
 
-/// The preset markets, which Drift routes its spot fills through.
-const PRESETS: &[(&str, &str)] = &[
-    (
-        "openbook-v2-sol-usdc-market",
-        "AFgkED1FUVfBe2trPUDqSqK9QKd4stJrfzq5q1RwAFTa",
-    ),
-    (
-        "openbook-v2-btc-usdc-market",
-        "2HXgKaXKsMUEzQaSBZiXSd54eMHaS3roiefyGWtkW97W",
-    ),
-    (
-        "openbook-v2-eth-usdc-market",
-        "AT1R2jUNb9iTo4EaRfKSTPiNTX4Jb64KSwnVmig6Hu4t",
-    ),
-    (
-        "openbook-v2-wif-usdc-market",
-        "CwGmEwYFo7u5D7vghGwtcCbRToWosytaZa3Ys3JAto6J",
-    ),
-    (
-        "openbook-v2-bonk-usdc-market",
-        "D3gZwng2MgZGjktYcKpbR8Bz8653i4qCgzHCf5E4TcZb",
-    ),
+/// Busy SOL, BTC, ETH, WIF and BONK markets against USDC, as samples of the live `Market` layout.
+const MARKETS: &[&str] = &[
+    SOL_USDC,
+    "2HXgKaXKsMUEzQaSBZiXSd54eMHaS3roiefyGWtkW97W",
+    "AT1R2jUNb9iTo4EaRfKSTPiNTX4Jb64KSwnVmig6Hu4t",
+    "CwGmEwYFo7u5D7vghGwtcCbRToWosytaZa3Ys3JAto6J",
+    "D3gZwng2MgZGjktYcKpbR8Bz8653i4qCgzHCf5E4TcZb",
 ];
+/// The SOL/USDC market the overrides and the deployed program run against.
+const SOL_USDC: &str = "AFgkED1FUVfBe2trPUDqSqK9QKd4stJrfzq5q1RwAFTa";
 
 /// An open orders account on the SOL/USDC market with a resting bid, so its order slots are
 /// populated.
@@ -143,9 +130,9 @@ fn assert_only_fields_changed(forged: &[u8], original: &[u8], fields: &[Range<us
 /// A failure here means the converted IDL disagrees with the live on-chain layout.
 #[tokio::test]
 async fn real_mainnet_accounts_round_trip_unchanged() {
-    let mut cases: Vec<(&str, &str, &str, usize)> = PRESETS
+    let mut cases: Vec<(&str, &str, &str, usize)> = MARKETS
         .iter()
-        .map(|(id, address)| (*id, "Market", *address, MARKET_LEN))
+        .map(|address| ("openbook-v2-market-custom", "Market", *address, MARKET_LEN))
         .collect();
     cases.push((
         "openbook-v2-open-orders",
@@ -199,8 +186,7 @@ async fn real_mainnet_accounts_round_trip_unchanged() {
 /// into the live SOL/USDC market.
 #[tokio::test]
 async fn market_override_touches_only_target_fields() {
-    let (_, address) = PRESETS[0];
-    let data = fetch(&[address]).await.remove(0);
+    let data = fetch(&[SOL_USDC]).await.remove(0);
 
     let (surfnet_svm, _simnet_events_rx, _geyser_events_rx) = SurfnetSvm::default();
     let registry = TemplateRegistry::new();
@@ -336,7 +322,7 @@ fn take_order(
             AccountMeta::new(user[0], false),
             AccountMeta::new(user[1], false),
             // Anchor reads the program id as an absent optional account: neither oracle, nor an
-            // open orders admin, is set on the preset markets.
+            // open orders admin, is set on the SOL/USDC market.
             AccountMeta::new_readonly(PROGRAM_ID, false),
             AccountMeta::new_readonly(PROGRAM_ID, false),
             AccountMeta::new_readonly(spl_token_interface::id(), false),
@@ -352,7 +338,7 @@ fn take_order(
 /// the overridden one, so the override is what the program reads.
 #[tokio::test]
 async fn the_deployed_program_refuses_orders_on_an_expired_market() {
-    let (_, market_address) = PRESETS[0];
+    let market_address = SOL_USDC;
     let market = Pubkey::from_str_const(market_address);
     let program = fetch_accounts(&[&PROGRAM_ID.to_string()]).await.remove(0);
     // An upgradeable program's account holds its ProgramData address after a 4-byte tag; the ELF

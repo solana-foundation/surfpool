@@ -1,8 +1,8 @@
 # OpenBook v2
 
 A central limit order book (CLOB) on Solana, program `opnb2LAfJYbRMAHHvqjCwQxanZn7ReEHp1k81EohpZb`.
-Drift routes spot fills through it and Jupiter routes swaps through it, so its markets are worth
-overriding when testing either integration.
+Jupiter routes swaps through it, so its markets are worth overriding when testing a swap
+integration as well as a CLOB one.
 
 Two accounts are covered: a `Market` (fees, expiry, deposits) and an `OpenOrdersAccount` (one
 owner's balances and locked order lots on a market). The order book itself (`BookSide`) and the
@@ -12,23 +12,18 @@ fill queue (`EventHeap`) hold nested order trees and are not covered.
 
 | Template | Overrides |
 |---|---|
-| `openbook-v2-sol-usdc-market` | the SOL/USDC market |
-| `openbook-v2-btc-usdc-market` | the BTC/USDC market |
-| `openbook-v2-eth-usdc-market` | the ETH/USDC market |
-| `openbook-v2-wif-usdc-market` | the WIF/USDC market |
-| `openbook-v2-bonk-usdc-market` | the BONK/USDC market |
-| `openbook-v2-market-custom` | any market by address, plus its oracle staleness window |
+| `openbook-v2-market-custom` | a market's fees, expiry, deposit totals and oracle staleness window |
 | `openbook-v2-open-orders` | an open orders account's free balances and locked lots |
+
+Both take the account's address from the caller.
 
 ## Picking a market
 
 Anyone can create an OpenBook v2 market, so a pair has many: mainnet holds 18 SOL/USDC markets,
-most of them empty. The five presets are the markets Drift's `OpenbookV2FulfillmentConfig`
-accounts point at, which are the ones carrying real flow. For any other market use
-`openbook-v2-market-custom` with the market's address.
+most of them empty. Pass the address of the market your integration actually uses, for example
+the one your router or keeper is configured with, rather than the first match for the pair.
 
-None of the presets has an oracle, so oracle staleness only appears on the custom template. It has
-no effect on a market whose `oracle_a` is empty.
+The oracle staleness window has no effect on a market whose `oracle_a` is empty.
 
 ## Number formats
 
@@ -40,18 +35,10 @@ no effect on a market whose `oracle_a` is empty.
 | `position.*_free_native` | native units of the token | `1_000_000_000` = 1 SOL |
 | `position.*_lots` | lots of the market | see below |
 
-A market's lot sizes convert lots to native units: base native = base lots × `base_lot_size`. The
-presets' sizes:
-
-| Market | Base decimals | `base_lot_size` | `quote_lot_size` |
-|---|---|---|---|
-| SOL/USDC | 9 | 100000 | 1 |
-| BTC/USDC | 8 | 100 | 1 |
-| ETH/USDC | 8 | 1000 | 1 |
-| WIF/USDC | 6 | 10000 | 1 |
-| BONK/USDC | 5 | 100000000 | 1 |
-
-All five quote in USDC (6 decimals).
+A market's lot sizes convert lots to native units: base native = base lots × `base_lot_size`, and
+quote native = quote lots × `quote_lot_size`. Both are stored on the market and differ between
+markets: the SOL/USDC market `AFgkED1FUVfBe2trPUDqSqK9QKd4stJrfzq5q1RwAFTa`, for example, has a
+`base_lot_size` of 100000 (0.0001 SOL) and a `quote_lot_size` of 1.
 
 ## Overrides are bookkeeping
 
@@ -104,7 +91,7 @@ has shipped. The `Market` and `OpenOrdersAccount` layouts are the same in both.
 
 # Testing
 
-`crates/core/src/tests/openbook/` fetches the preset markets and a live open orders account from
+`crates/core/src/tests/openbook/` fetches five busy markets and a live open orders account from
 mainnet, checks that they round-trip through the bundled IDL unchanged, and checks that overrides
 change only their target bytes. Its last test runs the deployed program: it takes an order on the
 live SOL/USDC market, and refuses the same order as `MarketHasExpired` once `time_expiry` is

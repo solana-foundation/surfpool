@@ -10,79 +10,13 @@ tags:
   - defi
   - clock-sensitive
 
-# The preset markets are the OpenBook v2 markets Drift routes its spot fills through
-# (its OpenbookV2FulfillmentConfig accounts). OpenBook v2 markets are permissionless, so
-# a pair such as SOL/USDC has many markets; these are the ones with real flow.
 templates:
-  - id: openbook-v2-sol-usdc-market
-    name: Override SOL/USDC Market
-    description: Override fees, expiry and deposit totals of the SOL/USDC OpenBook v2 market
-    idl_account_name: Market
-    properties: &market_properties
-      - path: maker_fee
-        label: Maker Fee
-        description: Maker fee in 10^-6 (100 = 1 bps). Negative values rebate makers out of the taker fee
-      - path: taker_fee
-        label: Taker Fee
-        description: Taker fee in 10^-6 (100 = 1 bps), always >= 0
-      - path: time_expiry
-        label: Expiry Time
-        description: Unix timestamp after which deposits and new orders are refused. 0 = never expires, -1 = expired now
-      - path: base_deposit_total
-        label: Base Deposit Total
-        description: Base tokens (native units) the market tracks as deposited in its base vault
-      - path: quote_deposit_total
-        label: Quote Deposit Total
-        description: Quote tokens (native units) the market tracks as deposited in its quote vault
-      - path: fees_available
-        label: Fees Available
-        description: Quote fees (native units) withdrawable through sweep_fees
-    address:
-      type: pubkey
-      value: AFgkED1FUVfBe2trPUDqSqK9QKd4stJrfzq5q1RwAFTa
-
-  - id: openbook-v2-btc-usdc-market
-    name: Override BTC/USDC Market
-    description: Override fees, expiry and deposit totals of the BTC/USDC OpenBook v2 market
-    idl_account_name: Market
-    properties: *market_properties
-    address:
-      type: pubkey
-      value: 2HXgKaXKsMUEzQaSBZiXSd54eMHaS3roiefyGWtkW97W
-
-  - id: openbook-v2-eth-usdc-market
-    name: Override ETH/USDC Market
-    description: Override fees, expiry and deposit totals of the ETH/USDC OpenBook v2 market
-    idl_account_name: Market
-    properties: *market_properties
-    address:
-      type: pubkey
-      value: AT1R2jUNb9iTo4EaRfKSTPiNTX4Jb64KSwnVmig6Hu4t
-
-  - id: openbook-v2-wif-usdc-market
-    name: Override WIF/USDC Market
-    description: Override fees, expiry and deposit totals of the WIF/USDC OpenBook v2 market
-    idl_account_name: Market
-    properties: *market_properties
-    address:
-      type: pubkey
-      value: CwGmEwYFo7u5D7vghGwtcCbRToWosytaZa3Ys3JAto6J
-
-  - id: openbook-v2-bonk-usdc-market
-    name: Override BONK/USDC Market
-    description: Override fees, expiry and deposit totals of the BONK/USDC OpenBook v2 market
-    idl_account_name: Market
-    properties: *market_properties
-    address:
-      type: pubkey
-      value: D3gZwng2MgZGjktYcKpbR8Bz8653i4qCgzHCf5E4TcZb
-
   - id: openbook-v2-market-custom
     name: Override Custom Market
     description: Override fees, expiry, deposit totals and oracle staleness of any OpenBook v2 market by address
     idl_account_name: Market
-    # The preset markets' fields, plus the oracle staleness window: none of the presets has an
-    # oracle, but markets created with one refuse oracle-pegged orders once it goes stale.
+    # Markets created with an oracle refuse oracle-pegged orders once it goes stale; on a market
+    # without one the staleness window has no effect.
     properties:
       - path: maker_fee
         label: Maker Fee

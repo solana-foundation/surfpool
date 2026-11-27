@@ -904,11 +904,11 @@ templates:
         // Pyth (1) + Jupiter (1) + Raydium CLMM (1) + Raydium AMM v4 (4) + Meteora (2)
         // + Kamino (Lend 17, Scope 3, Farms 5, Swap 2, Vault 5, Liquidity 4 = 36)
         // + Whirlpool (6) + SPL Token (2) + Pump (2) + PumpSwap (3) + GoonFi (4) + HumidiFi (3)
-        // + SolFi (4) + BisonFi (3) + Phoenix Eternal (19) + OpenBook v2 (7) = 98
+        // + SolFi (4) + BisonFi (3) + Phoenix Eternal (19) + OpenBook v2 (2) = 93
         assert_eq!(
             registry.count(),
-            98,
-            "Registry should load 98 templates total"
+            93,
+            "Registry should load 93 templates total"
         );
 
         assert!(registry.contains("pyth-price-feed-v2"));
@@ -1030,11 +1030,6 @@ templates:
         assert!(registry.contains("phoenix-oracle-price"));
         assert!(registry.contains("phoenix-trader-collateral"));
 
-        assert!(registry.contains("openbook-v2-sol-usdc-market"));
-        assert!(registry.contains("openbook-v2-btc-usdc-market"));
-        assert!(registry.contains("openbook-v2-eth-usdc-market"));
-        assert!(registry.contains("openbook-v2-wif-usdc-market"));
-        assert!(registry.contains("openbook-v2-bonk-usdc-market"));
         assert!(registry.contains("openbook-v2-market-custom"));
         assert!(registry.contains("openbook-v2-open-orders"));
     }
@@ -1604,8 +1599,8 @@ templates: []
         let openbook_templates = registry.by_protocol("OpenBook");
         assert_eq!(
             openbook_templates.len(),
-            7,
-            "Should have 7 OpenBook v2 templates (5 markets + custom market + open orders)"
+            2,
+            "Should have 2 OpenBook v2 templates (custom market + open orders)"
         );
         let openbook_accounts: BTreeSet<&str> = openbook_templates
             .iter()
@@ -2229,90 +2224,52 @@ templates: []
         );
     }
 
-    /// The preset markets are the ones Drift routes spot fills through. Their addresses are
-    /// hardcoded facts about mainnet, so guard their shape and uniqueness, and that the presets
-    /// offer the same fields while the custom template adds the oracle staleness window.
+    /// OpenBook v2 markets are permissionless, so a pair has many: both templates take the account
+    /// from the caller, and the market template offers the oracle staleness window.
     #[test]
-    fn test_openbook_v2_preset_markets_have_baked_addresses() {
-        use std::{collections::BTreeSet, str::FromStr};
-
-        use solana_pubkey::Pubkey;
-
-        const PRESETS: &[&str] = &[
-            "openbook-v2-sol-usdc-market",
-            "openbook-v2-btc-usdc-market",
-            "openbook-v2-eth-usdc-market",
-            "openbook-v2-wif-usdc-market",
-            "openbook-v2-bonk-usdc-market",
-        ];
-        const STALENESS: &str = "oracle_config.max_staleness_slots";
-
+    fn test_openbook_v2_templates_take_the_account_from_the_caller() {
         let registry = TemplateRegistry::new();
-        let paths = |id: &str| -> Vec<String> {
-            registry
+
+        for (id, account_type) in [
+            ("openbook-v2-market-custom", "Market"),
+            ("openbook-v2-open-orders", "OpenOrdersAccount"),
+        ] {
+            let template = registry
                 .get(id)
-                .unwrap_or_else(|| panic!("template {} should exist", id))
-                .properties
-                .iter()
-                .map(|p| p.path.clone())
-                .collect()
-        };
-
-        let preset_paths = paths(PRESETS[0]);
-        assert!(
-            preset_paths.iter().any(|p| p == "time_expiry"),
-            "market templates override the expiry"
-        );
-        assert!(
-            !preset_paths.iter().any(|p| p == STALENESS),
-            "no preset market has an oracle, so none offers its staleness window"
-        );
-
-        let custom = registry
-            .get("openbook-v2-market-custom")
-            .expect("openbook-v2-market-custom template should exist");
-        assert_eq!(
-            custom.address,
-            AccountAddress::Pubkey(String::new()),
-            "the custom template lets the caller pick the market"
-        );
-        let mut expected_custom = preset_paths.clone();
-        expected_custom.push(STALENESS.to_string());
-        assert_eq!(
-            paths("openbook-v2-market-custom"),
-            expected_custom,
-            "the custom template offers the preset fields plus the oracle staleness window"
-        );
-
-        let mut addresses = BTreeSet::new();
-        for id in PRESETS {
-            let template = registry.get(id).unwrap();
+                .unwrap_or_else(|| panic!("template {} should exist", id));
             assert_eq!(
-                template.account_type, "Market",
-                "{} should target a Market",
-                id
-            );
-            let AccountAddress::Pubkey(address) = &template.address else {
-                panic!("{} should carry a plain pubkey address, not a PDA", id);
-            };
-            assert!(
-                Pubkey::from_str(address).is_ok(),
-                "{} has an unparseable address: {}",
-                id,
-                address
-            );
-            assert!(
-                addresses.insert(address.clone()),
-                "{} reuses an address already used by another preset",
-                id
+                template.account_type, account_type,
+                "{} should target a {}",
+                id, account_type
             );
             assert_eq!(
-                paths(id),
-                preset_paths,
-                "{} should offer the same fields as the other presets",
+                template.address,
+                AccountAddress::Pubkey(String::new()),
+                "{} should let the caller pick the account",
                 id
             );
         }
+
+        let market_paths: Vec<&str> = registry
+            .get("openbook-v2-market-custom")
+            .unwrap()
+            .properties
+            .iter()
+            .map(|p| p.path.as_str())
+            .collect();
+        assert_eq!(
+            market_paths,
+            [
+                "maker_fee",
+                "taker_fee",
+                "time_expiry",
+                "base_deposit_total",
+                "quote_deposit_total",
+                "fees_available",
+                "oracle_config.max_staleness_slots",
+            ],
+            "the market template's fields"
+        );
     }
 
     /// These addresses are hardcoded facts about mainnet, so guard their shape and uniqueness.
